@@ -34,7 +34,7 @@ launch with Enter or change either one first:
 
 ```
 orc → stealth/ox-alpha · mode: auto
-  [Enter] launch   [m] model   [p] permission mode   [k] key   [q] quit
+  [Enter] launch   [m] model   [f] free model   [p] permission mode   [k] key   [q] quit
 ```
 
 ## Usage
@@ -45,15 +45,21 @@ orc [claude args...]    pass args through to claude (orc -c, orc -p "...", orc -
 orc -m <model> [...]    one-off model override (not saved)
 orc setup               re-run the setup wizard (key + model)
 orc model [query]       pick + save a new default model
+orc free [query]        pick + save a currently free model
 orc mode                pick + save the launch permission mode
 orc small [query]       pick + save a small/fast model for background tasks
 orc models [query]      list models with pricing + context window
+orc models --free [...] list only currently free models
 orc key                 configure key source (env var name or macOS keychain)
 orc env                 print the export lines orc uses (contains your key)
 orc refresh             force-refresh the cached model list
 orc doctor              check everything end to end
 orc config              open config in $EDITOR
 ```
+
+The model picker shows live OpenRouter input/output prices per million tokens.
+Free models are marked `FREE`; type `FREE` in the regular picker or use
+`orc free` to search only models whose current usage prices are all zero.
 
 ## How the key is resolved
 

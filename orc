@@ -86,12 +86,22 @@ fetch_models() {
 }
 
 model_rows() {
-  jq -r '
+  local filter="${1:-all}"
+  jq -r --arg filter "$filter" '
+    def price($name): ((.pricing[$name] // "0") | tonumber);
+    def is_free:
+      price("prompt") == 0
+      and price("completion") == 0
+      and price("request") == 0
+      and price("image") == 0
+      and price("web_search") == 0
+      and price("internal_reasoning") == 0;
     .data
     | sort_by(.id)[]
+    | select($filter != "free" or is_free)
     | [ .id,
-        (if ((.pricing.prompt // "0")|tonumber) == 0 and ((.pricing.completion // "0")|tonumber) == 0
-         then "free"
+        (if is_free
+         then "FREE"
          else "$\((((.pricing.prompt // "0")|tonumber) * 100000000 | round) / 100)/M in  $\((((.pricing.completion // "0")|tonumber) * 100000000 | round) / 100)/M out"
          end),
         "\(((.context_length // 0) / 1000) | round)k ctx"
@@ -103,9 +113,15 @@ model_exists() { jq -e --arg id "$1" '.data[] | select(.id == $id)' "$MODELS_CAC
 pick_model() {
   need fzf
   fetch_models
-  local sel
-  sel="$(model_rows | column -t -s "$(printf '\t')" \
-        | fzf --prompt="${2:-model}> " --query="${1:-}" --height=20 --reverse)" || return 1
+  local sel filter header
+  filter="${3:-all}"
+  if [ "$filter" = "free" ]; then
+    header="currently free on OpenRouter · live catalog"
+  else
+    header="live OpenRouter price per 1M tokens · type FREE for free models"
+  fi
+  sel="$(model_rows "$filter" | column -t -s "$(printf '\t')" \
+        | fzf --prompt="${2:-model}> " --query="${1:-}" --header="$header" --height=20 --reverse)" || return 1
   printf '%s' "${sel%% *}"
 }
 
@@ -205,7 +221,7 @@ confirm_or_change() {
   while true; do
     local mode; mode="$(cfg .mode)"; mode="${mode:-default}"
     bold "orc → $(cfg .model) · mode: $mode"
-    printf '  [Enter] launch   [m] model   [p] permission mode   [k] key   [q] quit\n' >&2
+    printf '  [Enter] launch   [m] model   [f] free model   [p] permission mode   [k] key   [q] quit\n' >&2
     local ans; IFS= read -rsn1 ans || true
     case "$ans" in
       m|M)
@@ -213,6 +229,13 @@ confirm_or_change() {
         if mm="$(pick_model "" "model")"; then
           save_cfg model "$mm"
           info "model saved: $mm"
+        fi
+        ;;
+      f|F)
+        local fm
+        if fm="$(pick_model "" "free model" "free")"; then
+          save_cfg model "$fm"
+          info "model saved: $fm"
         fi
         ;;
       p|P) pick_mode || true ;;
@@ -309,9 +332,11 @@ usage:
   orc -m <model> [...]    one-off model override (not saved)
   orc setup               re-run the setup wizard (key + model)
   orc model [query]       pick + save a new default model (fzf)
+  orc free [query]        pick + save a currently free model (fzf)
   orc mode                pick + save the launch permission mode
   orc small [query]       pick + save the small/fast background model
   orc models [query]      list models with pricing + context
+  orc models --free [...] list only currently free models
   orc key                 configure key source (env var name or keychain)
   orc env                 print the export lines orc uses (contains your key)
   orc refresh             force-refresh the cached model list
@@ -335,6 +360,10 @@ case "${1:-}" in
     shift
     if m="$(pick_model "${1:-}" "model")"; then save_cfg model "$m"; info "model saved: $m"; fi
     exit 0 ;;
+  free)
+    shift
+    if m="$(pick_model "${1:-}" "free model" "free")"; then save_cfg model "$m"; info "model saved: $m"; fi
+    exit 0 ;;
   mode) pick_mode || info "mode unchanged"; exit 0 ;;
   small)
     shift
@@ -343,8 +372,13 @@ case "${1:-}" in
   models)
     shift
     fetch_models
-    if [ -n "${1:-}" ]; then model_rows | grep -i -- "$1" | column -t -s "$(printf '\t')"
-    else model_rows | column -t -s "$(printf '\t')"
+    model_filter="all"
+    if [ "${1:-}" = "--free" ] || [ "${1:-}" = "free" ]; then
+      model_filter="free"
+      shift
+    fi
+    if [ -n "${1:-}" ]; then model_rows "$model_filter" | grep -i -- "$1" | column -t -s "$(printf '\t')"
+    else model_rows "$model_filter" | column -t -s "$(printf '\t')"
     fi
     exit 0 ;;
   env)
