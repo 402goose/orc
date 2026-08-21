@@ -1,4 +1,4 @@
-# 🧌 orc — OpenRouter × Claude Code
+# 🧌 orc — OpenRouter × Claude
 
 Run Claude Code against any OpenRouter model — GPT, Gemini, Kimi, DeepSeek, free
 stealth previews like `stealth/ox-alpha` — with one command. `orc` handles the
