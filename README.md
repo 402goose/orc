@@ -101,7 +101,11 @@ gateway — can't silently hijack an orc session.
 ```
 
 `ORC_YES=1` skips the launch confirmation (for scripts). `ORC_HOME` moves the
-config dir. The model catalog is cached for 24h (`orc refresh` to force).
+config dir. `ORC_MODE` overrides the launch permission mode for one invocation
+(`default` / `auto` / `acceptEdits` / `plan` / `dontAsk` / `yolo`) without
+touching the saved config — this is how wrappers like cmndcntr launch orc with
+their own per-run policy. The model catalog is cached for 24h (`orc refresh`
+to force).
 
 ## Caveats
 

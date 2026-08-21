@@ -183,6 +183,14 @@ pick_mode() {
   info "mode saved: $m"
 }
 
+orc_mode() {
+  local m="${ORC_MODE:-$(cfg .mode)}"
+  case "$m" in
+    ""|default|auto|acceptEdits|plan|dontAsk|yolo|bypassPermissions) printf '%s' "$m" ;;
+    *) err "invalid ORC_MODE: $m"; return 1 ;;
+  esac
+}
+
 setup_wizard() {
   bold "orc — OpenRouter x Claude Code setup"
   if [ "$(key_source)" = "none" ]; then
@@ -270,7 +278,7 @@ launch() {
   forced="$(jq -nc --arg burl "https://openrouter.ai/api" --arg model "$model" --arg small "$small" --arg ctx "$ctx" \
     '{env: ({ANTHROPIC_BASE_URL: $burl, ANTHROPIC_API_KEY: "", ANTHROPIC_MODEL: $model, ANTHROPIC_SMALL_FAST_MODEL: $small, ANTHROPIC_DEFAULT_HAIKU_MODEL: $small}
       + (if $ctx != "" then {CLAUDE_CODE_MAX_CONTEXT_TOKENS: $ctx} else {} end))}')"
-  local mode; mode="$(cfg .mode)"
+  local mode; mode="$(orc_mode)" || exit 1
   local modeargs=()
   case "$mode" in
     ""|default) ;;
@@ -346,6 +354,7 @@ usage:
 env:
   ORC_YES=1               skip the launch confirmation prompt
   ORC_HOME                config dir (default ~/.config/orc)
+  ORC_MODE                per-launch permission-mode override (does not change saved config)
 EOF
 }
 
