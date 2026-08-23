@@ -10,15 +10,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck orc hud.sh install.sh build.sh test/run.sh
+      - run: shellcheck orc hud.sh hud.sh.in install.sh build.sh test/run.sh
 
   test:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: verify orc is assembled from hud.sh
+      - name: verify generated scripts are assembled from sources
         run: |
           ./build.sh
-          git diff --exit-code orc
+          git diff --exit-code orc hud.sh
       - name: run tests
         run: ./test/run.sh

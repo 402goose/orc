@@ -56,18 +56,25 @@ orc profiles [rm <n>]   list saved profiles / remove one
 orc stats               token + cost totals across all orc transcripts
      [--json] [--by model|project|day]
 orc hud [on|off|demo]   toggle the statusline HUD / preview it on the newest transcript
-orc models [query]      list models with pricing + context window
+orc models [query]      list models with pricing + context + tool support
 orc models --free [...] list only currently free models
+orc models --tools [..] list only models advertising tool support
 orc key                 configure key source (env var name or macOS keychain)
 orc env                 print the export lines orc uses (contains your key)
 orc refresh             force-refresh the cached model list
 orc doctor              check everything end to end
+orc probe [model]       smoke-test the launch path (1-token request)
 orc config              open config in $EDITOR
 ```
 
 The model picker shows live OpenRouter input/output prices per million tokens.
 Free models are marked `FREE`; type `FREE` in the regular picker or use
 `orc free` to search only models whose current usage prices are all zero.
+Every row also carries a tool-support flag read from the catalog's
+`supported_parameters`: models marked `NO TOOLS` tend to feel broken under
+Claude Code, which leans hard on tools. `orc models --tools` lists only
+tool-capable models, and `orc doctor` warns when your saved default lacks
+tool support.
 
 ## Profiles
 
@@ -136,6 +143,13 @@ per project and per model as seen from your machine.
 If neither is found, **orc refuses to launch** (fail closed) and tells you how
 to fix it.
 
+`orc doctor` goes further than static checks: as a final step it probes the
+real launch path — a 1-token request to OpenRouter's Anthropic-compatible
+endpoint (`/api/v1/messages`) with your resolved key and saved model — and
+reports HTTP status and latency, so breakage surfaces before you are inside a
+session. The probe costs a fraction of a cent on paid models; skip it with
+`ORC_NO_PROBE=1`, or run it standalone against any model with `orc probe <id>`.
+
 ## What it sets for Claude Code
 
 - `ANTHROPIC_BASE_URL` → OpenRouter's Anthropic-compatible endpoint
@@ -203,7 +217,8 @@ not counted (they are in `orc stats`).
 
 `ORC_YES=1` skips the launch confirmation (for scripts). `ORC_HOME` moves the
 config dir. `ORC_HUD=0` hides the statusline HUD for one invocation.
-`ORC_MODE` overrides the launch permission mode for one invocation
+`ORC_NO_PROBE=1` skips doctor's launch probe. `ORC_MODE` overrides the launch
+permission mode for one invocation
 (`default` / `auto` / `acceptEdits` / `plan` / `dontAsk` / `yolo`) without
 touching the saved config — this is how wrappers like cmndcntr launch orc with
 their own per-run policy. `ORC_PROFILE` does the same for profiles. The model
@@ -211,17 +226,26 @@ catalog is cached for 24h (`orc refresh` to force).
 
 ## Development
 
-`orc` is shipped as a single self-contained script, but the HUD's source of
-truth is `hud.sh` — edit that, then run `./build.sh`, which splices it into
-`orc`'s embedded heredoc and stamps `ORC_HUD_VERSION` with a content hash (so
-installed HUDs regenerate automatically on the next launch).
+The shipped scripts are assembled. Sources of truth:
+
+- `pricing.jq` — the shared jq math behind the HUD, `orc stats`, and the model
+  picker (token normalization, transcript validation, pricing, free/tool flags).
+  The HUD and stats are guaranteed to price identically because they run the
+  same definitions.
+- `hud.sh.in` — the statusline HUD body.
+- `orc` — everything else.
+
+`./build.sh` expands the `#INCLUDE pricing.jq` markers, writes the generated
+`hud.sh`, splices it into `orc`'s embedded heredoc, and stamps `ORC_HUD_VERSION`
+with a content hash over both sources — installed HUDs regenerate automatically
+on the next launch. Edit the sources, then run `./build.sh`; CI fails if `orc`
+or `hud.sh` have drifted from them.
 
 `./test/run.sh` runs the test suite: HUD rendering against fixture
 transcripts and a fixture catalog (paid / free / unknown-model pricing,
 legacy and current cache-usage shapes, all three context-percentage sources),
-`orc stats` aggregation, and profile / `.orc.json` resolution. CI runs
-shellcheck on every script plus the test suite, and fails if `orc` was edited
-without being reassembled from `hud.sh`.
+`orc stats` aggregation, model tool-support flags, and profile / `.orc.json`
+resolution. CI runs shellcheck on every script plus the test suite.
 
 ## Caveats
 
