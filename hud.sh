@@ -69,6 +69,19 @@ def catalog_map:
                 w5:.pricing.input_cache_write,
                 w1h:.pricing.input_cache_write_1h}})
   | from_entries;
+
+def model_price($f): ((.pricing[$f] // "0") | tonumber);
+
+def is_free:
+  model_price("prompt") == 0
+  and model_price("completion") == 0
+  and model_price("request") == 0
+  and model_price("image") == 0
+  and model_price("web_search") == 0
+  and model_price("internal_reasoning") == 0;
+
+def has_tools:
+  ((.supported_parameters // []) | index("tools")) != null;
     catalog_map' "$MODELS_CACHE" 2>/dev/null || true)"
   [ -z "${P:-}" ] && P="{}"
 fi
@@ -121,6 +134,19 @@ def catalog_map:
                 w5:.pricing.input_cache_write,
                 w1h:.pricing.input_cache_write_1h}})
   | from_entries;
+
+def model_price($f): ((.pricing[$f] // "0") | tonumber);
+
+def is_free:
+  model_price("prompt") == 0
+  and model_price("completion") == 0
+  and model_price("request") == 0
+  and model_price("image") == 0
+  and model_price("web_search") == 0
+  and model_price("internal_reasoning") == 0;
+
+def has_tools:
+  ((.supported_parameters // []) | index("tools")) != null;
     reduce inputs as $r ({};
       ($r|response_ok) as $ok
       | if $ok
@@ -198,6 +224,19 @@ def catalog_map:
                 w5:.pricing.input_cache_write,
                 w1h:.pricing.input_cache_write_1h}})
   | from_entries;
+
+def model_price($f): ((.pricing[$f] // "0") | tonumber);
+
+def is_free:
+  model_price("prompt") == 0
+  and model_price("completion") == 0
+  and model_price("request") == 0
+  and model_price("image") == 0
+  and model_price("web_search") == 0
+  and model_price("internal_reasoning") == 0;
+
+def has_tools:
+  ((.supported_parameters // []) | index("tools")) != null;
   def num($s): if ($s|type)=="string" and ($s|length)>0 then (($s|tonumber?) // -1) else -1 end;
   def pct($t;$d): if $t >= 0 and $d > 0 then ((($t/$d)*100)|floor) else -1 end;
   $A as $a

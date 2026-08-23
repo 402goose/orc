@@ -11,7 +11,7 @@ KEYCHAIN_SERVICE="orc-openrouter"
 CACHE_TTL=86400
 HUD_SCRIPT="$ORC_HOME/hud.sh"
 # ORC_HUD_VERSION and the ORC_HUD_BODY heredoc are written by build.sh from hud.sh.in + pricing.jq
-ORC_HUD_VERSION="add63735387c"
+ORC_HUD_VERSION="ae167157c3aa"
 
 err()  { printf '\033[31morc: %s\033[0m\n' "$*" >&2; }
 info() { printf '\033[2m%s\033[0m\n' "$*" >&2; }
@@ -183,27 +183,141 @@ fetch_models() {
 model_rows() {
   local filter="${1:-all}"
   jq -r --arg filter "$filter" '
-    def price($name): ((.pricing[$name] // "0") | tonumber);
-    def is_free:
-      price("prompt") == 0
-      and price("completion") == 0
-      and price("request") == 0
-      and price("image") == 0
-      and price("web_search") == 0
-      and price("internal_reasoning") == 0;
+# orc pricing/catalog math — single source of truth; spliced by build.sh into marked jq programs.
+
+def n2($x):
+  if $x == null then 0
+  elif ($x|type)=="number" then $x
+  elif ($x|type)=="string" then (($x|tonumber?) // 0)
+  else 0 end;
+
+def response_ok:
+  ((type)=="object")
+  and ((.message // null)|type=="object")
+  and ((.message.id // null)|type=="string")
+  and ((.message.usage // null)|type=="object")
+  and ((.message.model // null)|type=="string")
+  and ((.message.model|startswith("<"))|not);
+
+def usage_row:
+  { m:  .m,
+    i:  n2(.u.input_tokens),
+    o:  n2(.u.output_tokens),
+    r:  n2(.u.cache_read_input_tokens),
+    w5: (if ((.u.cache_creation // null)|type)=="object"
+         then n2(.u.cache_creation.ephemeral_5m_input_tokens)
+         else n2(.u.cache_creation_input_tokens) end),
+    w1: (if ((.u.cache_creation // null)|type)=="object"
+         then n2(.u.cache_creation.ephemeral_1h_input_tokens)
+         else 0 end)};
+
+def row_cost($P):
+  ($P[.m] // null) as $pr
+  | if ($pr|type)=="object"
+    then (.i*n2($pr.p)) + (.o*n2($pr.c)) + (.r*n2($pr.cr))
+         + (.w5*n2($pr.w5)) + (.w1*n2($pr.w1h))
+    else null end;
+
+def catalog_map:
+  .data
+  | map({key:.id,
+         value:{ctx:(.context_length // 0),
+                p:.pricing.prompt, c:.pricing.completion,
+                cr:.pricing.input_cache_read,
+                w5:.pricing.input_cache_write,
+                w1h:.pricing.input_cache_write_1h}})
+  | from_entries;
+
+def model_price($f): ((.pricing[$f] // "0") | tonumber);
+
+def is_free:
+  model_price("prompt") == 0
+  and model_price("completion") == 0
+  and model_price("request") == 0
+  and model_price("image") == 0
+  and model_price("web_search") == 0
+  and model_price("internal_reasoning") == 0;
+
+def has_tools:
+  ((.supported_parameters // []) | index("tools")) != null;
     .data
     | sort_by(.id)[]
-    | select($filter != "free" or is_free)
+    | select($filter == "all"
+             or ($filter == "free" and is_free)
+             or ($filter == "tools" and has_tools))
     | [ .id,
         (if is_free
          then "FREE"
          else "$\((((.pricing.prompt // "0")|tonumber) * 100000000 | round) / 100)/M in  $\((((.pricing.completion // "0")|tonumber) * 100000000 | round) / 100)/M out"
          end),
-        "\(((.context_length // 0) / 1000) | round)k ctx"
+        "\(((.context_length // 0) / 1000) | round)k ctx",
+        (if has_tools then "tools" else "NO TOOLS" end)
       ] | @tsv' "$MODELS_CACHE"
 }
 
 model_exists() { jq -e --arg id "$1" '.data[] | select(.id == $id)' "$MODELS_CACHE" >/dev/null 2>&1; }
+
+model_has_tools() {
+  jq -e --arg id "$1" '
+# orc pricing/catalog math — single source of truth; spliced by build.sh into marked jq programs.
+
+def n2($x):
+  if $x == null then 0
+  elif ($x|type)=="number" then $x
+  elif ($x|type)=="string" then (($x|tonumber?) // 0)
+  else 0 end;
+
+def response_ok:
+  ((type)=="object")
+  and ((.message // null)|type=="object")
+  and ((.message.id // null)|type=="string")
+  and ((.message.usage // null)|type=="object")
+  and ((.message.model // null)|type=="string")
+  and ((.message.model|startswith("<"))|not);
+
+def usage_row:
+  { m:  .m,
+    i:  n2(.u.input_tokens),
+    o:  n2(.u.output_tokens),
+    r:  n2(.u.cache_read_input_tokens),
+    w5: (if ((.u.cache_creation // null)|type)=="object"
+         then n2(.u.cache_creation.ephemeral_5m_input_tokens)
+         else n2(.u.cache_creation_input_tokens) end),
+    w1: (if ((.u.cache_creation // null)|type)=="object"
+         then n2(.u.cache_creation.ephemeral_1h_input_tokens)
+         else 0 end)};
+
+def row_cost($P):
+  ($P[.m] // null) as $pr
+  | if ($pr|type)=="object"
+    then (.i*n2($pr.p)) + (.o*n2($pr.c)) + (.r*n2($pr.cr))
+         + (.w5*n2($pr.w5)) + (.w1*n2($pr.w1h))
+    else null end;
+
+def catalog_map:
+  .data
+  | map({key:.id,
+         value:{ctx:(.context_length // 0),
+                p:.pricing.prompt, c:.pricing.completion,
+                cr:.pricing.input_cache_read,
+                w5:.pricing.input_cache_write,
+                w1h:.pricing.input_cache_write_1h}})
+  | from_entries;
+
+def model_price($f): ((.pricing[$f] // "0") | tonumber);
+
+def is_free:
+  model_price("prompt") == 0
+  and model_price("completion") == 0
+  and model_price("request") == 0
+  and model_price("image") == 0
+  and model_price("web_search") == 0
+  and model_price("internal_reasoning") == 0;
+
+def has_tools:
+  ((.supported_parameters // []) | index("tools")) != null;
+    .data[] | select(.id == $id) | has_tools' "$MODELS_CACHE" >/dev/null 2>&1
+}
 
 pick_model() {
   need fzf
@@ -213,7 +327,7 @@ pick_model() {
   if [ "$filter" = "free" ]; then
     header="currently free on OpenRouter · live catalog"
   else
-    header="live OpenRouter price per 1M tokens · type FREE for free models"
+    header="live prices per 1M tokens · type FREE for free models · NO TOOLS = poor Claude Code fit"
   fi
   sel="$(model_rows "$filter" | column -t -s "$(printf '\t')" \
         | fzf --prompt="${2:-model}> " --query="${1:-}" --header="$header" --height=20 --reverse)" || return 1
@@ -438,6 +552,19 @@ def catalog_map:
                 w5:.pricing.input_cache_write,
                 w1h:.pricing.input_cache_write_1h}})
   | from_entries;
+
+def model_price($f): ((.pricing[$f] // "0") | tonumber);
+
+def is_free:
+  model_price("prompt") == 0
+  and model_price("completion") == 0
+  and model_price("request") == 0
+  and model_price("image") == 0
+  and model_price("web_search") == 0
+  and model_price("internal_reasoning") == 0;
+
+def has_tools:
+  ((.supported_parameters // []) | index("tools")) != null;
     catalog_map' "$MODELS_CACHE" 2>/dev/null || true)"
   [ -z "${P:-}" ] && P="{}"
 fi
@@ -490,6 +617,19 @@ def catalog_map:
                 w5:.pricing.input_cache_write,
                 w1h:.pricing.input_cache_write_1h}})
   | from_entries;
+
+def model_price($f): ((.pricing[$f] // "0") | tonumber);
+
+def is_free:
+  model_price("prompt") == 0
+  and model_price("completion") == 0
+  and model_price("request") == 0
+  and model_price("image") == 0
+  and model_price("web_search") == 0
+  and model_price("internal_reasoning") == 0;
+
+def has_tools:
+  ((.supported_parameters // []) | index("tools")) != null;
     reduce inputs as $r ({};
       ($r|response_ok) as $ok
       | if $ok
@@ -567,6 +707,19 @@ def catalog_map:
                 w5:.pricing.input_cache_write,
                 w1h:.pricing.input_cache_write_1h}})
   | from_entries;
+
+def model_price($f): ((.pricing[$f] // "0") | tonumber);
+
+def is_free:
+  model_price("prompt") == 0
+  and model_price("completion") == 0
+  and model_price("request") == 0
+  and model_price("image") == 0
+  and model_price("web_search") == 0
+  and model_price("internal_reasoning") == 0;
+
+def has_tools:
+  ((.supported_parameters // []) | index("tools")) != null;
   def num($s): if ($s|type)=="string" and ($s|length)>0 then (($s|tonumber?) // -1) else -1 end;
   def pct($t;$d): if $t >= 0 and $d > 0 then ((($t/$d)*100)|floor) else -1 end;
   $A as $a
@@ -903,7 +1056,12 @@ doctor() {
   else
     fetch_models
     if model_exists "$model"; then
-      printf '  ✓ model: %s\n' "$model"
+      if model_has_tools "$model"; then
+        printf '  ✓ model: %s\n' "$model"
+      else
+        printf '  ! model %s does not advertise tool support — Claude Code leans hard on tools\n' "$model"
+        printf '    expect degraded behavior; pick another with: orc model\n'
+      fi
     else
       printf '  ! model %s not in current OpenRouter list (may be delisted) — run: orc model\n' "$model"
     fi
@@ -933,8 +1091,9 @@ usage:
   orc profiles [rm <n>]   list saved profiles / remove one
   orc stats               token + cost totals across all orc transcripts
        [--json] [--by model|project|day]
-  orc models [query]      list models with pricing + context
+  orc models [query]      list models with pricing + context + tool support
   orc models --free [...] list only currently free models
+  orc models --tools [..] list only models advertising tool support
   orc hud [on|off|demo]   toggle the statusline HUD / preview it on newest transcript
   orc key                 configure key source (env var name or keychain)
   orc env                 print the export lines orc uses (contains your key)
@@ -1038,10 +1197,10 @@ case "${1:-}" in
     shift
     fetch_models
     model_filter="all"
-    if [ "${1:-}" = "--free" ] || [ "${1:-}" = "free" ]; then
-      model_filter="free"
-      shift
-    fi
+    case "${1:-}" in
+      --free|free) model_filter="free"; shift ;;
+      --tools|tools) model_filter="tools"; shift ;;
+    esac
     if [ -n "${1:-}" ]; then model_rows "$model_filter" | grep -i -- "$1" | column -t -s "$(printf '\t')"
     else model_rows "$model_filter" | column -t -s "$(printf '\t')"
     fi

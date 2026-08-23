@@ -42,3 +42,16 @@ def catalog_map:
                 w5:.pricing.input_cache_write,
                 w1h:.pricing.input_cache_write_1h}})
   | from_entries;
+
+def model_price($f): ((.pricing[$f] // "0") | tonumber);
+
+def is_free:
+  model_price("prompt") == 0
+  and model_price("completion") == 0
+  and model_price("request") == 0
+  and model_price("image") == 0
+  and model_price("web_search") == 0
+  and model_price("internal_reasoning") == 0;
+
+def has_tools:
+  ((.supported_parameters // []) | index("tools")) != null;

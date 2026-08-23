@@ -1,4 +1,5 @@
 {"data":[
-  {"id":"test/paid","context_length":128000,"pricing":{"prompt":"0.000001","completion":"0.000002","request":"0","image":"0","web_search":"0","internal_reasoning":"0","input_cache_read":"0.0000001","input_cache_write":"0.00000125"}},
-  {"id":"test/free","context_length":64000,"pricing":{"prompt":"0","completion":"0","request":"0","image":"0","web_search":"0","internal_reasoning":"0"}}
+  {"id":"test/paid","context_length":128000,"supported_parameters":["tools","tool_choice","temperature"],"pricing":{"prompt":"0.000001","completion":"0.000002","request":"0","image":"0","web_search":"0","internal_reasoning":"0","input_cache_read":"0.0000001","input_cache_write":"0.00000125"}},
+  {"id":"test/free","context_length":64000,"pricing":{"prompt":"0","completion":"0","request":"0","image":"0","web_search":"0","internal_reasoning":"0"}},
+  {"id":"test/notools","context_length":8000,"supported_parameters":["temperature","top_p"],"pricing":{"prompt":"0.000005","completion":"0.000001","request":"0","image":"0","web_search":"0","internal_reasoning":"0"}}
 ]}
