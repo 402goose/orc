@@ -6,11 +6,12 @@ CONFIG="$ORC_HOME/config.json"
 MODELS_CACHE="$ORC_HOME/models.json"
 CLAUDE_STATE="$ORC_HOME/claude-state"
 API="https://openrouter.ai/api/v1"
+BASE_URL="https://openrouter.ai/api"
 KEYCHAIN_SERVICE="orc-openrouter"
 CACHE_TTL=86400
 HUD_SCRIPT="$ORC_HOME/hud.sh"
-# ORC_HUD_VERSION and the ORC_HUD_BODY heredoc are written by build.sh from hud.sh
-ORC_HUD_VERSION="bb107908552c"
+# ORC_HUD_VERSION and the ORC_HUD_BODY heredoc are written by build.sh from hud.sh.in + pricing.jq
+ORC_HUD_VERSION="add63735387c"
 
 err()  { printf '\033[31morc: %s\033[0m\n' "$*" >&2; }
 info() { printf '\033[2m%s\033[0m\n' "$*" >&2; }
@@ -392,14 +393,52 @@ eval "$(printf '%s' "$payload" | jq -r '
 
 P="{}"
 if [ -f "$MODELS_CACHE" ]; then
-  P="$(jq -c '.data
-        | map({key:.id,
-               value:{ctx:(.context_length // 0),
-                      p:.pricing.prompt, c:.pricing.completion,
-                      cr:.pricing.input_cache_read,
-                      w5:.pricing.input_cache_write,
-                      w1h:.pricing.input_cache_write_1h}})
-        | from_entries' "$MODELS_CACHE" 2>/dev/null || true)"
+  P="$(jq -c '
+# orc pricing/catalog math — single source of truth; spliced by build.sh into marked jq programs.
+
+def n2($x):
+  if $x == null then 0
+  elif ($x|type)=="number" then $x
+  elif ($x|type)=="string" then (($x|tonumber?) // 0)
+  else 0 end;
+
+def response_ok:
+  ((type)=="object")
+  and ((.message // null)|type=="object")
+  and ((.message.id // null)|type=="string")
+  and ((.message.usage // null)|type=="object")
+  and ((.message.model // null)|type=="string")
+  and ((.message.model|startswith("<"))|not);
+
+def usage_row:
+  { m:  .m,
+    i:  n2(.u.input_tokens),
+    o:  n2(.u.output_tokens),
+    r:  n2(.u.cache_read_input_tokens),
+    w5: (if ((.u.cache_creation // null)|type)=="object"
+         then n2(.u.cache_creation.ephemeral_5m_input_tokens)
+         else n2(.u.cache_creation_input_tokens) end),
+    w1: (if ((.u.cache_creation // null)|type)=="object"
+         then n2(.u.cache_creation.ephemeral_1h_input_tokens)
+         else 0 end)};
+
+def row_cost($P):
+  ($P[.m] // null) as $pr
+  | if ($pr|type)=="object"
+    then (.i*n2($pr.p)) + (.o*n2($pr.c)) + (.r*n2($pr.cr))
+         + (.w5*n2($pr.w5)) + (.w1*n2($pr.w1h))
+    else null end;
+
+def catalog_map:
+  .data
+  | map({key:.id,
+         value:{ctx:(.context_length // 0),
+                p:.pricing.prompt, c:.pricing.completion,
+                cr:.pricing.input_cache_read,
+                w5:.pricing.input_cache_write,
+                w1h:.pricing.input_cache_write_1h}})
+  | from_entries;
+    catalog_map' "$MODELS_CACHE" 2>/dev/null || true)"
   [ -z "${P:-}" ] && P="{}"
 fi
 
@@ -407,44 +446,67 @@ Z='{"i":0,"o":0,"r":0,"w5":0,"w1":0,"cost":0,"unknown":false,"last_model":"","ct
 A="$Z"
 if [ -n "$P_TX" ] && [ -f "$P_TX" ]; then
   A="$(jq -nc --argjson P "$P" '
-    def n2($x):
-      if $x == null then 0
-      elif ($x|type)=="number" then $x
-      elif ($x|type)=="string" then (($x|tonumber?) // 0)
-      else 0 end;
+# orc pricing/catalog math — single source of truth; spliced by build.sh into marked jq programs.
+
+def n2($x):
+  if $x == null then 0
+  elif ($x|type)=="number" then $x
+  elif ($x|type)=="string" then (($x|tonumber?) // 0)
+  else 0 end;
+
+def response_ok:
+  ((type)=="object")
+  and ((.message // null)|type=="object")
+  and ((.message.id // null)|type=="string")
+  and ((.message.usage // null)|type=="object")
+  and ((.message.model // null)|type=="string")
+  and ((.message.model|startswith("<"))|not);
+
+def usage_row:
+  { m:  .m,
+    i:  n2(.u.input_tokens),
+    o:  n2(.u.output_tokens),
+    r:  n2(.u.cache_read_input_tokens),
+    w5: (if ((.u.cache_creation // null)|type)=="object"
+         then n2(.u.cache_creation.ephemeral_5m_input_tokens)
+         else n2(.u.cache_creation_input_tokens) end),
+    w1: (if ((.u.cache_creation // null)|type)=="object"
+         then n2(.u.cache_creation.ephemeral_1h_input_tokens)
+         else 0 end)};
+
+def row_cost($P):
+  ($P[.m] // null) as $pr
+  | if ($pr|type)=="object"
+    then (.i*n2($pr.p)) + (.o*n2($pr.c)) + (.r*n2($pr.cr))
+         + (.w5*n2($pr.w5)) + (.w1*n2($pr.w1h))
+    else null end;
+
+def catalog_map:
+  .data
+  | map({key:.id,
+         value:{ctx:(.context_length // 0),
+                p:.pricing.prompt, c:.pricing.completion,
+                cr:.pricing.input_cache_read,
+                w5:.pricing.input_cache_write,
+                w1h:.pricing.input_cache_write_1h}})
+  | from_entries;
     reduce inputs as $r ({};
-      (((($r|type)=="object")
-        and (($r.message // null)|type=="object")
-        and (($r.message.id // null)|type=="string")
-        and (($r.message.usage // null)|type=="object")
-        and (($r.message.model // null)|type=="string")
-        and (($r.message.model|startswith("<"))|not)) as $ok
+      ($r|response_ok) as $ok
       | if $ok
         then .[$r.message.id] = {m:$r.message.model, u:$r.message.usage}
            | ._last = {m:$r.message.model, u:$r.message.usage}
-        else . end))
+        else . end)
     | . as $all
     | [($all | to_entries[] | select(.key != "_last") | .value)]
-    | map(. as $row | {
-        m:  $row.m,
-        i:  n2($row.u.input_tokens),
-        o:  n2($row.u.output_tokens),
-        r:  n2($row.u.cache_read_input_tokens),
-        w5: (if (($row.u.cache_creation // null)|type)=="object"
-             then n2($row.u.cache_creation.ephemeral_5m_input_tokens)
-             else n2($row.u.cache_creation_input_tokens) end),
-        w1: (if (($row.u.cache_creation // null)|type)=="object"
-             then n2($row.u.cache_creation.ephemeral_1h_input_tokens)
-             else 0 end)})
+    | map(usage_row)
     | reduce .[] as $x (
         {i:0,o:0,r:0,w5:0,w1:0,cost:0,unknown:false};
         (.i += $x.i) | (.o += $x.o) | (.r += $x.r)
         | (.w5 += $x.w5) | (.w1 += $x.w1)
-        | ($P[$x.m] // null) as $pr
-        | if ($pr|type)=="object"
-          then .cost += (($x.i*n2($pr.p)) + ($x.o*n2($pr.c)) + ($x.r*n2($pr.cr))
-                       + ($x.w5*n2($pr.w5)) + ($x.w1*n2($pr.w1h)))
-          else (if ($x.i+$x.o+$x.r+$x.w5+$x.w1) > 0 then .unknown = true else . end)
+        | ($x|row_cost($P)) as $c
+        | if $c == null
+          then (if ($x.i+$x.o+$x.r+$x.w5+$x.w1) > 0 then .unknown = true else . end)
+          else .cost += $c
           end)
     | . + {
         last_model: ($all._last.m // ""),
@@ -461,11 +523,50 @@ fi
 jq -rn --argjson A "$A" --argjson P "$P" --argjson cu "$P_CU" \
    --arg mid "$P_MID" --arg mname "$P_MNAME" \
    --arg upct "$P_UPCT" --arg csize "$P_CSIZE" '
-  def n2($x):
-    if $x == null then 0
-    elif ($x|type)=="number" then $x
-    elif ($x|type)=="string" then (($x|tonumber?) // 0)
-    else 0 end;
+# orc pricing/catalog math — single source of truth; spliced by build.sh into marked jq programs.
+
+def n2($x):
+  if $x == null then 0
+  elif ($x|type)=="number" then $x
+  elif ($x|type)=="string" then (($x|tonumber?) // 0)
+  else 0 end;
+
+def response_ok:
+  ((type)=="object")
+  and ((.message // null)|type=="object")
+  and ((.message.id // null)|type=="string")
+  and ((.message.usage // null)|type=="object")
+  and ((.message.model // null)|type=="string")
+  and ((.message.model|startswith("<"))|not);
+
+def usage_row:
+  { m:  .m,
+    i:  n2(.u.input_tokens),
+    o:  n2(.u.output_tokens),
+    r:  n2(.u.cache_read_input_tokens),
+    w5: (if ((.u.cache_creation // null)|type)=="object"
+         then n2(.u.cache_creation.ephemeral_5m_input_tokens)
+         else n2(.u.cache_creation_input_tokens) end),
+    w1: (if ((.u.cache_creation // null)|type)=="object"
+         then n2(.u.cache_creation.ephemeral_1h_input_tokens)
+         else 0 end)};
+
+def row_cost($P):
+  ($P[.m] // null) as $pr
+  | if ($pr|type)=="object"
+    then (.i*n2($pr.p)) + (.o*n2($pr.c)) + (.r*n2($pr.cr))
+         + (.w5*n2($pr.w5)) + (.w1*n2($pr.w1h))
+    else null end;
+
+def catalog_map:
+  .data
+  | map({key:.id,
+         value:{ctx:(.context_length // 0),
+                p:.pricing.prompt, c:.pricing.completion,
+                cr:.pricing.input_cache_read,
+                w5:.pricing.input_cache_write,
+                w1h:.pricing.input_cache_write_1h}})
+  | from_entries;
   def num($s): if ($s|type)=="string" and ($s|length)>0 then (($s|tonumber?) // -1) else -1 end;
   def pct($t;$d): if $t >= 0 and $d > 0 then ((($t/$d)*100)|floor) else -1 end;
   $A as $a
@@ -569,7 +670,7 @@ launch() {
     ctx="$(jq -r --arg id "$model" '.data[] | select(.id == $id) | .context_length // empty' "$MODELS_CACHE" 2>/dev/null || true)"
   fi
   local envargs=( ANTHROPIC_API_KEY=""
-    ANTHROPIC_BASE_URL="https://openrouter.ai/api"
+    ANTHROPIC_BASE_URL="$BASE_URL"
     ANTHROPIC_AUTH_TOKEN="$key"
     ANTHROPIC_MODEL="$model"
     ANTHROPIC_SMALL_FAST_MODEL="$small"
@@ -585,7 +686,7 @@ launch() {
       info "hud unavailable — launching without statusline"
     fi
   fi
-  forced="$(jq -nc "${sl_args[@]}" --arg burl "https://openrouter.ai/api" --arg model "$model" --arg small "$small" --arg ctx "$ctx" \
+  forced="$(jq -nc "${sl_args[@]}" --arg burl "$BASE_URL" --arg model "$model" --arg small "$small" --arg ctx "$ctx" \
     '{env: ({ANTHROPIC_BASE_URL: $burl, ANTHROPIC_API_KEY: "", ANTHROPIC_MODEL: $model, ANTHROPIC_SMALL_FAST_MODEL: $small, ANTHROPIC_DEFAULT_HAIKU_MODEL: $small}
       + (if $ctx != "" then {CLAUDE_CODE_MAX_CONTEXT_TOKENS: $ctx} else {} end))}
      + (if $sl != "" then {statusLine:{type:"command",command:$sl,padding:0}} else {} end)')"
@@ -623,21 +724,103 @@ stats() {
     exit 0
   fi
   local P="{}"
-  P="$(jq -c '.data
-        | map({key:.id,
-               value:{p:.pricing.prompt, c:.pricing.completion,
-                      cr:.pricing.input_cache_read,
-                      w5:.pricing.input_cache_write,
-                      w1h:.pricing.input_cache_write_1h}})
-        | from_entries' "$MODELS_CACHE" 2>/dev/null || printf '{}')"
+  P="$(jq -c '
+# orc pricing/catalog math — single source of truth.
+# build.sh splices this file into every jq program carrying a `#INCLUDE pricing.jq`
+# marker line. Constraint: no single quotes here (consumer programs are bash single-quoted).
+
+def n2($x):
+  if $x == null then 0
+  elif ($x|type)=="number" then $x
+  elif ($x|type)=="string" then (($x|tonumber?) // 0)
+  else 0 end;
+
+def response_ok:
+  ((type)=="object")
+  and ((.message // null)|type=="object")
+  and ((.message.id // null)|type=="string")
+  and ((.message.usage // null)|type=="object")
+  and ((.message.model // null)|type=="string")
+  and ((.message.model|startswith("<"))|not);
+
+def usage_row:
+  { m:  .m,
+    i:  n2(.u.input_tokens),
+    o:  n2(.u.output_tokens),
+    r:  n2(.u.cache_read_input_tokens),
+    w5: (if ((.u.cache_creation // null)|type)=="object"
+         then n2(.u.cache_creation.ephemeral_5m_input_tokens)
+         else n2(.u.cache_creation_input_tokens) end),
+    w1: (if ((.u.cache_creation // null)|type)=="object"
+         then n2(.u.cache_creation.ephemeral_1h_input_tokens)
+         else 0 end)};
+
+def row_cost($P):
+  ($P[.m] // null) as $pr
+  | if ($pr|type)=="object"
+    then (.i*n2($pr.p)) + (.o*n2($pr.c)) + (.r*n2($pr.cr))
+         + (.w5*n2($pr.w5)) + (.w1*n2($pr.w1h))
+    else null end;
+
+def catalog_map:
+  .data
+  | map({key:.id,
+         value:{ctx:(.context_length // 0),
+                p:.pricing.prompt, c:.pricing.completion,
+                cr:.pricing.input_cache_read,
+                w5:.pricing.input_cache_write,
+                w1h:.pricing.input_cache_write_1h}})
+  | from_entries;
+    catalog_map' "$MODELS_CACHE" 2>/dev/null || printf '{}')"
   [ -z "$P" ] && P="{}"
   local S
   S="$(jq -nc --argjson P "$P" '
-    def n2($x):
-      if $x == null then 0
-      elif ($x|type)=="number" then $x
-      elif ($x|type)=="string" then (($x|tonumber?) // 0)
-      else 0 end;
+# orc pricing/catalog math — single source of truth.
+# build.sh splices this file into every jq program carrying a `#INCLUDE pricing.jq`
+# marker line. Constraint: no single quotes here (consumer programs are bash single-quoted).
+
+def n2($x):
+  if $x == null then 0
+  elif ($x|type)=="number" then $x
+  elif ($x|type)=="string" then (($x|tonumber?) // 0)
+  else 0 end;
+
+def response_ok:
+  ((type)=="object")
+  and ((.message // null)|type=="object")
+  and ((.message.id // null)|type=="string")
+  and ((.message.usage // null)|type=="object")
+  and ((.message.model // null)|type=="string")
+  and ((.message.model|startswith("<"))|not);
+
+def usage_row:
+  { m:  .m,
+    i:  n2(.u.input_tokens),
+    o:  n2(.u.output_tokens),
+    r:  n2(.u.cache_read_input_tokens),
+    w5: (if ((.u.cache_creation // null)|type)=="object"
+         then n2(.u.cache_creation.ephemeral_5m_input_tokens)
+         else n2(.u.cache_creation_input_tokens) end),
+    w1: (if ((.u.cache_creation // null)|type)=="object"
+         then n2(.u.cache_creation.ephemeral_1h_input_tokens)
+         else 0 end)};
+
+def row_cost($P):
+  ($P[.m] // null) as $pr
+  | if ($pr|type)=="object"
+    then (.i*n2($pr.p)) + (.o*n2($pr.c)) + (.r*n2($pr.cr))
+         + (.w5*n2($pr.w5)) + (.w1*n2($pr.w1h))
+    else null end;
+
+def catalog_map:
+  .data
+  | map({key:.id,
+         value:{ctx:(.context_length // 0),
+                p:.pricing.prompt, c:.pricing.completion,
+                cr:.pricing.input_cache_read,
+                w5:.pricing.input_cache_write,
+                w1h:.pricing.input_cache_write_1h}})
+  | from_entries;
     def summarize:
       { msgs: length,
         i: (map(.i) | add // 0),
@@ -647,12 +830,7 @@ stats() {
         cost: ((map(.cost // 0) | add // 0) * 1000000 | round / 1000000),
         unpriced: (map(select(.cost == null)) | length) };
     [ reduce inputs as $rec ({};
-        if (($rec|type)=="object"
-            and (($rec.message // null)|type=="object")
-            and (($rec.message.id // null)|type=="string")
-            and (($rec.message.usage // null)|type=="object")
-            and (($rec.message.model // null)|type=="string")
-            and (($rec.message.model|startswith("<"))|not))
+        if ($rec|response_ok)
         then .[$rec.message.id] = {
             m: $rec.message.model,
             day: ((($rec.timestamp // "")[0:10]) as $d | if $d == "" then "?" else $d end),
@@ -660,21 +838,8 @@ stats() {
             u: $rec.message.usage }
         else . end)
       | .[] ]
-    | map({m, day, project,
-           i: n2(.u.input_tokens),
-           o: n2(.u.output_tokens),
-           r: n2(.u.cache_read_input_tokens),
-           w5: (if ((.u.cache_creation // null)|type)=="object"
-                then n2(.u.cache_creation.ephemeral_5m_input_tokens)
-                else n2(.u.cache_creation_input_tokens) end),
-           w1: (if ((.u.cache_creation // null)|type)=="object"
-                then n2(.u.cache_creation.ephemeral_1h_input_tokens)
-                else 0 end)})
-    | map(. + {cost: (($P[.m] // null) as $pr
-          | if ($pr|type)=="object"
-            then (.i*n2($pr.p)) + (.o*n2($pr.c)) + (.r*n2($pr.cr))
-               + (.w5*n2($pr.w5)) + (.w1*n2($pr.w1h))
-            else null end)})
+    | map(usage_row + {day:.day, project:.project})
+    | map(. + {cost: row_cost($P)})
     | { messages: length,
         total: summarize,
         by_model:   (group_by(.m)       | map({key: .[0].m}       + summarize) | sort_by(-.cost)),
@@ -884,7 +1049,7 @@ case "${1:-}" in
   env)
     key="$(require_key)"
     model="$(resolve model)"; small="$(resolve small_model)"; small="${small:-$model}"
-    printf 'export ANTHROPIC_BASE_URL="https://openrouter.ai/api"\n'
+    printf 'export ANTHROPIC_BASE_URL="%s"\n' "$BASE_URL"
     printf 'export ANTHROPIC_AUTH_TOKEN="%s"\n' "$key"
     printf 'export ANTHROPIC_MODEL="%s"\n' "$model"
     printf 'export ANTHROPIC_SMALL_FAST_MODEL="%s"\n' "$small"
