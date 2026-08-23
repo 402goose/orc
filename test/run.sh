@@ -107,6 +107,26 @@ cp "$FIX/models.json" "$EMPTY_HOME/models.json"
 OUT="$(ORC_HOME="$EMPTY_HOME" "$ROOT/orc" stats 2>&1 | strip_ansi)"
 t_contains "stats: no transcripts message" "no transcripts" "$OUT"
 
+echo "== models: tool support =="
+export ORC_HOME="$TMP/tools-home"
+mkdir -p "$ORC_HOME"
+cp "$FIX/models.json" "$ORC_HOME/models.json"
+
+ROWS="$("$ROOT/orc" models 2>/dev/null | strip_ansi)"
+NOTOOLS_COUNT="$(printf '%s\n' "$ROWS" | grep -c 'NO TOOLS' || true)"
+t "models: no-tools rows flagged" "2" "$NOTOOLS_COUNT"
+TOOLS_ONLY="$("$ROOT/orc" models --tools 2>/dev/null | strip_ansi)"
+t_contains "models --tools keeps tool-capable model" "test/paid" "$TOOLS_ONLY"
+case "$TOOLS_ONLY" in
+  *test/notools*|*test/free*)
+    FAIL=$((FAIL + 1))
+    printf 'FAIL  models --tools lists a no-tools model\n'
+    printf '  got:  %s\n' "$TOOLS_ONLY" ;;
+  *)
+    PASS=$((PASS + 1))
+    printf '  ok  models --tools drops no-tools models\n' ;;
+esac
+
 echo "== profiles + project config =="
 export ORC_HOME="$TMP/prof-home"
 mkdir -p "$ORC_HOME"
@@ -137,6 +157,7 @@ mkdir -p "$PROJ"
 printf '{"model":"test/free"}\n' > "$PROJ/.orc.json"
 ENVOUT="$(cd "$PROJ" && "$ROOT/orc" env 2>/dev/null)"
 t_contains ".orc.json model overrides global config" 'ANTHROPIC_MODEL="test/free"' "$ENVOUT"
+t_contains "env exports OpenRouter base URL" 'export ANTHROPIC_BASE_URL="https://openrouter.ai/api"' "$ENVOUT"
 
 ENVOUT="$(cd "$PROJ" && ORC_PROFILE=work "$ROOT/orc" env 2>/dev/null)"
 t_contains "ORC_PROFILE beats .orc.json" 'ANTHROPIC_MODEL="test/paid"' "$ENVOUT"
