@@ -2,10 +2,29 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-[ -f hud.sh ] || { echo "build.sh: hud.sh not found" >&2; exit 1; }
-[ -f orc ] || { echo "build.sh: orc not found" >&2; exit 1; }
+for f in orc hud.sh.in pricing.jq; do
+  [ -f "$f" ] || { echo "build.sh: $f not found" >&2; exit 1; }
+done
 
-ver="$(shasum -a 256 hud.sh | cut -c1-12)"
+ver="$(cat pricing.jq hud.sh.in | shasum -a 256 | cut -c1-12)"
+
+expand_includes() {
+  awk '
+    /^[[:space:]]*#INCLUDE / {
+      lib = $2
+      while ((getline line < lib) > 0) print line
+      close(lib)
+      next
+    }
+    { print }
+  '
+}
+
+expand_includes < hud.sh.in > hud.sh
+chmod 755 hud.sh
+bash -n hud.sh
+
+expand_includes < orc > orc.stage1
 
 awk -v ver="$ver" '
   /^ORC_HUD_VERSION=/ { print "ORC_HUD_VERSION=\"" ver "\""; next }
@@ -20,8 +39,9 @@ awk -v ver="$ver" '
   skip && /^ORC_HUD_BODY$/ { print; skip = 0; next }
   skip { next }
   { print }
-' orc > orc.tmp
+' orc.stage1 > orc.tmp
 
+rm -f orc.stage1
 bash -n orc.tmp
 mv orc.tmp orc
 chmod +x orc
