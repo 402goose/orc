@@ -1025,6 +1025,44 @@ def catalog_map:
   exit 0
 }
 
+probe_model() {
+  local model="${1:-}"
+  [ -z "$model" ] && model="$(resolve model)"
+  if [ -z "$model" ]; then
+    err "no model to probe — pass one: orc probe <model-id>"
+    return 1
+  fi
+  local key
+  key="$(require_key)"
+  local payload raw meta http secs body err_msg
+  payload="$(jq -nc --arg m "$model" '{model:$m, max_tokens:1, messages:[{role:"user", content:"ping"}]}')"
+  info "probing $model — POST $API/messages (max_tokens: 1)..."
+  if ! raw="$(curl -sS --max-time 30 \
+       -H "Authorization: Bearer $key" \
+       -H "anthropic-version: 2023-06-01" \
+       -H "content-type: application/json" \
+       -w '\n%{http_code} %{time_total}' \
+       -d "$payload" "$API/messages" 2>&1)"; then
+    err "probe failed: $raw"
+    return 1
+  fi
+  meta="$(printf '%s\n' "$raw" | tail -n1)"
+  body="$(printf '%s\n' "$raw" | sed '$d')"
+  http="${meta%% *}"; secs="${meta#* }"
+  case "$http" in ''|*[!0-9]*) http="000"; body="$raw" ;; esac
+  err_msg="$(printf '%s' "$body" | jq -r '.error.message // empty' 2>/dev/null || true)"
+  if [ "$http" = "200" ] && [ -z "$err_msg" ]; then
+    bold "probe ok: $model — HTTP 200 in ${secs}s (launch path verified)"
+    return 0
+  fi
+  if [ -n "$err_msg" ]; then
+    err "probe failed: $model — HTTP $http: $err_msg"
+  else
+    err "probe failed: $model — HTTP $http: $(printf '%s' "$body" | head -c 200)"
+  fi
+  return 1
+}
+
 doctor() {
   bold "orc doctor"
   local ok=0
@@ -1067,6 +1105,14 @@ doctor() {
     fi
   fi
   if [ -n "$(cfg .small_model)" ]; then printf '  ✓ small model: %s\n' "$(cfg .small_model)"; fi
+  if [ "${ORC_NO_PROBE:-}" = "1" ]; then
+    printf '  - launch probe skipped (ORC_NO_PROBE=1)\n'
+  elif [ "$src" != "none" ] && [ -n "${model:-}" ]; then
+    local prc=0 probe_out
+    probe_out="$(probe_model "$model" 2>&1)" || prc=1
+    printf '%s\n' "$probe_out" | sed 's/^/  /'
+    [ "$prc" = "1" ] && ok=1
+  fi
   printf '  ✓ claude state dir: %s (isolated from ~/.claude)\n' "$CLAUDE_STATE"
   exit "$ok"
 }
@@ -1099,6 +1145,7 @@ usage:
   orc env                 print the export lines orc uses (contains your key)
   orc refresh             force-refresh the cached model list
   orc doctor              check everything end to end
+  orc probe [model]       smoke-test the launch path (1-token request; default: saved model)
   orc config              open config in $EDITOR
 
 project config:
@@ -1111,6 +1158,7 @@ env:
   ORC_MODE                per-launch permission-mode override (does not change saved config)
   ORC_PROFILE             per-launch profile override (same as orc @<name>)
   ORC_HUD=0               disable the statusline HUD for one launch
+  ORC_NO_PROBE=1          skip the launch probe in orc doctor
 EOF
 }
 
@@ -1119,6 +1167,9 @@ case "${1:-}" in
   setup) setup_wizard; exit 0 ;;
   key) key_wizard; exit 0 ;;
   doctor) doctor ;;
+  probe)
+    shift
+    probe_model "${1:-}" ;;
   refresh) fetch_models force; info "model list refreshed"; exit 0 ;;
   config) mkdir -p "$ORC_HOME"; [ -f "$CONFIG" ] || printf '{}\n' > "$CONFIG"; exec "${EDITOR:-vi}" "$CONFIG" ;;
   model)
