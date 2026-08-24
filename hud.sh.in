@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 ORC_HOME="${ORC_HOME:-$HOME/.config/orc}"
 MODELS_CACHE="${MODELS_CACHE:-$ORC_HOME/models.json}"
+SESSION_DIR="${ORC_SESSION_CACHE:-$ORC_HOME/sessions}"
+LAST_LAUNCH="${ORC_LAST_LAUNCH:-$ORC_HOME/last-launch}"
 
 payload="$(cat 2>/dev/null || true)"
 DIM=$'\033[2m'; RST=$'\033[0m'; BOLD=$'\033[1m'
@@ -30,76 +32,185 @@ if [ -f "$MODELS_CACHE" ]; then
   [ -z "${P:-}" ] && P="{}"
 fi
 
-Z='{"i":0,"o":0,"r":0,"w5":0,"w1":0,"cost":0,"unknown":false,"last_model":"","ctx_est":0}'
-A="$Z"
-if [ -n "$P_TX" ] && [ -f "$P_TX" ]; then
-  A="$(jq -nc --argjson P "$P" '
+Z='{"i":0,"o":0,"r":0,"w5":0,"w1":0,"cost":0,"unknown":false,"msgs":0}'
+EMPTY_ST='{"size":0,"off":0,"ids":{},"agg":'"$Z"',"last":null}'
+
+file_bytes() { wc -c < "$1" 2>/dev/null | tr -d ' \t\n'; }
+
+complete_chunk() {
+  local src="$1" dest="$2" hex
+  if [ ! -s "$src" ]; then
+    : > "$dest"
+    printf '0'
+    return 0
+  fi
+  hex="$(tail -c 1 "$src" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  if [ "$hex" = "0a" ]; then
+    cp "$src" "$dest" 2>/dev/null || : > "$dest"
+  else
+    sed '$d' "$src" > "$dest" 2>/dev/null || : > "$dest"
+  fi
+  file_bytes "$dest"
+}
+
+ingest_file() {
+  local path="$1" state="$2" tmp chunk complete consumed size off newstate
+  if [ ! -f "$path" ]; then
+    printf '%s' "$EMPTY_ST"
+    return 0
+  fi
+  size="$(file_bytes "$path")"
+  [ -z "$size" ] && size=0
+  state="$(printf '%s' "$state" | jq -c --argjson z "$Z" '
 #INCLUDE pricing.jq
-    reduce inputs as $r ({};
-      ($r|response_ok) as $ok
-      | if $ok
-        then .[$r.message.id] = {m:$r.message.model, u:$r.message.usage}
-           | ._last = {m:$r.message.model, u:$r.message.usage}
-        else . end)
-    | . as $all
-    | [($all | to_entries[] | select(.key != "_last") | .value)]
-    | map(usage_row)
-    | reduce .[] as $x (
-        {i:0,o:0,r:0,w5:0,w1:0,cost:0,unknown:false};
-        (.i += $x.i) | (.o += $x.o) | (.r += $x.r)
-        | (.w5 += $x.w5) | (.w1 += $x.w1)
-        | ($x|row_cost($P)) as $c
-        | if $c == null
-          then (if ($x.i+$x.o+$x.r+$x.w5+$x.w1) > 0 then .unknown = true else . end)
-          else .cost += $c
-          end)
-    | . + {
-        last_model: ($all._last.m // ""),
-        ctx_est: (if ($all._last.u // null) == null then 0 else
-          ((n2($all._last.u.input_tokens) + n2($all._last.u.cache_read_input_tokens))
-           + (if (($all._last.u.cache_creation // null)|type)=="object"
-              then n2($all._last.u.cache_creation.ephemeral_5m_input_tokens)
-                 + n2($all._last.u.cache_creation.ephemeral_1h_input_tokens)
-              else n2($all._last.u.cache_creation_input_tokens) end)) end)}
-  ' "$P_TX" 2>/dev/null)" || true
-  [ -z "$A" ] && A="$Z"
+    if type == "object" then
+      . + {size:(.size // 0), off:(.off // 0),
+           ids:(.ids // {}), agg:(.agg // empty_agg), last:(.last // null)}
+    else empty_file_state end' 2>/dev/null)" || state=""
+  [ -z "$state" ] && state="$EMPTY_ST"
+  off="$(printf '%s' "$state" | jq -r '.off // 0')"
+  case "$off" in ''|*[!0-9]*) off=0 ;; esac
+  if [ "$size" -lt "$off" ]; then
+    state="$EMPTY_ST"
+    off=0
+  fi
+  tmp="$(mktemp "${TMPDIR:-/tmp}/orc-hud.XXXXXX")" || {
+    printf '%s' "$state"
+    return 0
+  }
+  chunk="$tmp.chunk"
+  complete="$tmp.ok"
+  if [ "$size" -ne "$(printf '%s' "$state" | jq -r '.size // 0')" ] || [ "$size" -ne "$off" ]; then
+    if [ "$off" -eq 0 ]; then
+      cp "$path" "$chunk" 2>/dev/null || : > "$chunk"
+    else
+      tail -c +"$((off + 1))" "$path" > "$chunk" 2>/dev/null || : > "$chunk"
+    fi
+    consumed="$(complete_chunk "$chunk" "$complete")"
+    case "$consumed" in ''|*[!0-9]*) consumed=0 ;; esac
+    if [ "$consumed" -gt 0 ]; then
+      newstate="$(jq -nc --argjson st "$state" --argjson P "$P" '
+#INCLUDE pricing.jq
+        $st | ingest_lines($P)
+      ' "$complete" 2>/dev/null)" || newstate=""
+      if [ -n "$newstate" ]; then
+        state="$(printf '%s' "$newstate" | jq -c --argjson size "$size" --argjson off "$((off + consumed))" '
+          .size = $size | .off = $off' 2>/dev/null || printf '%s' "$newstate")"
+      fi
+    else
+      state="$(printf '%s' "$state" | jq -c --argjson size "$size" '
+        .size = $size' 2>/dev/null || printf '%s' "$state")"
+    fi
+  fi
+  state="$(printf '%s' "$state" | jq -c --argjson P "$P" '
+#INCLUDE pricing.jq
+    reprice($P)
+  ' 2>/dev/null || printf '%s' "$state")"
+  rm -f "$tmp" "$chunk" "$complete"
+  printf '%s' "$state"
+}
+
+A="$Z"
+LAST_U="null"
+LAST_M=""
+AGENTS_COST="0"
+AGENTS_ON=0
+SESSION="$Z"
+HAVE_SESSION=0
+
+if [ -n "$P_TX" ] && [ -f "$P_TX" ]; then
+  sid="$(basename "$P_TX" .jsonl)"
+  cache_path="$SESSION_DIR/$sid.json"
+  cache="{}"
+  [ -f "$cache_path" ] && cache="$(cat "$cache_path" 2>/dev/null || printf '{}')"
+  main_st="$(printf '%s' "$cache" | jq -c '.main // {}' 2>/dev/null || printf '{}')"
+  main_st="$(ingest_file "$P_TX" "$main_st")"
+  agent_map="$(printf '%s' "$cache" | jq -c '.agents // {}' 2>/dev/null || printf '{}')"
+  new_agents="{}"
+  agent_dir="${P_TX%.jsonl}/subagents"
+  if [ -d "$agent_dir" ]; then
+    while IFS= read -r -d '' af; do
+      an="$(basename "$af")"
+      ast="$(printf '%s' "$agent_map" | jq -c --arg n "$an" '.[$n] // {}' 2>/dev/null || printf '{}')"
+      ast="$(ingest_file "$af" "$ast")"
+      new_agents="$(printf '%s' "$new_agents" | jq -c --arg n "$an" --argjson st "$ast" '.[$n] = $st' 2>/dev/null || printf '%s' "$new_agents")"
+    done < <(find "$agent_dir" -type f -name 'agent-*.jsonl' -print0 2>/dev/null)
+  fi
+  A="$(printf '%s' "$main_st" | jq -c --argjson z "$Z" '.agg // $z' 2>/dev/null || printf '%s' "$Z")"
+  LAST_U="$(printf '%s' "$main_st" | jq -c '.last.u // null' 2>/dev/null || printf 'null')"
+  LAST_M="$(printf '%s' "$main_st" | jq -r '.last.m // empty' 2>/dev/null || true)"
+  agent_agg="$(printf '%s' "$new_agents" | jq -c --argjson z "$Z" '
+#INCLUDE pricing.jq
+    reduce (to_entries[] | .value.agg // empty_agg) as $g ($z; merge_agg($g))
+  ' 2>/dev/null || printf '%s' "$Z")"
+  AGENTS_COST="$(printf '%s' "$agent_agg" | jq -r '.cost // 0')"
+  AGENTS_ON="$(printf '%s' "$agent_agg" | jq -r 'if (.msgs // 0) > 0 then 1 else 0 end')"
+  launch_ts=""
+  [ -f "$LAST_LAUNCH" ] && launch_ts="$(tr -d '[:space:]' < "$LAST_LAUNCH" 2>/dev/null || true)"
+  case "$launch_ts" in ''|*[!0-9]*) launch_ts="" ;; esac
+  prev_launch="$(printf '%s' "$cache" | jq -r '.launch_ts // empty' 2>/dev/null || true)"
+  baseline="$(printf '%s' "$cache" | jq -c --argjson z "$Z" '.baseline // $z' 2>/dev/null || printf '%s' "$Z")"
+  if [ -n "$launch_ts" ]; then
+    if [ "$launch_ts" != "$prev_launch" ]; then
+      baseline="$A"
+    fi
+    SESSION="$(jq -nc --argjson a "$A" --argjson b "$baseline" '
+#INCLUDE pricing.jq
+      $a | sub_agg($b)
+    ' 2>/dev/null || printf '%s' "$Z")"
+    HAVE_SESSION=1
+  fi
+  mkdir -p "$SESSION_DIR" 2>/dev/null || true
+  if jq -nc --argjson main "$main_st" --argjson agents "$new_agents" \
+        --argjson base "$baseline" --arg lts "$launch_ts" \
+    '{main:$main, agents:$agents, baseline:$base, launch_ts:$lts}' \
+    > "$cache_path.tmp" 2>/dev/null
+  then
+    mv "$cache_path.tmp" "$cache_path" 2>/dev/null || rm -f "$cache_path.tmp"
+  else
+    rm -f "$cache_path.tmp"
+  fi
 fi
 
 jq -rn --argjson A "$A" --argjson P "$P" --argjson cu "$P_CU" \
+   --argjson S "$SESSION" --argjson agents_cost "$AGENTS_COST" \
+   --argjson agents_on "$AGENTS_ON" --argjson have_session "$HAVE_SESSION" \
+   --argjson lastu "$LAST_U" --arg lastm "$LAST_M" \
    --arg mid "$P_MID" --arg mname "$P_MNAME" \
    --arg upct "$P_UPCT" --arg csize "$P_CSIZE" '
 #INCLUDE pricing.jq
   def num($s): if ($s|type)=="string" and ($s|length)>0 then (($s|tonumber?) // -1) else -1 end;
   def pct($t;$d): if $t >= 0 and $d > 0 then ((($t/$d)*100)|floor) else -1 end;
+  def cents($c): (($c*10000)|round);
   $A as $a
   | (if $mname != "" then $mname elif $mid != "" then $mid
-     elif $a.last_model != "" then $a.last_model else "?" end) as $name
+     elif $lastm != "" then $lastm else "?" end) as $name
   | (if ($a.unknown|not) and $a.cost == 0
        and (($a.i+$a.o+$a.r+$a.w5+$a.w1) > 0)
      then 1 else 0 end) as $free
   | (num($upct)|if . >= 0 then floor else -1 end) as $p1
-  | (if ($cu|type)=="object"
-     then ((n2($cu.input_tokens) + n2($cu.cache_read_input_tokens))
-          + (if ($cu.cache_creation|type)=="object"
-             then n2($cu.cache_creation.ephemeral_5m_input_tokens)
-                + n2($cu.cache_creation.ephemeral_1h_input_tokens)
-             else n2($cu.cache_creation_input_tokens) end))
-     else -1 end) as $cutok
+  | (if ($cu|type)=="object" then ($cu|ctx_tokens) else -1 end) as $cutok
   | num($csize) as $cs
-  | n2(($P[$a.last_model] // {}) | (.ctx // 0)) as $mc
+  | (if ($lastu|type)=="object" then ($lastu|ctx_tokens) else 0 end) as $ctx_est
+  | n2(($P[(if $lastm != "" then $lastm else $mid end)] // {}) | (.ctx // 0)) as $mc
   | (if $cs > $mc then $cs else $mc end) as $den
   | (if $p1 >= 0 then $p1 else pct($cutok;$cs) end) as $p2
-  | (if $p2 >= 0 then $p2 else pct($a.ctx_est;$den) end) as $p3
+  | (if $p2 >= 0 then $p2 else pct($ctx_est;$den) end) as $p3
   | (if $p3 > 100 then 100 elif $p3 < 0 then -1 else $p3 end) as $ctxp
   | (($a.i+$a.r+$a.w5+$a.w1)|round) as $tin
   | (($a.i+$a.r+$a.w5+$a.w1)) as $cden
   | (if $cden > 0 then ((($a.r/$cden)*100)|round) else -1 end) as $cachep
-  | (($a.cost*10000)|round) as $c4
-  | [$name, $tin, ($a.o|round), $cachep, $ctxp, $c4,
-     (if $a.unknown then "u" elif $free == 1 then "f" else "n" end)]
-  | map(tostring) | join("\u001f")
+  | cents($a.cost) as $c4
+  | cents($S.cost) as $sc4
+  | cents($agents_cost) as $ac4
+  | (if $a.unknown then "u" elif $free == 1 then "f" else "n" end) as $flag
+  | (if $have_session == 1 and $flag == "n" and $sc4 > 0 and ($c4 - $sc4) > 1
+     then 1 else 0 end) as $show_sess
+  | [$name, $tin, ($a.o|round), $cachep, $ctxp, $c4, $sc4, $ac4,
+     $flag, $show_sess, $agents_on]
+  | map(tostring) | join("")
 ' 2>/dev/null | {
-  IFS=$'\037' read -r R_NAME R_IN R_OUT R_CACHE R_CTX R_COST R_FLAGS || true
+  IFS=$'\037' read -r R_NAME R_IN R_OUT R_CACHE R_CTX R_COST R_SESS R_AGENTS R_FLAGS R_SHOW_SESS R_AGENTS_ON || true
   human() {
     case "${1:-}" in ''|*[!0-9]*) printf '?'; return ;; esac
     local t="$1"
@@ -110,6 +221,12 @@ jq -rn --argjson A "$A" --argjson P "$P" --argjson cu "$P_CU" \
     else
       printf '%d' "$t"
     fi
+  }
+  money() {
+    local c4="${1:-0}"
+    case "$c4" in ''|*[!0-9-]*) c4=0 ;; esac
+    if [ "$c4" -lt 0 ]; then c4=0; fi
+    printf '$%d.%04d' $(( c4 / 10000 )) $(( c4 % 10000 ))
   }
   bar() {
     local p="$1" fill="" rem="" i fn
@@ -136,10 +253,16 @@ jq -rn --argjson A "$A" --argjson P "$P" --argjson cu "$P_CU" \
     u) segs+=("${DIM}\$—${RST}") ;;
     f) segs+=("${GRN}FREE${RST}") ;;
     *)
-      c4="${R_COST:-0}"
-      case "$c4" in ''|*[!0-9]*) c4=0 ;; esac
-      segs+=("${BOLD}$(printf '$%d.%04d' $(( c4 / 10000 )) $(( c4 % 10000 )))${RST}") ;;
+      if [ "${R_SHOW_SESS:-0}" = "1" ]; then
+        segs+=("${BOLD}$(money "${R_SESS:-0}") this${RST} ${DIM}$(money "${R_COST:-0}") file${RST}")
+      else
+        segs+=("${BOLD}$(money "${R_COST:-0}")${RST}")
+      fi
+      ;;
   esac
+  if [ "${R_AGENTS_ON:-0}" = "1" ]; then
+    segs+=("${DIM}+$(money "${R_AGENTS:-0}") agents${RST}")
+  fi
   line=""
   sep="${DIM}│${RST}"
   for s in "${segs[@]}"; do

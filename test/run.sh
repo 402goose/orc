@@ -38,6 +38,10 @@ t_contains() {
 
 echo "== hud =="
 export MODELS_CACHE="$FIX/models.json"
+export ORC_SESSION_CACHE="$TMP/hud-cache"
+export ORC_LAST_LAUNCH="$TMP/hud-nolaunch"
+rm -rf "$ORC_SESSION_CACHE"
+mkdir -p "$ORC_SESSION_CACHE"
 
 hud() { "$ROOT/hud.sh" | strip_ansi; }
 payload() { jq -n --arg tp "$FIX/$1" "$2"; }
@@ -68,7 +72,33 @@ t "missing transcript renders zeros without failing" \
   '?│↑ 0 ↓ 0│$0.0000' \
   "$(jq -n '{transcript_path:"/nonexistent/x.jsonl",context_window:null}' | hud)"
 
+t "subagent spend is a sibling segment, parent tokens unchanged" \
+  'paid│↑ 20.0k ↓ 300│cache 45%│ctx ░░░░░░░░░░░░ 7%│$0.0149│+$0.0011 agents' \
+  "$(payload with-agents.jsonl '{transcript_path:$tp,model:{id:"test/paid",display_name:"paid"},context_window:null}' | hud)"
+
+RESUME_DIR="$TMP/hud-resume"
+mkdir -p "$RESUME_DIR" "$TMP/hud-resume-cache"
+cp "$FIX/paid.jsonl" "$RESUME_DIR/s.jsonl"
+printf '1\n' > "$TMP/hud-launch"
+hud_resume() {
+  ORC_LAST_LAUNCH="$TMP/hud-launch" ORC_SESSION_CACHE="$TMP/hud-resume-cache" hud
+}
+payload_resume() {
+  jq -n --arg tp "$RESUME_DIR/s.jsonl" '{transcript_path:$tp,model:{id:"test/paid",display_name:"paid"},context_window:null}'
+}
+FIRST="$(payload_resume | hud_resume)"
+t "resume baseline on first join matches file cost" \
+  'paid│↑ 20.0k ↓ 300│cache 45%│ctx ░░░░░░░░░░░░ 7%│$0.0149' \
+  "$FIRST"
+printf '%s\n' '{"type":"assistant","timestamp":"2026-08-20T12:00:00.000Z","message":{"id":"msg_new","model":"test/paid","usage":{"input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}' >> "$RESUME_DIR/s.jsonl"
+SECOND="$(payload_resume | hud_resume)"
+t "resume split shows this-join vs file" \
+  'paid│↑ 21.0k ↓ 400│cache 43%│ctx ░░░░░░░░░░░░ 0%│$0.0012 this $0.0161 file' \
+  "$SECOND"
+
 unset MODELS_CACHE
+unset ORC_SESSION_CACHE
+unset ORC_LAST_LAUNCH
 
 echo "== stats =="
 export ORC_HOME="$TMP/stats-home"
@@ -169,6 +199,65 @@ t_contains ".orc.json profile reference resolves" 'ANTHROPIC_MODEL="test/paid"' 
 
 "$ROOT/orc" profiles rm work >/dev/null 2>&1
 t "profiles rm deletes profile" "null" "$(jq -r '.profiles.work' "$ORC_HOME/config.json")"
+
+echo "== status + resolved save + env + fit =="
+export ORC_HOME="$TMP/status-home"
+mkdir -p "$ORC_HOME"
+cp "$FIX/models.json" "$ORC_HOME/models.json"
+"$ROOT/orc" model --set test/paid >/dev/null 2>&1
+"$ROOT/orc" small --set test/free >/dev/null 2>&1
+
+ST="$("$ROOT/orc" status --json 2>/dev/null)"
+t "status --json model" "test/paid" "$(printf '%s' "$ST" | jq -r .model)"
+t "status --json source is config" "config" "$(printf '%s' "$ST" | jq -r .source.model)"
+t "status --json fit untested" "UNTESTED" "$(printf '%s' "$ST" | jq -r .fit)"
+t "status --json tools true" "true" "$(printf '%s' "$ST" | jq -r .tools)"
+
+PROJ2="$TMP/proj2"
+mkdir -p "$PROJ2"
+printf '{"model":"test/free","mode":"plan"}\n' > "$PROJ2/.orc.json"
+ST="$(cd "$PROJ2" && "$ROOT/orc" status --json 2>/dev/null)"
+t "status honors .orc.json model" "test/free" "$(printf '%s' "$ST" | jq -r .model)"
+t "status honors .orc.json mode" "plan" "$(printf '%s' "$ST" | jq -r .mode)"
+t "status source is project" "project" "$(printf '%s' "$ST" | jq -r .source.model)"
+
+"$ROOT/orc" save work >/dev/null 2>&1
+ST="$(cd "$PROJ2" && ORC_PROFILE=work "$ROOT/orc" status --json 2>/dev/null)"
+t "status ORC_PROFILE beats .orc.json" "test/paid" "$(printf '%s' "$ST" | jq -r .model)"
+t "status source is profile" "profile" "$(printf '%s' "$ST" | jq -r .source.model)"
+
+ST="$(cd "$PROJ2" && ORC_PROFILE=work "$ROOT/orc" -m test/notools status --json 2>/dev/null || true)"
+# -m only applies to launch; status is its own command. Override via env:
+ST="$(cd "$PROJ2" && ORC_MODEL_OVERRIDE=test/notools "$ROOT/orc" status --json 2>/dev/null)"
+t "status ORC_MODEL_OVERRIDE wins" "test/notools" "$(printf '%s' "$ST" | jq -r .model)"
+t "status override source is flag" "flag" "$(printf '%s' "$ST" | jq -r .source.model)"
+
+(cd "$PROJ2" && "$ROOT/orc" save fromproj >/dev/null 2>&1)
+t "save snapshots resolved project model" "test/free" "$(jq -r .profiles.fromproj.model "$ORC_HOME/config.json")"
+t "save snapshots resolved project mode" "plan" "$(jq -r .profiles.fromproj.mode "$ORC_HOME/config.json")"
+
+ENVOUT="$(cd "$PROJ2" && "$ROOT/orc" env 2>/dev/null)"
+t_contains "env exports DEFAULT_HAIKU" 'export ANTHROPIC_DEFAULT_HAIKU_MODEL="test/free"' "$ENVOUT"
+t_contains "env exports gateway discovery" 'export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1' "$ENVOUT"
+t_contains "env exports context window" 'export CLAUDE_CODE_MAX_CONTEXT_TOKENS="64000"' "$ENVOUT"
+
+ROWS="$("$ROOT/orc" models 2>/dev/null | strip_ansi)"
+t_contains "models lists UNTESTED fit column" "UNTESTED" "$ROWS"
+NOW="$(date +%s)"
+printf '{"test/paid":{"ok":true,"http":200,"ttft":0.1,"tool_roundtrip":0.2,"error":null,"checked_at":%s}}\n' "$NOW" > "$ORC_HOME/fit.json"
+FIT_ONLY="$("$ROOT/orc" models --fit 2>/dev/null | strip_ansi)"
+t_contains "models --fit keeps FIT model" "test/paid" "$FIT_ONLY"
+case "$FIT_ONLY" in
+  *test/notools*|*test/free*)
+    FAIL=$((FAIL + 1))
+    printf 'FAIL  models --fit lists an untested model\n'
+    printf '  got:  %s\n' "$FIT_ONLY" ;;
+  *)
+    PASS=$((PASS + 1))
+    printf '  ok  models --fit drops untested models\n' ;;
+esac
+ROWS="$("$ROOT/orc" models 2>/dev/null | strip_ansi)"
+t_contains "models marks cached FIT" "FIT" "$ROWS"
 
 echo
 if [ "$FAIL" -gt 0 ]; then

@@ -1,4 +1,5 @@
 # orc pricing/catalog math — single source of truth; spliced by build.sh into marked jq programs.
+# Constraint: no single quotes here (consumer programs are bash single-quoted).
 
 def n2($x):
   if $x == null then 0
@@ -55,3 +56,62 @@ def is_free:
 
 def has_tools:
   ((.supported_parameters // []) | index("tools")) != null;
+
+def empty_agg:
+  {i:0,o:0,r:0,w5:0,w1:0,cost:0,unknown:false,msgs:0};
+
+def acc_row($P; $x):
+  .i += $x.i | .o += $x.o | .r += $x.r | .w5 += $x.w5 | .w1 += $x.w1
+  | .msgs += 1
+  | ($x|row_cost($P)) as $c
+  | if $c == null
+    then (if ($x.i+$x.o+$x.r+$x.w5+$x.w1) > 0 then .unknown = true else . end)
+    else .cost += $c end;
+
+def dec_row($P; $x):
+  .i -= $x.i | .o -= $x.o | .r -= $x.r | .w5 -= $x.w5 | .w1 -= $x.w1
+  | .msgs -= 1
+  | ($x|row_cost($P)) as $c
+  | if $c == null then . else .cost -= $c end;
+
+def merge_agg($b):
+  .i += $b.i | .o += $b.o | .r += $b.r | .w5 += $b.w5 | .w1 += $b.w1
+  | .msgs += $b.msgs | .cost += $b.cost
+  | .unknown = (.unknown or $b.unknown);
+
+def sub_agg($b):
+  .i -= $b.i | .o -= $b.o | .r -= $b.r | .w5 -= $b.w5 | .w1 -= $b.w1
+  | .msgs -= $b.msgs | .cost -= $b.cost
+  | .unknown = (.unknown or $b.unknown);
+
+def apply_msg($P; $id; $nu):
+  ($nu|usage_row) as $nr
+  | (.ids[$id] // null) as $old
+  | (if $old != null then ($old|usage_row) else null end) as $orow
+  | if $orow != null
+    then .agg = (.agg | dec_row($P; $orow) | acc_row($P; $nr))
+    else .agg = (.agg | acc_row($P; $nr)) end
+  | .ids[$id] = $nu
+  | .last = $nu;
+
+def ingest_lines($P):
+  reduce inputs as $r (.;
+    if ($r|response_ok)
+    then apply_msg($P; $r.message.id; {m:$r.message.model, u:$r.message.usage})
+    else . end);
+
+def ctx_tokens:
+  if . == null then 0
+  else
+    (n2(.input_tokens) + n2(.cache_read_input_tokens))
+    + (if ((.cache_creation // null)|type)=="object"
+       then n2(.cache_creation.ephemeral_5m_input_tokens)
+          + n2(.cache_creation.ephemeral_1h_input_tokens)
+       else n2(.cache_creation_input_tokens) end)
+  end;
+
+def empty_file_state:
+  {size:0, off:0, ids:{}, agg:empty_agg, last:null};
+
+def reprice($P):
+  .agg = reduce (.ids | to_entries[] | .value | usage_row) as $x (empty_agg; acc_row($P; $x));
