@@ -76,7 +76,7 @@ table() {
   fi
 }
 
-cfg() { [ -f "$CONFIG" ] && jq -r "$1 // empty" "$CONFIG" 2>/dev/null || true; }
+cfg() { [ -f "$CONFIG" ] || return 0; jq -r "$1 // empty" "$CONFIG" 2>/dev/null || true; }
 
 save_cfg() {
   mkdir -p "$ORC_HOME"
