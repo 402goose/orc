@@ -22,6 +22,60 @@ bold() { printf '\033[1m%s\033[0m\n' "$*" >&2; }
 need() { command -v "$1" >/dev/null 2>&1 || { err "missing dependency: $1"; exit 1; }; }
 need jq; need curl
 
+ORC_OS="$(uname -s 2>/dev/null || printf unknown)"
+KEY_FILE="$ORC_HOME/key"
+is_mac() { [ "$ORC_OS" = "Darwin" ]; }
+
+key_read() {
+  if is_mac; then
+    security find-generic-password -ws "$KEYCHAIN_SERVICE" 2>/dev/null || true
+  else
+    [ -f "$KEY_FILE" ] || return 0
+    if [ -n "$(find "$KEY_FILE" -perm -004 2>/dev/null)" ]; then
+      info "note: $KEY_FILE is readable by other users — fix with: chmod 600 $KEY_FILE"
+    fi
+    cat "$KEY_FILE"
+  fi
+}
+
+key_store() {
+  if is_mac; then
+    security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$USER" -w "$1"
+  else
+    mkdir -p "$ORC_HOME"
+    (umask 077; printf '%s' "$1" > "$KEY_FILE")
+  fi
+}
+
+key_noun() {
+  if is_mac; then printf 'macOS keychain (%s)' "$KEYCHAIN_SERVICE"
+  else printf 'key file (%s)' "$KEY_FILE"
+  fi
+}
+
+mtime_of() {
+  if is_mac; then stat -f %m "$1"; else stat -c %Y "$1"; fi
+}
+
+mtime_lines() {
+  if is_mac; then xargs -0 stat -f '%m %N'; else xargs -0 stat -c '%Y %n'; fi
+}
+
+table() {
+  if command -v column >/dev/null 2>&1; then
+    column -t -s "$(printf '\t')"
+  else
+    awk -F'\t' '
+      { lines[NR] = $0; n = NR
+        for (i = 1; i <= NF; i++) if (length($i) > w[i]) w[i] = length($i) }
+      END { for (r = 1; r <= n; r++) {
+              nf = split(lines[r], f, "\t"); s = ""
+              for (i = 1; i <= nf; i++)
+                s = s sprintf("%-*s", w[i] + (i < nf ? 2 : 0), f[i])
+              print s } }'
+  fi
+}
+
 cfg() { [ -f "$CONFIG" ] && jq -r "$1 // empty" "$CONFIG" 2>/dev/null || true; }
 
 save_cfg() {
@@ -246,7 +300,7 @@ profiles_cmd() {
         jq -r '.profiles | to_entries | sort_by(.key)[]
                | [("@" + .key), (.value.model // "-"), (.value.small_model // "-"), (.value.mode // "-")]
                | @tsv' "$CONFIG"
-      } | column -t -s "$(printf '\t')"
+      } | table
       ;;
     *)
       err "unknown option: profiles $1"
@@ -271,14 +325,14 @@ resolve_key() {
   envname="$(key_env_name)"
   v="${!envname:-}"
   if [ -n "$v" ]; then printf '%s' "$v"; return 0; fi
-  security find-generic-password -ws "$KEYCHAIN_SERVICE" 2>/dev/null || true
+  key_read
 }
 
 key_source() {
   local envname
   envname="$(key_env_name)"
   if [ -n "${!envname:-}" ]; then printf 'env $%s' "$envname"
-  elif security find-generic-password -ws "$KEYCHAIN_SERVICE" >/dev/null 2>&1; then printf 'macOS keychain (%s)' "$KEYCHAIN_SERVICE"
+  elif [ -n "$(key_read)" ]; then key_noun
   else printf 'none'
   fi
 }
@@ -288,7 +342,7 @@ require_key() {
   key="$(resolve_key)"
   if [ -z "$key" ]; then
     err "no OpenRouter API key found"
-    info "looked in: env \$$(key_env_name), then macOS keychain service '$KEYCHAIN_SERVICE'"
+    info "looked in: env \$$(key_env_name), then $(key_noun)"
     info "fix: export $(key_env_name)=sk-or-... in your shell, or run: orc key"
     exit 1
   fi
@@ -298,7 +352,7 @@ require_key() {
 fetch_models() {
   mkdir -p "$ORC_HOME"
   if [ -f "$MODELS_CACHE" ] && [ "${1:-}" != "force" ]; then
-    local age=$(( $(date +%s) - $(stat -f %m "$MODELS_CACHE") ))
+    local age=$(( $(date +%s) - $(mtime_of "$MODELS_CACHE" 2>/dev/null || echo 0) ))
     [ "$age" -lt "$CACHE_TTL" ] && return 0
   fi
   info "fetching model list from OpenRouter..."
@@ -583,7 +637,7 @@ pick_model() {
     fit) header="models that survived orc probe --fit in the last 24h" ;;
     *) header="live prices per 1M tokens · type FREE for free models · NO TOOLS = poor Claude Code fit · FIT = probed" ;;
   esac
-  sel="$(model_rows "$filter" | column -t -s "$(printf '\t')" \
+  sel="$(model_rows "$filter" | table \
         | fzf --prompt="${2:-model}> " --query="${1:-}" --header="$header" --height=20 --reverse)" || return 1
   printf '%s' "${sel%% *}"
 }
@@ -592,9 +646,9 @@ key_wizard() {
   local envname
   envname="$(key_env_name)"
   bold "orc key setup"
-  info "key lookup order: env \$$envname, then macOS keychain ('$KEYCHAIN_SERVICE')"
+  info "key lookup order: env \$$envname, then $(key_noun)"
   info "current source: $(key_source)"
-  printf '  [1] change which env var orc reads\n  [2] paste a key -> store in macOS keychain\n  [Enter] keep as is\n' >&2
+  printf '  [1] change which env var orc reads\n  [2] paste a key -> store in %s\n  [Enter] keep as is\n' "$(key_noun)" >&2
   printf '> ' >&2
   local ans; IFS= read -r ans
   case "$ans" in
@@ -615,8 +669,8 @@ key_wizard() {
       printf 'paste key (input hidden): ' >&2
       local k; IFS= read -rs k; printf '\n' >&2
       if [ -n "$k" ]; then
-        security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$USER" -w "$k"
-        info "stored in keychain; orc will use it whenever \$$(key_env_name) is unset"
+        key_store "$k"
+        info "stored in $(key_noun); orc will use it whenever \$$(key_env_name) is unset"
       fi
       ;;
   esac
@@ -659,7 +713,7 @@ pick_profile() {
   local sel
   sel="$(jq -r '.profiles | to_entries | sort_by(.key)[]
                 | [.key, (.value.model // "-"), (.value.mode // "-")] | @tsv' "$CONFIG" \
-        | column -t -s "$(printf '\t')" \
+        | table \
         | fzf --prompt="profile> " --header="saved profiles" --height=12 --reverse)" || return 1
   printf '%s' "${sel%% *}"
 }
@@ -2259,7 +2313,7 @@ def reprice($P):
     | ([($by | ascii_upcase), "MSGS", "IN", "OUT", "CACHE", "COST"] | @tsv),
       ($rows[] | line(.key)),
       (.total | line("TOTAL"))
-  ' | column -t -s "$(printf '\t')"
+  ' | table
   local unpriced
   unpriced="$(printf '%s' "$S" | jq -r '.total.unpriced')"
   if [ "$unpriced" != "0" ]; then
@@ -2417,7 +2471,7 @@ doctor() {
   done
   local src; src="$(key_source)"
   if [ "$src" = "none" ]; then
-    printf '  ✗ API key: not found (env $%s or keychain) — run: orc key\n' "$(key_env_name)"; ok=1
+    printf '  ✗ API key: not found (env $%s or stored key) — run: orc key\n' "$(key_env_name)"; ok=1
   else
     printf '  ✓ API key: %s\n' "$src"
     local resp
@@ -2499,7 +2553,7 @@ usage:
   orc models --tools [..] list only models advertising tool support
   orc models --fit [...]  list only models that passed orc probe --fit
   orc hud [on|off|demo]   toggle the statusline HUD / preview it on newest transcript
-  orc key                 configure key source (env var name or keychain)
+  orc key                 configure key source (env var name or key store)
   orc env                 print the export lines launch uses (contains your key)
   orc refresh             force-refresh the cached model list
   orc doctor              check everything end to end (resolved model + fit)
@@ -2578,7 +2632,7 @@ case "${1:-}" in
       demo)
         install_hud || { err "could not generate $HUD_SCRIPT"; exit 1; }
         tp="$(find "$CLAUDE_STATE/projects" -type f -name '*.jsonl' -print0 2>/dev/null \
-              | xargs -0 stat -f '%m %N' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)"
+              | mtime_lines 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)"
         [ -z "$tp" ] && { err "no transcripts found under $CLAUDE_STATE/projects"; exit 1; }
         info "demo — rendering newest transcript: $tp"
         jq -nc --arg tp "$tp" --arg cwd "$PWD" \
@@ -2618,8 +2672,8 @@ case "${1:-}" in
       --tools|tools) model_filter="tools"; shift ;;
       --fit|fit) model_filter="fit"; shift ;;
     esac
-    if [ -n "${1:-}" ]; then model_rows "$model_filter" | grep -i -- "$1" | column -t -s "$(printf '\t')"
-    else model_rows "$model_filter" | column -t -s "$(printf '\t')"
+    if [ -n "${1:-}" ]; then model_rows "$model_filter" | grep -i -- "$1" | table
+    else model_rows "$model_filter" | table
     fi
     exit 0 ;;
   env)

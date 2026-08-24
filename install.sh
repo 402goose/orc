@@ -10,7 +10,19 @@ for dep in jq curl fzf; do
 done
 if [ -n "$missing" ]; then
   echo "missing dependencies:$missing"
-  echo "install with: brew install$missing"
+  case "$(uname -s)" in
+    Darwin)
+      echo "install with: brew install$missing" ;;
+    Linux)
+      if command -v apt-get >/dev/null 2>&1; then echo "install with: sudo apt-get install$missing"
+      elif command -v dnf >/dev/null 2>&1; then echo "install with: sudo dnf install$missing"
+      elif command -v pacman >/dev/null 2>&1; then echo "install with: sudo pacman -S --needed$missing"
+      elif command -v zypper >/dev/null 2>&1; then echo "install with: sudo zypper install$missing"
+      else echo "install jq, curl and fzf with your package manager"
+      fi ;;
+    *)
+      echo "install jq, curl and fzf with your package manager" ;;
+  esac
   exit 1
 fi
 command -v claude >/dev/null 2>&1 || {
