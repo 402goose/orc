@@ -29,13 +29,18 @@ First run launches the setup wizard: it finds your API key (or helps you set
 one up), fetches the live OpenRouter model catalog, and gives you an fzf
 picker with per-model pricing and context sizes. It also offers a launch
 permission mode (default / auto / acceptEdits / plan / dontAsk / yolo).
-Choices are saved; the next run shows the saved model + mode and lets you
-launch with Enter or change either one first:
+Choices are saved; the next run shows the resolved model + mode (and
+`@profile` / `.orc.json` when those apply) and lets you launch with Enter
+or change this invocation first:
 
 ```
-orc → stealth/ox-alpha · mode: auto
-  [Enter] launch   [m] model   [f] free model   [p] permission mode   [k] key   [q] quit
+orc → stealth/ox-alpha · mode: auto · @work · .orc.json
+  [Enter] launch   [m] model   [a] profile   [f] free   [p] mode   [s] save   [k] key   [q]
 ```
+
+`[m]` / `[p]` write the global default unless a profile or `.orc.json` is
+in effect — then they override this launch only. `[s]` snapshots the
+resolved combo as a named profile.
 
 ## Usage
 
@@ -51,19 +56,22 @@ orc free [query]        pick + save a currently free model
 orc mode                pick + save the launch permission mode
 orc small [query]       pick + save a small/fast model for background tasks
 orc small --set <id>    set the small model non-interactively
-orc save <name>         snapshot current model/small/mode as profile @<name>
+orc save <name>         snapshot the resolved model/small/mode as profile @<name>
 orc profiles [rm <n>]   list saved profiles / remove one
+orc status [--json]     print the resolved launch (model/mode/profile/source)
 orc stats               token + cost totals across all orc transcripts
      [--json] [--by model|project|day]
 orc hud [on|off|demo]   toggle the statusline HUD / preview it on the newest transcript
-orc models [query]      list models with pricing + context + tool support
+orc models [query]      list models with pricing + context + tool + fit
 orc models --free [...] list only currently free models
 orc models --tools [..] list only models advertising tool support
+orc models --fit [...]  list only models that passed orc probe --fit
 orc key                 configure key source (env var name or macOS keychain)
-orc env                 print the export lines orc uses (contains your key)
+orc env                 print the export lines launch uses (contains your key)
 orc refresh             force-refresh the cached model list
-orc doctor              check everything end to end
+orc doctor              check everything end to end (resolved model + fit)
 orc probe [model]       smoke-test the launch path (1-token request)
+orc probe --fit [model] tool-loop smoke test; result cached 24h as FIT/FAIL
 orc config              open config in $EDITOR
 ```
 
@@ -73,14 +81,38 @@ Free models are marked `FREE`; type `FREE` in the regular picker or use
 Every row also carries a tool-support flag read from the catalog's
 `supported_parameters`: models marked `NO TOOLS` tend to feel broken under
 Claude Code, which leans hard on tools. `orc models --tools` lists only
-tool-capable models, and `orc doctor` warns when your saved default lacks
-tool support.
+tool-capable models, and `orc doctor` warns when the *resolved* model
+(not just the global default) lacks tool support.
+
+A second column, `FIT` / `FAIL` / `UNTESTED`, is orc's own measurement:
+`orc probe --fit` forces a one-tool round trip through OpenRouter's
+Anthropic-compatible endpoint and caches the result for 24h. The picker
+sorts last-known-good models first; `orc models --fit` lists only those.
+`orc doctor` runs the fit probe when the cache is empty (`ORC_NO_FIT=1`
+skips it). Catalog `tools` is an advertisement; FIT is whether the model
+survived a Claude Code-shaped loop.
 
 ## Profiles
 
-A profile is a named snapshot of `model` + `small_model` + `mode`. Keep one
+A profile is a named snapshot of the *resolved* `model` + `small_model` +
+`mode` — including a one-off `-m`, `ORC_MODE`, or `.orc.json` pin. Keep one
 combo for real work and one for throwaway experiments, and switch per launch
-without touching your saved default:
+without touching your saved default. `orc status` prints the combo that
+would launch from this directory. `orc env` prints the same exports
+`launch` would set (including context window and gateway discovery).
+
+```bash
+orc status              # what would launch right now
+orc status --json       # same object, for wrappers
+```
+
+Resolution order for each of `model` / `small_model` / `mode`:
+
+1. one-off flags: `-m` / `ORC_MODEL_OVERRIDE` / `ORC_MODE`
+2. `orc @<profile>` / `ORC_PROFILE`
+3. `.orc.json` inline keys
+4. the profile named by `.orc.json`'s `"profile"`
+5. `~/.config/orc/config.json`
 
 ```bash
 orc save work           # snapshot the current setup as @work
@@ -106,13 +138,9 @@ or inline, without needing a profile:
 { "model": "moonshotai/kimi-k2", "mode": "plan" }
 ```
 
-Resolution order for each of `model` / `small_model` / `mode`:
-
-1. one-off flags: `-m` / `ORC_MODE`
-2. `orc @<profile>` / `ORC_PROFILE`
-3. `.orc.json` inline keys
-4. the profile named by `.orc.json`'s `"profile"`
-5. `~/.config/orc/config.json`
+Resolution is the same stack `orc status` prints — see above. The launch
+menu, `orc env`, `orc save`, `orc doctor`, and `orc probe` all consume
+that object, so a project pin or `@work` is never silently ignored.
 
 ## Stats
 
@@ -173,18 +201,29 @@ Every orc launch injects a Claude Code statusline (on by default, your real
 `~/.claude` settings are never touched). It renders one line:
 
 ```
-stealth/ox-alpha │ ↑ 3.50M ↓ 45.8k │ cache 89% │ ctx ▓▓░░░░░░░░░ 11% │ $0.8412
+stealth/ox-alpha │ ↑ 3.50M ↓ 45.8k │ cache 89% │ ctx ▓▓░░░░░░░░░ 11% │ $0.8412 │ +$0.31 agents
 ```
 
-- **↑ / ↓** — total tokens in (including cached) and out this session
-- **cache** — share of input tokens served from prompt cache
-- **ctx** — context gauge; green under 60%, yellow under 85%, red at the top.
-  Prefers Claude Code's own context reading, falls back to the last API call's
-  usage over the model's catalog context length
-- **cost** — session cost estimated from transcript usage × live OpenRouter
-  catalog prices, joined per response (mid-session model switches price
-  correctly). Shows `FREE` for zero-priced models, `$—` when a model isn't in
-  the cached catalog
+- **↑ / ↓** — total tokens in (including cached) and out on the parent
+  transcript. Subagent tokens are priced separately so the parent window
+  stays honest.
+- **cache** — share of parent input tokens served from prompt cache
+- **ctx** — context gauge of the parent window; green under 60%, yellow
+  under 85%, red at the top. Prefers Claude Code's own context reading,
+  falls back to the last parent API call over the catalog context length
+- **cost** — parent-transcript cost from usage × live OpenRouter catalog
+  prices, joined per response (mid-session model switches price correctly).
+  Shows `FREE` for zero-priced models, `$—` when a model isn't in the
+  cached catalog. After `orc -c` / `/resume`, a second figure appears:
+  `$0.12 this $1.24 file` — spend since this join vs the whole file
+- **+agents** — sibling spend from `<session>/subagents/agent-*.jsonl`,
+  same math as `orc stats`. Shown only when a subagent has billed tokens
+
+The HUD keeps an incremental cache at `~/.config/orc/sessions/<id>.json`
+and only reads new bytes on each statusline tick, so a multi-megabyte
+transcript does not get fully reparsed every time. `orc` stamps
+`~/.config/orc/last-launch` at exec so a resume can split "this join"
+from "the file".
 
 Claude Code's built-in cost figure is deliberately ignored: it prices tokens
 at Anthropic list rates, which is wrong when you're billed OpenRouter rates.
@@ -195,9 +234,9 @@ repo. Toggle with `orc hud off` / `orc hud on`, preview against your newest
 transcript with `orc hud demo`, or disable for a single launch with
 `ORC_HUD=0`.
 
-Two known limits: on `/resume` the figure covers the whole conversation file,
-not just since you rejoined; and tokens spent inside subagent transcripts are
-not counted (they are in `orc stats`).
+The HUD now folds sibling subagent transcripts and splits resume spend
+as `$this` vs `$file`. Compacted / rewritten transcript files reset the
+byte-offset cache automatically.
 
 ## Config
 
@@ -217,21 +256,23 @@ not counted (they are in `orc stats`).
 
 `ORC_YES=1` skips the launch confirmation (for scripts). `ORC_HOME` moves the
 config dir. `ORC_HUD=0` hides the statusline HUD for one invocation.
-`ORC_NO_PROBE=1` skips doctor's launch probe. `ORC_MODE` overrides the launch
-permission mode for one invocation
-(`default` / `auto` / `acceptEdits` / `plan` / `dontAsk` / `yolo`) without
-touching the saved config — this is how wrappers like cmndcntr launch orc with
-their own per-run policy. `ORC_PROFILE` does the same for profiles. The model
-catalog is cached for 24h (`orc refresh` to force).
+`ORC_NO_PROBE=1` skips doctor's launch probe. `ORC_NO_FIT=1` skips doctor's
+tool-loop fit probe. `ORC_MODE` overrides the launch permission mode for
+one invocation (`default` / `auto` / `acceptEdits` / `plan` / `dontAsk` /
+`yolo`) without touching the saved config — this is how wrappers like
+cmndcntr launch orc with their own per-run policy. `ORC_PROFILE` does the
+same for profiles. `ORC_MODEL_OVERRIDE` is the env form of `-m`. The model
+catalog and fit cache both live 24h (`orc refresh` / `orc probe --fit`
+to force). `orc env` is `launch` without the `exec`.
 
 ## Development
 
 The shipped scripts are assembled. Sources of truth:
 
 - `pricing.jq` — the shared jq math behind the HUD, `orc stats`, and the model
-  picker (token normalization, transcript validation, pricing, free/tool flags).
-  The HUD and stats are guaranteed to price identically because they run the
-  same definitions.
+  picker (token normalization, transcript validation, pricing, free/tool
+  flags, incremental session aggregates). The HUD and stats are guaranteed
+  to price identically because they run the same definitions.
 - `hud.sh.in` — the statusline HUD body.
 - `orc` — everything else.
 
@@ -243,9 +284,11 @@ or `hud.sh` have drifted from them.
 
 `./test/run.sh` runs the test suite: HUD rendering against fixture
 transcripts and a fixture catalog (paid / free / unknown-model pricing,
-legacy and current cache-usage shapes, all three context-percentage sources),
-`orc stats` aggregation, model tool-support flags, and profile / `.orc.json`
-resolution. CI runs shellcheck on every script plus the test suite.
+legacy and current cache-usage shapes, all three context-percentage
+sources, subagent sibling spend, resume this-vs-file split), `orc stats`
+aggregation, model tool-support and fit flags, profile / `.orc.json`
+resolution, and `orc status` / `orc env` / `orc save` consuming the same
+resolved object. CI runs shellcheck on every script plus the test suite.
 
 ## Caveats
 
