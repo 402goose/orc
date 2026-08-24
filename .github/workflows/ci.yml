@@ -13,7 +13,11 @@ jobs:
       - run: shellcheck orc hud.sh hud.sh.in install.sh build.sh test/run.sh
 
   test:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: verify generated scripts are assembled from sources

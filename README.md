@@ -7,9 +7,10 @@ isolated from your normal Anthropic login.
 
 ## Requirements
 
-- macOS (uses the Keychain and BSD `stat`)
+- macOS or Linux
 - [Claude Code](https://claude.com/claude-code) (`claude` on PATH)
-- `jq`, `curl`, `fzf` — `brew install jq fzf` covers the non-default ones
+- `jq`, `curl`, `fzf` — `brew install jq fzf` on macOS, e.g.
+  `sudo apt-get install jq curl fzf` on Debian/Ubuntu
 - An [OpenRouter](https://openrouter.ai) API key
 
 ## Install
@@ -66,7 +67,7 @@ orc models [query]      list models with pricing + context + tool + fit
 orc models --free [...] list only currently free models
 orc models --tools [..] list only models advertising tool support
 orc models --fit [...]  list only models that passed orc probe --fit
-orc key                 configure key source (env var name or macOS keychain)
+orc key                 configure key source (env var name or key store)
 orc env                 print the export lines launch uses (contains your key)
 orc refresh             force-refresh the cached model list
 orc doctor              check everything end to end (resolved model + fit)
@@ -165,8 +166,11 @@ per project and per model as seen from your machine.
 
 1. The env var named in your config — `OPENROUTER_API_KEY` by default,
    changeable via `orc key`.
-2. The macOS Keychain (service `orc-openrouter`), where the key wizard stores
-   pasted keys. Nothing is ever written to a plaintext config file.
+2. The system key store, where the key wizard stores pasted keys: the macOS
+   Keychain (service `orc-openrouter`) on macOS; on Linux a file at
+   `~/.config/orc/key`, created with `0600` permissions and never made
+   group/world readable (orc warns if it is). Nothing is ever written to a
+   plaintext config file.
 
 If neither is found, **orc refuses to launch** (fail closed) and tells you how
 to fix it.
