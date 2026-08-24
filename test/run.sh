@@ -226,7 +226,7 @@ ST="$(cd "$PROJ2" && ORC_PROFILE=work "$ROOT/orc" status --json 2>/dev/null)"
 t "status ORC_PROFILE beats .orc.json" "test/paid" "$(printf '%s' "$ST" | jq -r .model)"
 t "status source is profile" "profile" "$(printf '%s' "$ST" | jq -r .source.model)"
 
-ST="$(cd "$PROJ2" && ORC_PROFILE=work "$ROOT/orc" -m test/notools status --json 2>/dev/null || true)"
+ST="$(cd "$PROJ2" && ORC_PROFILE=work "$ROOT/orc" -m test/notools status --json 2>/dev/null)"
 # -m only applies to launch; status is its own command. Override via env:
 ST="$(cd "$PROJ2" && ORC_MODEL_OVERRIDE=test/notools "$ROOT/orc" status --json 2>/dev/null)"
 t "status ORC_MODEL_OVERRIDE wins" "test/notools" "$(printf '%s' "$ST" | jq -r .model)"
