@@ -4,6 +4,7 @@ set -euo pipefail
 ORC_HOME="${ORC_HOME:-$HOME/.config/orc}"
 CONFIG="$ORC_HOME/config.json"
 MODELS_CACHE="$ORC_HOME/models.json"
+QUALITY_CACHE="$ORC_HOME/quality.json"
 CLAUDE_STATE="$ORC_HOME/claude-state"
 API="https://openrouter.ai/api/v1"
 BASE_URL="https://openrouter.ai/api"
@@ -12,8 +13,12 @@ CACHE_TTL=86400
 HUD_SCRIPT="$ORC_HOME/hud.sh"
 FIT_CACHE="$ORC_HOME/fit.json"
 LAST_LAUNCH="$ORC_HOME/last-launch"
+# Bundled Artificial Analysis quality snapshot, shipped with the script.
+# Resolves to data/quality.json next to the orc script, or to the path
+# shipped in the installed copy under $ORC_HOME.
+BUNDLED_QUALITY="${BUNDLED_QUALITY:-$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/data/quality.json}"
 # ORC_HUD_VERSION and the ORC_HUD_BODY heredoc are written by build.sh from hud.sh.in + pricing.jq
-ORC_HUD_VERSION="be2c9d49eda3"
+ORC_HUD_VERSION="75c071be539e"
 
 err()  { printf '\033[31morc: %s\033[0m\n' "$*" >&2; }
 info() { printf '\033[2m%s\033[0m\n' "$*" >&2; }
@@ -366,9 +371,72 @@ fetch_models() {
   fi
 }
 
+# Artificial Analysis quality ranking.
+#
+# fetch_quality mirrors fetch_models but is fail-soft: if the cache is
+# missing AND the bundled seed isn't there AND we can't reach the
+# network, the picker still works (it just falls back to the old
+# FIT-then-id sort). Never block a launch on this.
+#
+# The bundled seed (data/quality.json in the orc source) is shipped with
+# the script and copied to $ORC_HOME/quality.json on first run, so the
+# picker has a real ranking out of the box. `orc refresh` re-fetches.
+
+fetch_quality() {
+  mkdir -p "$ORC_HOME"
+  # Seed the cache from the bundled data on first run only.
+  if [ ! -f "$QUALITY_CACHE" ] && [ -f "$BUNDLED_QUALITY" ]; then
+    cp "$BUNDLED_QUALITY" "$QUALITY_CACHE"
+  fi
+  if [ -f "$QUALITY_CACHE" ] && [ "${1:-}" != "force" ]; then
+    local age=$(( $(date +%s) - $(mtime_of "$QUALITY_CACHE" 2>/dev/null || echo 0) ))
+    [ "$age" -lt "$CACHE_TTL" ] && return 0
+  fi
+  # Refreshing requires the cmndcntr fetcher to actually be present.
+  # We don't try to re-implement the leaderboard scrape here; the bundled
+  # snapshot is authoritative until the user runs `make refresh-quality`
+  # (or copies a fresh quality.json into $ORC_HOME by hand).
+  info "quality cache is stale; refresh with: cp graphify-out/artificial-analysis-quality.json $ORC_HOME/quality.json"
+}
+
+# Static slug -> openrouterId map for records Artificial Analysis lists
+# under a different slug than OpenRouter (e.g. effort variants like
+# "claude-opus-5-xhigh" don't have their own OR id — they live under
+# "anthropic/claude-opus-5"). 8 entries; grew from the live fetcher's
+# unmappedSlugs list. Add new entries here as they show up in
+# `unmappedSlugs` from a quality.json refresh.
+SLUG_TO_OR_ID='{
+  "claude-opus-5-xhigh":   "anthropic/claude-opus-5",
+  "claude-opus-5-high":    "anthropic/claude-opus-5",
+  "claude-opus-5-medium":  "anthropic/claude-opus-5",
+  "claude-opus-5-low":     "anthropic/claude-opus-5",
+  "claude-fable-5-xhigh":  "anthropic/claude-fable-5",
+  "gpt-5-6-sol-xhigh":     "openai/gpt-5.6-sol",
+  "grok-4-6-xhigh":        "x-ai/grok-4.6",
+  "gemini-3-5-flash-minimal": "google/gemini-3.5-flash"
+}'
+
+# quality_map: produce { "<openrouterId>": <intelligenceIndex, ...> }
+# for every record in the quality cache. Records with no openrouterApiId
+# fall through to slug_to_or_id_map. Returns "{}" on a missing cache
+# so the picker sort degrades to "no rank" cleanly.
+quality_map() {
+  [ -f "$QUALITY_CACHE" ] || { printf '{}'; return 0; }
+  jq -c --argjson slugmap "$SLUG_TO_OR_ID" '
+    .records
+    | map(
+        if .openrouterApiId then {key: .openrouterApiId, value: .}
+        elif $slugmap[.slug] then {key: $slugmap[.slug], value: .}
+        else empty
+        end
+      )
+    | from_entries
+  ' "$QUALITY_CACHE" 2>/dev/null || printf '{}'
+}
+
 model_rows() {
   local filter="${1:-all}"
-  jq -r --arg filter "$filter" --argjson fit "$(fit_map)" '
+  jq -r --arg filter "$filter" --argjson fit "$(fit_map)" --argjson quality "$(quality_map)" '
 # orc pricing/catalog math — single source of truth; spliced by build.sh into marked jq programs.
 # Constraint: no single quotes here (consumer programs are bash single-quoted).
 
@@ -486,6 +554,8 @@ def reprice($P):
   .agg = reduce (.ids | to_entries[] | .value | usage_row) as $x (empty_agg; acc_row($P; $x));
     .data
     | sort_by(
+        -((($quality[.id].intelligenceIndex // -1))),
+        ((.pricing.prompt // "0") | tonumber? // 0),
         (if ($fit[.id] // "") == "FIT" then 0
          elif has_tools then 1
          else 2 end),
@@ -630,16 +700,51 @@ def reprice($P):
 pick_model() {
   need fzf
   fetch_models
+  fetch_quality
   local sel filter header
   filter="${3:-all}"
   case "$filter" in
-    free) header="currently free on OpenRouter · live catalog · FIT = survived a tool-loop probe" ;;
-    fit) header="models that survived orc probe --fit in the last 24h" ;;
-    *) header="live prices per 1M tokens · type FREE for free models · NO TOOLS = poor Claude Code fit · FIT = probed" ;;
+    free) header="currently free on OpenRouter · ranked by Artificial Analysis intelligence · FIT = probed" ;;
+    fit) header="models that survived orc probe --fit in the last 24h · ranked by quality" ;;
+    *) header="ranked by Artificial Analysis intelligence index · type FREE for free models · NO TOOLS = poor Claude Code fit · FIT = probed" ;;
   esac
   sel="$(model_rows "$filter" | table \
         | fzf --prompt="${2:-model}> " --query="${1:-}" --header="$header" --height=20 --reverse)" || return 1
   printf '%s' "${sel%% *}"
+}
+
+# `orc quality` — dump the quality cache as a sorted table.
+# Columns: openrouter id, intelligence index, code/agent scores, creator.
+# Reads $QUALITY_CACHE only; does not touch the network. Useful for
+# spot-checking what the picker will see, without opening a browser.
+quality_cmd() {
+  fetch_quality
+  if [ ! -f "$QUALITY_CACHE" ]; then
+    err "no quality cache at $QUALITY_CACHE"
+    info "ship a fresh copy to that path, or re-run: make refresh-quality (from the orc source)"
+    return 1
+  fi
+  {
+    printf '%s\n' "OR_ID	II	CODE	AGENT	CREATOR	SLUG"
+    jq -r --argjson slugmap "$SLUG_TO_OR_ID" '
+      .records
+      | map(
+          ((if .openrouterApiId then .openrouterApiId
+           elif $slugmap[.slug] then "[map] " + $slugmap[.slug]
+           else "(no OR id)" end)) as $orid
+        | ((if .intelligenceIndex == null then "—"
+           else (.intelligenceIndex | tostring | .[0:5]) end)) as $ii
+        | ((if .codingIndex == null then "—"
+           else (.codingIndex | tostring | .[0:5]) end)) as $ci
+        | ((if .agenticIndex == null then "—"
+           else (.agenticIndex | tostring | .[0:5]) end)) as $ai
+        | ((if .intelligenceIndexIsEstimated then " est" else "" end)) as $est
+        | [(.intelligenceIndex // -1), $orid, $ii + $est, $ci, $ai, (.modelCreatorName // "-"), .slug]
+      )
+      | sort_by(.[0]) | reverse
+      | .[] | .[1:] | @tsv
+    ' "$QUALITY_CACHE"
+  } | table
 }
 
 key_wizard() {
@@ -2589,7 +2694,11 @@ case "${1:-}" in
   probe)
     shift
     probe_model "$@" ;;
-  refresh) fetch_models force; info "model list refreshed"; exit 0 ;;
+  refresh) fetch_models force; fetch_quality force; info "model list and quality cache refreshed"; exit 0 ;;
+  quality)
+    shift
+    quality_cmd "$@"
+    exit 0 ;;
   config) mkdir -p "$ORC_HOME"; [ -f "$CONFIG" ] || printf '{}\n' > "$CONFIG"; exec "${EDITOR:-vi}" "$CONFIG" ;;
   model)
     shift
@@ -2666,6 +2775,7 @@ case "${1:-}" in
   models)
     shift
     fetch_models
+    fetch_quality
     model_filter="all"
     case "${1:-}" in
       --free|free) model_filter="free"; shift ;;

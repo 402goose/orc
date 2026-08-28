@@ -2,14 +2,14 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-for f in orc hud.sh.in pricing.jq; do
+for f in orc hud.sh.in pricing.jq data/quality.json; do
   [ -f "$f" ] || { echo "build.sh: $f not found" >&2; exit 1; }
 done
 
 if command -v shasum >/dev/null 2>&1; then
-  ver="$(cat pricing.jq hud.sh.in | shasum -a 256 | cut -c1-12)"
+  ver="$(cat pricing.jq hud.sh.in data/quality.json | shasum -a 256 | cut -c1-12)"
 else
-  ver="$(cat pricing.jq hud.sh.in | sha256sum | cut -c1-12)"
+  ver="$(cat pricing.jq hud.sh.in data/quality.json | sha256sum | cut -c1-12)"
 fi
 
 expand_includes() {
