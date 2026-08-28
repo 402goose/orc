@@ -1,0 +1,52 @@
+{
+  "source": "https://artificialanalysis.ai/leaderboards/models",
+  "fetchedAt": "2026-08-28T00:00:00.000Z",
+  "recordCount": 3,
+  "mappedCount": 3,
+  "unmappedCount": 0,
+  "records": [
+    {
+      "openrouterApiId": "test/paid",
+      "slug": "test-paid",
+      "name": "Test Paid",
+      "intelligenceIndex": 63.05,
+      "intelligenceIndexIsEstimated": false,
+      "codingIndex": 77.98,
+      "agenticIndex": 59.17,
+      "deprecated": false,
+      "isReasoning": true,
+      "modelCreatorSlug": "anthropic",
+      "modelCreatorName": "Anthropic",
+      "releaseDate": "2026-07-24"
+    },
+    {
+      "openrouterApiId": "test/free",
+      "slug": "test-free",
+      "name": "Test Free",
+      "intelligenceIndex": 22.0,
+      "intelligenceIndexIsEstimated": false,
+      "codingIndex": 18.0,
+      "agenticIndex": 12.0,
+      "deprecated": false,
+      "isReasoning": false,
+      "modelCreatorSlug": "test",
+      "modelCreatorName": "Test",
+      "releaseDate": "2026-01-01"
+    },
+    {
+      "openrouterApiId": "test/notools",
+      "slug": "test-notools",
+      "name": "Test No Tools (also no quality score)",
+      "intelligenceIndex": null,
+      "intelligenceIndexIsEstimated": false,
+      "codingIndex": null,
+      "agenticIndex": null,
+      "deprecated": false,
+      "isReasoning": false,
+      "modelCreatorSlug": "test",
+      "modelCreatorName": "Test",
+      "releaseDate": "2026-01-01"
+    }
+  ],
+  "unmappedSlugs": []
+}

@@ -259,6 +259,45 @@ esac
 ROWS="$("$ROOT/orc" models 2>/dev/null | strip_ansi)"
 t_contains "models marks cached FIT" "FIT" "$ROWS"
 
+echo "== models: quality ranking =="
+export ORC_HOME="$TMP/quality-home"
+mkdir -p "$ORC_HOME"
+cp "$FIX/models.json" "$ORC_HOME/models.json"
+cp "$FIX/quality.json" "$ORC_HOME/quality.json"
+
+# All 3 fixture models are in the quality cache, so the picker should
+# list test/paid (score 63) first, then test/free (score 22), then
+# test/notools (no score) last. test/notools has no tools either, so
+# it should still appear in `orc models` (just at the bottom).
+RANKED_FIRST="$(ORC_HOME="$ORC_HOME" "$ROOT/orc" models 2>/dev/null | strip_ansi | head -1 | awk '{print $1}')"
+t "models: ranked by quality (paid first)" "test/paid" "$RANKED_FIRST"
+
+# Quality order should also hold with the --tools filter, which drops
+# test/free and test/notools (no `supported_parameters:["tools"]` in
+# the fixture). The remaining test/paid should still be at the top.
+TOOLS_RANKED="$(ORC_HOME="$ORC_HOME" "$ROOT/orc" models --tools 2>/dev/null | strip_ansi)"
+TOOLS_FIRST="$(printf '%s' "$TOOLS_RANKED" | head -1 | awk '{print $1}')"
+t "models --tools: top pick is the highest-quality model" "test/paid" "$TOOLS_FIRST"
+
+# No-quality rows must still be listed (fail-soft: a missing or stale
+# quality cache never removes models from the picker).
+ALL_LISTED="$(ORC_HOME="$ORC_HOME" "$ROOT/orc" models 2>/dev/null | strip_ansi)"
+t_contains "models: no-quality rows still listed" "test/notools" "$ALL_LISTED"
+
+# `orc quality` should print a table; check the header is present and
+# the top entry is test/paid.
+QUALITY_OUT="$(ORC_HOME="$ORC_HOME" "$ROOT/orc" quality 2>/dev/null | strip_ansi)"
+t_contains "quality subcommand prints header" "OR_ID" "$QUALITY_OUT"
+PAID_LINE="$(printf '%s\n' "$QUALITY_OUT" | grep -n 'test/paid' | head -1 | cut -d: -f1)"
+FREE_LINE="$(printf '%s\n' "$QUALITY_OUT" | grep -n 'test/free' | head -1 | cut -d: -f1)"
+if [ -n "$PAID_LINE" ] && [ -n "$FREE_LINE" ] && [ "$PAID_LINE" -lt "$FREE_LINE" ]; then
+  PASS=$((PASS + 1))
+  printf '  ok  quality subcommand lists test/paid before test/free\n'
+else
+  FAIL=$((FAIL + 1))
+  printf 'FAIL  quality subcommand ordering wrong\n  got:  %s\n' "$QUALITY_OUT"
+fi
+
 echo
 if [ "$FAIL" -gt 0 ]; then
   printf '%d passed, %d FAILED\n' "$PASS" "$FAIL"
