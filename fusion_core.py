@@ -528,11 +528,7 @@ def agent_settings(config: dict[str, Any], task: dict[str, Any]) -> dict[str, An
     return settings
 
 
-def select_orc_model(command: str, selector: str) -> str | None:
-    """Ask orc for its current ranked model; never hard-code a volatile model id."""
-    if selector not in {"free", "best"}:
-        return None
-    filter_args = ["--free", "--tools"] if selector == "free" else ["--tools"]
+def _orc_model_ids(command: str, filter_args: list[str]) -> list[str]:
     try:
         completed = subprocess.run(
             [command, "models", *filter_args],
@@ -542,13 +538,35 @@ def select_orc_model(command: str, selector: str) -> str | None:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return None
+        return []
     if completed.returncode != 0:
-        return None
+        return []
+    ids = []
     for line in completed.stdout.splitlines():
         candidate = line.strip().split(maxsplit=1)
         if candidate and "/" in candidate[0] and not candidate[0].startswith("-"):
-            return candidate[0]
+            ids.append(candidate[0])
+    return ids
+
+
+def select_orc_model(command: str, selector: str, allow_untested: bool = False) -> str | None:
+    """Ask orc for its current ranked model; never hard-code a volatile model id.
+
+    Free/best selectors require a model that already passed `orc probe --fit`
+    unless allow_untested is set. Picking the first tool-capable model
+    regardless of fit let a workflow route to a model that rejects every
+    call before generation even starts; pass allow_untested=True to opt back
+    into that best-effort behavior.
+    """
+    if selector not in {"free", "best"}:
+        return None
+    ranked = _orc_model_ids(command, ["--free", "--tools"] if selector == "free" else ["--tools"])
+    if allow_untested:
+        return ranked[0] if ranked else None
+    fit_ids = set(_orc_model_ids(command, ["--fit"]))
+    for candidate in ranked:
+        if candidate in fit_ids:
+            return candidate
     return None
 
 
@@ -583,7 +601,11 @@ def agent_command(
         argv = [command, *launcher_args]
         selected_model = str(settings.get("model", ""))
         if command_name == "orc" and not selected_model:
-            selected_model = select_orc_model(command, str(settings.get("model_selector", ""))) or ""
+            selected_model = select_orc_model(
+                command,
+                str(settings.get("model_selector", "")),
+                bool(settings.get("allow_untested", False)),
+            ) or ""
         if command_name == "orc" and selected_model:
             argv += ["-m", selected_model]
         mode = settings.get("permission_mode", "acceptEdits") if task["write"] else "plan"

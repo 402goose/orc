@@ -27,6 +27,9 @@ NODE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 TERMINAL_SUCCESS = {"success"}
 TERMINAL_FAILURE = {"failed", "blocked", "invalid"}
 TERMINAL_PAUSED = {"paused_quota", "paused_budget"}
+# How long a recent quota/session-limit trace keeps an agent lane in cooldown
+# before a fresh run is willing to try it again.
+LANE_COOLDOWN_SECONDS = 900
 
 
 def _run_id(prefix: str = "wf") -> str:
@@ -265,6 +268,7 @@ class WorkflowRunner:
                 "result": None,
                 "artifact": str(self.nodes_root / node["id"] / "node.json"),
             }
+        self.lane_health: dict[str, dict[str, Any]] = {}
         if resume:
             self._load_existing()
         else:
@@ -272,6 +276,7 @@ class WorkflowRunner:
             self.nodes_root.mkdir(parents=True, exist_ok=True)
             self._write_manifest("running")
             self._event("workflow.created", {"task": self.spec.get("task", "")})
+        self._preflight_lanes()
 
     def _load_existing(self) -> None:
         if not self.manifest_path.exists():
@@ -317,6 +322,7 @@ class WorkflowRunner:
             "spec": self.spec,
             "workflow_baseline": self.workflow_baseline,
             "nodes": self.nodes,
+            "lanes": self.lane_health,
             "error": error,
             "artifacts": {
                 "root": str(self.root),
@@ -345,6 +351,46 @@ class WorkflowRunner:
                 f"summary={str((item.get('result') or {}).get('summary', ''))[:500]}"
             )
         return "\n".join(lines)
+
+    def _agent_command_for(self, agent: str) -> str:
+        settings = core.agent_settings(self.config, {"agent": agent, "route": None, "settings_overrides": {}})
+        return str(settings.get("command", agent))
+
+    def _set_lane(self, agent: str, status: str, reason: str) -> None:
+        if self.lane_health.get(agent, {}).get("status") == status:
+            return
+        self.lane_health[agent] = {"status": status, "reason": reason}
+        self._event("lane.status", {"agent": agent, "status": status, "reason": reason})
+
+    def _preflight_lanes(self) -> None:
+        """Check agent lanes once before dispatch instead of discovering a dead
+        lane N times in parallel. Executable checks are free; the quota/session
+        cooldown reuses the most recent trace per agent rather than spending a
+        real call to find out a lane is already blocked. A resume is an
+        explicit "try again now", so it skips the trace-history cooldown but
+        still gets the executable check and its own in-run cooldown."""
+        for agent in {node["agent"] for node in self.nodes.values()}:
+            command = self._agent_command_for(agent)
+            if core.executable(command) is None:
+                self._set_lane(agent, "blocked", f"{command} is not available on PATH")
+        if self.resume:
+            return
+        store = core.RunStore(self.workspace)
+        now = core.now_ms()
+        seen: set[str] = set()
+        for span in store.traces(limit=50):
+            agent = span.get("agent")
+            if not agent or agent in seen:
+                continue
+            seen.add(agent)
+            if agent in self.lane_health:
+                continue
+            end_time = span.get("end_time_ms")
+            if not isinstance(end_time, (int, float)):
+                continue
+            age_ms = now - end_time
+            if 0 <= age_ms <= LANE_COOLDOWN_SECONDS * 1000 and _quota_failure(span):
+                self._set_lane(agent, "cooldown", f"a {agent} run reported a quota/session limit {int(age_ms / 1000)}s ago")
 
     def _prompt(self, node: dict[str, Any]) -> str:
         required = ", ".join(node.get("required_files", [])) or "none"
@@ -415,6 +461,7 @@ BLOCKERS: unresolved issues, or none
         settings = {key: node[key] for key in (
             "command", "model", "model_selector", "profile", "launcher_args",
             "max_budget_usd", "permission_mode", "permission_prompts", "allowed_tools",
+            "allow_untested",
         ) if key in node}
         task = core.make_task(
             self.workspace,
@@ -473,6 +520,23 @@ BLOCKERS: unresolved issues, or none
             changed = False
             for node in self.nodes.values():
                 if node["status"] != "pending":
+                    continue
+                lane = self.lane_health.get(node["agent"])
+                if lane:
+                    status = "paused_quota" if lane["status"] == "cooldown" else "blocked"
+                    node["status"] = status
+                    node["result"] = {
+                        "status": status,
+                        "summary": f"agent lane {node['agent']} is {lane['status']}",
+                        "blockers": [lane["reason"]],
+                    }
+                    self._save_node(node["id"], {
+                        "task": {},
+                        "result": node["result"],
+                        "acceptance": {"ok": False, "problems": node["result"]["blockers"]},
+                    })
+                    self._event(f"node.{status}", {"node_id": node["id"], "result": node["result"]})
+                    changed = True
                     continue
                 dependency_statuses = [self.nodes[dependency]["status"] for dependency in node["needs"]]
                 if any(status in TERMINAL_FAILURE or status in TERMINAL_PAUSED for status in dependency_statuses):
@@ -601,6 +665,7 @@ BLOCKERS: unresolved issues, or none
                     elif _quota_failure(result):
                         node["status"] = "paused_quota"
                         self._event("node.paused_quota", {"node_id": node_id, "attempt": node["attempts"]})
+                        self._set_lane(node["agent"], "cooldown", f"node {node_id} reported a quota/session limit")
                     elif node["attempts"] < self.spec["max_attempts"]:
                         node["status"] = "pending"
                         self._event("node.retrying", {"node_id": node_id, "attempt": node["attempts"], "problems": problems})
@@ -628,6 +693,7 @@ BLOCKERS: unresolved issues, or none
             "task": self.spec.get("task", ""),
             "spent_usd": self._spent(),
             "nodes": [self.nodes[node_id] for node_id in self.nodes],
+            "lanes": self.lane_health,
             "acceptance": {
                 "ok": status == "success" and not acceptance_problems,
                 "problems": acceptance_problems or [],
