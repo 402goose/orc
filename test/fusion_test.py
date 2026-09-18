@@ -631,7 +631,10 @@ sys.exit(1)
                 {"id": "fanin", "needs": ["quota", "sibling"], "task": "fanin", "agent": "claude"},
             ]
         }
-        runner = WorkflowRunner(self.workspace, {}, spec)
+        # Pin the claude lane to a resolvable command: WorkflowRunner's
+        # preflight blocks lanes whose executable is missing, which would
+        # otherwise depend on whether claude happens to be on PATH.
+        runner = WorkflowRunner(self.workspace, {"claude": {"command": "true"}}, spec)
         runner.nodes["quota"]["status"] = "paused_quota"
         runner.nodes["sibling"]["status"] = "running"
         runner._block_unrunnable()
