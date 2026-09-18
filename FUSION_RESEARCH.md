@@ -303,21 +303,44 @@ text would currently be invisible to the harness; `permission_denials` would
 catch that structurally instead of relying on the model to self-report it --
 *if* its populated shape were known.
 
-Four separate live attempts to trigger a populated `permission_denials`
-entry (plan mode asked to delete a file; `--allowedTools Read` asked to run
-Bash; `--disallowedTools Bash` asked to run Bash; the same with
-`--permission-prompts none`) all came back with an empty array. Claude Code
-appears to filter a fully-disallowed tool out of the model's own visible
-tool list rather than emitting a structural denial when the model attempts
-it -- the model just reports "I don't have that tool," which is exactly the
-kind of silent-in-the-summary case this field was meant to catch, except the
-field itself stayed empty too. A real populated example likely needs an
-interactive-rejection or fine-grained pattern-rule scenario (e.g.
-`Bash(rm *)` denied while `Bash(*)` is otherwise allowed) that a headless
-smoke script can't trivially construct. Given the model/`total_cost_usd`
-bug above came from exactly this mistake -- assuming an unverified schema --
-this is deliberately left unbuilt rather than guessed at. Building it
-correctly needs one real captured example of a populated entry first.
+Seven separate live attempts to trigger a populated `permission_denials`
+entry all came back with an empty array:
+
+1. Plan mode asked to delete a file -- declined verbally, never attempted
+   the tool call.
+2. `--allowedTools Read` asked to run Bash -- ran anyway (allowlist did not
+   restrict it in this scenario).
+3. `--disallowedTools Bash` asked to run Bash -- and 4. the same with
+   `--permission-prompts none` added -- the model reported "I don't have a
+   Bash tool," meaning the tool was filtered out of its visible list before
+   it could attempt (and be denied) the call.
+5. `--permission-mode manual --permission-prompts none` (prompts
+   auto-deny) asked to run a benign `echo` -- ran anyway; "manual" mode did
+   not require approval for this command.
+6. The same mode asked to run `rm -rf` on a nonexistent path -- the model
+   refused on its own judgment before attempting any tool call, so nothing
+   reached the permission layer to be denied.
+7. `--permission-mode plan --permission-prompts none`, explicitly instructed
+   to call the Write tool immediately with no explanation -- found an
+   allowed side-channel instead (wrote a plan file to `~/.claude/plans/`,
+   outside the working directory, and asked for confirmation before writing
+   the actual requested file).
+
+Across all seven, `permission_denials` never populated: the model either
+self-censors before attempting a disallowed action (a judgment-level
+refusal, not a permission-system-level one), finds an allowed alternative
+path, or the action turns out to be permitted after all. None of the
+headless, flag-only scenarios this harness can construct reach the
+"model attempts a visible tool, permission layer rejects it" path this field
+is presumably for. A real populated example likely needs either genuine
+interactive rejection (a human or a custom `--permission-prompt-tool`
+returning deny) or a fine-grained pattern rule (e.g. `Bash(rm *)` denied
+while `Bash(*)` is otherwise allowed) that a headless smoke script can't
+trivially construct. Given the model/`total_cost_usd` bug above came from
+exactly this mistake -- assuming an unverified schema -- this is
+deliberately left unbuilt rather than guessed at. Building it correctly
+needs one real captured example of a populated entry first; that's now a
+known dead end for cheap headless reproduction, not just an untried idea.
 
 ## How to try it
 
