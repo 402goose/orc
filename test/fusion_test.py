@@ -176,6 +176,20 @@ print(json.dumps({'conversation_id':'conv-denied','status':'SUCCESS','response':
         self.assertIn("auto-denied", " ".join(result["blockers"]))
         self.assertIn("RunCommand", " ".join(result["blockers"]))
 
+    def test_orc_free_routes_skip_max_budget_but_paid_routes_keep_it(self):
+        free_task = fusion_core.make_task(
+            self.workspace, "claude", "t", "r", [], [], None, False, False,
+            settings_overrides={"command": "orc", "model": "cohere/north-mini-code:free", "max_budget_usd": 0.1},
+        )
+        argv, _, _ = fusion_core.agent_command({}, free_task, None)
+        self.assertNotIn("--max-budget-usd", argv)
+        paid_task = fusion_core.make_task(
+            self.workspace, "claude", "t", "r", [], [], None, False, False,
+            settings_overrides={"command": "orc", "model": "anthropic/claude-opus-5", "max_budget_usd": 0.4},
+        )
+        argv, _, _ = fusion_core.agent_command({}, paid_task, None)
+        self.assertIn("--max-budget-usd", argv)
+
     def test_mcp_lists_tools(self):
         self.config()
         requests = "\n".join(

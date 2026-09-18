@@ -655,7 +655,13 @@ def agent_command(
         if command_name != "orc" and selected_model:
             argv += ["--model", selected_model]
         max_budget = settings.get("max_budget_usd")
-        if max_budget is not None:
+        free_route = command_name == "orc" and (
+            str(settings.get("model_selector", "")) == "free" or selected_model.endswith(":free")
+        )
+        if max_budget is not None and not free_route:
+            # Claude Code prices --max-budget-usd at Anthropic list rates, so on
+            # :free OpenRouter routes the guard trips on phantom cost while real
+            # spend is zero; it would only sabotage cheap lanes.
             argv += ["--max-budget-usd", str(max_budget)]
         allowed = settings.get("allowed_tools") or []
         if allowed:
