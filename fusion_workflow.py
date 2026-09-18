@@ -728,3 +728,64 @@ def workflow_status(workspace: Path, run_id: str) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read workflow run {run_id}: {exc}") from exc
+
+
+def workflow_report(workspace: Path, run_id: str) -> dict[str, Any]:
+    """One combined view of a workflow run: waves, lanes, usage, and blockers.
+
+    Assessing the Saloon run required manually joining `workflow status`,
+    `trace`, `usage`, and events by hand. This reconstructs that same picture
+    from the persisted manifest and the trace ledger in one read-only call.
+    """
+    manifest = workflow_status(workspace, run_id)
+    nodes = manifest.get("nodes") or {}
+    spec_nodes = {node["id"]: node for node in (manifest.get("spec", {}).get("graph", {}).get("nodes") or [])}
+
+    wave_cache: dict[str, int] = {}
+
+    def wave_of(node_id: str) -> int:
+        if node_id in wave_cache:
+            return wave_cache[node_id]
+        wave_cache[node_id] = 0  # guard against a spec that slipped a cycle past validation
+        needs = spec_nodes.get(node_id, {}).get("needs") or []
+        depth = 0 if not needs else 1 + max((wave_of(dep) for dep in needs), default=-1)
+        wave_cache[node_id] = depth
+        return depth
+
+    waves: dict[int, list[dict[str, Any]]] = {}
+    blockers: list[dict[str, Any]] = []
+    for node_id, node in nodes.items():
+        result = node.get("result") or {}
+        waves.setdefault(wave_of(node_id), []).append({
+            "id": node_id,
+            "agent": node.get("agent"),
+            "status": node.get("status"),
+            "attempts": node.get("attempts"),
+            "summary": result.get("summary"),
+        })
+        if node.get("status") not in {"success", "pending", "running"}:
+            for blocker in result.get("blockers") or []:
+                blockers.append({"node_id": node_id, "status": node.get("status"), "blocker": blocker})
+
+    spans = [span for span in core.RunStore(workspace).traces(limit=10000) if span.get("trace_id") == run_id]
+    status = manifest.get("status")
+    error = manifest.get("error")
+    return {
+        "schema": "fusion.workflow.report.v1",
+        "workflow_id": run_id,
+        "status": status,
+        "task": manifest.get("task"),
+        "spent_usd": sum(_result_cost(node.get("result") or {}) for node in nodes.values()),
+        "budget_usd": (manifest.get("spec") or {}).get("budget_usd") or 0,
+        "waves": [{"wave": wave, "nodes": waves[wave]} for wave in sorted(waves)],
+        "lanes": manifest.get("lanes") or {},
+        "usage": core.usage_summary(spans),
+        "blockers": blockers,
+        "acceptance_problems": [item for item in (error or "").split("; ") if item],
+        "artifacts": manifest.get("artifacts") or {},
+        "resume_command": (
+            f"fusion --workspace {workspace} --json workflow resume {run_id}"
+            if status in {"paused_quota", "paused_budget", "running", "failed"}
+            else None
+        ),
+    }

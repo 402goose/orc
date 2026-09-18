@@ -369,7 +369,15 @@ cp .fusion.workflow.example.json workflow.json
 fusion --workspace . --json workflow run workflow.json
 fusion --workspace . --json workflow status WORKFLOW_ID
 fusion --workspace . --json workflow resume WORKFLOW_ID
+fusion --workspace . workflow report WORKFLOW_ID
 ```
+
+`workflow report` combines what previously took manually joining `status`,
+`trace`, and `usage` into one read-only view: nodes grouped into dependency
+waves, lane health, a token/cost/call summary from the trace ledger scoped to
+this run, every non-success node's blockers, and a ready-to-run resume
+command when the run is paused or failed. Add `--json` for the machine-
+readable form.
 
 Every node gets a durable artifact under `.fusion/workflows/WORKFLOW_ID/` and
 every worker still gets the existing `.fusion/runs/` trace. A node is accepted

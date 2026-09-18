@@ -12,7 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import fusion_core  # noqa: E402
-from fusion_workflow import WorkflowRunner, run_workflow, resume_workflow  # noqa: E402
+from fusion_workflow import WorkflowRunner, run_workflow, resume_workflow, workflow_report  # noqa: E402
 
 
 class FusionHarnessTest(unittest.TestCase):
@@ -348,6 +348,72 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
         result = run_workflow(self.workspace, json.loads((self.workspace / ".fusion.json").read_text()), spec_path)
         self.assertEqual(result["status"], "failed")
         self.assertIn("did not change", " ".join(result["nodes"][0]["result"]["blockers"]))
+
+    def test_workflow_report_groups_waves_and_usage(self):
+        claude = self.write_agent(
+            "report-claude",
+            """
+import json, pathlib, sys
+prompt = sys.argv[-1]
+if 'final.md' in prompt:
+    pathlib.Path('final.md').write_text('synthesized workflow output\\n', encoding='utf-8')
+print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':'report-claude','result':'STATUS: success\\nSUMMARY: node completed\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}))
+""",
+        )
+        self.config(claude=claude)
+        spec = {
+            "task": "evaluate the repository",
+            "max_parallel": 2,
+            "nodes": [
+                {"id": "research", "items": ["alpha", "beta", "gamma"], "task_template": "Research {item}", "agent": "claude"},
+                {
+                    "id": "synthesize",
+                    "needs": ["research"],
+                    "task": "Synthesize the research into final.md",
+                    "agent": "claude",
+                    "write": True,
+                    "required_files": ["final.md"],
+                },
+            ],
+            "acceptance": {"required_files": ["final.md"]},
+        }
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        config = json.loads((self.workspace / ".fusion.json").read_text())
+        result = run_workflow(self.workspace, config, spec_path)
+        self.assertEqual(result["status"], "success")
+
+        report = workflow_report(self.workspace, result["workflow_id"])
+        self.assertEqual(report["status"], "success")
+        waves = {item["wave"]: {node["id"] for node in item["nodes"]} for item in report["waves"]}
+        self.assertEqual(waves[0], {"research-01", "research-02", "research-03"})
+        self.assertEqual(waves[1], {"synthesize"})
+        self.assertEqual(report["usage"]["spans"], 4)
+        self.assertEqual(report["blockers"], [])
+        self.assertIsNone(report["resume_command"])
+
+    def test_workflow_report_surfaces_blockers_and_resume_command(self):
+        claude = self.write_agent(
+            "report-quota-claude",
+            """
+import json
+print(json.dumps({'type':'result','subtype':'error','is_error':True,'session_id':'s','result':\"You've hit your session limit; resets at 5:10am\"}))
+""",
+        )
+        self.config(claude=claude)
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps({"task": "report quota test", "nodes": [{"id": "probe", "task": "probe", "agent": "claude"}]}), encoding="utf-8")
+        config = json.loads((self.workspace / ".fusion.json").read_text())
+        result = run_workflow(self.workspace, config, spec_path)
+        self.assertEqual(result["status"], "paused_quota")
+
+        report = workflow_report(self.workspace, result["workflow_id"])
+        self.assertEqual(report["status"], "paused_quota")
+        self.assertTrue(report["blockers"])
+        self.assertTrue(all(item["node_id"] == "probe" for item in report["blockers"]))
+        self.assertTrue(any("session limit" in item["blocker"] for item in report["blockers"]))
+        self.assertIn("workflow resume", report["resume_command"])
+        self.assertIn(result["workflow_id"], report["resume_command"])
 
     def test_preflight_blocks_missing_executable_before_any_dispatch(self):
         self.config(claude=Path("missing-claude-binary"))
