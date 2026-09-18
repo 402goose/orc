@@ -1253,6 +1253,9 @@ def build_parser() -> argparse.ArgumentParser:
     workflow_run.add_argument("--task", help="override the task in the spec")
     workflow_resume = workflow_sub.add_parser("resume", help="resume a paused or failed workflow")
     workflow_resume.add_argument("run_id")
+    workflow_resume.add_argument(
+        "--spec", help="re-validate against this workflow JSON instead of replaying the persisted spec unchanged"
+    )
     workflow_status = workflow_sub.add_parser("status", help="show a persisted workflow manifest")
     workflow_status.add_argument("run_id")
     workflow_report = workflow_sub.add_parser(
@@ -1303,7 +1306,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.workflow_command == "run":
                 result = run_workflow(workspace, config, Path(args.spec).expanduser().resolve(), args.task)
             elif args.workflow_command == "resume":
-                result = resume_workflow(workspace, config, args.run_id)
+                spec_path = Path(args.spec).expanduser().resolve() if getattr(args, "spec", None) else None
+                result = resume_workflow(workspace, config, args.run_id, spec_path)
             elif args.workflow_command == "report":
                 result = workflow_report(workspace, args.run_id)
             else:

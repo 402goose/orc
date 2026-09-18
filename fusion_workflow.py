@@ -296,12 +296,78 @@ class WorkflowRunner:
             result = old.get("result")
             self.nodes[node_id]["result"] = result
             status = str(old.get("status", "pending"))
-            if status == "success" and self._accept_node(self.nodes[node_id], result or {})[0]:
-                self.nodes[node_id]["status"] = "success"
-            else:
-                self.nodes[node_id]["status"] = "pending"
+            self.nodes[node_id]["status"] = "success" if status == "success" else "pending"
+        self._invalidate_stale_receipts()
         self._write_manifest("running")
         self._event("workflow.resumed", {})
+
+    def _definition_digest(self, node: dict[str, Any]) -> str:
+        """Hash of everything that defines what a node does, independent of
+        who ran it or what it depends on. Deliberately excludes the resolved
+        command/model: orc-free/orc-best are meant to re-resolve to a
+        different model over time, and invalidating a cached receipt every
+        time that catalog reshuffles would make resume useless for them."""
+        payload = {
+            "task": node["task"],
+            "role": node["role"],
+            "agent": node["agent"],
+            "route": node.get("route"),
+            "write": node["write"],
+            "required_files": node["required_files"],
+            "acceptance": node.get("acceptance") or {},
+        }
+        return hashlib.sha256(core.json_text(payload).encode("utf-8")).hexdigest()
+
+    def _input_digest(self, definition_digest: str, dependency_digests: dict[str, str]) -> str:
+        payload = {"definition": definition_digest, "dependencies": dependency_digests}
+        return hashlib.sha256(core.json_text(payload).encode("utf-8")).hexdigest()
+
+    def _topological_order(self) -> list[str]:
+        order: list[str] = []
+        visited: set[str] = set()
+
+        def visit(node_id: str) -> None:
+            if node_id in visited:
+                return
+            visited.add(node_id)
+            for dependency in self.nodes[node_id]["needs"]:
+                if dependency in self.nodes:
+                    visit(dependency)
+            order.append(node_id)
+
+        for node_id in self.nodes:
+            visit(node_id)
+        return order
+
+    def _invalidate_stale_receipts(self) -> None:
+        """Content-address every "success" node against its current
+        definition and its dependencies' current digests, processed in
+        dependency order. A node whose own definition changed, or whose
+        digest no longer matches what was recorded when it last succeeded,
+        goes back to pending; that invalidation cascades to dependents in
+        the same pass since a dependent's expected digest embeds its
+        dependencies' digests. This makes a no-op resume dispatch nothing,
+        and an edited node (plus everything downstream of it) rerun."""
+        current_digest: dict[str, str] = {}
+        for node_id in self._topological_order():
+            node = self.nodes[node_id]
+            if node["status"] != "success":
+                continue
+            result = node.get("result") or {}
+            if not self._accept_node(node, result)[0]:
+                node["status"] = "pending"
+                continue
+            dependency_digests = {dep: current_digest.get(dep) for dep in node["needs"]}
+            if any(value is None for value in dependency_digests.values()):
+                node["status"] = "pending"
+                self._event("node.stale", {"node_id": node_id, "reason": "a dependency was invalidated"})
+                continue
+            expected = self._input_digest(self._definition_digest(node), dependency_digests)
+            if result.get("digest") != expected:
+                node["status"] = "pending"
+                self._event("node.stale", {"node_id": node_id, "reason": "definition or dependency evidence changed"})
+                continue
+            current_digest[node_id] = expected
 
     @property
     def manifest_id(self) -> str:
@@ -655,6 +721,10 @@ BLOCKERS: unresolved issues, or none
                     accepted, problems = self._accept_node(node, result)
                     if problems:
                         result.setdefault("blockers", []).extend(problems)
+                    if accepted:
+                        dependency_digests = {dep: (self.nodes[dep].get("result") or {}).get("digest") for dep in node["needs"]}
+                        result["digest"] = self._input_digest(self._definition_digest(node), dependency_digests)
+                        result["resolved"] = payload.get("task", {}).get("resolved") or {}
                     node["result"] = result
                     node_dir = self._node_dir(node_id)
                     payload["acceptance"] = {"ok": accepted, "problems": problems}
@@ -713,13 +783,18 @@ def run_workflow(workspace: Path, config: dict[str, Any], spec_path: Path, task:
     return WorkflowRunner(workspace, config, spec).run()
 
 
-def resume_workflow(workspace: Path, config: dict[str, Any], run_id: str) -> dict[str, Any]:
+def resume_workflow(workspace: Path, config: dict[str, Any], run_id: str, spec_path: Path | None = None) -> dict[str, Any]:
     manifest_path = workspace / ".fusion" / "workflows" / run_id / "manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read workflow run {run_id}: {exc}") from exc
-    return WorkflowRunner(workspace, config, manifest.get("spec") or {}, run_id=run_id, resume=True).run()
+    # A resume normally replays the persisted spec unchanged. Passing spec_path
+    # lets a caller resume with an edited workflow.json; the digest check in
+    # _invalidate_stale_receipts() then reruns only the nodes whose definition
+    # or dependency evidence actually changed, not the whole graph.
+    spec = load_spec(spec_path) if spec_path else (manifest.get("spec") or {})
+    return WorkflowRunner(workspace, config, spec, run_id=run_id, resume=True).run()
 
 
 def workflow_status(workspace: Path, run_id: str) -> dict[str, Any]:
@@ -756,12 +831,14 @@ def workflow_report(workspace: Path, run_id: str) -> dict[str, Any]:
     blockers: list[dict[str, Any]] = []
     for node_id, node in nodes.items():
         result = node.get("result") or {}
+        digest = result.get("digest")
         waves.setdefault(wave_of(node_id), []).append({
             "id": node_id,
             "agent": node.get("agent"),
             "status": node.get("status"),
             "attempts": node.get("attempts"),
             "summary": result.get("summary"),
+            "digest": digest[:12] if digest else None,
         })
         if node.get("status") not in {"success", "pending", "running"}:
             for blocker in result.get("blockers") or []:
