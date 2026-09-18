@@ -336,8 +336,11 @@ Copy `.fusion.json.example` to `.fusion.json` in a project, then make sure ORC
 has a current model catalog and key. The `orc-free` route selects the highest
 ranked currently free tool-capable model; `orc-best` selects the highest ranked
 tool-capable model from ORC's live catalog. The IDs are resolved at run time so
-the pipeline does not pin a stale model name. Override either route with an
-explicit `model`, `profile`, or `launcher_args` when you want a fixed lane.
+the pipeline does not pin a stale model name. Both routes require a model that
+already passed `orc probe --fit`; set `allow_untested: true` on the route,
+task, or workflow node to fall back to the highest-ranked tool-capable model
+regardless of fit. Override either route with an explicit `model`, `profile`,
+or `launcher_args` when you want a fixed lane.
 
 ```sh
 cp .fusion.json.example .fusion.json
@@ -375,6 +378,17 @@ acceptance checks pass. `max_parallel`, `max_attempts`, `budget_usd`, and the
 single-writer limit are enforced by the scheduler. Keep fan-out nodes
 read-only; put repository writes behind a final writer or use separate Git
 worktrees for independent implementations.
+
+Before dispatching, the runner preflights each agent lane used in the graph:
+it checks the resolved command is on PATH, and (on a fresh `run`, not a
+`resume`) checks whether the most recent trace for that agent in
+`.fusion/traces.jsonl` reported a quota or session limit in the last 15
+minutes. A blocked or cooling-down lane pauses every pending node for that
+agent immediately instead of dispatching a full wave into a lane that is
+already known to be dead; the manifest's top-level `lanes` field records why.
+The same in-run cooldown kicks in reactively the first time any node reports
+a quota failure, so the rest of that wave does not repeat the same failure in
+parallel.
 
 For the Saloon integration smoke, use the included read-only graph against a
 disposable checkout or the existing `~/saloon` workspace:
