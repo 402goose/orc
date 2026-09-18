@@ -476,7 +476,24 @@ def executable(command: str) -> str | None:
     return shutil.which(command)
 
 
-def parse_codex_events(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None]:
+def _denial_note(item: Any) -> str:
+    """Best-effort label for one denied-tool-call entry. The exact shape of a
+    real populated permission_denials entry is unverified (every live attempt
+    to trigger one came back empty -- see FUSION_RESEARCH.md), so this tries
+    several plausible field names and falls back to the raw entry rather than
+    guessing wrong and silently dropping information."""
+    if not isinstance(item, dict):
+        return str(item)
+    name = item.get("tool_name") or item.get("name") or item.get("tool") or item.get("display_name") or item.get("action")
+    reason = item.get("reason") or item.get("message")
+    if name and reason:
+        return f"{name}: {reason}"
+    if name:
+        return str(name)
+    return json.dumps(item, sort_keys=True)
+
+
+def parse_codex_events(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None, list[str]]:
     thread_id = None
     model = None
     messages: list[str] = []
@@ -505,16 +522,16 @@ def parse_codex_events(stdout: str) -> tuple[str | None, str, str | None, dict[s
         elif event_type == "error":
             failure = str(event.get("message") or "Codex emitted an error")
     text = messages[-1] if messages else "\n".join(non_json)
-    return thread_id, text, failure, usage, model
+    return thread_id, text, failure, usage, model, []
 
 
-def parse_claude_output(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None]:
+def parse_claude_output(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None, list[str]]:
     try:
         value = json.loads(stdout)
     except json.JSONDecodeError:
-        return None, stdout.strip(), None, {}, None
+        return None, stdout.strip(), None, {}, None, []
     if not isinstance(value, dict):
-        return None, stdout.strip(), None, {}, None
+        return None, stdout.strip(), None, {}, None, []
     session_id = value.get("session_id")
     text = str(value.get("result") or value.get("message") or "")
     failure = text if value.get("is_error") else None
@@ -530,16 +547,18 @@ def parse_claude_output(stdout: str) -> tuple[str | None, str, str | None, dict[
         model_usage = value.get("modelUsage")
         if isinstance(model_usage, dict) and model_usage:
             model = next(iter(model_usage))
-    return session_id, text, failure, usage, model
+    denials = value.get("permission_denials")
+    denial_notes = [f"permission denied: {_denial_note(item)}" for item in denials] if isinstance(denials, list) and denials else []
+    return session_id, text, failure, usage, model, denial_notes
 
 
-def parse_agy_output(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None]:
+def parse_agy_output(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None, list[str]]:
     try:
         value = json.loads(stdout)
     except json.JSONDecodeError:
-        return None, stdout.strip(), None, {}, None
+        return None, stdout.strip(), None, {}, None, []
     if not isinstance(value, dict):
-        return None, stdout.strip(), None, {}, None
+        return None, stdout.strip(), None, {}, None, []
     session_id = value.get("conversation_id")
     text = str(value.get("response") or "")
     status = str(value.get("status") or "").upper()
@@ -564,7 +583,16 @@ def parse_agy_output(stdout: str) -> tuple[str | None, str, str | None, dict[str
         "reasoning_output_tokens": raw_usage.get("thinking_tokens", 0),
     }
     model = value.get("model") or value.get("model_id")
-    return session_id, text, failure, usage, model
+    # The failure branch above already covers a denial-with-no-other-text
+    # turn. Surface denials here only when there IS other text, so a denial
+    # alongside an otherwise-successful turn isn't silently dropped without
+    # duplicating the failure message above.
+    denial_notes = (
+        [f"agy denied: {_denial_note(item)}" for item in denied]
+        if text and isinstance(denied, list) and denied
+        else []
+    )
+    return session_id, text, failure, usage, model, denial_notes
 
 
 def agent_settings(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
@@ -753,6 +781,7 @@ def dispatch(
     usage: dict[str, Any] = {}
     model = metadata.get("model")
     handoff: dict[str, Any] = {}
+    denial_notes: list[str] = []
     exit_code = 1
     try:
         with writer_lock(Path(task["workspace"]), task["write"]):
@@ -771,11 +800,11 @@ def dispatch(
         stdout_path.write_text(completed.stdout, encoding="utf-8")
         stderr_path.write_text(completed.stderr, encoding="utf-8")
         if task["agent"] == "codex":
-            new_session, summary, failure, usage, event_model = parse_codex_events(completed.stdout)
+            new_session, summary, failure, usage, event_model, denial_notes = parse_codex_events(completed.stdout)
         elif task["agent"] == "agy":
-            new_session, summary, failure, usage, event_model = parse_agy_output(completed.stdout)
+            new_session, summary, failure, usage, event_model, denial_notes = parse_agy_output(completed.stdout)
         else:
-            new_session, summary, failure, usage, event_model = parse_claude_output(completed.stdout)
+            new_session, summary, failure, usage, event_model, denial_notes = parse_claude_output(completed.stdout)
         model = event_model or model
         handoff = parse_handoff(summary)
         if new_session:
@@ -813,7 +842,7 @@ def dispatch(
         "summary": compact(str(handoff.get("summary") or summary).strip(), int(config.get("max_result_chars", 12000))),
         "changed": handoff.get("changed", []),
         "tests": handoff.get("tests", []),
-        "blockers": handoff.get("blockers", []) + ([failure] if failure else []),
+        "blockers": handoff.get("blockers", []) + denial_notes + ([failure] if failure else []),
         "exit_code": exit_code,
         "duration_ms": duration_ms,
         "usage": usage,
