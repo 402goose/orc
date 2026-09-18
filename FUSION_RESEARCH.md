@@ -135,6 +135,113 @@ without changing the orchestration contract. This is the data needed to tune
 stage count, route choice, retry policy, and repair rate from real repository
 work instead of benchmark guesses.
 
+## Lateral findings from the Saloon assessment
+
+The first real persisted workflow tested the control plane, not model quality.
+Fusion expanded the graph correctly, launched three Claude inventory nodes,
+then two Codex counterchecks, persisted five quota pauses, and refused to run
+the synthesis node. The trace ledger recorded five failed spans, zero tokens,
+and zero spend because both providers rejected the turns before generation.
+That is a useful production result: the scheduler preserved state and avoided
+claiming a deliverable that did not exist. It also exposed the next boundary:
+provider admission and outcome evaluation need to be as deliberate as graph
+execution.
+
+The mechanism skeleton is:
+
+```text
+goal -> graph -> input snapshot -> routed worker -> evidence/artifact
+     -> adjudication -> durable receipt -> resume/replay
+```
+
+The current implementation is strongest from `graph` through `durable
+receipt`. The next work should make the other nodes explicit.
+
+### Ranked adjacent hypotheses
+
+1. **Make an agent node behave like a hermetic build action.** Bazel's
+   [hermeticity model](https://docs.bazel.build/versions/main/hermeticity.html)
+   and [remote cache](https://bazel.build/versions/7.1.0/remote/caching?hl=en)
+   connect naturally to Fusion: hash the workflow spec, repository/input
+   snapshot, prompt packet, route, model, and tool policy, then reuse only a
+   successful receipt with the same key. The established part is content
+   addressed build reuse; the inferred part is applying it to agent evidence.
+   Test this with a no-op Saloon rerun and prove that unchanged accepted nodes
+   are not dispatched while changed evidence invalidates only downstream work.
+
+2. **Use MapReduce-style straggler handling for expensive workers.** The
+   [MapReduce paper](https://research.google.com/archive/mapreduce-osdi04.pdf)
+   describes backup tasks for slow workers. Fusion can launch one hedge after
+   a latency threshold, using a different provider or model, rather than
+   blindly retrying every failed node. Accept the first result that passes the
+   evidence gate and record the losing result for comparison. Test with a fake
+   delayed worker, a strict hedge budget, and cancellation or late-result
+   handling.
+
+3. **Turn ORC routing into admission control and a circuit breaker.** The
+   current free/best selector can take the first tool-capable model even when
+   ORC reports it as `UNTESTED`. The Saloon run also showed that known Claude
+   session limits and Codex usage limits should stop a wave before dispatch,
+   rather than produce one failure per fan-out item. A preflight should check
+   executable/auth/provider health, model fit, and quota state; the scheduler
+   should mark a lane `healthy`, `degraded`, `cooldown`, or `blocked`.
+   [Temporal's durable execution model](https://docs.temporal.io/) and
+   [retry policies](https://github.com/temporalio/documentation/blob/main/docs/encyclopedia/retry-policies.mdx)
+   are the closest adjacent design. Test by injecting a provider limit and
+   verifying zero worker dispatches, one admission event, and a resumable
+   manifest.
+
+4. **Make synthesis a provenance query, not a prose merge.** Saloon's output
+   is evidence-backed, so every accepted claim should point to its source
+   artifact, worker activity, model/route, timestamp, and verification result.
+   The [W3C PROV primer](https://www.w3.org/TR/prov-primer/) provides the
+   useful cross-domain vocabulary: entities, activities, agents, and
+   derivations. Test by requiring claim coverage and contradiction resolution
+   before synthesis can pass acceptance.
+
+5. **Choose the worker set by information gain.** Three identical inventory
+   prompts spend more than two role-diverse prompts when they discover the
+   same facts. Borrow ensemble diversity and active-learning stop rules:
+   dispatch an initial small sample, measure unique findings and disagreement,
+   then buy another worker only when expected evidence gain exceeds its cost.
+   Test on a fixed Saloon question set and compare unique accepted facts per
+   dollar, disagreement detection, and wall time.
+
+6. **Use mutation tests for reviewer quality.** A reviewer prompt saying
+   “check this” is weaker than a verifier that must catch a seeded false claim,
+   removed citation, or stale artifact. Generate controlled mutations of a
+   worker receipt, run the countercheck, and score detection. This transfers
+   mutation-testing and N-version validation ideas into agent evaluation.
+
+### Build order
+
+The next PR should stay narrow and operational:
+
+1. Add route admission/preflight. Refuse `UNTESTED` ORC models unless a
+   workflow explicitly opts in, and collapse a known provider outage into one
+   blocked lane before fan-out.
+2. Add `fusion workflow report RUN_ID`, combining node waves, blockers,
+   latency, token/cost totals, artifact acceptance, and the next resume
+   command. The Saloon assessment should be one command instead of manually
+   joining `status`, `trace`, `usage`, and events.
+3. Add workflow/spec/input digests and route/model versions to manifests and
+   node receipts. Resume should reuse accepted work only when those digests
+   still match; provider session resume becomes an optimization.
+4. Land the stale fan-in receipt fix from the local follow-up branch. A fan-in
+   node must wait until all dependencies reach terminal states before writing
+   its blocker receipt, otherwise a later resume sees a misleading graph.
+5. Add a deterministic evidence/provenance fixture and one real two-worker
+   smoke after provider quotas reset. Only then tune model choice, speculative
+   hedging, or larger fan-out.
+
+The test ladder should be: deterministic fake workers; a two-node real ORC
+smoke; the six-node Saloon read-only graph; and finally one writer in a
+disposable Saloon worktree. Compare task success, artifact validity, evidence
+coverage, disagreements caught, wall time, tokens, cost, and repair rate.
+Until the real ORC route is exercised successfully, adding more frameworks or
+more parallel agents would measure availability failures rather than Fusion
+quality.
+
 ## How to try it
 
 ```sh
