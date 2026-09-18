@@ -5,6 +5,7 @@ DEST="${DEST:-$HOME/.local/bin}"
 SRC="$(cd "$(dirname "$0")" && pwd)/orc"
 FUSION_SRC="$(cd "$(dirname "$0")" && pwd)/fusion"
 FUSION_CORE_SRC="$(cd "$(dirname "$0")" && pwd)/fusion_core.py"
+FUSION_WORKFLOW_SRC="$(cd "$(dirname "$0")" && pwd)/fusion_workflow.py"
 
 missing=""
 for dep in jq curl; do
@@ -42,6 +43,7 @@ chmod +x "$DEST/orc"
 echo "installed: $DEST/orc"
 cp "$FUSION_SRC" "$DEST/fusion"
 cp "$FUSION_CORE_SRC" "$DEST/fusion_core.py"
+cp "$FUSION_WORKFLOW_SRC" "$DEST/fusion_workflow.py"
 chmod +x "$DEST/fusion"
 echo "installed: $DEST/fusion"
 

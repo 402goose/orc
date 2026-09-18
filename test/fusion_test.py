@@ -12,6 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import fusion_core  # noqa: E402
+from fusion_workflow import run_workflow, resume_workflow  # noqa: E402
 
 
 class FusionHarnessTest(unittest.TestCase):
@@ -231,6 +232,122 @@ print(json.dumps({'type':'turn.completed','usage':{}}))
         codex_result = json.loads(codex_output.getvalue())
         self.assertEqual(codex_result["stages"][0]["task"]["agent"], "codex")
         self.assertEqual(codex_result["stages"][0]["task"]["route"], "codex-read")
+
+    def test_doctor_checks_named_route_commands(self):
+        claude = self.write_agent("claude-fake", "print('unused')\n")
+        codex = self.write_agent("codex-fake", "print('unused')\n")
+        self.config(codex=codex, claude=claude)
+        value = json.loads((self.workspace / ".fusion.json").read_text())
+        value["routes"] = {
+            "good": {"agent": "claude", "command": str(claude)},
+            "missing": {"agent": "claude", "command": "missing-orc"},
+        }
+        (self.workspace / ".fusion.json").write_text(json.dumps(value), encoding="utf-8")
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(fusion_core.main(["--workspace", str(self.workspace), "doctor"]), 1)
+        result = json.loads(output.getvalue())
+        route_checks = {item["route"]: item for item in result["route_checks"]}
+        self.assertTrue(route_checks["good"]["ok"])
+        self.assertFalse(route_checks["missing"]["ok"])
+
+    def test_workflow_fanout_fanin_and_artifact_gate(self):
+        claude = self.write_agent(
+            "workflow-claude",
+            """
+import json, pathlib, sys
+prompt = sys.argv[-1]
+if 'final.md' in prompt:
+    pathlib.Path('final.md').write_text('synthesized workflow output\\n', encoding='utf-8')
+print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':'workflow-claude','result':'STATUS: success\\nSUMMARY: node completed\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}))
+""",
+        )
+        self.config(claude=claude)
+        spec = {
+            "task": "evaluate the repository",
+            "max_parallel": 2,
+            "max_attempts": 1,
+            "nodes": [
+                {
+                    "id": "research",
+                    "items": ["alpha", "beta", "gamma"],
+                    "task_template": "Research {item}",
+                    "role": "researcher",
+                    "agent": "claude",
+                },
+                {
+                    "id": "synthesize",
+                    "needs": ["research"],
+                    "task": "Synthesize the research into final.md",
+                    "role": "synthesizer",
+                    "agent": "claude",
+                    "write": True,
+                    "required_files": ["final.md"],
+                    "acceptance": {"required_handoff": ["summary"]},
+                },
+            ],
+            "acceptance": {"required_files": ["final.md"], "required_nodes": ["synthesize"]},
+        }
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        result = run_workflow(self.workspace, json.loads((self.workspace / ".fusion.json").read_text()), spec_path)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(result["nodes"]), 4)
+        self.assertTrue(all(node["status"] == "success" for node in result["nodes"]))
+        self.assertTrue((self.workspace / "final.md").is_file())
+        events = (Path(result["artifacts"]["events"])).read_text(encoding="utf-8")
+        self.assertIn('"type": "node.succeeded"', events)
+
+    def test_workflow_pauses_on_quota_and_resumes_with_persisted_state(self):
+        claude = self.write_agent(
+            "quota-claude",
+            """
+import json
+print(json.dumps({'type':'result','subtype':'error','is_error':True,'session_id':'quota-claude','result':\"You've hit your session limit; resets at 5:10am\"}))
+""",
+        )
+        self.config(claude=claude)
+        spec = {
+            "task": "quota test",
+            "nodes": [{"id": "probe", "task": "probe", "agent": "claude"}],
+        }
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        config = json.loads((self.workspace / ".fusion.json").read_text())
+        first = run_workflow(self.workspace, config, spec_path)
+        self.assertEqual(first["status"], "paused_quota")
+        run_id = first["workflow_id"]
+
+        claude.write_text(
+            "#!/usr/bin/env python3\nimport json\nprint(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':'quota-claude','result':'STATUS: success\\nSUMMARY: resumed\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}))\n",
+            encoding="utf-8",
+        )
+        claude.chmod(0o755)
+        resumed = resume_workflow(self.workspace, config, run_id)
+        self.assertEqual(resumed["status"], "success")
+        self.assertEqual(resumed["nodes"][0]["attempts"], 2)
+
+    def test_workflow_rejects_stale_required_artifact(self):
+        claude = self.write_agent(
+            "stale-claude",
+            """
+import json
+print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':'stale-claude','result':'STATUS: success\\nSUMMARY: reported success\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}))
+""",
+        )
+        self.config(claude=claude)
+        (self.workspace / "FINAL.md").write_text("old output\\n", encoding="utf-8")
+        spec = {
+            "task": "stale artifact test",
+            "nodes": [{"id": "writer", "task": "write the final artifact", "agent": "claude", "required_files": ["FINAL.md"]}],
+            "acceptance": {"required_files": ["FINAL.md"]},
+        }
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        result = run_workflow(self.workspace, json.loads((self.workspace / ".fusion.json").read_text()), spec_path)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("did not change", " ".join(result["nodes"][0]["result"]["blockers"]))
 
 
 if __name__ == "__main__":

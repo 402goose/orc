@@ -1,0 +1,42 @@
+{
+  "task": "Inspect the repository, verify the proposed change, and produce a tested handoff.",
+  "max_parallel": 4,
+  "max_parallel_writers": 1,
+  "max_attempts": 2,
+  "budget_usd": 5,
+  "nodes": [
+    {
+      "id": "inventory",
+      "items": ["architecture", "tests", "operational risks"],
+      "task_template": "Inventory {item} and record evidence in your handoff.",
+      "agent": "claude",
+      "route": "orc-free",
+      "role": "read-only investigator"
+    },
+    {
+      "id": "verify",
+      "needs": ["inventory"],
+      "task": "Adversarially verify the inventory. Read the node artifacts before reporting corrections.",
+      "agent": "codex",
+      "route": "codex-read",
+      "role": "verifier"
+    },
+    {
+      "id": "synthesize",
+      "needs": ["verify"],
+      "task": "Synthesize the verified evidence into the requested final handoff.",
+      "agent": "claude",
+      "route": "orc-best",
+      "role": "lead synthesizer",
+      "write": true,
+      "required_files": ["FINAL_HANDOFF.md"],
+      "acceptance": {
+        "required_handoff": ["summary"]
+      }
+    }
+  ],
+  "acceptance": {
+    "required_files": ["FINAL_HANDOFF.md"],
+    "required_nodes": ["synthesize"]
+  }
+}
