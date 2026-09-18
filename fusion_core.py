@@ -80,6 +80,19 @@ DEFAULTS: dict[str, Any] = {
         "model": "",
         "allowed_tools": [],
     },
+    "agy": {
+        "command": "agy",
+        "mode": "",
+        "model": "",
+    },
+}
+
+AGY_MODE_ALIASES = {
+    "": "",
+    "default": "accept-edits",
+    "acceptEdits": "accept-edits",
+    "accept-edits": "accept-edits",
+    "plan": "plan",
 }
 
 
@@ -510,6 +523,40 @@ def parse_claude_output(stdout: str) -> tuple[str | None, str, str | None, dict[
     return session_id, text, failure, usage, model
 
 
+def parse_agy_output(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None]:
+    try:
+        value = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None, stdout.strip(), None, {}, None
+    if not isinstance(value, dict):
+        return None, stdout.strip(), None, {}, None
+    session_id = value.get("conversation_id")
+    text = str(value.get("response") or "")
+    status = str(value.get("status") or "").upper()
+    denied = value.get("denied_actions") or []
+    failure = None
+    if status not in {"SUCCESS", ""}:
+        failure = str(value.get("error") or f"agy reported status {status.lower() or 'unknown'}")
+    elif not text and denied:
+        names = ", ".join(
+            str(item.get("display_name") or item.get("action") or "tool")
+            for item in denied
+            if isinstance(item, dict)
+        ) or "tool"
+        failure = f"agy auto-denied tools in headless mode: {names}; grant them in settings.json or use a sandboxed route"
+    elif not text:
+        failure = "agy returned an empty response"
+    raw_usage = value.get("usage") if isinstance(value.get("usage"), dict) else {}
+    usage = {
+        "input_tokens": raw_usage.get("input_tokens", 0),
+        "output_tokens": raw_usage.get("output_tokens", 0),
+        "cache_read_input_tokens": raw_usage.get("cache_read_tokens", 0),
+        "reasoning_output_tokens": raw_usage.get("thinking_tokens", 0),
+    }
+    model = value.get("model") or value.get("model_id")
+    return session_id, text, failure, usage, model
+
+
 def agent_settings(config: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
     agent = task["agent"]
     settings = deep_merge({}, config.get(agent, {}))
@@ -591,6 +638,20 @@ def agent_command(
                 argv += ["-m", model]
         argv.append("-")
         return argv, os.environ.copy(), {"command": command, "model": settings.get("model") or ""}
+    if agent == "agy":
+        command = settings.get("command", "agy")
+        mode_key = str(settings.get("mode") or settings.get("permission_mode") or "")
+        mode = AGY_MODE_ALIASES.get(mode_key) or ("accept-edits" if task["write"] else "plan")
+        argv = [command, "-p", brief_for(task), "--output-format", "json", "--mode", mode]
+        selected_model = str(settings.get("model", ""))
+        if selected_model:
+            argv += ["--model", selected_model]
+        print_timeout = settings.get("print_timeout")
+        if print_timeout:
+            argv += ["--print-timeout", str(print_timeout)]
+        if session_id:
+            argv += ["--conversation", session_id]
+        return argv, os.environ.copy(), {"command": command, "model": selected_model}
     if agent == "claude":
         command = settings.get("command", "claude")
         command_name = Path(command).name
@@ -616,7 +677,13 @@ def agent_command(
         if command_name != "orc" and selected_model:
             argv += ["--model", selected_model]
         max_budget = settings.get("max_budget_usd")
-        if max_budget is not None:
+        free_route = command_name == "orc" and (
+            str(settings.get("model_selector", "")) == "free" or selected_model.endswith(":free")
+        )
+        if max_budget is not None and not free_route:
+            # Claude Code prices --max-budget-usd at Anthropic list rates, so on
+            # :free OpenRouter routes the guard trips on phantom cost while real
+            # spend is zero; it would only sabotage cheap lanes.
             argv += ["--max-budget-usd", str(max_budget)]
         allowed = settings.get("allowed_tools") or []
         if allowed:
@@ -695,6 +762,8 @@ def dispatch(
         stderr_path.write_text(completed.stderr, encoding="utf-8")
         if task["agent"] == "codex":
             new_session, summary, failure, usage, event_model = parse_codex_events(completed.stdout)
+        elif task["agent"] == "agy":
+            new_session, summary, failure, usage, event_model = parse_agy_output(completed.stdout)
         else:
             new_session, summary, failure, usage, event_model = parse_claude_output(completed.stdout)
         model = event_model or model
@@ -771,6 +840,8 @@ def ultra_stage_overrides(stage: dict[str, Any]) -> dict[str, Any]:
         "permission_mode",
         "permission_prompts",
         "allowed_tools",
+        "mode",
+        "print_timeout",
     )
     return {key: stage[key] for key in keys if key in stage}
 
@@ -821,6 +892,8 @@ def run_ultra(
         route = stage.get("route")
         if harness == "codex":
             route = "codex-write" if write else "codex-read"
+        elif harness:
+            route = None
         elif cheap_only and agent == "claude":
             route = "orc-free"
         context_lines = "\n".join(f"- {path}" for path in previous_paths) or "- none; start by inspecting the repository"
@@ -914,7 +987,7 @@ def tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "agent": {"type": "string", "enum": ["codex", "claude"]},
+                    "agent": {"type": "string", "enum": ["codex", "claude", "agy"]},
                     "task": {"type": "string"},
                     "role": {"type": "string", "default": "implementation"},
                     "success_criteria": {"type": "array", "items": {"type": "string"}},
@@ -973,8 +1046,8 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
                     payload = store.recent(int(args.get("limit", 10)))
                 elif name == "fusion_delegate":
                     agent = args.get("agent")
-                    if agent not in {"codex", "claude"}:
-                        raise ValueError("agent must be codex or claude")
+                    if agent not in {"codex", "claude", "agy"}:
+                        raise ValueError("agent must be codex, claude, or agy")
                     target = workspace_path(args["workspace"]) if args.get("workspace") else workspace
                     if target != workspace:
                         target_config, _ = load_config(target)
@@ -1074,6 +1147,8 @@ def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str |
         env = os.environ.copy()
         env["FUSION_WORKSPACE"] = str(workspace)
         return subprocess.run(argv, cwd=workspace, env=env, check=False).returncode
+    if agent == "agy":
+        raise SystemExit("fusion: agy can be a sidekick, workflow node, or Ultra harness, but not (yet) the interactive lead")
     raise SystemExit(f"fusion: unsupported lead agent {agent}")
 
 
@@ -1105,10 +1180,18 @@ def print_ultra_result(result: dict[str, Any], as_json: bool) -> None:
 
 def doctor(workspace: Path, config: dict[str, Any]) -> int:
     checks = []
-    for agent in ("claude", "codex"):
-        command = config[agent].get("command", agent)
+    for agent in ("claude", "codex", "agy"):
+        command = config.get(agent, {}).get("command", agent)
         path = executable(command)
-        checks.append({"agent": agent, "command": command, "path": path, "ok": bool(path)})
+        checks.append(
+            {
+                "agent": agent,
+                "command": command,
+                "path": path,
+                "ok": bool(path),
+                "required": agent in {"claude", "codex"},
+            }
+        )
     route_checks = []
     for name, route in (config.get("routes") or {}).items():
         if not isinstance(route, dict):
@@ -1129,11 +1212,11 @@ def doctor(workspace: Path, config: dict[str, Any]) -> int:
         )
     payload = {"workspace": str(workspace), "config": config, "checks": checks, "route_checks": route_checks}
     print(json_text(payload))
-    return 0 if all(item["ok"] for item in checks + route_checks) else 1
+    return 0 if all(item["ok"] for item in checks if item["required"]) and all(item["ok"] for item in route_checks) else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="fusion", description="Lead/sidekick orchestration for Claude Code and Codex CLI")
+    parser = argparse.ArgumentParser(prog="fusion", description="Lead/sidekick orchestration for Claude Code, Codex CLI, and Antigravity CLI")
     parser.add_argument("--workspace", help="workspace to operate in; defaults to the current directory")
     parser.add_argument("--json", action="store_true", help="emit machine-readable output")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1147,7 +1230,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("task", help="initial task for the lead")
 
     delegate = sub.add_parser("delegate", help="run one bounded sidekick task")
-    delegate.add_argument("--agent", choices=["claude", "codex"], required=True)
+    delegate.add_argument("--agent", choices=["claude", "codex", "agy"], required=True)
     delegate.add_argument("--role", default="implementation")
     delegate.add_argument("--read-only", action="store_true", help="give the worker a read-only workspace")
     delegate.add_argument("--fresh", action="store_true", help="start a fresh agent session")
@@ -1160,7 +1243,7 @@ def build_parser() -> argparse.ArgumentParser:
     ultra = sub.add_parser("ultra", help="run a bounded UltraCode-style explore/plan/implement/review pipeline")
     ultra.add_argument("--stages", type=int, help="maximum number of configured stages")
     ultra.add_argument("--cheap-only", action="store_true", help="force Claude stages onto the orc-free route")
-    ultra.add_argument("--harness", choices=["claude", "codex"], help="run every Ultra stage through one harness")
+    ultra.add_argument("--harness", choices=["claude", "codex", "agy"], help="run every Ultra stage through one harness")
     ultra.add_argument("task", help="task for the pipeline")
 
     workflow = sub.add_parser("workflow", help="run a persisted bounded Fusion DAG")
