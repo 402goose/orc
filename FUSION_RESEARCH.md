@@ -296,11 +296,28 @@ for this whole session -- that assumption should get the same treatment once
 Codex quota resets, rather than being patched blind.
 
 Also visible in the real Claude response but not yet used anywhere:
-`permission_denials` (an array, empty in this run) and `subagent_stats`.
-Neither is currently surfaced into `blockers` or the trace span. A tool
-denial that isn't verbally mentioned in the model's own summary text would
-currently be invisible to the harness; `permission_denials` would catch that
-structurally instead of relying on the model to self-report it.
+`permission_denials` (an array, empty in every run so far) and
+`subagent_stats`. Neither is currently surfaced into `blockers` or the trace
+span. A tool denial that isn't verbally mentioned in the model's own summary
+text would currently be invisible to the harness; `permission_denials` would
+catch that structurally instead of relying on the model to self-report it --
+*if* its populated shape were known.
+
+Four separate live attempts to trigger a populated `permission_denials`
+entry (plan mode asked to delete a file; `--allowedTools Read` asked to run
+Bash; `--disallowedTools Bash` asked to run Bash; the same with
+`--permission-prompts none`) all came back with an empty array. Claude Code
+appears to filter a fully-disallowed tool out of the model's own visible
+tool list rather than emitting a structural denial when the model attempts
+it -- the model just reports "I don't have that tool," which is exactly the
+kind of silent-in-the-summary case this field was meant to catch, except the
+field itself stayed empty too. A real populated example likely needs an
+interactive-rejection or fine-grained pattern-rule scenario (e.g.
+`Bash(rm *)` denied while `Bash(*)` is otherwise allowed) that a headless
+smoke script can't trivially construct. Given the model/`total_cost_usd`
+bug above came from exactly this mistake -- assuming an unverified schema --
+this is deliberately left unbuilt rather than guessed at. Building it
+correctly needs one real captured example of a populated entry first.
 
 ## How to try it
 
