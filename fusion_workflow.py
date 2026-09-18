@@ -137,7 +137,7 @@ def expand_spec(spec: dict[str, Any]) -> tuple[dict[str, Any], dict[str, list[st
                 raise ValueError(f"workflow node {node['id']} depends on unknown node {dependency_id}")
         node["needs"] = list(dict.fromkeys(needs))
         node["agent"] = str(node.get("agent", "claude"))
-        if node["agent"] not in {"claude", "codex"}:
+        if node["agent"] not in {"claude", "codex", "agy"}:
             raise ValueError(f"workflow node {node['id']} has unsupported agent {node['agent']}")
         node["role"] = str(node.get("role", node["id"]))
         node["write"] = bool(node.get("write", False))

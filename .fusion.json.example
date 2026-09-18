@@ -18,6 +18,16 @@
       "permission_mode": "plan",
       "permission_prompts": "none",
       "max_budget_usd": 0.40
+    },
+    "agy-gemini": {
+      "agent": "agy",
+      "model": "gemini-3.1-pro-high",
+      "mode": "plan"
+    },
+    "agy-claude": {
+      "agent": "agy",
+      "model": "claude-sonnet-4-6",
+      "mode": "plan"
     }
   },
   "ultra": {

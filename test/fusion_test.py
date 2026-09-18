@@ -33,10 +33,11 @@ class FusionHarnessTest(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def config(self, codex: Path | None = None, claude: Path | None = None) -> None:
+    def config(self, codex: Path | None = None, claude: Path | None = None, agy: Path | None = None) -> None:
         value = {
             "codex": {"command": str(codex or "missing-codex")},
             "claude": {"command": str(claude or "missing-claude")},
+            "agy": {"command": str(agy or "missing-agy")},
             "timeout_seconds": 30,
         }
         (self.workspace / ".fusion.json").write_text(json.dumps(value), encoding="utf-8")
@@ -105,6 +106,89 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
         self.assertEqual(result["changed"], ["src/app.py", "README.md"])
         self.assertEqual(result["tests"], ["python -m unittest"])
         self.assertEqual(result["blockers"], [])
+
+    def test_agy_result_is_structured_and_session_is_resumed(self):
+        calls = str(self.calls)
+        agy = self.write_agent(
+            "agy-fake",
+            f"""
+import json, pathlib, sys
+pathlib.Path({calls!r}).open('a', encoding='utf-8').write(json.dumps(sys.argv[1:]) + '\\n')
+print(json.dumps({{'conversation_id':'conv-123','status':'SUCCESS','response':'STATUS: success\\nSUMMARY: agy completed\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none','num_turns':1,'usage':{{'input_tokens':20,'output_tokens':5,'thinking_tokens':3,'cache_read_tokens':10}}}}))
+""",
+        )
+        self.config(agy=agy)
+
+        first = io.StringIO()
+        with contextlib.redirect_stdout(first):
+            self.assertEqual(
+                fusion_core.main(
+                    ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "agy", "--read-only", "--fresh", "--role", "investigator", "inspect"]
+                ),
+                0,
+            )
+        first_result = json.loads(first.getvalue())
+        self.assertEqual(first_result["status"], "success")
+        self.assertEqual(first_result["summary"], "agy completed")
+        self.assertEqual(first_result["usage"]["cache_read_input_tokens"], 10)
+        self.assertEqual(first_result["usage"]["reasoning_output_tokens"], 3)
+        self.assertEqual(json.loads((self.workspace / ".fusion" / "sessions.json").read_text())["agy:investigator"], "conv-123")
+
+        argv = json.loads(self.calls.read_text().splitlines()[0])
+        self.assertIn("--output-format", argv)
+        self.assertIn("json", argv)
+        self.assertIn("--mode", argv)
+        self.assertIn("plan", argv)
+
+        second = io.StringIO()
+        with contextlib.redirect_stdout(second):
+            self.assertEqual(
+                fusion_core.main(
+                    ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "agy", "--read-only", "--role", "investigator", "follow up"]
+                ),
+                0,
+            )
+        self.assertEqual(json.loads(second.getvalue())["status"], "success")
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--conversation", calls[1])
+        self.assertIn("conv-123", calls[1])
+
+    def test_agy_denied_tools_and_failure_are_reported(self):
+        agy = self.write_agent(
+            "agy-denied",
+            """
+import json
+print(json.dumps({'conversation_id':'conv-denied','status':'SUCCESS','response':'','denied_actions':[{'action':'command','display_name':'RunCommand'}],'usage':{'input_tokens':9,'output_tokens':1}}))
+""",
+        )
+        self.config(agy=agy)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                fusion_core.main(
+                    ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "agy", "--fresh", "run something"]
+                ),
+                1,
+            )
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["status"], "error")
+        self.assertIn("auto-denied", " ".join(result["blockers"]))
+        self.assertIn("RunCommand", " ".join(result["blockers"]))
+
+    def test_orc_free_routes_skip_max_budget_but_paid_routes_keep_it(self):
+        free_task = fusion_core.make_task(
+            self.workspace, "claude", "t", "r", [], [], None, False, False,
+            settings_overrides={"command": "orc", "model": "cohere/north-mini-code:free", "max_budget_usd": 0.1},
+        )
+        argv, _, _ = fusion_core.agent_command({}, free_task, None)
+        self.assertNotIn("--max-budget-usd", argv)
+        paid_task = fusion_core.make_task(
+            self.workspace, "claude", "t", "r", [], [], None, False, False,
+            settings_overrides={"command": "orc", "model": "anthropic/claude-opus-5", "max_budget_usd": 0.4},
+        )
+        argv, _, _ = fusion_core.agent_command({}, paid_task, None)
+        self.assertIn("--max-budget-usd", argv)
 
     def test_mcp_lists_tools(self):
         self.config()
@@ -547,7 +631,10 @@ sys.exit(1)
                 {"id": "fanin", "needs": ["quota", "sibling"], "task": "fanin", "agent": "claude"},
             ]
         }
-        runner = WorkflowRunner(self.workspace, {}, spec)
+        # Pin the claude lane to a resolvable command: WorkflowRunner's
+        # preflight blocks lanes whose executable is missing, which would
+        # otherwise depend on whether claude happens to be on PATH.
+        runner = WorkflowRunner(self.workspace, {"claude": {"command": "true"}}, spec)
         runner.nodes["quota"]["status"] = "paused_quota"
         runner.nodes["sibling"]["status"] = "running"
         runner._block_unrunnable()
