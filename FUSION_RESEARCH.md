@@ -242,6 +242,66 @@ Until the real ORC route is exercised successfully, adding more frameworks or
 more parallel agents would measure availability failures rather than Fusion
 quality.
 
+## Real provider verification: build order items 1-4 closed, one trace bug found
+
+The build order above (route admission, `workflow report`, digests, the
+fan-in fix) landed as #4/#6/#7/#9. Before calling it done, each feature was
+also dogfooded through the real `fusion` CLI with real subprocesses -- not
+just unit tests -- and the resulting `.fusion/traces.jsonl` and
+`.fusion/workflows/<id>/events.jsonl` were read back to confirm the claims:
+
+- Fail-safe model selection: a live run against a fake `orc-free` catalog
+  with one FIT model ranked below an UNTESTED one picked the FIT model, not
+  the higher-ranked untested one.
+- Lane admission: a fan-out that hit a real quota failure mid-wave recorded
+  `lane.status: cooldown`; a brand-new second workflow in the same workspace
+  made zero dispatch attempts because preflight saw the still-fresh trace; an
+  explicit resume correctly bypassed that same trace-history block.
+- Digests: a no-op resume redispatched nothing; resuming with one edited
+  node's task text redispatched only that node and its downstream dependent,
+  leaving an unrelated sibling node cached at its original digest -- all
+  confirmed against the real subprocess call log, not just the reported
+  status.
+
+Then `FUSION_REAL=1 make dogfood-real` was run against the live `claude` and
+`codex` CLIs (real quota, real cost, run with explicit authorization). Claude
+succeeded end-to-end with real usage recorded; Codex hit its actual OpenAI
+usage limit (reset time included in the error), which the harness correctly
+classified as a provider gate rather than a broken worker.
+
+That live Claude trace is what surfaced a real bug, found by diffing what
+`parse_claude_output` assumes against the actual JSON `claude -p
+--output-format json` returns:
+
+- **`model` was always blank.** The parser reads top-level `model`/
+  `model_id`; real output has neither. The model name is a key in a
+  `modelUsage` dict instead (`{"claude-sonnet-5": {...}}`).
+- **Cost was silently dropped.** Real cost is `total_cost_usd` at the *top
+  level* of the response, not inside `usage`. `_result_cost()` and every
+  `budget_usd`/`max_budget_usd` check only ever look inside `usage`, so every
+  real Claude Code dispatch was reporting `$0` spent regardless of actual
+  cost -- meaning budget caps were not being enforced at all for real
+  dispatches, only for test fixtures that happened to set `usage.cost_usd`
+  directly. Fixed in the same pass the bug was found, with a regression test
+  built from the actual captured JSON shape (see `fusion_core.py:
+  parse_claude_output`).
+
+This is a useful general lesson for this harness: a fixture that encodes an
+*assumed* schema will happily stay green forever even if the real CLI's
+schema drifts or was never quite what the parser assumed, since nothing ever
+diffs the fixture against a live response. `parse_codex_events` makes the
+same top-level `model`/`model_id` assumption and has not been checked
+against a real successful Codex response, because Codex has been quota-gated
+for this whole session -- that assumption should get the same treatment once
+Codex quota resets, rather than being patched blind.
+
+Also visible in the real Claude response but not yet used anywhere:
+`permission_denials` (an array, empty in this run) and `subagent_stats`.
+Neither is currently surfaced into `blockers` or the trace span. A tool
+denial that isn't verbally mentioned in the model's own summary text would
+currently be invisible to the harness; `permission_denials` would catch that
+structurally instead of relying on the model to self-report it.
+
 ## How to try it
 
 ```sh
