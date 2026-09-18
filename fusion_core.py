@@ -353,9 +353,15 @@ class RunStore:
 
     def set_session(self, key: str, session_id: str) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        sessions = self.sessions()
-        sessions[key] = session_id
-        self.write_json(self.sessions_path, sessions)
+        lock_path = self.root / "sessions.lock"
+        with lock_path.open("w", encoding="utf-8") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                sessions = self.sessions()
+                sessions[key] = session_id
+                self.write_json(self.sessions_path, sessions)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def recent(self, limit: int = 20) -> list[dict[str, Any]]:
         if not self.runs.exists():
@@ -1081,9 +1087,27 @@ def doctor(workspace: Path, config: dict[str, Any]) -> int:
         command = config[agent].get("command", agent)
         path = executable(command)
         checks.append({"agent": agent, "command": command, "path": path, "ok": bool(path)})
-    payload = {"workspace": str(workspace), "config": config, "checks": checks}
+    route_checks = []
+    for name, route in (config.get("routes") or {}).items():
+        if not isinstance(route, dict):
+            route_checks.append({"route": name, "ok": False, "error": "route must be an object"})
+            continue
+        agent = str(route.get("agent") or "")
+        command = str(route.get("command") or config.get(agent, {}).get("command") or agent)
+        path = executable(command)
+        route_checks.append(
+            {
+                "route": name,
+                "agent": agent,
+                "command": command,
+                "path": path,
+                "ok": bool(path),
+                **({"error": "command is not executable"} if not path else {}),
+            }
+        )
+    payload = {"workspace": str(workspace), "config": config, "checks": checks, "route_checks": route_checks}
     print(json_text(payload))
-    return 0 if all(item["ok"] for item in checks) else 1
+    return 0 if all(item["ok"] for item in checks + route_checks) else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1116,6 +1140,16 @@ def build_parser() -> argparse.ArgumentParser:
     ultra.add_argument("--cheap-only", action="store_true", help="force Claude stages onto the orc-free route")
     ultra.add_argument("--harness", choices=["claude", "codex"], help="run every Ultra stage through one harness")
     ultra.add_argument("task", help="task for the pipeline")
+
+    workflow = sub.add_parser("workflow", help="run a persisted bounded Fusion DAG")
+    workflow_sub = workflow.add_subparsers(dest="workflow_command", required=True)
+    workflow_run = workflow_sub.add_parser("run", help="validate and run a workflow JSON spec")
+    workflow_run.add_argument("spec", help="path to a fusion.workflow.v1 JSON spec")
+    workflow_run.add_argument("--task", help="override the task in the spec")
+    workflow_resume = workflow_sub.add_parser("resume", help="resume a paused or failed workflow")
+    workflow_resume.add_argument("run_id")
+    workflow_status = workflow_sub.add_parser("status", help="show a persisted workflow manifest")
+    workflow_status.add_argument("run_id")
 
     sub.add_parser("doctor", help="check the local CLI prerequisites")
     status = sub.add_parser("status", help="show recent runs")
@@ -1153,6 +1187,33 @@ def main(argv: list[str] | None = None) -> int:
         result = run_ultra(workspace, config, args.task, args.stages, args.cheap_only, args.harness)
         print_ultra_result(result, args.json)
         return 0 if result["status"] == "success" else 1
+    if args.command == "workflow":
+        from fusion_workflow import resume_workflow, run_workflow, workflow_status
+
+        try:
+            if args.workflow_command == "run":
+                result = run_workflow(workspace, config, Path(args.spec).expanduser().resolve(), args.task)
+            elif args.workflow_command == "resume":
+                result = resume_workflow(workspace, config, args.run_id)
+            else:
+                result = workflow_status(workspace, args.run_id)
+        except (OSError, ValueError, RuntimeError) as exc:
+            if args.json:
+                print(json_text({"schema": "fusion.workflow.v1", "status": "error", "error": str(exc)}))
+            else:
+                print(f"fusion workflow: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json_text(result))
+        else:
+            workflow_id = result.get("workflow_id") or getattr(args, "run_id", "unknown")
+            print(f"workflow {workflow_id}: {result.get('status', 'unknown')}")
+            if result.get("artifacts", {}).get("manifest"):
+                print(f"  manifest: {result['artifacts']['manifest']}")
+            for problem in result.get("acceptance", {}).get("problems", []):
+                print(f"  acceptance: {problem}")
+        status = result.get("status")
+        return 0 if status == "success" else 2 if status in {"paused_quota", "paused_budget", "running"} else 1
     if args.command in {"lead", "run"}:
         lead = args.agent or config.get("lead", "claude")
         return launch_lead(workspace, config, lead, args.task, interactive=args.command == "lead")

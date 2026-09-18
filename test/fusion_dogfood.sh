@@ -11,7 +11,10 @@ printf '%s\n' '# dogfood fixture' > "$WORKSPACE/README.md"
 
 cat > "$BIN/claude" <<'PY'
 #!/usr/bin/env python3
-import json
+import json, pathlib, sys
+prompt = sys.argv[-1] if len(sys.argv) > 1 else ""
+if "FINAL_HANDOFF.md" in prompt:
+    pathlib.Path("FINAL_HANDOFF.md").write_text("dogfood handoff\\n", encoding="utf-8")
 print(json.dumps({
     "type": "result",
     "subtype": "success",
@@ -74,4 +77,53 @@ printf '%s\n' "$TRACE" | jq -e 'length == 3 and all(.[]; .schema == "fusion.trac
 USAGE="$(PYTHONDONTWRITEBYTECODE=1 "$ROOT/fusion" --workspace "$WORKSPACE" usage --limit 10)"
 printf '%s\n' "$USAGE" | jq -e '.spans == 3 and .total.input_tokens == 12 and .total.output_tokens == 8' >/dev/null
 
-printf 'fusion dogfood passed: subprocesses, handoffs, traces, usage, and ledger\n'
+cat > "$WORKSPACE/workflow.json" <<'JSON'
+{
+  "task": "dogfood the persisted fan-out workflow",
+  "max_parallel": 2,
+  "max_attempts": 1,
+  "nodes": [
+    {
+      "id": "inventory",
+      "items": ["one", "two", "three"],
+      "task_template": "Inventory {item}",
+      "agent": "claude",
+      "role": "investigator"
+    },
+    {
+      "id": "verify",
+      "needs": ["inventory"],
+      "task": "Verify the inventory",
+      "agent": "codex",
+      "route": "codex-read",
+      "role": "verifier"
+    },
+    {
+      "id": "synthesize",
+      "needs": ["verify"],
+      "task": "Write FINAL_HANDOFF.md from the verified evidence",
+      "agent": "claude",
+      "role": "synthesizer",
+      "write": true,
+      "required_files": ["FINAL_HANDOFF.md"]
+    }
+  ],
+  "acceptance": {
+    "required_files": ["FINAL_HANDOFF.md"],
+    "required_nodes": ["synthesize"]
+  }
+}
+JSON
+
+WORKFLOW_RESULT="$(PYTHONDONTWRITEBYTECODE=1 "$ROOT/fusion" --workspace "$WORKSPACE" --json workflow run "$WORKSPACE/workflow.json")"
+printf '%s\n' "$WORKFLOW_RESULT" | jq -e '
+  .schema == "fusion.workflow.v1"
+  and .status == "success"
+  and (.nodes | length) == 5
+  and all(.nodes[]; .status == "success")
+  and (.acceptance.ok == true)
+' >/dev/null
+printf '%s\n' "$WORKFLOW_RESULT" | jq -r '.artifacts.manifest' | xargs test -f
+test -f "$WORKSPACE/FINAL_HANDOFF.md"
+
+printf 'fusion dogfood passed: subprocesses, handoffs, traces, usage, ledger, and fan-out workflow\n'
