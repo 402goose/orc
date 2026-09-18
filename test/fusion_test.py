@@ -12,7 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import fusion_core  # noqa: E402
-from fusion_workflow import run_workflow, resume_workflow  # noqa: E402
+from fusion_workflow import WorkflowRunner, run_workflow, resume_workflow  # noqa: E402
 
 
 class FusionHarnessTest(unittest.TestCase):
@@ -348,6 +348,28 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
         result = run_workflow(self.workspace, json.loads((self.workspace / ".fusion.json").read_text()), spec_path)
         self.assertEqual(result["status"], "failed")
         self.assertIn("did not change", " ".join(result["nodes"][0]["result"]["blockers"]))
+
+    def test_workflow_waits_for_all_dependencies_before_blocking_fanin(self):
+        spec = {
+            "nodes": [
+                {"id": "quota", "task": "quota", "agent": "claude"},
+                {"id": "sibling", "task": "sibling", "agent": "claude"},
+                {"id": "fanin", "needs": ["quota", "sibling"], "task": "fanin", "agent": "claude"},
+            ]
+        }
+        runner = WorkflowRunner(self.workspace, {}, spec)
+        runner.nodes["quota"]["status"] = "paused_quota"
+        runner.nodes["sibling"]["status"] = "running"
+        runner._block_unrunnable()
+        self.assertEqual(runner.nodes["fanin"]["status"], "pending")
+
+        runner.nodes["sibling"]["status"] = "failed"
+        runner._block_unrunnable()
+        self.assertEqual(runner.nodes["fanin"]["status"], "blocked")
+        self.assertEqual(
+            runner.nodes["fanin"]["result"]["blockers"],
+            ["quota: paused_quota", "sibling: failed"],
+        )
 
 
 if __name__ == "__main__":
