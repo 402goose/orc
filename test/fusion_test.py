@@ -12,7 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import fusion_core  # noqa: E402
-from fusion_workflow import run_workflow, resume_workflow  # noqa: E402
+from fusion_workflow import WorkflowRunner, run_workflow, resume_workflow, workflow_report  # noqa: E402
 
 
 class FusionHarnessTest(unittest.TestCase):
@@ -432,6 +432,218 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
         result = run_workflow(self.workspace, json.loads((self.workspace / ".fusion.json").read_text()), spec_path)
         self.assertEqual(result["status"], "failed")
         self.assertIn("did not change", " ".join(result["nodes"][0]["result"]["blockers"]))
+
+    def test_workflow_report_groups_waves_and_usage(self):
+        claude = self.write_agent(
+            "report-claude",
+            """
+import json, pathlib, sys
+prompt = sys.argv[-1]
+if 'final.md' in prompt:
+    pathlib.Path('final.md').write_text('synthesized workflow output\\n', encoding='utf-8')
+print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':'report-claude','result':'STATUS: success\\nSUMMARY: node completed\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}))
+""",
+        )
+        self.config(claude=claude)
+        spec = {
+            "task": "evaluate the repository",
+            "max_parallel": 2,
+            "nodes": [
+                {"id": "research", "items": ["alpha", "beta", "gamma"], "task_template": "Research {item}", "agent": "claude"},
+                {
+                    "id": "synthesize",
+                    "needs": ["research"],
+                    "task": "Synthesize the research into final.md",
+                    "agent": "claude",
+                    "write": True,
+                    "required_files": ["final.md"],
+                },
+            ],
+            "acceptance": {"required_files": ["final.md"]},
+        }
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        config = json.loads((self.workspace / ".fusion.json").read_text())
+        result = run_workflow(self.workspace, config, spec_path)
+        self.assertEqual(result["status"], "success")
+
+        report = workflow_report(self.workspace, result["workflow_id"])
+        self.assertEqual(report["status"], "success")
+        waves = {item["wave"]: {node["id"] for node in item["nodes"]} for item in report["waves"]}
+        self.assertEqual(waves[0], {"research-01", "research-02", "research-03"})
+        self.assertEqual(waves[1], {"synthesize"})
+        self.assertEqual(report["usage"]["spans"], 4)
+        self.assertEqual(report["blockers"], [])
+        self.assertIsNone(report["resume_command"])
+
+    def test_workflow_report_surfaces_blockers_and_resume_command(self):
+        claude = self.write_agent(
+            "report-quota-claude",
+            """
+import json
+print(json.dumps({'type':'result','subtype':'error','is_error':True,'session_id':'s','result':\"You've hit your session limit; resets at 5:10am\"}))
+""",
+        )
+        self.config(claude=claude)
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps({"task": "report quota test", "nodes": [{"id": "probe", "task": "probe", "agent": "claude"}]}), encoding="utf-8")
+        config = json.loads((self.workspace / ".fusion.json").read_text())
+        result = run_workflow(self.workspace, config, spec_path)
+        self.assertEqual(result["status"], "paused_quota")
+
+        report = workflow_report(self.workspace, result["workflow_id"])
+        self.assertEqual(report["status"], "paused_quota")
+        self.assertTrue(report["blockers"])
+        self.assertTrue(all(item["node_id"] == "probe" for item in report["blockers"]))
+        self.assertTrue(any("session limit" in item["blocker"] for item in report["blockers"]))
+        self.assertIn("workflow resume", report["resume_command"])
+        self.assertIn(result["workflow_id"], report["resume_command"])
+
+    def test_preflight_blocks_missing_executable_before_any_dispatch(self):
+        self.config(claude=Path("missing-claude-binary"))
+        spec = {
+            "task": "preflight test",
+            "max_parallel": 3,
+            "nodes": [
+                {"id": "a", "task": "a", "agent": "claude"},
+                {"id": "b", "task": "b", "agent": "claude"},
+                {"id": "c", "task": "c", "agent": "claude"},
+            ],
+        }
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        result = run_workflow(self.workspace, json.loads((self.workspace / ".fusion.json").read_text()), spec_path)
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(all(node["status"] == "blocked" for node in result["nodes"]))
+        self.assertTrue(all("not available on PATH" in node["result"]["blockers"][0] for node in result["nodes"]))
+        # No node was actually dispatched: the preflight caught the missing
+        # binary once instead of three separate worker attempts discovering it.
+        self.assertFalse((self.workspace / ".fusion" / "runs").exists())
+
+    def test_lane_cooldown_prevents_further_dispatch_in_same_run(self):
+        calls = self.bin_dir / "calls.txt"
+        claude = self.write_agent(
+            "quota-lane-claude",
+            f"""
+import json, pathlib
+pathlib.Path({str(calls)!r}).open('a', encoding='utf-8').write('call\\n')
+print(json.dumps({{'type':'result','subtype':'error','is_error':True,'session_id':'s','result':\"You've hit your session limit; resets at 5:10am\"}}))
+""",
+        )
+        self.config(claude=claude)
+        spec = {
+            "task": "lane cooldown test",
+            "max_parallel": 1,
+            "nodes": [
+                {"id": "a", "task": "a", "agent": "claude"},
+                {"id": "b", "task": "b", "agent": "claude"},
+            ],
+        }
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        result = run_workflow(self.workspace, json.loads((self.workspace / ".fusion.json").read_text()), spec_path)
+        self.assertEqual(result["status"], "paused_quota")
+        statuses = {node["id"]: node["status"] for node in result["nodes"]}
+        self.assertEqual(statuses["a"], "paused_quota")
+        self.assertEqual(statuses["b"], "paused_quota")
+        node_b = next(node for node in result["nodes"] if node["id"] == "b")
+        self.assertIn("lane", node_b["result"]["summary"])
+        # Node b never actually ran a worker; only node a's failure did.
+        self.assertEqual(calls.read_text().count("call"), 1)
+
+    def test_fresh_run_seeds_lane_cooldown_from_recent_trace_but_resume_does_not(self):
+        claude = self.write_agent(
+            "history-claude",
+            """
+import json
+print(json.dumps({'type':'result','subtype':'error','is_error':True,'session_id':'s','result':\"You've hit your usage limit; resets in 10 minutes\"}))
+""",
+        )
+        self.config(claude=claude)
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps({"task": "seed", "nodes": [{"id": "a", "task": "a", "agent": "claude"}]}), encoding="utf-8")
+        config = json.loads((self.workspace / ".fusion.json").read_text())
+        first = run_workflow(self.workspace, config, spec_path)
+        self.assertEqual(first["status"], "paused_quota")
+
+        # A brand new workflow in the same workspace should see the still-fresh
+        # quota trace and refuse to dispatch into the same dead lane.
+        spec_path_2 = self.workspace / "workflow2.json"
+        spec_path_2.write_text(json.dumps({"task": "seed2", "nodes": [{"id": "b", "task": "b", "agent": "claude"}]}), encoding="utf-8")
+        second = run_workflow(self.workspace, config, spec_path_2)
+        self.assertEqual(second["status"], "paused_quota")
+        self.assertEqual(second["nodes"][0]["status"], "paused_quota")
+        self.assertIn("quota", second["nodes"][0]["result"]["blockers"][0])
+
+        # But an explicit resume of the first run is a "try again now" signal
+        # and must not be blocked by that same trace history.
+        claude.write_text(
+            "#!/usr/bin/env python3\nimport json\nprint(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':'s','result':'STATUS: success\\nSUMMARY: resumed\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}))\n",
+            encoding="utf-8",
+        )
+        claude.chmod(0o755)
+        resumed = resume_workflow(self.workspace, config, first["workflow_id"])
+        self.assertEqual(resumed["status"], "success")
+
+    def test_select_orc_model_requires_fit_unless_allow_untested(self):
+        orc = self.write_agent(
+            "orc",
+            """
+import sys
+argv = sys.argv[1:]
+if argv[:1] == ['models']:
+    if '--fit' in argv:
+        print('providerA/good-model\\tFIT stuff')
+    else:
+        # Untested candidate ranks ahead of the fit one.
+        print('providerB/untested-model\\tstuff')
+        print('providerA/good-model\\tstuff')
+    sys.exit(0)
+sys.exit(1)
+""",
+        )
+        self.assertEqual(fusion_core.select_orc_model(str(orc), "free"), "providerA/good-model")
+        self.assertEqual(
+            fusion_core.select_orc_model(str(orc), "free", allow_untested=True),
+            "providerB/untested-model",
+        )
+
+    def test_select_orc_model_returns_none_when_nothing_is_fit(self):
+        orc = self.write_agent(
+            "orc",
+            """
+import sys
+argv = sys.argv[1:]
+if argv[:1] == ['models']:
+    if '--fit' not in argv:
+        print('providerB/untested-model\\tstuff')
+    sys.exit(0)
+sys.exit(1)
+""",
+        )
+        self.assertIsNone(fusion_core.select_orc_model(str(orc), "free"))
+
+    def test_workflow_waits_for_all_dependencies_before_blocking_fanin(self):
+        spec = {
+            "nodes": [
+                {"id": "quota", "task": "quota", "agent": "claude"},
+                {"id": "sibling", "task": "sibling", "agent": "claude"},
+                {"id": "fanin", "needs": ["quota", "sibling"], "task": "fanin", "agent": "claude"},
+            ]
+        }
+        runner = WorkflowRunner(self.workspace, {}, spec)
+        runner.nodes["quota"]["status"] = "paused_quota"
+        runner.nodes["sibling"]["status"] = "running"
+        runner._block_unrunnable()
+        self.assertEqual(runner.nodes["fanin"]["status"], "pending")
+
+        runner.nodes["sibling"]["status"] = "failed"
+        runner._block_unrunnable()
+        self.assertEqual(runner.nodes["fanin"]["status"], "blocked")
+        self.assertEqual(
+            runner.nodes["fanin"]["result"]["blockers"],
+            ["quota: paused_quota", "sibling: failed"],
+        )
 
 
 if __name__ == "__main__":

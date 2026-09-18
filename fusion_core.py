@@ -575,11 +575,7 @@ def agent_settings(config: dict[str, Any], task: dict[str, Any]) -> dict[str, An
     return settings
 
 
-def select_orc_model(command: str, selector: str) -> str | None:
-    """Ask orc for its current ranked model; never hard-code a volatile model id."""
-    if selector not in {"free", "best"}:
-        return None
-    filter_args = ["--free", "--tools"] if selector == "free" else ["--tools"]
+def _orc_model_ids(command: str, filter_args: list[str]) -> list[str]:
     try:
         completed = subprocess.run(
             [command, "models", *filter_args],
@@ -589,13 +585,35 @@ def select_orc_model(command: str, selector: str) -> str | None:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return None
+        return []
     if completed.returncode != 0:
-        return None
+        return []
+    ids = []
     for line in completed.stdout.splitlines():
         candidate = line.strip().split(maxsplit=1)
         if candidate and "/" in candidate[0] and not candidate[0].startswith("-"):
-            return candidate[0]
+            ids.append(candidate[0])
+    return ids
+
+
+def select_orc_model(command: str, selector: str, allow_untested: bool = False) -> str | None:
+    """Ask orc for its current ranked model; never hard-code a volatile model id.
+
+    Free/best selectors require a model that already passed `orc probe --fit`
+    unless allow_untested is set. Picking the first tool-capable model
+    regardless of fit let a workflow route to a model that rejects every
+    call before generation even starts; pass allow_untested=True to opt back
+    into that best-effort behavior.
+    """
+    if selector not in {"free", "best"}:
+        return None
+    ranked = _orc_model_ids(command, ["--free", "--tools"] if selector == "free" else ["--tools"])
+    if allow_untested:
+        return ranked[0] if ranked else None
+    fit_ids = set(_orc_model_ids(command, ["--fit"]))
+    for candidate in ranked:
+        if candidate in fit_ids:
+            return candidate
     return None
 
 
@@ -644,7 +662,11 @@ def agent_command(
         argv = [command, *launcher_args]
         selected_model = str(settings.get("model", ""))
         if command_name == "orc" and not selected_model:
-            selected_model = select_orc_model(command, str(settings.get("model_selector", ""))) or ""
+            selected_model = select_orc_model(
+                command,
+                str(settings.get("model_selector", "")),
+                bool(settings.get("allow_untested", False)),
+            ) or ""
         if command_name == "orc" and selected_model:
             argv += ["-m", selected_model]
         mode = settings.get("permission_mode", "acceptEdits") if task["write"] else "plan"
@@ -1233,6 +1255,10 @@ def build_parser() -> argparse.ArgumentParser:
     workflow_resume.add_argument("run_id")
     workflow_status = workflow_sub.add_parser("status", help="show a persisted workflow manifest")
     workflow_status.add_argument("run_id")
+    workflow_report = workflow_sub.add_parser(
+        "report", help="combined waves/lanes/usage/blockers view of a workflow run"
+    )
+    workflow_report.add_argument("run_id")
 
     sub.add_parser("doctor", help="check the local CLI prerequisites")
     status = sub.add_parser("status", help="show recent runs")
@@ -1271,13 +1297,15 @@ def main(argv: list[str] | None = None) -> int:
         print_ultra_result(result, args.json)
         return 0 if result["status"] == "success" else 1
     if args.command == "workflow":
-        from fusion_workflow import resume_workflow, run_workflow, workflow_status
+        from fusion_workflow import resume_workflow, run_workflow, workflow_report, workflow_status
 
         try:
             if args.workflow_command == "run":
                 result = run_workflow(workspace, config, Path(args.spec).expanduser().resolve(), args.task)
             elif args.workflow_command == "resume":
                 result = resume_workflow(workspace, config, args.run_id)
+            elif args.workflow_command == "report":
+                result = workflow_report(workspace, args.run_id)
             else:
                 result = workflow_status(workspace, args.run_id)
         except (OSError, ValueError, RuntimeError) as exc:
@@ -1288,6 +1316,27 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if args.json:
             print(json_text(result))
+        elif args.workflow_command == "report":
+            print(f"workflow {result['workflow_id']}: {result.get('status', 'unknown')}")
+            print(f"  task: {result.get('task', '')}")
+            print(f"  spent: ${result.get('spent_usd', 0):.4f} of ${result.get('budget_usd', 0):.2f} budget" if result.get("budget_usd") else f"  spent: ${result.get('spent_usd', 0):.4f}")
+            for wave in result.get("waves", []):
+                print(f"  wave {wave['wave']}:")
+                for node in wave["nodes"]:
+                    print(f"    - {node['id']} [{node['agent']}] {node['status']} (attempts={node['attempts']}): {node.get('summary') or ''}")
+            if result.get("lanes"):
+                print("  lanes:")
+                for agent, lane in result["lanes"].items():
+                    print(f"    - {agent}: {lane.get('status')} — {lane.get('reason')}")
+            usage = result.get("usage", {})
+            if usage.get("by_route"):
+                print("  usage:")
+                for group in usage["by_route"]:
+                    print(f"    - {group.get('agent')}/{group.get('route')}/{group.get('model')}: {group.get('calls')} calls, {group.get('success')} success, {group.get('failed')} failed")
+            for blocker in result.get("blockers", []):
+                print(f"  blocker: {blocker['node_id']} ({blocker['status']}): {blocker['blocker']}")
+            if result.get("resume_command"):
+                print(f"  resume: {result['resume_command']}")
         else:
             workflow_id = result.get("workflow_id") or getattr(args, "run_id", "unknown")
             print(f"workflow {workflow_id}: {result.get('status', 'unknown')}")
