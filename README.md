@@ -353,6 +353,43 @@ stronger model. `--harness codex` runs every configured stage through Codex;
 `fusion lead --agent codex` makes Codex the interactive lead and exposes the
 same MCP delegation tools for Claude workers.
 
+### Persisted fan-out workflows
+
+For real orchestration, use `fusion workflow` with a JSON graph. Unlike the
+linear Ultra preset, a workflow can map one node over many items, fan in on
+explicit dependencies, run independent read-only nodes concurrently, retry
+invalid handoffs, pause on provider quota, and resume from the persisted
+manifest without repeating accepted nodes.
+
+```sh
+cp .fusion.workflow.example.json workflow.json
+fusion --workspace . --json workflow run workflow.json
+fusion --workspace . --json workflow status WORKFLOW_ID
+fusion --workspace . --json workflow resume WORKFLOW_ID
+```
+
+Every node gets a durable artifact under `.fusion/workflows/WORKFLOW_ID/` and
+every worker still gets the existing `.fusion/runs/` trace. A node is accepted
+only when its worker reports success and its declared `required_files` and
+acceptance checks pass. `max_parallel`, `max_attempts`, `budget_usd`, and the
+single-writer limit are enforced by the scheduler. Keep fan-out nodes
+read-only; put repository writes behind a final writer or use separate Git
+worktrees for independent implementations.
+
+For the Saloon integration smoke, use the included read-only graph against a
+disposable checkout or the existing `~/saloon` workspace:
+
+```sh
+fusion --workspace ~/saloon --json workflow run \
+  /path/to/orc/examples/saloon-readonly.workflow.json
+```
+
+Start with this graph before adding implementation writers. It intentionally
+uses three Claude inventory nodes, two Codex counterchecks, and one Claude
+reviewer. If a provider reaches a session or usage limit, the command exits
+with status 2 and leaves a resumable manifest under
+`~/saloon/.fusion/workflows/`.
+
 ### Traces and dogfood
 
 Every dispatched worker writes a metadata-only span to
