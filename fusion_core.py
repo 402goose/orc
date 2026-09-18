@@ -15,11 +15,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import uuid
 from typing import Any, Iterator
 
 
 SCHEMA = "fusion.v1"
+TELEMETRY_SCHEMA = "fusion.telemetry.v1"
 DEFAULTS: dict[str, Any] = {
     "lead": "claude",
     "sidekick": "codex",
@@ -28,6 +31,15 @@ DEFAULTS: dict[str, Any] = {
     "telemetry": {
         "enabled": True,
         "include_content": False,
+        # Off by default for anyone who just clones the repo -- there is no
+        # collector to send to unless a project's own .fusion.json sets
+        # remote.enabled + remote.endpoint (and remote.token, for the shared
+        # ingestion secret out-of-band; never commit a real token here).
+        "remote": {
+            "enabled": False,
+            "endpoint": "",
+            "token": "",
+        },
     },
     "routes": {
         "orc-free": {
@@ -269,6 +281,88 @@ def usage_summary(spans: list[dict[str, Any]]) -> dict[str, Any]:
     return {"spans": len(spans), "total": total, "by_route": list(groups.values())}
 
 
+def failure_class(result: dict[str, Any]) -> str | None:
+    """Coarse, non-identifying category for a non-success result. Used both
+    to make local `fusion usage` slicing easier and as the only failure
+    signal sent in a remote telemetry payload -- raw blocker text can
+    contain project-specific detail and is never sent remotely."""
+    if result.get("status") == "success":
+        return None
+    text = " ".join(str(item) for item in result.get("blockers", [])).lower()
+    if "permission denied" in text or "agy denied" in text:
+        return "permission_denied"
+    if any(marker in text for marker in ("usage limit", "session limit", "rate limit", "quota", "resets at", "resets ")):
+        return "quota"
+    if result.get("exit_code") == 124 or "timeout" in text:
+        return "timeout"
+    if "not available on path" in text:
+        return "missing_executable"
+    return "worker_error"
+
+
+def telemetry_install_id() -> str:
+    """A random id stable across a machine's projects, not tied to a
+    person's identity. Generated once and cached under ORC_HOME (matching
+    the orc CLI's own convention), not per-workspace."""
+    home = Path(os.environ.get("ORC_HOME") or (Path.home() / ".config" / "orc")).expanduser()
+    home.mkdir(parents=True, exist_ok=True)
+    id_path = home / "telemetry_id"
+    try:
+        existing = id_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        existing = ""
+    if existing:
+        return existing
+    new_id = uuid.uuid4().hex
+    try:
+        id_path.write_text(new_id + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return new_id
+
+
+def send_remote_telemetry(remote: dict[str, Any], span: dict[str, Any]) -> None:
+    """Best-effort, deliberately reduced telemetry send. Never raises: a
+    down or misconfigured collector must never affect the actual dispatch.
+    Strips everything the local trace span carries that could be
+    identifying or project-specific -- changed file paths, test commands,
+    raw blocker text, and local filesystem artifact paths -- keeping only
+    what real Anthropic Cost & Usage-style dashboards need: agent, route,
+    model, outcome, timing, and token/cost usage."""
+    endpoint = str(remote.get("endpoint") or "")
+    if not endpoint:
+        return
+    payload = {
+        "schema": TELEMETRY_SCHEMA,
+        "install_id": telemetry_install_id(),
+        "spans": [{
+            "trace_id": span.get("trace_id"),
+            "span_id": span.get("span_id"),
+            "parent_span_id": span.get("parent_span_id"),
+            "agent": span.get("agent"),
+            "role": span.get("role"),
+            "route": span.get("route"),
+            "model": span.get("model"),
+            "write": span.get("write"),
+            "status": span.get("status"),
+            "failure_class": span.get("failure_class"),
+            "start_time_ms": span.get("start_time_ms"),
+            "end_time_ms": span.get("end_time_ms"),
+            "duration_ms": span.get("duration_ms"),
+            "usage": normalized_usage(span.get("usage")),
+        }],
+    }
+    try:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(endpoint, data=body, method="POST", headers={"Content-Type": "application/json"})
+        token = str(remote.get("token") or "")
+        if token:
+            request.add_header("Authorization", f"Bearer {token}")
+        urllib.request.urlopen(request, timeout=3).close()
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        pass
+
+
 class RunStore:
     def __init__(self, workspace: Path):
         self.workspace = workspace
@@ -318,6 +412,7 @@ class RunStore:
             "end_time_ms": ended_at_ms,
             "duration_ms": max(0, ended_at_ms - started_at_ms),
             "status": result.get("status"),
+            "failure_class": failure_class(result),
             "agent": task["agent"],
             "role": task["role"],
             "route": task.get("route"),
@@ -335,6 +430,9 @@ class RunStore:
         run_dir = result.get("artifacts", {}).get("run_dir")
         if run_dir:
             Path(run_dir, "trace.json").write_text(json_text(span) + "\n", encoding="utf-8")
+        remote = telemetry.get("remote") or {}
+        if remote.get("enabled"):
+            send_remote_telemetry(remote, span)
 
     def traces(self, limit: int = 100) -> list[dict[str, Any]]:
         if not self.traces_path.exists():
@@ -1267,6 +1365,11 @@ def build_parser() -> argparse.ArgumentParser:
     trace.add_argument("--limit", type=int, default=100)
     usage = sub.add_parser("usage", help="summarize token usage and latency from telemetry")
     usage.add_argument("--limit", type=int, default=10000)
+
+    telemetry = sub.add_parser("telemetry", help="local and remote telemetry configuration")
+    telemetry_sub = telemetry.add_subparsers(dest="telemetry_command", required=True)
+    telemetry_sub.add_parser("status", help="show what remote telemetry is configured to send, if any")
+
     sub.add_parser("mcp-serve", help=argparse.SUPPRESS)
     return parser
 
@@ -1290,6 +1393,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "usage":
         payload = usage_summary(RunStore(workspace).traces(args.limit))
+        print(json_text(payload))
+        return 0
+    if args.command == "telemetry":
+        remote = (config.get("telemetry") or {}).get("remote") or {}
+        enabled = bool(remote.get("enabled"))
+        payload = {
+            "local_enabled": (config.get("telemetry") or {}).get("enabled", True),
+            "local_path": str(workspace / ".fusion" / "traces.jsonl"),
+            "remote_enabled": enabled,
+            "remote_endpoint": remote.get("endpoint") or None,
+            "install_id": telemetry_install_id() if enabled else None,
+            "fields_sent": (
+                ["trace_id", "span_id", "parent_span_id", "agent", "role", "route", "model",
+                 "write", "status", "failure_class", "start_time_ms", "end_time_ms",
+                 "duration_ms", "usage"]
+                if enabled else []
+            ),
+            "fields_never_sent": ["changed", "tests", "blockers", "artifacts", "workspace path", "prompt/task text", "model output"],
+        }
         print(json_text(payload))
         return 0
     if args.command == "ultra":

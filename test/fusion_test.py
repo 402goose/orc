@@ -1,4 +1,5 @@
 import contextlib
+import http.server
 import io
 import json
 import os
@@ -6,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 
@@ -647,6 +649,152 @@ sys.exit(1)
             runner.nodes["fanin"]["result"]["blockers"],
             ["quota: paused_quota", "sibling: failed"],
         )
+
+    def test_failure_class_categorizes_common_failure_reasons(self):
+        self.assertIsNone(fusion_core.failure_class({"status": "success", "blockers": []}))
+        self.assertEqual(
+            fusion_core.failure_class({"status": "error", "blockers": ["You've hit your session limit; resets at 5pm"]}),
+            "quota",
+        )
+        self.assertEqual(
+            fusion_core.failure_class({"status": "error", "blockers": ["permission denied: Bash"]}),
+            "permission_denied",
+        )
+        self.assertEqual(
+            fusion_core.failure_class({"status": "blocked", "exit_code": 124, "blockers": ["timeout after 60 seconds"]}),
+            "timeout",
+        )
+        self.assertEqual(
+            fusion_core.failure_class({"status": "error", "blockers": ["orc is not available on PATH"]}),
+            "missing_executable",
+        )
+        self.assertEqual(
+            fusion_core.failure_class({"status": "error", "blockers": ["something else broke"]}),
+            "worker_error",
+        )
+
+    def test_telemetry_install_id_is_stable_and_not_per_workspace(self):
+        with tempfile.TemporaryDirectory() as home:
+            old_home = os.environ.get("ORC_HOME")
+            os.environ["ORC_HOME"] = home
+            try:
+                first = fusion_core.telemetry_install_id()
+                second = fusion_core.telemetry_install_id()
+                self.assertEqual(first, second)
+                self.assertTrue((Path(home) / "telemetry_id").is_file())
+            finally:
+                if old_home is None:
+                    os.environ.pop("ORC_HOME", None)
+                else:
+                    os.environ["ORC_HOME"] = old_home
+
+    def test_remote_telemetry_disabled_by_default_sends_nothing(self):
+        received = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append(True)
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            claude = self.write_agent(
+                "claude-default-telemetry",
+                """
+import json
+print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':'s','result':'STATUS: success\\nSUMMARY: done\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}))
+""",
+            )
+            value = {
+                "claude": {"command": str(claude)},
+                # remote.enabled deliberately omitted -- must default to off.
+                "telemetry": {"remote": {"endpoint": f"http://127.0.0.1:{port}/v1/ingest"}},
+            }
+            (self.workspace / ".fusion.json").write_text(json.dumps(value), encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                fusion_core.main(
+                    ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "do it"]
+                )
+            self.assertEqual(received, [])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_remote_telemetry_sends_reduced_payload_when_enabled(self):
+        received = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                received.append({
+                    "body": json.loads(self.rfile.read(length)),
+                    "auth": self.headers.get("Authorization"),
+                })
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            claude = self.write_agent(
+                "claude-remote-telemetry",
+                """
+import json
+print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':'s','result':'STATUS: success\\nSUMMARY: done\\nCHANGED: secret/path.py\\nTESTS: pytest\\nBLOCKERS: none'}))
+""",
+            )
+            value = {
+                "claude": {"command": str(claude)},
+                "telemetry": {"remote": {"enabled": True, "endpoint": f"http://127.0.0.1:{port}/v1/ingest", "token": "sekret"}},
+            }
+            (self.workspace / ".fusion.json").write_text(json.dumps(value), encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(
+                    fusion_core.main(
+                        ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "do secret/path.py work"]
+                    ),
+                    0,
+                )
+            self.assertEqual(len(received), 1)
+            self.assertEqual(received[0]["auth"], "Bearer sekret")
+            body = received[0]["body"]
+            self.assertEqual(body["schema"], "fusion.telemetry.v1")
+            span = body["spans"][0]
+            self.assertEqual(span["status"], "success")
+            self.assertIsNone(span["failure_class"])
+            # The risky, potentially project-identifying fields never leave
+            # the local trace even when remote telemetry is enabled.
+            self.assertNotIn("changed", span)
+            self.assertNotIn("tests", span)
+            self.assertNotIn("blockers", span)
+            self.assertNotIn("artifacts", span)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_telemetry_status_reports_configuration(self):
+        self.config()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(fusion_core.main(["--workspace", str(self.workspace), "telemetry", "status"]), 0)
+        result = json.loads(output.getvalue())
+        self.assertFalse(result["remote_enabled"])
+        self.assertIsNone(result["install_id"])
+        self.assertEqual(result["fields_sent"], [])
 
 
 if __name__ == "__main__":
