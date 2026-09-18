@@ -476,6 +476,12 @@ BLOCKERS: unresolved issues, or none
                     continue
                 dependency_statuses = [self.nodes[dependency]["status"] for dependency in node["needs"]]
                 if any(status in TERMINAL_FAILURE or status in TERMINAL_PAUSED for status in dependency_statuses):
+                    # Wait until every dependency is terminal before taking
+                    # the blocker snapshot. This keeps a downstream receipt
+                    # from saying one sibling is still running when another
+                    # sibling already made the fan-in impossible.
+                    if any(status in {"pending", "running"} for status in dependency_statuses):
+                        continue
                     node["status"] = "blocked"
                     node["result"] = {
                         "status": "blocked",
