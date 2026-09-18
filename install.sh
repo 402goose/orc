@@ -52,4 +52,4 @@ case ":$PATH:" in
   *) echo "note: $DEST is not on your PATH — add: export PATH=\"$DEST:\$PATH\"" ;;
 esac
 
-echo "next: run 'orc' to start the setup wizard or 'fusion doctor' to check both agents"
+echo "next: run 'orc' to start the setup wizard or 'fusion doctor' to check the agent CLIs"

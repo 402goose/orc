@@ -298,7 +298,7 @@ to update the bundled snapshot, then `./build.sh` and reinstall).
 
 ## Fusion: Claude lead + Codex sidekick
 
-`fusion` adds a small lead/sidekick harness beside `orc`. It keeps the lead agent in charge of the user conversation and final review, then delegates bounded work to Claude Code or Codex through a shared task contract. Each run records its task, JSONL events, stdout, stderr, result, and reusable session id under `.fusion/` in the workspace.
+`fusion` adds a small lead/sidekick harness beside `orc`. It keeps the lead agent in charge of the user conversation and final review, then delegates bounded work to Claude Code, Codex, or Antigravity through a shared task contract. Each run records its task, JSONL events, stdout, stderr, result, and reusable session id under `.fusion/` in the workspace.
 
 The lead can call the other agent through an MCP server:
 
@@ -322,6 +322,28 @@ fusion ultra --harness codex 'Run the full bounded pipeline through Codex.'
 ```
 
 `fusion` uses a single writer lock for a workspace, so two write tasks cannot edit the same checkout at once. Use separate Git worktrees when you want parallel write tasks. Read-only tasks can run independently. The default Codex sidekick uses `codex exec --json`; the default Claude sidekick uses Claude Code print mode with structured JSON output.
+
+### Antigravity (agy) workers
+
+`agy` — the Google Antigravity CLI — is a third worker harness. It runs as a
+sidekick (`--agent agy`), an Ultra stage/harness, or a workflow node, and its
+host model list covers Gemini, Claude, and GPT-OSS under a separate quota pool
+(`agy models`). Sessions resume through `--conversation` the same way Codex
+threads do.
+
+```sh
+fusion delegate --agent agy --read-only --role countercheck \
+  --success 'structured handoff' 'Re-verify the diff against the spec.'
+fusion --json ultra --harness agy 'Explore and review this change.'
+```
+
+Headless `agy` cannot answer tool-permission prompts, so it auto-denies tools
+outside its allow-rules; plan mode is safe for read-only work, and write routes
+should use `accept-edits` with the workspace sandbox rather than
+`--dangerously-skip-permissions`. `agy` has no per-call budget flag, so cap its
+cost with `timeout_seconds` and the workflow's `budget_usd`. OpenRouter models
+are not in the `agy` host list — route those through the `orc` path instead.
+`agy` is not (yet) a lead candidate; `fusion lead` remains Claude or Codex.
 
 ### Ultra without the token fire
 
