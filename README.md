@@ -456,6 +456,39 @@ The real smoke command returns exit code 2 when the CLI was reached but a
 provider blocked the turn for quota, authentication, or session limits. That
 keeps provider availability separate from harness regressions.
 
+### Remote telemetry (opt-in, off by default)
+
+`.fusion.json`'s `telemetry.remote` block can send a small, deliberately
+reduced copy of each span to a shared collector, so a group actually using
+Fusion together can see aggregate agent/route/model/failure patterns instead
+of everyone's usage staying siloed on their own machine. It is off unless a
+project's own `.fusion.json` sets `remote.enabled: true` and a
+`remote.endpoint` — cloning this repo alone sends nothing anywhere.
+
+```json
+{
+  "telemetry": {
+    "remote": {
+      "enabled": true,
+      "endpoint": "https://orc-telemetry.fly.dev/v1/ingest",
+      "token": "<shared ingest token, distributed out-of-band, never committed>"
+    }
+  }
+}
+```
+
+What gets sent, per dispatch: agent, role, route, model, whether it was a
+write, status, a coarse `failure_class` (`quota` / `permission_denied` /
+`timeout` / `missing_executable` / `worker_error` — never the raw blocker
+text), timing, and token/cost usage, tagged with a random per-machine
+`install_id` that isn't tied to identity. Never sent: prompts, model output,
+changed file paths, test commands, raw blocker text, or any local filesystem
+or workspace path. Run `fusion telemetry status` any time to see exactly
+what is currently configured to send. A send is always best-effort with a
+short timeout — a down or misconfigured collector never blocks or fails the
+actual dispatch. The collector itself (a small Fly + Postgres app) lives in
+[`telemetry/`](telemetry/).
+
 The architecture and source map are in [FUSION_RESEARCH.md](FUSION_RESEARCH.md).
 
 ## Development
