@@ -648,6 +648,119 @@ sys.exit(1)
             ["quota: paused_quota", "sibling: failed"],
         )
 
+    def test_resume_no_op_does_not_redispatch_any_node(self):
+        calls = self.bin_dir / "calls.txt"
+        claude = self.write_agent(
+            "digest-claude",
+            f"""
+import json, pathlib
+pathlib.Path({str(calls)!r}).open('a', encoding='utf-8').write('call\\n')
+print(json.dumps({{'type':'result','subtype':'success','is_error':False,'session_id':'s','result':'STATUS: success\\nSUMMARY: done\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}}))
+""",
+        )
+        self.config(claude=claude)
+        spec = {
+            "task": "no-op resume test",
+            "nodes": [
+                {"id": "a", "task": "task a", "agent": "claude"},
+                {"id": "b", "needs": ["a"], "task": "task b", "agent": "claude"},
+            ],
+        }
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        config = json.loads((self.workspace / ".fusion.json").read_text())
+        first = run_workflow(self.workspace, config, spec_path)
+        self.assertEqual(first["status"], "success")
+        self.assertEqual(calls.read_text().count("call"), 2)
+        first_digests = {node["id"]: node["result"]["digest"] for node in first["nodes"]}
+
+        resumed = resume_workflow(self.workspace, config, first["workflow_id"])
+        self.assertEqual(resumed["status"], "success")
+        # Nothing was dispatched again: both nodes were reused from their
+        # cached, digest-matched receipts instead of rerunning.
+        self.assertEqual(calls.read_text().count("call"), 2)
+        for node in resumed["nodes"]:
+            self.assertEqual(node["attempts"], 1)
+            self.assertEqual(node["result"]["digest"], first_digests[node["id"]])
+
+    def test_resume_with_edited_spec_reruns_only_changed_node_and_downstream(self):
+        calls = self.bin_dir / "calls.txt"
+        claude = self.write_agent(
+            "digest-edit-claude",
+            f"""
+import json, pathlib, sys
+pathlib.Path({str(calls)!r}).open('a', encoding='utf-8').write(sys.argv[-1][:1] + '\\n')
+print(json.dumps({{'type':'result','subtype':'success','is_error':False,'session_id':'s','result':'STATUS: success\\nSUMMARY: done\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}}))
+""",
+        )
+        self.config(claude=claude)
+        spec = {
+            "task": "edited resume test",
+            "nodes": [
+                {"id": "a", "task": "task a v1", "agent": "claude"},
+                {"id": "b", "task": "task b", "agent": "claude"},
+                {"id": "c", "needs": ["b"], "task": "task c", "agent": "claude"},
+            ],
+        }
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        config = json.loads((self.workspace / ".fusion.json").read_text())
+        first = run_workflow(self.workspace, config, spec_path)
+        self.assertEqual(first["status"], "success")
+        self.assertEqual(calls.read_text().count("\n"), 3)
+
+        # Edit only node "a"; "b" and its dependent "c" are untouched.
+        spec["nodes"][0]["task"] = "task a v2"
+        edited_spec_path = self.workspace / "workflow-edited.json"
+        edited_spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        resumed = resume_workflow(self.workspace, config, first["workflow_id"], edited_spec_path)
+        self.assertEqual(resumed["status"], "success")
+        statuses = {node["id"]: node for node in resumed["nodes"]}
+        self.assertEqual(statuses["a"]["attempts"], 2)
+        self.assertEqual(statuses["b"]["attempts"], 1)
+        self.assertEqual(statuses["c"]["attempts"], 1)
+        # Only "a" was actually redispatched; "b" and "c" were reused.
+        self.assertEqual(calls.read_text().count("\n"), 4)
+
+    def test_resume_with_edited_upstream_reruns_downstream_dependent(self):
+        calls = self.bin_dir / "calls.txt"
+        claude = self.write_agent(
+            "digest-cascade-claude",
+            f"""
+import json, pathlib
+pathlib.Path({str(calls)!r}).open('a', encoding='utf-8').write('call\\n')
+print(json.dumps({{'type':'result','subtype':'success','is_error':False,'session_id':'s','result':'STATUS: success\\nSUMMARY: done\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}}))
+""",
+        )
+        self.config(claude=claude)
+        spec = {
+            "task": "cascade resume test",
+            "nodes": [
+                {"id": "a", "task": "task a v1", "agent": "claude"},
+                {"id": "b", "needs": ["a"], "task": "task b", "agent": "claude"},
+            ],
+        }
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        config = json.loads((self.workspace / ".fusion.json").read_text())
+        first = run_workflow(self.workspace, config, spec_path)
+        self.assertEqual(first["status"], "success")
+        self.assertEqual(calls.read_text().count("call"), 2)
+
+        spec["nodes"][0]["task"] = "task a v2"
+        edited_spec_path = self.workspace / "workflow-edited.json"
+        edited_spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        resumed = resume_workflow(self.workspace, config, first["workflow_id"], edited_spec_path)
+        self.assertEqual(resumed["status"], "success")
+        statuses = {node["id"]: node for node in resumed["nodes"]}
+        # "a" changed directly; "b" reran too even though its own task text
+        # did not change, because its recorded digest embedded "a"'s old one.
+        self.assertEqual(statuses["a"]["attempts"], 2)
+        self.assertEqual(statuses["b"]["attempts"], 2)
+        self.assertEqual(calls.read_text().count("call"), 4)
+        self.assertNotEqual(statuses["a"]["result"]["digest"], first["nodes"][0]["result"]["digest"])
+        self.assertNotEqual(statuses["b"]["result"]["digest"], first["nodes"][1]["result"]["digest"])
+
 
 if __name__ == "__main__":
     unittest.main()
