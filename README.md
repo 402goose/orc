@@ -391,6 +391,7 @@ cp .fusion.workflow.example.json workflow.json
 fusion --workspace . --json workflow run workflow.json
 fusion --workspace . --json workflow status WORKFLOW_ID
 fusion --workspace . --json workflow resume WORKFLOW_ID
+fusion --workspace . --json workflow resume WORKFLOW_ID --spec workflow.json
 fusion --workspace . workflow report WORKFLOW_ID
 ```
 
@@ -419,6 +420,19 @@ already known to be dead; the manifest's top-level `lanes` field records why.
 The same in-run cooldown kicks in reactively the first time any node reports
 a quota failure, so the rest of that wave does not repeat the same failure in
 parallel.
+
+Every accepted node's receipt carries a content digest: a hash of the node's
+own definition (task, role, agent, route, required files, acceptance) plus
+its dependencies' digests, chained the way a build cache key would be. A
+plain resume replays the persisted spec unchanged, so every digest still
+matches and nothing is redispatched. `fusion workflow resume WORKFLOW_ID
+--spec workflow.json` instead re-validates against a workflow JSON you may
+have edited; only nodes whose own definition changed, or whose dependency
+evidence changed, lose their cached digest match and rerun — everything else
+is reused as-is. The resolved command/model actually used is recorded on the
+receipt for provenance but deliberately excluded from the digest itself, so
+`orc-free`/`orc-best` re-resolving to a different model over time does not
+by itself invalidate a cached node.
 
 For the Saloon integration smoke, use the included read-only graph against a
 disposable checkout or the existing `~/saloon` workspace:

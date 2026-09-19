@@ -109,6 +109,41 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
         self.assertEqual(result["tests"], ["python -m unittest"])
         self.assertEqual(result["blockers"], [])
 
+    def test_claude_json_result_extracts_model_and_cost_from_real_cli_shape(self):
+        # Matches the actual shape of `claude -p --output-format json` output:
+        # no top-level model/model_id, cost as total_cost_usd (not inside
+        # usage), and the model name as a key under modelUsage.
+        claude = self.write_agent(
+            "claude-real-shape",
+            """
+import json
+print(json.dumps({
+    'type': 'result',
+    'subtype': 'success',
+    'is_error': False,
+    'session_id': 'real-shape-session',
+    'result': 'STATUS: success\\nSUMMARY: did real work\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none',
+    'total_cost_usd': 0.183226,
+    'usage': {'input_tokens': 10, 'output_tokens': 2003, 'cache_creation_input_tokens': 31076, 'cache_read_input_tokens': 194360},
+    'modelUsage': {'claude-sonnet-5': {'inputTokens': 10, 'outputTokens': 2003, 'costUSD': 0.183226}},
+}))
+""",
+        )
+        self.config(claude=claude)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                fusion_core.main(
+                    ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "do real work"]
+                ),
+                0,
+            )
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["model"], "claude-sonnet-5")
+        self.assertEqual(result["usage"]["cost_usd"], 0.183226)
+        self.assertEqual(result["usage"]["input_tokens"], 10)
+
     def test_agy_result_is_structured_and_session_is_resumed(self):
         calls = str(self.calls)
         agy = self.write_agent(
@@ -177,6 +212,87 @@ print(json.dumps({'conversation_id':'conv-denied','status':'SUCCESS','response':
         self.assertEqual(result["status"], "error")
         self.assertIn("auto-denied", " ".join(result["blockers"]))
         self.assertIn("RunCommand", " ".join(result["blockers"]))
+
+    def test_agy_denial_alongside_success_text_is_still_surfaced(self):
+        # Unlike the no-text case above, a denial alongside an otherwise
+        # successful turn used to be silently dropped since the old failure
+        # branch only fired when there was no other text.
+        agy = self.write_agent(
+            "agy-partial-denied",
+            """
+import json
+print(json.dumps({'conversation_id':'conv-partial','status':'SUCCESS','response':'STATUS: success\\nSUMMARY: did the work anyway\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none','denied_actions':[{'action':'command','display_name':'RunCommand'}],'usage':{'input_tokens':9,'output_tokens':1}}))
+""",
+        )
+        self.config(agy=agy)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                fusion_core.main(
+                    ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "agy", "--fresh", "run something"]
+                ),
+                0,
+            )
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["status"], "success")
+        self.assertIn("RunCommand", " ".join(result["blockers"]))
+
+    def test_claude_permission_denials_are_surfaced_as_blockers(self):
+        # Real populated permission_denials entries are unverified (see
+        # FUSION_RESEARCH.md), so this exercises the defensive extraction
+        # with a plausible shape rather than a confirmed-real one.
+        claude = self.write_agent(
+            "claude-denied",
+            """
+import json
+print(json.dumps({
+    'type': 'result', 'subtype': 'success', 'is_error': False,
+    'session_id': 'denied-session',
+    'result': 'STATUS: success\\nSUMMARY: did the work\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none',
+    'permission_denials': [{'tool_name': 'Bash', 'reason': 'command not in allowlist'}],
+}))
+""",
+        )
+        self.config(claude=claude)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                fusion_core.main(
+                    ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "do it"]
+                ),
+                0,
+            )
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["status"], "success")
+        self.assertIn("Bash", " ".join(result["blockers"]))
+        self.assertIn("command not in allowlist", " ".join(result["blockers"]))
+
+    def test_claude_permission_denials_fall_back_to_raw_entry_when_unrecognized(self):
+        claude = self.write_agent(
+            "claude-denied-unknown-shape",
+            """
+import json
+print(json.dumps({
+    'type': 'result', 'subtype': 'success', 'is_error': False,
+    'session_id': 's',
+    'result': 'STATUS: success\\nSUMMARY: did the work\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none',
+    'permission_denials': [{'some_unexpected_field': 'value'}],
+}))
+""",
+        )
+        self.config(claude=claude)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                fusion_core.main(
+                    ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "do it"]
+                ),
+                0,
+            )
+        result = json.loads(output.getvalue())
+        # Doesn't crash or silently drop the entry when the shape doesn't
+        # match any recognized field name -- dumps the raw entry instead.
+        self.assertIn("some_unexpected_field", " ".join(result["blockers"]))
 
     def test_orc_free_routes_skip_max_budget_but_paid_routes_keep_it(self):
         free_task = fusion_core.make_task(
@@ -649,6 +765,119 @@ sys.exit(1)
             runner.nodes["fanin"]["result"]["blockers"],
             ["quota: paused_quota", "sibling: failed"],
         )
+
+    def test_resume_no_op_does_not_redispatch_any_node(self):
+        calls = self.bin_dir / "calls.txt"
+        claude = self.write_agent(
+            "digest-claude",
+            f"""
+import json, pathlib
+pathlib.Path({str(calls)!r}).open('a', encoding='utf-8').write('call\\n')
+print(json.dumps({{'type':'result','subtype':'success','is_error':False,'session_id':'s','result':'STATUS: success\\nSUMMARY: done\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}}))
+""",
+        )
+        self.config(claude=claude)
+        spec = {
+            "task": "no-op resume test",
+            "nodes": [
+                {"id": "a", "task": "task a", "agent": "claude"},
+                {"id": "b", "needs": ["a"], "task": "task b", "agent": "claude"},
+            ],
+        }
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        config = json.loads((self.workspace / ".fusion.json").read_text())
+        first = run_workflow(self.workspace, config, spec_path)
+        self.assertEqual(first["status"], "success")
+        self.assertEqual(calls.read_text().count("call"), 2)
+        first_digests = {node["id"]: node["result"]["digest"] for node in first["nodes"]}
+
+        resumed = resume_workflow(self.workspace, config, first["workflow_id"])
+        self.assertEqual(resumed["status"], "success")
+        # Nothing was dispatched again: both nodes were reused from their
+        # cached, digest-matched receipts instead of rerunning.
+        self.assertEqual(calls.read_text().count("call"), 2)
+        for node in resumed["nodes"]:
+            self.assertEqual(node["attempts"], 1)
+            self.assertEqual(node["result"]["digest"], first_digests[node["id"]])
+
+    def test_resume_with_edited_spec_reruns_only_changed_node_and_downstream(self):
+        calls = self.bin_dir / "calls.txt"
+        claude = self.write_agent(
+            "digest-edit-claude",
+            f"""
+import json, pathlib, sys
+pathlib.Path({str(calls)!r}).open('a', encoding='utf-8').write(sys.argv[-1][:1] + '\\n')
+print(json.dumps({{'type':'result','subtype':'success','is_error':False,'session_id':'s','result':'STATUS: success\\nSUMMARY: done\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}}))
+""",
+        )
+        self.config(claude=claude)
+        spec = {
+            "task": "edited resume test",
+            "nodes": [
+                {"id": "a", "task": "task a v1", "agent": "claude"},
+                {"id": "b", "task": "task b", "agent": "claude"},
+                {"id": "c", "needs": ["b"], "task": "task c", "agent": "claude"},
+            ],
+        }
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        config = json.loads((self.workspace / ".fusion.json").read_text())
+        first = run_workflow(self.workspace, config, spec_path)
+        self.assertEqual(first["status"], "success")
+        self.assertEqual(calls.read_text().count("\n"), 3)
+
+        # Edit only node "a"; "b" and its dependent "c" are untouched.
+        spec["nodes"][0]["task"] = "task a v2"
+        edited_spec_path = self.workspace / "workflow-edited.json"
+        edited_spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        resumed = resume_workflow(self.workspace, config, first["workflow_id"], edited_spec_path)
+        self.assertEqual(resumed["status"], "success")
+        statuses = {node["id"]: node for node in resumed["nodes"]}
+        self.assertEqual(statuses["a"]["attempts"], 2)
+        self.assertEqual(statuses["b"]["attempts"], 1)
+        self.assertEqual(statuses["c"]["attempts"], 1)
+        # Only "a" was actually redispatched; "b" and "c" were reused.
+        self.assertEqual(calls.read_text().count("\n"), 4)
+
+    def test_resume_with_edited_upstream_reruns_downstream_dependent(self):
+        calls = self.bin_dir / "calls.txt"
+        claude = self.write_agent(
+            "digest-cascade-claude",
+            f"""
+import json, pathlib
+pathlib.Path({str(calls)!r}).open('a', encoding='utf-8').write('call\\n')
+print(json.dumps({{'type':'result','subtype':'success','is_error':False,'session_id':'s','result':'STATUS: success\\nSUMMARY: done\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}}))
+""",
+        )
+        self.config(claude=claude)
+        spec = {
+            "task": "cascade resume test",
+            "nodes": [
+                {"id": "a", "task": "task a v1", "agent": "claude"},
+                {"id": "b", "needs": ["a"], "task": "task b", "agent": "claude"},
+            ],
+        }
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        config = json.loads((self.workspace / ".fusion.json").read_text())
+        first = run_workflow(self.workspace, config, spec_path)
+        self.assertEqual(first["status"], "success")
+        self.assertEqual(calls.read_text().count("call"), 2)
+
+        spec["nodes"][0]["task"] = "task a v2"
+        edited_spec_path = self.workspace / "workflow-edited.json"
+        edited_spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        resumed = resume_workflow(self.workspace, config, first["workflow_id"], edited_spec_path)
+        self.assertEqual(resumed["status"], "success")
+        statuses = {node["id"]: node for node in resumed["nodes"]}
+        # "a" changed directly; "b" reran too even though its own task text
+        # did not change, because its recorded digest embedded "a"'s old one.
+        self.assertEqual(statuses["a"]["attempts"], 2)
+        self.assertEqual(statuses["b"]["attempts"], 2)
+        self.assertEqual(calls.read_text().count("call"), 4)
+        self.assertNotEqual(statuses["a"]["result"]["digest"], first["nodes"][0]["result"]["digest"])
+        self.assertNotEqual(statuses["b"]["result"]["digest"], first["nodes"][1]["result"]["digest"])
 
     def test_failure_class_categorizes_common_failure_reasons(self):
         self.assertIsNone(fusion_core.failure_class({"status": "success", "blockers": []}))
