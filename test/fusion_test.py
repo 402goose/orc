@@ -211,6 +211,87 @@ print(json.dumps({'conversation_id':'conv-denied','status':'SUCCESS','response':
         self.assertIn("auto-denied", " ".join(result["blockers"]))
         self.assertIn("RunCommand", " ".join(result["blockers"]))
 
+    def test_agy_denial_alongside_success_text_is_still_surfaced(self):
+        # Unlike the no-text case above, a denial alongside an otherwise
+        # successful turn used to be silently dropped since the old failure
+        # branch only fired when there was no other text.
+        agy = self.write_agent(
+            "agy-partial-denied",
+            """
+import json
+print(json.dumps({'conversation_id':'conv-partial','status':'SUCCESS','response':'STATUS: success\\nSUMMARY: did the work anyway\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none','denied_actions':[{'action':'command','display_name':'RunCommand'}],'usage':{'input_tokens':9,'output_tokens':1}}))
+""",
+        )
+        self.config(agy=agy)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                fusion_core.main(
+                    ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "agy", "--fresh", "run something"]
+                ),
+                0,
+            )
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["status"], "success")
+        self.assertIn("RunCommand", " ".join(result["blockers"]))
+
+    def test_claude_permission_denials_are_surfaced_as_blockers(self):
+        # Real populated permission_denials entries are unverified (see
+        # FUSION_RESEARCH.md), so this exercises the defensive extraction
+        # with a plausible shape rather than a confirmed-real one.
+        claude = self.write_agent(
+            "claude-denied",
+            """
+import json
+print(json.dumps({
+    'type': 'result', 'subtype': 'success', 'is_error': False,
+    'session_id': 'denied-session',
+    'result': 'STATUS: success\\nSUMMARY: did the work\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none',
+    'permission_denials': [{'tool_name': 'Bash', 'reason': 'command not in allowlist'}],
+}))
+""",
+        )
+        self.config(claude=claude)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                fusion_core.main(
+                    ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "do it"]
+                ),
+                0,
+            )
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["status"], "success")
+        self.assertIn("Bash", " ".join(result["blockers"]))
+        self.assertIn("command not in allowlist", " ".join(result["blockers"]))
+
+    def test_claude_permission_denials_fall_back_to_raw_entry_when_unrecognized(self):
+        claude = self.write_agent(
+            "claude-denied-unknown-shape",
+            """
+import json
+print(json.dumps({
+    'type': 'result', 'subtype': 'success', 'is_error': False,
+    'session_id': 's',
+    'result': 'STATUS: success\\nSUMMARY: did the work\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none',
+    'permission_denials': [{'some_unexpected_field': 'value'}],
+}))
+""",
+        )
+        self.config(claude=claude)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                fusion_core.main(
+                    ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "do it"]
+                ),
+                0,
+            )
+        result = json.loads(output.getvalue())
+        # Doesn't crash or silently drop the entry when the shape doesn't
+        # match any recognized field name -- dumps the raw entry instead.
+        self.assertIn("some_unexpected_field", " ".join(result["blockers"]))
+
     def test_orc_free_routes_skip_max_budget_but_paid_routes_keep_it(self):
         free_task = fusion_core.make_task(
             self.workspace, "claude", "t", "r", [], [], None, False, False,

@@ -295,13 +295,12 @@ against a real successful Codex response, because Codex has been quota-gated
 for this whole session -- that assumption should get the same treatment once
 Codex quota resets, rather than being patched blind.
 
-Also visible in the real Claude response but not yet used anywhere:
-`permission_denials` (an array, empty in every run so far) and
-`subagent_stats`. Neither is currently surfaced into `blockers` or the trace
-span. A tool denial that isn't verbally mentioned in the model's own summary
-text would currently be invisible to the harness; `permission_denials` would
-catch that structurally instead of relying on the model to self-report it --
-*if* its populated shape were known.
+Also visible in the real Claude response: `permission_denials` (an array,
+empty in every run so far) and `subagent_stats` (not surfaced anywhere;
+left for later). A tool denial that isn't verbally mentioned in the model's
+own summary text would otherwise be invisible to the harness --
+`permission_denials` catches that structurally instead of relying on the
+model to self-report it.
 
 Seven separate live attempts to trigger a populated `permission_denials`
 entry all came back with an empty array:
@@ -332,15 +331,27 @@ refusal, not a permission-system-level one), finds an allowed alternative
 path, or the action turns out to be permitted after all. None of the
 headless, flag-only scenarios this harness can construct reach the
 "model attempts a visible tool, permission layer rejects it" path this field
-is presumably for. A real populated example likely needs either genuine
-interactive rejection (a human or a custom `--permission-prompt-tool`
-returning deny) or a fine-grained pattern rule (e.g. `Bash(rm *)` denied
-while `Bash(*)` is otherwise allowed) that a headless smoke script can't
-trivially construct. Given the model/`total_cost_usd` bug above came from
-exactly this mistake -- assuming an unverified schema -- this is
-deliberately left unbuilt rather than guessed at. Building it correctly
-needs one real captured example of a populated entry first; that's now a
-known dead end for cheap headless reproduction, not just an untried idea.
+is presumably for -- a real populated example likely needs genuine
+interactive rejection, or a fine-grained pattern rule (e.g. `Bash(rm *)`
+denied while `Bash(*)` is otherwise allowed) that a headless smoke script
+can't trivially construct. (Note: `--permission-prompt-tool`, floated above
+as a possible headless path, turned out not to be an actual CLI flag on
+this Claude Code version when checked against `claude --help` -- it's only
+referenced as an SDK-level concept inside `--permission-prompts`' help text.)
+
+Not knowing the populated shape doesn't mean the surfacing has to wait,
+though -- `parse_claude_output` extracts it defensively instead: tries a
+handful of plausible field names per entry (`tool_name`/`name`/`tool`/
+`display_name`/`action`, plus `reason`/`message`), and falls back to
+dumping the raw entry as JSON when none match, so an unrecognized shape
+still surfaces instead of silently vanishing or crashing. That's a
+different risk profile than the `total_cost_usd` bug: that bug produced a
+plausible-looking but *wrong* value ($0) with nothing to indicate anything
+was off; this either extracts correctly or visibly shows raw data, never a
+confident wrong answer. The same pass also fixed `parse_agy_output`, which
+already has a *verified* `denied_actions` shape (PR #8) but was only
+surfacing it when a denial was the entire outcome -- a denial alongside an
+otherwise-successful turn was silently dropped, which is now fixed too.
 
 ## How to try it
 
