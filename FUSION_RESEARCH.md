@@ -242,6 +242,106 @@ Until the real ORC route is exercised successfully, adding more frameworks or
 more parallel agents would measure availability failures rather than Fusion
 quality.
 
+## Real provider verification: build order items 1-4 closed, one trace bug found
+
+The build order above (route admission, `workflow report`, digests, the
+fan-in fix) landed as #4/#6/#7/#9. Before calling it done, each feature was
+also dogfooded through the real `fusion` CLI with real subprocesses -- not
+just unit tests -- and the resulting `.fusion/traces.jsonl` and
+`.fusion/workflows/<id>/events.jsonl` were read back to confirm the claims:
+
+- Fail-safe model selection: a live run against a fake `orc-free` catalog
+  with one FIT model ranked below an UNTESTED one picked the FIT model, not
+  the higher-ranked untested one.
+- Lane admission: a fan-out that hit a real quota failure mid-wave recorded
+  `lane.status: cooldown`; a brand-new second workflow in the same workspace
+  made zero dispatch attempts because preflight saw the still-fresh trace; an
+  explicit resume correctly bypassed that same trace-history block.
+- Digests: a no-op resume redispatched nothing; resuming with one edited
+  node's task text redispatched only that node and its downstream dependent,
+  leaving an unrelated sibling node cached at its original digest -- all
+  confirmed against the real subprocess call log, not just the reported
+  status.
+
+Then `FUSION_REAL=1 make dogfood-real` was run against the live `claude` and
+`codex` CLIs (real quota, real cost, run with explicit authorization). Claude
+succeeded end-to-end with real usage recorded; Codex hit its actual OpenAI
+usage limit (reset time included in the error), which the harness correctly
+classified as a provider gate rather than a broken worker.
+
+That live Claude trace is what surfaced a real bug, found by diffing what
+`parse_claude_output` assumes against the actual JSON `claude -p
+--output-format json` returns:
+
+- **`model` was always blank.** The parser reads top-level `model`/
+  `model_id`; real output has neither. The model name is a key in a
+  `modelUsage` dict instead (`{"claude-sonnet-5": {...}}`).
+- **Cost was silently dropped.** Real cost is `total_cost_usd` at the *top
+  level* of the response, not inside `usage`. `_result_cost()` and every
+  `budget_usd`/`max_budget_usd` check only ever look inside `usage`, so every
+  real Claude Code dispatch was reporting `$0` spent regardless of actual
+  cost -- meaning budget caps were not being enforced at all for real
+  dispatches, only for test fixtures that happened to set `usage.cost_usd`
+  directly. Fixed in the same pass the bug was found, with a regression test
+  built from the actual captured JSON shape (see `fusion_core.py:
+  parse_claude_output`).
+
+This is a useful general lesson for this harness: a fixture that encodes an
+*assumed* schema will happily stay green forever even if the real CLI's
+schema drifts or was never quite what the parser assumed, since nothing ever
+diffs the fixture against a live response. `parse_codex_events` makes the
+same top-level `model`/`model_id` assumption and has not been checked
+against a real successful Codex response, because Codex has been quota-gated
+for this whole session -- that assumption should get the same treatment once
+Codex quota resets, rather than being patched blind.
+
+Also visible in the real Claude response but not yet used anywhere:
+`permission_denials` (an array, empty in every run so far) and
+`subagent_stats`. Neither is currently surfaced into `blockers` or the trace
+span. A tool denial that isn't verbally mentioned in the model's own summary
+text would currently be invisible to the harness; `permission_denials` would
+catch that structurally instead of relying on the model to self-report it --
+*if* its populated shape were known.
+
+Seven separate live attempts to trigger a populated `permission_denials`
+entry all came back with an empty array:
+
+1. Plan mode asked to delete a file -- declined verbally, never attempted
+   the tool call.
+2. `--allowedTools Read` asked to run Bash -- ran anyway (allowlist did not
+   restrict it in this scenario).
+3. `--disallowedTools Bash` asked to run Bash -- and 4. the same with
+   `--permission-prompts none` added -- the model reported "I don't have a
+   Bash tool," meaning the tool was filtered out of its visible list before
+   it could attempt (and be denied) the call.
+5. `--permission-mode manual --permission-prompts none` (prompts
+   auto-deny) asked to run a benign `echo` -- ran anyway; "manual" mode did
+   not require approval for this command.
+6. The same mode asked to run `rm -rf` on a nonexistent path -- the model
+   refused on its own judgment before attempting any tool call, so nothing
+   reached the permission layer to be denied.
+7. `--permission-mode plan --permission-prompts none`, explicitly instructed
+   to call the Write tool immediately with no explanation -- found an
+   allowed side-channel instead (wrote a plan file to `~/.claude/plans/`,
+   outside the working directory, and asked for confirmation before writing
+   the actual requested file).
+
+Across all seven, `permission_denials` never populated: the model either
+self-censors before attempting a disallowed action (a judgment-level
+refusal, not a permission-system-level one), finds an allowed alternative
+path, or the action turns out to be permitted after all. None of the
+headless, flag-only scenarios this harness can construct reach the
+"model attempts a visible tool, permission layer rejects it" path this field
+is presumably for. A real populated example likely needs either genuine
+interactive rejection (a human or a custom `--permission-prompt-tool`
+returning deny) or a fine-grained pattern rule (e.g. `Bash(rm *)` denied
+while `Bash(*)` is otherwise allowed) that a headless smoke script can't
+trivially construct. Given the model/`total_cost_usd` bug above came from
+exactly this mistake -- assuming an unverified schema -- this is
+deliberately left unbuilt rather than guessed at. Building it correctly
+needs one real captured example of a populated entry first; that's now a
+known dead end for cheap headless reproduction, not just an untried idea.
+
 ## How to try it
 
 ```sh

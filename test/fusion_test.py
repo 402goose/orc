@@ -107,6 +107,41 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
         self.assertEqual(result["tests"], ["python -m unittest"])
         self.assertEqual(result["blockers"], [])
 
+    def test_claude_json_result_extracts_model_and_cost_from_real_cli_shape(self):
+        # Matches the actual shape of `claude -p --output-format json` output:
+        # no top-level model/model_id, cost as total_cost_usd (not inside
+        # usage), and the model name as a key under modelUsage.
+        claude = self.write_agent(
+            "claude-real-shape",
+            """
+import json
+print(json.dumps({
+    'type': 'result',
+    'subtype': 'success',
+    'is_error': False,
+    'session_id': 'real-shape-session',
+    'result': 'STATUS: success\\nSUMMARY: did real work\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none',
+    'total_cost_usd': 0.183226,
+    'usage': {'input_tokens': 10, 'output_tokens': 2003, 'cache_creation_input_tokens': 31076, 'cache_read_input_tokens': 194360},
+    'modelUsage': {'claude-sonnet-5': {'inputTokens': 10, 'outputTokens': 2003, 'costUSD': 0.183226}},
+}))
+""",
+        )
+        self.config(claude=claude)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                fusion_core.main(
+                    ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "do real work"]
+                ),
+                0,
+            )
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["model"], "claude-sonnet-5")
+        self.assertEqual(result["usage"]["cost_usd"], 0.183226)
+        self.assertEqual(result["usage"]["input_tokens"], 10)
+
     def test_agy_result_is_structured_and_session_is_resumed(self):
         calls = str(self.calls)
         agy = self.write_agent(

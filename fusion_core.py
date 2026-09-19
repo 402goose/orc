@@ -518,8 +518,18 @@ def parse_claude_output(stdout: str) -> tuple[str | None, str, str | None, dict[
     session_id = value.get("session_id")
     text = str(value.get("result") or value.get("message") or "")
     failure = text if value.get("is_error") else None
-    usage = value.get("usage") or {}
+    usage = dict(value.get("usage") or {})
+    # Real `claude -p --output-format json` puts cost at the top level as
+    # total_cost_usd, not inside usage, and does not have a top-level model/
+    # model_id field at all -- the model lives as a key in modelUsage. Older
+    # or synthetic output that already sets these directly is left alone.
+    if "cost_usd" not in usage and "cost" not in usage and value.get("total_cost_usd") is not None:
+        usage["cost_usd"] = value["total_cost_usd"]
     model = value.get("model") or value.get("model_id")
+    if not model:
+        model_usage = value.get("modelUsage")
+        if isinstance(model_usage, dict) and model_usage:
+            model = next(iter(model_usage))
     return session_id, text, failure, usage, model
 
 
