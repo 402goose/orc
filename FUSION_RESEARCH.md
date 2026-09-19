@@ -169,6 +169,22 @@ receipt`. The next work should make the other nodes explicit.
    Test this with a no-op Saloon rerun and prove that unchanged accepted nodes
    are not dispatched while changed evidence invalidates only downstream work.
 
+   **Open in #9.** Implemented as `WorkflowRunner._invalidate_stale_receipts()`:
+   each accepted node's digest chains its own definition (task, role, agent,
+   route, required files, acceptance) with its dependencies' digests, so
+   invalidation cascades downstream automatically. One deliberate deviation
+   from the hypothesis above: the resolved **model** is recorded on the
+   receipt for provenance but excluded from the digest itself.
+   `orc-free`/`orc-best` are designed to re-resolve to a different model as
+   the catalog shifts; hashing that in would invalidate a cached node on
+   every catalog reshuffle even though nothing about the task changed,
+   making resume useless for exactly the routes most likely to use it.
+   Verified end to end through the real `fusion` CLI (not just unit tests):
+   a no-op resume redispatched nothing, and resuming with one edited node's
+   task text redispatched only that node and its downstream dependent,
+   confirmed against the real subprocess call log and the `node.stale`
+   events in `.fusion/workflows/<id>/events.jsonl`.
+
 2. **Use MapReduce-style straggler handling for expensive workers.** The
    [MapReduce paper](https://research.google.com/archive/mapreduce-osdi04.pdf)
    describes backup tasks for slow workers. Fusion can launch one hedge after
@@ -190,6 +206,21 @@ receipt`. The next work should make the other nodes explicit.
    are the closest adjacent design. Test by injecting a provider limit and
    verifying zero worker dispatches, one admission event, and a resumable
    manifest.
+
+   **Shipped in #6.** `select_orc_model` now requires a model that passed
+   `orc probe --fit` unless a route/task/node explicitly sets
+   `allow_untested: true`. `WorkflowRunner` preflights each agent lane before
+   the first dispatch (executable on PATH, and — on a fresh run, not a
+   resume — the most recent trace for that agent within 15 minutes) and
+   reactively cools a lane down the moment any node in the run hits a quota
+   failure, so the rest of that wave stops dispatching into a lane already
+   known dead. Landed with three lane states (`healthy`, `blocked`,
+   `cooldown`) rather than the four proposed above — `degraded` had no
+   concrete trigger condition once the other three covered the observed
+   failure modes, so it was left out rather than added speculatively.
+   Verified live: a real fan-out that hit a quota failure mid-wave correctly
+   cooled that lane, and a brand-new second workflow in the same workspace
+   made zero dispatch attempts because preflight saw the still-fresh trace.
 
 4. **Make synthesis a provenance query, not a prose merge.** Saloon's output
    is evidence-backed, so every accepted claim should point to its source
@@ -215,24 +246,44 @@ receipt`. The next work should make the other nodes explicit.
 
 ### Build order
 
-The next PR should stay narrow and operational:
+Status as of this writing — 1, 2, and 4 merged; 3 open for review; 5 partially
+done:
 
-1. Add route admission/preflight. Refuse `UNTESTED` ORC models unless a
-   workflow explicitly opts in, and collapse a known provider outage into one
-   blocked lane before fan-out.
-2. Add `fusion workflow report RUN_ID`, combining node waves, blockers,
-   latency, token/cost totals, artifact acceptance, and the next resume
-   command. The Saloon assessment should be one command instead of manually
-   joining `status`, `trace`, `usage`, and events.
-3. Add workflow/spec/input digests and route/model versions to manifests and
-   node receipts. Resume should reuse accepted work only when those digests
-   still match; provider session resume becomes an optimization.
-4. Land the stale fan-in receipt fix from the local follow-up branch. A fan-in
-   node must wait until all dependencies reach terminal states before writing
-   its blocker receipt, otherwise a later resume sees a misleading graph.
-5. Add a deterministic evidence/provenance fixture and one real two-worker
-   smoke after provider quotas reset. Only then tune model choice, speculative
-   hedging, or larger fan-out.
+1. ✅ **Merged in #6.** Route admission/preflight. Refuse `UNTESTED` ORC
+   models unless a workflow explicitly opts in, and collapse a known
+   provider outage into one blocked lane before fan-out.
+2. ✅ **Merged in #7.** `fusion workflow report RUN_ID`, combining node
+   waves, blockers, latency, token/cost totals, artifact acceptance, and the
+   next resume command. The Saloon assessment is now one command instead of
+   manually joining `status`, `trace`, `usage`, and events.
+3. 🔶 **Open in #9.** Workflow/spec/input digests and route/model versions
+   on manifests and node receipts. Resume reuses accepted work only when
+   those digests still match; provider session resume is unaffected. See
+   the resolution note on hypothesis 1 above for what shipped and the one
+   deliberate deviation (model excluded from the digest itself).
+4. ✅ **Merged in #4.** The stale fan-in receipt fix. A fan-in node now
+   waits until all dependencies reach terminal states before writing its
+   blocker receipt.
+5. 🔶 **Partially done.** `FUSION_REAL=1 make dogfood-real` ran against live
+   Claude and Codex: Claude succeeded end-to-end with real usage recorded;
+   Codex hit its actual OpenAI usage limit (external quota, not a harness
+   bug — reset time was in the error). That single-worker-per-agent smoke
+   is not the same thing as the two-worker real ORC smoke or the six-node
+   Saloon replay described below, which are still open, and no deterministic
+   evidence/provenance fixture has been built yet. The live pass did already
+   pay for itself once: it surfaced a real `model`/cost parsing bug, fixed
+   in #10 — `parse_claude_output` assumed a top-level `model`/`model_id`
+   field and `usage.cost_usd` that don't exist in real `claude -p
+   --output-format json` output (the model is a key under `modelUsage`; cost
+   is the top-level `total_cost_usd`), so every real dispatch was recording
+   `model: ""` and `$0` spent regardless of actual cost — meaning
+   `budget_usd`/`max_budget_usd` were not being enforced for any real
+   dispatch. A fixture-only test suite would never have caught that, since
+   the fixtures encode the same assumption the parser did; `parse_codex_events`
+   makes the identical top-level `model`/`model_id` assumption and hasn't
+   been checked against a real successful Codex response yet, since Codex
+   has been quota-gated this whole session — flagged rather than patched
+   blind.
 
 The test ladder should be: deterministic fake workers; a two-node real ORC
 smoke; the six-node Saloon read-only graph; and finally one writer in a
@@ -355,14 +406,14 @@ otherwise-successful turn was silently dropped, which is now fixed too.
 
 ## How to try it
 
+See the README's [Fusion](README.md#fusion-claude-lead--codex-sidekick)
+section for the current command set (`lead`/`delegate`/`ultra`/`workflow`,
+plus `agy` as a third worker) — kept in one place instead of duplicated here
+to avoid the two drifting apart. Minimal bootstrap:
+
 ```sh
 ./install.sh
 fusion doctor
-fusion lead
-fusion lead --agent codex
-fusion delegate --agent codex --role implementation \
-  --success 'tests pass' \
-  'Implement the bounded change and report the files and tests.'
 ```
 
 Use `.fusion.json` in a repository to pin commands, models, permission modes, timeouts, and the default lead. Do not put API keys in that file.
