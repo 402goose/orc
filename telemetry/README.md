@@ -5,6 +5,18 @@ deliberately reduced batch of span records from `fusion` clients that have
 `telemetry.remote.enabled: true` in their `.fusion.json`, and stores them in
 Postgres.
 
+**Deployed:** `https://orc-telemetry.fly.dev` (Fly app `orc-telemetry`,
+Postgres cluster `orc-telemetry-db`, org `jfl`). Verified live end to end:
+`/healthz` returns 200, `/v1/ingest` correctly rejects missing/wrong auth
+with 401, and a real authenticated payload lands in Postgres with the
+expected reduced fields.
+
+If `orc-telemetry.fly.dev` doesn't resolve from a given machine but `fly
+status` shows the app healthy, check whether Tailscale's MagicDNS resolver
+(`100.100.100.100`) is intercepting DNS and not forwarding `fly.dev` --
+`nslookup orc-telemetry.fly.dev 8.8.8.8` will resolve correctly even when
+the default resolver doesn't.
+
 Sized for a handful of known collaborators (a few people, not public
 internet scale): a single shared bearer token, no per-install rate limiting,
 no multi-tenant auth.
