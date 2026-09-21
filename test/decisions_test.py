@@ -360,6 +360,30 @@ class DecisionsTest(unittest.TestCase):
         report = fit_calibration(path, self.workspace / "qualified.json")
         self.assertTrue(next(iter(report["buckets"].values()))["qualified"])
 
+    def test_calibration_reports_ece_reliability_and_certain_errors(self):
+        path, rows = self.calibration_data()
+        rows[25]["labels"] = {"action": "stop"}
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        bucket = next(iter(fit_calibration(path, self.workspace / "report.json")["buckets"].values()))
+        self.assertEqual(bucket["certain_errors"], {"0.9": 1, "0.95": 1, "0.99": 1})
+        self.assertEqual(len(bucket["reliability"]), 1)
+        self.assertEqual((bucket["reliability"][0]["floor"], bucket["reliability"][0]["count"], bucket["reliability"][0]["accuracy"]), (0.9, 20, 0.95))
+        self.assertAlmostEqual(bucket["ece"], bucket["reliability"][0]["confidence"] - 0.95, places=6)
+
+    def test_evaluate_control_exposes_a_backend_that_ignores_the_state(self):
+        from fusion_laya import evaluate
+        path, rows = self.calibration_data()
+        class Blind:
+            def predict(self, request):
+                return {"answers": {"action": {"probabilities": {"repair": .9, "stop": .1}}}, "model_identity": "blind", "truncated": False}
+        args = argparse.Namespace(dataset=str(path), output=str(self.workspace / "predictions.jsonl"), model_path="", device="cpu", control=True)
+        with patch("fusion_laya.Backend", return_value=Blind()):
+            report = evaluate(args)
+        self.assertEqual((report["validation_questions"], report["accuracy"], report["control_accuracy"]), (20, 1.0, 1.0))
+        args = argparse.Namespace(dataset=str(path), output=str(self.workspace / "plain.jsonl"), model_path="", device="cpu")
+        with patch("fusion_laya.Backend", return_value=Blind()):
+            self.assertIsNone(evaluate(args)["control_accuracy"])
+
     def test_calibration_rejects_train_validation_leakage(self):
         path, rows = self.calibration_data()
         rows[-1]["group"] = rows[0]["group"]

@@ -383,20 +383,36 @@ def fit_calibration(dataset, output, threshold=0.9):
         correct = confident = confident_correct = 0
         confident_groups = set()
         brier = 0.0
+        bins = [[0, 0.0, 0] for _ in range(10)]
+        certain_errors = {"0.9": 0, "0.95": 0, "0.99": 0}
         for probs, label, group in validation:
             p = temperature_scale(probs, temperature)
             selected = max(p, key=p.get)
-            correct += selected == label
+            hit = selected == label
+            correct += hit
             brier += sum((v - (k == label)) ** 2 for k, v in p.items())
-            if p[selected] >= threshold:
+            top = p[selected]
+            bucket_bin = bins[min(9, int(top * 10))]
+            bucket_bin[0] += 1
+            bucket_bin[1] += top
+            bucket_bin[2] += hit
+            for floor in certain_errors:
+                if top >= float(floor) and not hit:
+                    certain_errors[floor] += 1
+            if top >= threshold:
                 confident += 1
-                confident_correct += selected == label
+                confident_correct += hit
                 confident_groups.add(group)
         selective_accuracy = confident_correct / confident if confident else None
+        # Expected calibration error over the selected label's probability, ten equal bins.
+        reliability = [{"floor": index / 10, "count": count, "confidence": total / count, "accuracy": hits / count}
+                       for index, (count, total, hits) in enumerate(bins) if count]
+        ece = sum(item["count"] / len(validation) * abs(item["accuracy"] - item["confidence"]) for item in reliability) if validation else None
         report["buckets"][key] = {
             "temperature": temperature, "threshold": threshold, "train": len(train), "validation": len(validation),
             "accuracy": correct / len(validation) if validation else None,
             "brier": brier / len(validation) if validation else None,
+            "ece": ece, "reliability": reliability, "certain_errors": certain_errors,
             "coverage": confident / len(validation) if validation else 0,
             "selective_accuracy": selective_accuracy,
             "train_groups": len({group for _, _, group in train}), "confident_validation_groups": len(confident_groups),
