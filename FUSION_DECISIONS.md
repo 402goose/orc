@@ -108,6 +108,8 @@ uncached models, timeouts and invalid predictions cause abstention.
 ```sh
 orc fusion decisions status
 orc fusion decisions probe "Implement CSV export with tests"
+orc fusion decisions probe --kind acceptance \
+  '{"task": "Add CSV export with tests", "summary": "did nothing", "changed": [], "tests": []}'
 orc fusion decisions list --limit 10
 orc fusion decisions show DECISION_ID
 orc fusion delegate --agent auto --read-only "Map the checkout retry logic"
