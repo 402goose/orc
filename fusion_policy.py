@@ -37,7 +37,7 @@ def route_candidates(config, task, store):
         lane = config.get("routes", {}).get(span.get("route"), {})
         settings = {**config.get(agent, {}), **lane}
         family = (agent, settings.get("command", agent))
-        if key not in seen and 0 <= time.time() * 1000 - span.get("end_time_ms", 0) < 900_000:
+        if key not in seen and 0 <= time.time() * 1000 - span.get("end_time_ms", 0) < core.LANE_COOLDOWN_SECONDS * 1000:
             if span.get("failure_class") in {"quota", "permission_denied"}:
                 unhealthy.add(key)
                 if family not in seen_commands and Path(str(family[1])).name != "orc":
@@ -161,11 +161,13 @@ def recovery(config, workspace, workflow_id, node, result, accepted, max_attempt
     import fusion_core as core
     engine = DecisionEngine(workspace, config)
     failure = core.failure_class(result)
-    can_retry = node["attempts"] < max_attempts
+    repeated = bool(node.get("repeated_failure"))
+    can_retry = node["attempts"] < max_attempts and not repeated
     actual = "continue" if accepted else "stop" if failure in {"quota", "permission_denied"} or not can_retry else "repair"
     record = engine.decide("recovery", {"status": result.get("status"), "accepted": accepted,
                                        "failure": failure, "blockers": result.get("blockers", []),
                                        "attempt": node["attempts"], "max_attempts": max_attempts,
+                                       "repeated_failure": repeated,
                                        "automatic_lane": node["agent"] == "auto"}, RECOVERY_QUESTIONS,
                            {"task_id": result.get("run_id"), "group": workflow_id})
     applied = False
