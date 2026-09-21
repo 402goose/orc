@@ -43,12 +43,12 @@ RECOVERY_QUESTIONS = {
                             "switch": "worker unavailable; another permitted worker may help", "ask": "missing user decision or permission",
                             "stop": "external blocker; do not retry now"}},
 }
+# Two single-clause nouls of opposite polarity; a rejection needs both to agree.
+# A double-barreled "does it satisfy, or is it off-task?" phrasing inverted the
+# live model's answer on real workflow states.
 ACCEPTANCE_QUESTIONS = {
-    "plausible": {"type": "noul", "instructions": "This node's structural checks already passed (required files "
-                  "exist and changed, required handoff fields present, acceptance commands exited 0). Given the "
-                  "node's task and the worker's reported summary/changed evidence, does the reported success "
-                  "plausibly satisfy the task, or does it look like a syntactically valid but substantively wrong "
-                  "or off-task result?"},
+    "plausible": {"type": "noul", "instructions": "Does the worker's reported summary and evidence plausibly satisfy the task?"},
+    "off_task": {"type": "noul", "instructions": "Is the reported success off-task or substantively wrong for the task?"},
 }
 
 
