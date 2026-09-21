@@ -233,6 +233,13 @@ accuracy. This is a rollout gate, not proof of generalization. Small
 datasets remain unqualified. Calibration currently targets one model
 identity per report; other language checkpoints abstain from active actions.
 
+Temperature calibration sharpens a distribution whose ordering is already
+right; it cannot make a wrong answer right. Run `test/laya_benchmark.py`
+before choosing where to spend labeling effort: a kind that ranks the
+clear-cut cases correctly at low confidence is the one calibration can carry
+over the threshold, and a kind that returns the same answer for most states
+will not qualify however many workflows are labeled.
+
 Compare candidate and baseline reports before setting `model_path`,
 `calibration_file`, `mode: active` and selected `auto_actions`. None of those
 settings is changed by train, evaluate or calibrate. Output commands refuse
@@ -250,6 +257,7 @@ ordinary inference and training use cached/local files offline.
 make test dogfood
 make dogfood-paired
 ~/.local/share/orc/laya/bin/python test/laya_smoke.py --train
+~/.local/share/orc/laya/bin/python test/laya_benchmark.py
 ```
 
 `dogfood-paired` runs the fixture fan-out workflow twice, with decisions off
@@ -264,6 +272,12 @@ runtime and pays one cold start.
 and asserts only the clear-cut ones: a clean success reads plausible, a
 "did nothing" claim and a plausible-sounding off-task summary do not. The
 near-misses print for comparison and are not asserted.
+The benchmark runs authored cases, including deliberate near-misses, against
+the installed checkpoint and prints per-kind accuracy on the clear-cut ones,
+the probability range, and how many distinct answers the kind produced. It
+answers, before anyone spends weeks labeling, whether a decision kind has any
+signal on this checkpoint at all. Re-run it after a fine-tune or a checkpoint
+change to see what moved. It uses synthetic inputs and contributes no labels.
 
 The standard tests use isolated fixtures and require no Laya installation
 or coding-agent calls. The optional smoke test exercises real cached-model
