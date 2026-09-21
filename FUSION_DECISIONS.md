@@ -254,6 +254,7 @@ ordinary inference and training use cached/local files offline.
 ```sh
 make test dogfood
 make dogfood-paired
+~/.local/share/orc/laya/bin/python test/laya_smoke.py --train --acceptance
 ```
 
 `dogfood-paired` runs the fixture fan-out workflow twice, with decisions off
