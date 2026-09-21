@@ -161,14 +161,19 @@ printf 'fusion dogfood passed: claude/codex/agy subprocesses, handoffs, traces, 
 if [ "${FUSION_DOGFOOD_PAIRED:-0}" = "1" ]; then
   LAYA_PYTHON="$HOME/.local/share/orc/laya/bin/python"
   test -x "$LAYA_PYTHON" || { printf 'dogfood-paired: run `orc fusion decisions setup` first\n' >&2; exit 1; }
-  PAIRED_RESULT="$(FUSION_DECISIONS_MODE=shadow PYTHONDONTWRITEBYTECODE=1 "$ROOT/fusion" --workspace "$WORKSPACE" --json workflow run "$WORKSPACE/workflow.json")"
+  fail() { printf 'dogfood-paired failed: %s\n' "$1" >&2; exit 1; }
+  PAIRED_RESULT="$(FUSION_DECISIONS_MODE=shadow PYTHONDONTWRITEBYTECODE=1 "$ROOT/fusion" --workspace "$WORKSPACE" --json workflow run "$WORKSPACE/workflow.json")" \
+    || fail "shadow workflow run exited non-zero"
   diff <(printf '%s\n' "$WORKFLOW_RESULT" | jq -S '[.nodes[] | {id, status, attempts}]') \
-       <(printf '%s\n' "$PAIRED_RESULT" | jq -S '[.nodes[] | {id, status, attempts}]')
-  printf '%s\n' "$PAIRED_RESULT" | jq -e 'all(.nodes[]; .result.decisions.recovery != null)' >/dev/null
-  jq -s -e '[.[] | select(.event == "decision" and .kind == "recovery")] | length == 6 and all(.[]; .status == "ok")' \
-    "$WORKSPACE/.fusion/decisions/events.jsonl" >/dev/null
+       <(printf '%s\n' "$PAIRED_RESULT" | jq -S '[.nodes[] | {id, status, attempts}]') \
+    || fail "shadow mode changed a node status or attempt count (diff above: off vs shadow)"
+  printf '%s\n' "$PAIRED_RESULT" | jq -e 'all(.nodes[]; .result.decisions.recovery != null)' >/dev/null \
+    || fail "a node receipt has no recovery decision id"
+  DECISIONS="$WORKSPACE/.fusion/decisions/events.jsonl"
+  jq -s -e '[.[] | select(.event == "decision" and .kind == "recovery")] | length == 6 and all(.[]; .status == "ok")' "$DECISIONS" >/dev/null \
+    || { jq -c 'select(.event == "decision") | {kind, status, error}' "$DECISIONS" >&2; fail "expected 6 recovery decisions with status ok (records above)"; }
   PAIRED_REPORT="$(PYTHONDONTWRITEBYTECODE=1 "$ROOT/fusion" --workspace "$WORKSPACE" workflow report "$(printf '%s\n' "$PAIRED_RESULT" | jq -r .workflow_id)" --brief)"
-  printf '%s\n' "$PAIRED_REPORT" | grep -q 'laya recovery: action='
-  printf '%s\n' "$PAIRED_REPORT" | grep -q '^Gate: 6 accepted, 0 rejected'
+  printf '%s\n' "$PAIRED_REPORT" | grep -q 'laya recovery: action=' || { printf '%s\n' "$PAIRED_REPORT" >&2; fail "report has no laya recovery line"; }
+  printf '%s\n' "$PAIRED_REPORT" | grep -q '^Gate: 6 accepted, 0 rejected' || { printf '%s\n' "$PAIRED_REPORT" >&2; fail "report gate count is not 6 accepted, 0 rejected"; }
   printf 'fusion dogfood paired: shadow recorded 6 recovery decisions and changed no node outcome\n'
 fi
