@@ -63,8 +63,11 @@ it. Interactive lead sessions use their own provider controls.
 
 ## What changes at each decision point
 
-1. **Intake:** recommends discovery, build, debug or review; records whether
-   clarification appears necessary. Explicit scope is authoritative.
+1. **Intake:** recommends discovery, build, debug or review, and whether a
+   consequential product decision is missing. A qualified clarification
+   flag turns a build or debug workflow into discovery and tells the brief
+   to name the missing decision; it can remove the implementation node,
+   never add one. Explicit scope and `--kind` are authoritative.
 2. **Routing:** `--agent auto` and workflow nodes with `"agent": "auto"`
    choose among available native workers and configured ORC routes. Inputs
    include task, write permission, routing goal, reported costs/latency,
@@ -79,7 +82,9 @@ it. Interactive lead sessions use their own provider controls.
    Repairs receive the previous result and log paths. Quota failures pause
    by default. User-requested resume is an explicit new attempt.
 4. **Review:** adds general, security, payments or data-integrity checks to
-   read-only review workers. Generated implementation workflows always
+   read-only review workers. The specialty is applied only when the paired
+   "needs an independent review" question agrees; the two question types
+   fail in different places. Generated implementation workflows always
    retain their independent review. The classifier cannot remove it or
    authorize writes. A different installed worker is preferred; otherwise
    review uses a fresh context on an available worker.
