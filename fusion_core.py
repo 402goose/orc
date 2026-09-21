@@ -20,10 +20,14 @@ import urllib.request
 import uuid
 from typing import Any, Iterator
 
+from fusion_decisions import DEFAULTS as DECISION_DEFAULTS
+import fusion_progress as progress
+
 
 SCHEMA = "fusion.v1"
 TELEMETRY_SCHEMA = "fusion.telemetry.v1"
 DEFAULTS: dict[str, Any] = {
+    "decisions": DECISION_DEFAULTS,
     "lead": "claude",
     "sidekick": "codex",
     "timeout_seconds": 3600,
@@ -289,11 +293,11 @@ def failure_class(result: dict[str, Any]) -> str | None:
     to make local `fusion usage` slicing easier and as the only failure
     signal sent in a remote telemetry payload -- raw blocker text can
     contain project-specific detail and is never sent remotely."""
-    if result.get("status") in {"success", "cache_hit"}:
-        return None
     text = " ".join(str(item) for item in result.get("blockers", [])).lower()
     if "permission denied" in text or "agy denied" in text:
         return "permission_denied"
+    if result.get("status") in {"success", "cache_hit"}:
+        return None
     if any(marker in text for marker in ("usage limit", "session limit", "rate limit", "quota", "resets at", "resets ")):
         return "quota"
     if result.get("exit_code") == 124 or "timeout" in text:
@@ -601,6 +605,7 @@ def parse_codex_events(stdout: str) -> tuple[str | None, str, str | None, dict[s
     failure: str | None = None
     usage: dict[str, Any] = {}
     non_json: list[str] = []
+    command_evidence: list[str] = []
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -616,6 +621,19 @@ def parse_codex_events(stdout: str) -> tuple[str | None, str, str | None, dict[s
             item = event.get("item") or {}
             if item.get("type") == "agent_message" and item.get("text"):
                 messages.append(str(item["text"]))
+            elif item.get("type") == "command_execution":
+                # A structural signal Fusion previously never looked at: the
+                # turn can complete and the worker's own STATUS line can
+                # still claim success while a command it actually ran
+                # failed. Surfaced as evidence (a blocker), not an automatic
+                # status override -- a nonzero exit isn't always a real
+                # failure (grep returning 1 for "no matches" is routine),
+                # so this is data for a human or an acceptance gate to
+                # weigh, the same way permission denials already are.
+                exit_code = item.get("exit_code")
+                if isinstance(exit_code, int) and exit_code != 0:
+                    command = compact(str(item.get("command") or "command"), 200)
+                    command_evidence.append(f"command exited {exit_code}: {command}")
         elif event_type == "turn.completed":
             usage = event.get("usage") or {}
         elif event_type == "turn.failed":
@@ -623,7 +641,7 @@ def parse_codex_events(stdout: str) -> tuple[str | None, str, str | None, dict[s
         elif event_type == "error":
             failure = str(event.get("message") or "Codex emitted an error")
     text = messages[-1] if messages else "\n".join(non_json)
-    return thread_id, text, failure, usage, model, []
+    return thread_id, text, failure, usage, model, command_evidence
 
 
 def parse_claude_output(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None, list[str]]:
@@ -780,7 +798,7 @@ def agent_command(
     if agent == "agy":
         command = settings.get("command", "agy")
         mode_key = str(settings.get("mode") or settings.get("permission_mode") or "")
-        mode = AGY_MODE_ALIASES.get(mode_key) or ("accept-edits" if task["write"] else "plan")
+        mode = (AGY_MODE_ALIASES.get(mode_key) or "accept-edits") if task["write"] else "plan"
         argv = [command, "-p", brief_for(task), "--output-format", "json", "--mode", mode]
         selected_model = str(settings.get("model", ""))
         if selected_model:
@@ -840,6 +858,12 @@ def dispatch(
     store: RunStore,
     run_dir: Path | None = None,
 ) -> dict[str, Any]:
+    from fusion_policy import route_task, review_task
+    if os.environ.get("FUSION_READ_ONLY") == "1" and task["write"]:
+        raise ValueError("this Fusion session permits read-only work only")
+    route_task(config, task, store)
+    if "review" in task["role"].lower() and not task["write"]:
+        review_task(config, task)
     run_dir = run_dir or store.create(task)
     store.event(run_dir, "run.started", {"agent": task["agent"], "write": task["write"]})
     started_at_ms = now_ms()
@@ -851,6 +875,7 @@ def dispatch(
     store.write_json(run_dir / "task.json", task)
     binary = executable(argv[0])
     if binary is None:
+        progress.emit(task.get("progress_label", task["role"]), f"cannot start {task['agent']}: executable unavailable")
         result = {
             "schema": SCHEMA,
             "run_id": task["run_id"],
@@ -882,35 +907,41 @@ def dispatch(
     usage: dict[str, Any] = {}
     model = metadata.get("model")
     handoff: dict[str, Any] = {}
-    denial_notes: list[str] = []
+    evidence_notes: list[str] = []
     exit_code = 1
+    label = task.get("progress_label", task["role"])
+    progress.emit(label, f"selected {task['agent']} ({task.get('route') or 'native'}); {'write permitted' if task['write'] else 'read-only'}")
     try:
-        with writer_lock(Path(task["workspace"]), task["write"]):
+        with contextlib.ExitStack() as stack:
+            with progress.activity(label, "acquiring workspace writer lock" if task["write"] else "preparing read-only worker"):
+                stack.enter_context(writer_lock(Path(task["workspace"]), task["write"]))
             store.event(run_dir, "worker.started", {"argv": argv, "resumed_session": bool(session_id)})
-            completed = subprocess.run(
+            completed = progress.run_logged(
                 argv,
                 cwd=task["workspace"],
                 env=env,
                 input=prompt if task["agent"] == "codex" else None,
-                capture_output=True,
-                text=True,
                 timeout=int(config.get("timeout_seconds", 3600)),
-                check=False,
+                stdout_path=stdout_path, stderr_path=stderr_path, label=label,
             )
         exit_code = completed.returncode
-        stdout_path.write_text(completed.stdout, encoding="utf-8")
-        stderr_path.write_text(completed.stderr, encoding="utf-8")
         if task["agent"] == "codex":
-            new_session, summary, failure, usage, event_model, denial_notes = parse_codex_events(completed.stdout)
+            new_session, summary, failure, usage, event_model, evidence_notes = parse_codex_events(completed.stdout)
         elif task["agent"] == "agy":
-            new_session, summary, failure, usage, event_model, denial_notes = parse_agy_output(completed.stdout)
+            new_session, summary, failure, usage, event_model, evidence_notes = parse_agy_output(completed.stdout)
         else:
-            new_session, summary, failure, usage, event_model, denial_notes = parse_claude_output(completed.stdout)
+            new_session, summary, failure, usage, event_model, evidence_notes = parse_claude_output(completed.stdout)
+        # Preserve the public deliverable outside the compact receipt and trace.
+        if summary.strip():
+            answer_path = run_dir / "answer.md"
+            with open(answer_path, "w", encoding="utf-8", opener=lambda name, flags: os.open(name, flags, 0o600)) as stream:
+                stream.write(summary.strip() + "\n")
         model = event_model or model
         handoff = parse_handoff(summary)
         if new_session:
             store.set_session(task["session_key"], new_session)
-        if failure:
+        # Codex command exits remain evidence; provider permission denials fail.
+        if failure or (task["agent"] != "codex" and evidence_notes):
             status = "error"
         elif exit_code == 0:
             status = handoff.get("reported_status") or "success"
@@ -918,10 +949,6 @@ def dispatch(
             status = "error"
             failure = failure or f"worker exited with code {exit_code}"
     except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        stdout_path.write_text(stdout, encoding="utf-8")
-        stderr_path.write_text(stderr, encoding="utf-8")
         summary = "worker timed out"
         failure = f"timeout after {config.get('timeout_seconds', 3600)} seconds"
         status = "blocked"
@@ -931,7 +958,10 @@ def dispatch(
         failure = str(exc)
         status = "error"
         exit_code = 126
+    except progress.WorkerCancelled as exc:
+        summary, failure, status, exit_code = "worker interrupted", str(exc), "blocked", 130
     duration_ms = int((time.monotonic() - started) * 1000)
+    progress.emit(label, f"worker {status} after {progress.elapsed(duration_ms / 1000)}; exit {exit_code}")
     result = {
         "schema": SCHEMA,
         "run_id": task["run_id"],
@@ -943,14 +973,16 @@ def dispatch(
         "summary": compact(str(handoff.get("summary") or summary).strip(), int(config.get("max_result_chars", 12000))),
         "changed": handoff.get("changed", []),
         "tests": handoff.get("tests", []),
-        "blockers": handoff.get("blockers", []) + denial_notes + ([failure] if failure else []),
+        "blockers": handoff.get("blockers", []) + evidence_notes + ([failure] if failure else []),
         "exit_code": exit_code,
         "duration_ms": duration_ms,
         "usage": usage,
+        "decisions": task.get("decisions", {}),
         "artifacts": {
             "run_dir": str(run_dir),
             "stdout": str(stdout_path),
             "stderr": str(stderr_path),
+            **({"answer": str(run_dir / "answer.md")} if (run_dir / "answer.md").exists() else {}),
         },
     }
     store.write_json(run_dir / "result.json", result)
@@ -1023,6 +1055,7 @@ def run_ultra(
     previous_paths: list[str] = []
     pipeline_status = "success"
     for index, stage_name in enumerate(stage_names, start=1):
+        progress.emit("ultra", f"stage {index}/{len(stage_names)}: {stage_name}")
         raw_stage = configured_stages.get(stage_name) or {}
         if not isinstance(raw_stage, dict):
             raise ValueError(f"ultra stage {stage_name} must be an object")
@@ -1127,7 +1160,7 @@ def tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "agent": {"type": "string", "enum": ["codex", "claude", "agy"]},
+                    "agent": {"type": "string", "enum": ["auto", "codex", "claude", "agy"]},
                     "task": {"type": "string"},
                     "role": {"type": "string", "default": "implementation"},
                     "success_criteria": {"type": "array", "items": {"type": "string"}},
@@ -1140,6 +1173,11 @@ def tool_definitions() -> list[dict[str, Any]]:
                 },
                 "required": ["agent", "task"],
             },
+        },
+        {
+            "name": "fusion_decisions",
+            "description": "Inspect local classifier advice; recommendations never confer permissions or replace verification.",
+            "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50}}},
         },
         {
             "name": "fusion_status",
@@ -1184,10 +1222,13 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
             try:
                 if name == "fusion_status":
                     payload = store.recent(int(args.get("limit", 10)))
+                elif name == "fusion_decisions":
+                    from fusion_decisions import DecisionStore
+                    payload = {"decisions": DecisionStore(workspace).records()[-max(1, min(50, int(args.get("limit", 10)))):]}
                 elif name == "fusion_delegate":
                     agent = args.get("agent")
-                    if agent not in {"codex", "claude", "agy"}:
-                        raise ValueError("agent must be codex, claude, or agy")
+                    if agent not in {"auto", "codex", "claude", "agy"}:
+                        raise ValueError("agent must be auto, codex, claude, or agy")
                     target = workspace_path(args["workspace"]) if args.get("workspace") else workspace
                     if target != workspace:
                         target_config, _ = load_config(target)
@@ -1225,14 +1266,27 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
 LEAD_PROMPT = """You are the lead agent in a Fusion harness. Own the user conversation, the plan, ambiguity, and final judgment. Use fusion_delegate for bounded work that benefits from a fresh context or a cheaper sidekick. Send a precise brief with success criteria and constraints. Keep writes single-threaded in the shared workspace. Review the returned handoff, inspect the diff and tests yourself, and take control back when the sidekick is out of depth. Do not delegate the final decision or silently accept an unverified result."""
 
 
-def mcp_config_file(workspace: Path) -> tuple[tempfile.NamedTemporaryFile, Path]:
+BUILD_PROMPT = """You are the lead for a Fusion feature build. Take the user's idea through requirements, implementation, verification, and review fixes. The user supplies the outcome; you own the coordination. Follow the repository instructions.
+
+1. Inspect the repository, existing behavior, and tests. Infer implementation details from its conventions. Turn the idea into a concise feature brief with observable acceptance criteria, scope, edge cases, and a small implementation plan. Save the brief and plan in a new directory under .fusion/builds/ so they remain available during the build.
+2. Ask only when a missing product decision materially changes behavior or scope, using at most three focused questions at a time. State reasonable assumptions and proceed when the scope is clear. Do not require the user to write a specification, select workers, or approve routine implementation decisions.
+3. Use fusion_delegate for a bounded investigation when it helps and for an independent review of the implementation. Choose an available Claude, Codex, or agy worker; prefer a different agent for review. Give each worker precise questions, success criteria, constraints, and the relevant brief or artifact paths. Set write=false for investigations and reviews. Tell workers not to delegate further. If a worker is unavailable, continue with another available worker or do the work yourself and disclose the missing independent review. Do not repeatedly retry an unavailable provider.
+4. Implement the feature across the relevant layers, including user-facing states and failure behavior where applicable. Keep the change scoped to the brief and preserve unrelated work. Keep one writer in the workspace at a time, including yourself: wait for any delegated writer before editing. Do not stop after planning or scaffolding.
+5. Run meaningful verification for the acceptance criteria and the repository's required checks. Add tests for changed behavior where useful. Have the reviewer inspect the actual diff and verification evidence. Verify review findings yourself, fix real issues, and rerun affected checks. Continue until the acceptance criteria are met or a concrete blocker prevents progress.
+6. Keep the user informed with concise progress updates. Finish with what shipped, what was tested, any remaining blockers, and how to try the feature. Never claim an unrun check passed or an unresolved requirement is complete.
+
+Feature idea:
+"""
+
+
+def mcp_config_file(workspace: Path, read_only: bool = False) -> tuple[tempfile.NamedTemporaryFile, Path]:
     script = Path(__file__).resolve().parent / "fusion"
     config = {
         "mcpServers": {
             "fusion": {
                 "command": sys.executable,
                 "args": [str(script), "mcp-serve"],
-                "env": {"FUSION_WORKSPACE": str(workspace)},
+                "env": {"FUSION_WORKSPACE": str(workspace), **({"FUSION_READ_ONLY": "1"} if read_only else {})},
             }
         }
     }
@@ -1243,18 +1297,20 @@ def mcp_config_file(workspace: Path) -> tuple[tempfile.NamedTemporaryFile, Path]
     return handle, Path(handle.name)
 
 
-def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str | None, interactive: bool = True) -> int:
+def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str | None, interactive: bool = True, read_only: bool = False) -> int:
     if agent == "claude":
         settings = config["claude"]
         command = executable(settings.get("command", "claude"))
         if not command:
             print("fusion: claude is not available on PATH", file=sys.stderr)
             return 127
-        handle, config_path = mcp_config_file(workspace)
+        handle, config_path = mcp_config_file(workspace, read_only)
         handle.close()
         argv = [command, "--mcp-config", str(config_path), "--append-system-prompt", LEAD_PROMPT]
+        if read_only and interactive:
+            argv += ["--permission-mode", "plan"]
         if not interactive:
-            argv += ["-p", "--output-format", "json", "--permission-mode", settings.get("permission_mode", "acceptEdits")]
+            argv += ["-p", "--output-format", "json", "--permission-mode", "plan" if read_only else settings.get("permission_mode", "acceptEdits")]
             permission_prompts = settings.get("permission_prompts")
             if permission_prompts:
                 argv += ["--permission-prompts", permission_prompts]
@@ -1263,6 +1319,8 @@ def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str |
         try:
             env = os.environ.copy()
             env["FUSION_WORKSPACE"] = str(workspace)
+            if read_only:
+                env["FUSION_READ_ONLY"] = "1"
             return subprocess.run(argv, cwd=workspace, env=env, check=False).returncode
         finally:
             config_path.unlink(missing_ok=True)
@@ -1274,7 +1332,10 @@ def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str |
             return 127
         script = Path(__file__).resolve().parent / "fusion"
         args_toml = json.dumps([str(script), "mcp-serve"])
-        argv = [command, "-C", str(workspace), "-s", settings.get("sandbox", "workspace-write"), "-a", "on-request", "-c", f"mcp_servers.fusion.command={json.dumps(sys.executable)}", "-c", f"mcp_servers.fusion.args={args_toml}"]
+        argv = [command, "-C", str(workspace), "-s", "read-only" if read_only else settings.get("sandbox", "workspace-write"), "-a", "never" if read_only else "on-request", "-c", f"mcp_servers.fusion.command={json.dumps(sys.executable)}", "-c", f"mcp_servers.fusion.args={args_toml}"]
+        argv += ["-c", f"mcp_servers.fusion.env.FUSION_WORKSPACE={json.dumps(str(workspace))}"]
+        if read_only:
+            argv += ["-c", 'mcp_servers.fusion.env.FUSION_READ_ONLY="1"']
         if settings.get("model"):
             argv += ["-m", settings["model"]]
         if interactive:
@@ -1286,6 +1347,8 @@ def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str |
                 argv.append(task)
         env = os.environ.copy()
         env["FUSION_WORKSPACE"] = str(workspace)
+        if read_only:
+            env["FUSION_READ_ONLY"] = "1"
         return subprocess.run(argv, cwd=workspace, env=env, check=False).returncode
     if agent == "agy":
         raise SystemExit("fusion: agy can be a sidekick, workflow node, or Ultra harness, but not (yet) the interactive lead")
@@ -1359,18 +1422,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fusion", description="Lead/sidekick orchestration for Claude Code, Codex CLI, and Antigravity CLI")
     parser.add_argument("--workspace", help="workspace to operate in; defaults to the current directory")
     parser.add_argument("--json", action="store_true", help="emit machine-readable output")
+    display = parser.add_mutually_exclusive_group()
+    display.add_argument("--progress", dest="progress", action="store_true", default=None, help="show live progress on stderr, including when redirected")
+    display.add_argument("--quiet", dest="progress", action="store_false", help="hide progress; keep the final result")
     sub = parser.add_subparsers(dest="command", required=True)
 
     lead = sub.add_parser("lead", help="launch an interactive lead agent with the Fusion MCP server")
     lead.add_argument("--agent", choices=["claude", "codex"], help="lead agent; defaults to .fusion.json or claude")
     lead.add_argument("task", nargs="?", help="optional initial task")
 
+    build = sub.add_parser("build", help="turn a feature idea into an interactive build, with planning and review instructions included")
+    build.add_argument("--agent", choices=["claude", "codex"], default="codex", help="lead agent (default: codex)")
+    build.add_argument("--kind", choices=["discovery", "build", "debug", "review"], help="explicit workflow; planning-only requests remain read-only")
+    build_mode = build.add_mutually_exclusive_group()
+    build_mode.add_argument("--plan-only", action="store_true", help="save the brief and workflow without starting coding agents")
+    build_mode.add_argument("--execute", action="store_true", help="execute the generated bounded workflow instead of an interactive lead")
+    build.add_argument("--budget-usd", type=float, default=0, help="stop workflow dispatches after recorded spend reaches this amount (0 disables)")
+    build.add_argument("--max-attempts", type=int, default=2)
+    build.add_argument("--from-workflow", metavar="RUN_ID", help="use a completed workflow's numbered recommendation as the new implementation request")
+    build.add_argument("--from-node", help="stage containing the recommendation; defaults to the final output")
+    build.add_argument("--finding", type=int, help="recommendation number from --from-workflow")
+    build.add_argument("idea", nargs="?", help="describe a feature, or add constraints to --from-workflow")
+
     run = sub.add_parser("run", help="launch a non-interactive lead turn with the Fusion MCP server")
     run.add_argument("--agent", choices=["claude", "codex"], help="lead agent; defaults to .fusion.json or claude")
     run.add_argument("task", help="initial task for the lead")
 
     delegate = sub.add_parser("delegate", help="run one bounded sidekick task")
-    delegate.add_argument("--agent", choices=["claude", "codex", "agy"], required=True)
+    delegate.add_argument("--agent", choices=["auto", "claude", "codex", "agy"], required=True)
     delegate.add_argument("--role", default="implementation")
     delegate.add_argument("--read-only", action="store_true", help="give the worker a read-only workspace")
     delegate.add_argument("--fresh", action="store_true", help="start a fresh agent session")
@@ -1399,9 +1478,18 @@ def build_parser() -> argparse.ArgumentParser:
     workflow_status = workflow_sub.add_parser("status", help="show a persisted workflow manifest")
     workflow_status.add_argument("run_id")
     workflow_report = workflow_sub.add_parser(
-        "report", help="combined waves/lanes/usage/blockers view of a workflow run"
+        "report", help="show final deliverables, findings, evidence, usage and next commands"
     )
     workflow_report.add_argument("run_id")
+    report_selection = workflow_report.add_mutually_exclusive_group()
+    report_selection.add_argument("--node", help="show a specific stage's full answer")
+    report_selection.add_argument("--all", action="store_true", help="show every stage's full answer")
+    workflow_report.add_argument("--finding", type=int, help="focus on a numbered recommendation and show its implementation preparation command")
+    workflow_report.add_argument("--brief", action="store_true", help="show status and summaries without the full answers")
+    workflow_report.add_argument("--output", help="save the displayed report as Markdown; refuses to overwrite an existing file")
+    workflow_watch = workflow_sub.add_parser("watch", help="watch saved progress without starting or restarting workers")
+    workflow_watch.add_argument("run_id", nargs="?", help="workflow or build ID; defaults to the most recently started workflow/build --execute, including intake")
+    workflow_watch.add_argument("--once", action="store_true", help="show a snapshot and exit")
 
     sub.add_parser("doctor", help="check the local CLI prerequisites")
     status = sub.add_parser("status", help="show recent runs")
@@ -1415,6 +1503,8 @@ def build_parser() -> argparse.ArgumentParser:
     telemetry_sub = telemetry.add_subparsers(dest="telemetry_command", required=True)
     telemetry_sub.add_parser("status", help="show what remote telemetry is configured to send, if any")
 
+    from fusion_decision_cli import add_parser
+    add_parser(sub)
     sub.add_parser("mcp-serve", help=argparse.SUPPRESS)
     return parser
 
@@ -1422,8 +1512,32 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    enabled = args.progress
+    if enabled is None:
+        setting = os.environ.get("FUSION_PROGRESS", "auto")
+        enabled = setting == "1" or setting == "auto" and sys.stderr.isatty() and not args.json
+    if args.command == "mcp-serve":
+        enabled = False
+    with progress.session(enabled):
+        try:
+            return _main(args, parser)
+        except KeyboardInterrupt:
+            progress.emit("fusion", "detached from watcher" if args.command == "workflow" and args.workflow_command == "watch" else "interrupted; partial logs remain in .fusion")
+            return 130
+
+
+def _main(args, parser) -> int:
     workspace = workspace_path(args.workspace)
     config, config_path = load_config(workspace)
+    if args.command in {"build", "delegate", "ultra"} or args.command == "workflow" and args.workflow_command in {"run", "resume"}:
+        from fusion_decisions import config_for
+        progress.emit("fusion", f"{args.command} in {workspace}; Laya {config_for(config)['mode']}")
+    if args.command == "decisions":
+        from fusion_decision_cli import run as run_decisions
+        try:
+            return run_decisions(args, workspace, config)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            parser.error(str(exc))
     if args.command == "mcp-serve":
         return run_mcp(workspace, config)
     if args.command == "doctor":
@@ -1467,13 +1581,25 @@ def main(argv: list[str] | None = None) -> int:
         from fusion_workflow import resume_workflow, run_workflow, workflow_report, workflow_status
 
         try:
+            if args.workflow_command == "watch":
+                return progress.watch_workflow(workspace, args.run_id, as_json=args.json, once=args.once)
             if args.workflow_command == "run":
                 result = run_workflow(workspace, config, Path(args.spec).expanduser().resolve(), args.task)
             elif args.workflow_command == "resume":
                 spec_path = Path(args.spec).expanduser().resolve() if getattr(args, "spec", None) else None
                 result = resume_workflow(workspace, config, args.run_id, spec_path)
             elif args.workflow_command == "report":
+                from fusion_report import format_report, select_report
                 result = workflow_report(workspace, args.run_id)
+                result = select_report(result, node=args.node, finding=args.finding, all_nodes=args.all)
+                rendered_report = format_report(result, brief=args.brief)
+                if args.output:
+                    output = Path(args.output).expanduser().resolve()
+                    with open(output, "x", encoding="utf-8", opener=lambda name, flags: os.open(name, flags, 0o600)) as stream:
+                        stream.write(rendered_report)
+                    result["report_artifact"] = str(output)
+                    if not args.json:
+                        print(f"Saved report: {output}", file=sys.stderr)
             else:
                 result = workflow_status(workspace, args.run_id)
         except (OSError, ValueError, RuntimeError) as exc:
@@ -1485,26 +1611,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             print(json_text(result))
         elif args.workflow_command == "report":
-            print(f"workflow {result['workflow_id']}: {result.get('status', 'unknown')}")
-            print(f"  task: {result.get('task', '')}")
-            print(f"  spent: ${result.get('spent_usd', 0):.4f} of ${result.get('budget_usd', 0):.2f} budget" if result.get("budget_usd") else f"  spent: ${result.get('spent_usd', 0):.4f}")
-            for wave in result.get("waves", []):
-                print(f"  wave {wave['wave']}:")
-                for node in wave["nodes"]:
-                    print(f"    - {node['id']} [{node['agent']}] {node['status']} (attempts={node['attempts']}): {node.get('summary') or ''}")
-            if result.get("lanes"):
-                print("  lanes:")
-                for agent, lane in result["lanes"].items():
-                    print(f"    - {agent}: {lane.get('status')} — {lane.get('reason')}")
-            usage = result.get("usage", {})
-            if usage.get("by_route"):
-                print("  usage:")
-                for group in usage["by_route"]:
-                    print(f"    - {group.get('agent')}/{group.get('route')}/{group.get('model')}: {group.get('calls')} calls, {group.get('success')} success, {group.get('failed')} failed")
-            for blocker in result.get("blockers", []):
-                print(f"  blocker: {blocker['node_id']} ({blocker['status']}): {blocker['blocker']}")
-            if result.get("resume_command"):
-                print(f"  resume: {result['resume_command']}")
+            print(rendered_report, end="")
+        elif args.workflow_command in {"run", "resume"}:
+            progress.print_workflow(result)
         else:
             workflow_id = result.get("workflow_id") or getattr(args, "run_id", "unknown")
             print(f"workflow {workflow_id}: {result.get('status', 'unknown')}")
@@ -1514,6 +1623,39 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  acceptance: {problem}")
         status = result.get("status")
         return 0 if status == "success" else 2 if status in {"paused_quota", "paused_budget", "running"} else 1
+    if args.command == "build":
+        if args.from_workflow:
+            if args.finding is None:
+                parser.error("--from-workflow requires --finding NUMBER")
+            from fusion_report import finding_request
+            try:
+                idea = finding_request(workspace, args.from_workflow, args.finding, args.from_node)
+            except (OSError, ValueError, RuntimeError) as exc:
+                parser.error(str(exc))
+            args.idea = idea + (f"\nAdditional user constraints: {args.idea}" if args.idea else "")
+            args.kind = args.kind or "build"
+        elif args.finding is not None or args.from_node:
+            parser.error("--finding and --from-node require --from-workflow")
+        if not args.idea or not args.idea.strip():
+            parser.error("feature idea must not be empty")
+        from fusion_build import prepare, run_prepared
+        try:
+            prepared = prepare(workspace, config, args.idea, args.kind, args.budget_usd, args.max_attempts, execute=args.execute)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            parser.error(str(exc))
+        if args.plan_only:
+            print(json_text(prepared))
+            return 0
+        if args.execute:
+            result = run_prepared(workspace, config, prepared)
+            if args.json:
+                print(json_text(result))
+            else:
+                progress.print_workflow(result)
+            return 0 if result["status"] == "success" else 1
+        scope = "This request is read-only. Investigate or review, and do not implement.\n" if prepared["read_only"] else ""
+        prompt = scope + BUILD_PROMPT + args.idea + f"\nRead the complete request and brief: {prepared['brief']}\nPrepared workflow: {prepared['workflow']}"
+        return launch_lead(workspace, config, args.agent, prompt, interactive=True, read_only=prepared["read_only"])
     if args.command in {"lead", "run"}:
         lead = args.agent or config.get("lead", "claude")
         return launch_lead(workspace, config, lead, args.task, interactive=args.command == "lead")
