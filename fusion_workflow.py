@@ -12,6 +12,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import copy
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 import subprocess
@@ -20,6 +21,7 @@ import uuid
 from typing import Any
 
 import fusion_core as core
+import fusion_progress as progress
 
 
 WORKFLOW_SCHEMA = "fusion.workflow.v1"
@@ -137,7 +139,7 @@ def expand_spec(spec: dict[str, Any]) -> tuple[dict[str, Any], dict[str, list[st
                 raise ValueError(f"workflow node {node['id']} depends on unknown node {dependency_id}")
         node["needs"] = list(dict.fromkeys(needs))
         node["agent"] = str(node.get("agent", "claude"))
-        if node["agent"] not in {"claude", "codex", "agy"}:
+        if node["agent"] not in {"auto", "claude", "codex", "agy"}:
             raise ValueError(f"workflow node {node['id']} has unsupported agent {node['agent']}")
         node["role"] = str(node.get("role", node["id"]))
         node["write"] = bool(node.get("write", False))
@@ -188,6 +190,8 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
 
     for node in nodes:
         visit(node["id"])
+        if node.get("independent_of") and node["independent_of"] not in node["needs"]:
+            raise ValueError("independent_of must name a direct dependency")
 
     acceptance = spec.get("acceptance") or {}
     if not isinstance(acceptance, dict):
@@ -250,6 +254,7 @@ class WorkflowRunner:
         self.config = config
         self.spec = validate_spec(spec)
         self.run_id = run_id or _run_id()
+        self.started_at_ms = core.now_ms()
         self.resume = resume
         self.root = workspace / ".fusion" / "workflows" / self.run_id
         self.nodes_root = self.root / "nodes"
@@ -269,6 +274,7 @@ class WorkflowRunner:
                 "artifact": str(self.nodes_root / node["id"] / "node.json"),
             }
         self.lane_health: dict[str, dict[str, Any]] = {}
+        self.attempt_ledger: list[dict[str, Any]] = []
         if resume:
             self._load_existing()
         else:
@@ -289,12 +295,26 @@ class WorkflowRunner:
             raise ValueError(f"unsupported workflow manifest schema in {self.manifest_id}")
         if isinstance(manifest.get("workflow_baseline"), dict):
             self.workflow_baseline = manifest["workflow_baseline"]
+        self.attempt_ledger = manifest.get("attempt_ledger", [])
+        if "attempt_ledger" not in manifest:
+            # Preserve costs when resuming manifests produced before cumulative accounting.
+            self.attempt_ledger = [{"run_id": (node.get("result") or {}).get("run_id"),
+                                    "node_id": key, "cost_usd": _result_cost(node.get("result") or {})}
+                                   for key, node in manifest.get("nodes", {}).items()]
+        recorded = {item.get("run_id") for item in self.attempt_ledger}
+        for span in core.RunStore(self.workspace).traces(limit=100000):
+            # Recover a receipt written after the last manifest flush (e.g. interrupted coordinator).
+            if span.get("trace_id") == self.run_id and span.get("run_id") not in recorded:
+                self.attempt_ledger.append({"run_id": span["run_id"], "cost_usd": _result_cost(span),
+                                            "usage": span.get("usage", {}), "recovered_from_trace": True})
+                recorded.add(span["run_id"])
         for node_id, old in (manifest.get("nodes") or {}).items():
             if node_id not in self.nodes:
                 continue
             self.nodes[node_id]["attempts"] = int(old.get("attempts", 0))
             result = old.get("result")
             self.nodes[node_id]["result"] = result
+            self.nodes[node_id]["excluded_routes"] = old.get("excluded_routes", [])
             status = str(old.get("status", "pending"))
             self.nodes[node_id]["status"] = "success" if status == "success" else "pending"
         self._invalidate_stale_receipts()
@@ -316,6 +336,10 @@ class WorkflowRunner:
             "required_files": node["required_files"],
             "acceptance": node.get("acceptance") or {},
         }
+        # Preserve legacy receipt digests when these new optional fields are absent.
+        for key in ("independent_of", "decision_context"):
+            if key in node:
+                payload[key] = node[key]
         return hashlib.sha256(core.json_text(payload).encode("utf-8")).hexdigest()
 
     def _input_digest(self, definition_digest: str, dependency_digests: dict[str, str]) -> str:
@@ -404,6 +428,21 @@ class WorkflowRunner:
         event = {"ts": core.now_ms(), "type": event_type, "workflow_id": self.run_id, **payload}
         with self.events_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        node_id = payload.get("node_id")
+        if event_type == "workflow.started":
+            progress.emit("workflow", f"{self.run_id}: {' → '.join(self.nodes)} ({len(self.nodes)} nodes)")
+            progress.emit("workflow", f"watch from another terminal: fusion workflow watch {self.run_id}")
+        elif event_type == "node.started":
+            progress.emit(node_id, f"starting node {list(self.nodes).index(node_id) + 1}/{len(self.nodes)}; attempt {payload['attempt']}/{self.spec['max_attempts']}")
+        elif event_type == "node.succeeded":
+            progress.emit(node_id, f"accepted; {sum(node['status'] == 'success' for node in self.nodes.values())}/{len(self.nodes)} nodes complete")
+        elif event_type.startswith("node.") and event_type not in {"node.started", "node.succeeded"}:
+            detail = "; ".join(str(item) for item in (payload.get("problems") or (payload.get("result") or {}).get("blockers", [])))
+            progress.emit(node_id, event_type.removeprefix("node.") + (f": {detail}" if detail else ""))
+        elif event_type == "lane.status":
+            progress.emit("routing", f"{payload['agent']}: {payload['status']} — {payload['reason']}")
+        elif event_type == "workflow.finished":
+            progress.emit("workflow", f"{payload['status']}; reported spend ${payload['spent_usd']:.4f}")
 
     def _write_manifest(self, status: str, error: str | None = None) -> None:
         manifest = {
@@ -415,6 +454,8 @@ class WorkflowRunner:
             "workflow_baseline": self.workflow_baseline,
             "nodes": self.nodes,
             "lanes": self.lane_health,
+            "attempt_ledger": self.attempt_ledger,
+            "spent_usd": self._spent(),
             "error": error,
             "artifacts": {
                 "root": str(self.root),
@@ -422,6 +463,8 @@ class WorkflowRunner:
                 "events": str(self.events_path),
             },
             "updated_at": core.now_ms(),
+            "started_at_ms": self.started_at_ms,
+            "coordinator_pid": os.getpid(),
         }
         temp = self.manifest_path.with_suffix(".tmp")
         temp.write_text(core.json_text(manifest) + "\n", encoding="utf-8")
@@ -462,6 +505,8 @@ class WorkflowRunner:
         explicit "try again now", so it skips the trace-history cooldown but
         still gets the executable check and its own in-run cooldown."""
         for agent in {node["agent"] for node in self.nodes.values()}:
+            if agent == "auto":
+                continue
             command = self._agent_command_for(agent)
             if core.executable(command) is None:
                 self._set_lane(agent, "blocked", f"{command} is not available on PATH")
@@ -495,6 +540,9 @@ Task: {node['task']}
 Dependency artifacts:
 {self._dependency_context(node)}
 
+Previous attempt (repair the reported failure; inspect its logs):
+{core.json_text(node.get('result')) if node.get('result') else 'none'}
+
 Required workspace artifacts: {required}
 Read dependency artifacts before acting. Keep the scope limited to this node.
 If this node writes code, run the narrowest meaningful verification. The
@@ -512,6 +560,8 @@ BLOCKERS: unresolved issues, or none
         problems: list[str] = []
         if result.get("status") not in TERMINAL_SUCCESS:
             problems.append(f"worker status is {result.get('status', 'unknown')}")
+        if result.get("blockers"):
+            problems.append("worker reported unresolved blockers")
         for relative in node.get("required_files", []):
             path = self.workspace / relative
             if not path.is_file():
@@ -570,6 +620,19 @@ BLOCKERS: unresolved issues, or none
             settings_overrides=settings,
         )
         store = core.RunStore(self.workspace)
+        task["progress_label"] = node_id
+        store.write_json(self._node_dir(node_id) / "active.json", {"run_id": task["run_id"], "attempt": attempt})
+        task["excluded_routes"] = list(node.get("excluded_routes", []))
+        task["decision_context"] = {"request": node.get("decision_context", node["task"]),
+                                    "dependencies": [{"status": self.nodes[dep]["status"],
+                                                      "changed": (self.nodes[dep].get("result") or {}).get("changed", []),
+                                                      "blockers": (self.nodes[dep].get("result") or {}).get("blockers", [])}
+                                                     for dep in node["needs"]]}
+        if node.get("independent_of"):
+            prior = (self.nodes[node["independent_of"]].get("result") or {})
+            task["prefer_different_agent"] = prior.get("agent")
+        if self.spec["budget_usd"]:
+            task["budget_remaining_usd"] = max(0, self.spec["budget_usd"] - self._spent())
         try:
             result = core.dispatch(self.config, task, store)
         except (OSError, ValueError, RuntimeError) as exc:
@@ -601,7 +664,7 @@ BLOCKERS: unresolved issues, or none
         temp.replace(path)
 
     def _spent(self) -> float:
-        return sum(_result_cost(node.get("result") or {}) for node in self.nodes.values())
+        return sum(item["cost_usd"] for item in self.attempt_ledger)
 
     def _ready(self, node: dict[str, Any]) -> bool:
         return node["status"] == "pending" and all(self.nodes[dependency]["status"] == "success" for dependency in node["needs"])
@@ -685,6 +748,18 @@ BLOCKERS: unresolved issues, or none
         return not problems, problems
 
     def run(self) -> dict[str, Any]:
+        try:
+            return self._execute()
+        except KeyboardInterrupt:
+            for node in self.nodes.values():
+                if node["status"] == "running":
+                    node["status"] = "blocked"
+                    node["result"] = {"status": "blocked", "summary": "interrupted by user", "blockers": ["workflow interrupted; inspect partial worker logs before resuming"]}
+            self._write_manifest("interrupted")
+            self._event("workflow.interrupted", {})
+            raise
+
+    def _execute(self) -> dict[str, Any]:
         self._event("workflow.started", {"max_parallel": self.spec["max_parallel"]})
         max_parallel = self.spec["max_parallel"]
         max_writers = self.spec["max_parallel_writers"]
@@ -744,7 +819,11 @@ BLOCKERS: unresolved issues, or none
                         payload = {"task": {}, "result": {"status": "error", "summary": "worker thread failed", "blockers": [str(exc)]}}
                     node = self.nodes[node_id]
                     result = payload.get("result") or {}
-                    accepted, problems = self._accept_node(node, result)
+                    self.attempt_ledger.append({"run_id": result.get("run_id"), "node_id": node_id,
+                                                "attempt": node["attempts"], "cost_usd": _result_cost(result),
+                                                "usage": result.get("usage", {})})
+                    with progress.activity(node_id, "checking handoff and acceptance criteria"):
+                        accepted, problems = self._accept_node(node, result)
                     if problems:
                         result.setdefault("blockers", []).extend(problems)
                     if accepted:
@@ -752,17 +831,26 @@ BLOCKERS: unresolved issues, or none
                         result["digest"] = self._input_digest(self._definition_digest(node), dependency_digests)
                         result["resolved"] = payload.get("task", {}).get("resolved") or {}
                     node["result"] = result
-                    node_dir = self._node_dir(node_id)
+                    from fusion_policy import recovery
+                    action, decision_id = recovery(self.config, self.workspace, self.run_id, node, result, accepted, self.spec["max_attempts"])
+                    result.setdefault("decisions", {})["recovery"] = decision_id
                     payload["acceptance"] = {"ok": accepted, "problems": problems}
                     self._save_node(node_id, payload)
                     if accepted:
                         node["status"] = "success"
                         self._event("node.succeeded", {"node_id": node_id, "attempt": node["attempts"]})
+                    elif action == "switch":
+                        node["status"] = "pending"
+                        self._event("node.switching", {"node_id": node_id, "excluded_routes": node["excluded_routes"]})
                     elif _quota_failure(result):
                         node["status"] = "paused_quota"
                         self._event("node.paused_quota", {"node_id": node_id, "attempt": node["attempts"]})
-                        self._set_lane(node["agent"], "cooldown", f"node {node_id} reported a quota/session limit")
-                    elif node["attempts"] < self.spec["max_attempts"]:
+                        if node["agent"] != "auto":
+                            self._set_lane(node["agent"], "cooldown", f"node {node_id} reported a quota/session limit")
+                    elif action == "ask":
+                        node["status"] = "blocked"
+                        self._event("node.needs_input", {"node_id": node_id, "problems": problems})
+                    elif action == "repair" and node["attempts"] < self.spec["max_attempts"]:
                         node["status"] = "pending"
                         self._event("node.retrying", {"node_id": node_id, "attempt": node["attempts"], "problems": problems})
                     else:
@@ -788,6 +876,7 @@ BLOCKERS: unresolved issues, or none
             "status": status or self._final_status(),
             "task": self.spec.get("task", ""),
             "spent_usd": self._spent(),
+            "attempt_ledger": self.attempt_ledger,
             "nodes": [self.nodes[node_id] for node_id in self.nodes],
             "lanes": self.lane_health,
             "acceptance": {
@@ -838,6 +927,7 @@ def workflow_report(workspace: Path, run_id: str) -> dict[str, Any]:
     `trace`, `usage`, and events by hand. This reconstructs that same picture
     from the persisted manifest and the trace ledger in one read-only call.
     """
+    from fusion_report import command, findings, read_answer, reported_cost
     manifest = workflow_status(workspace, run_id)
     nodes = manifest.get("nodes") or {}
     spec_nodes = {node["id"]: node for node in (manifest.get("spec", {}).get("graph", {}).get("nodes") or [])}
@@ -855,40 +945,62 @@ def workflow_report(workspace: Path, run_id: str) -> dict[str, Any]:
 
     waves: dict[int, list[dict[str, Any]]] = {}
     blockers: list[dict[str, Any]] = []
+    outputs = []
     for node_id, node in nodes.items():
         result = node.get("result") or {}
         digest = result.get("digest")
         waves.setdefault(wave_of(node_id), []).append({
             "id": node_id,
-            "agent": node.get("agent"),
+            "agent": result.get("agent") or node.get("agent"),
+            "requested_agent": node.get("agent"),
             "status": node.get("status"),
             "attempts": node.get("attempts"),
             "summary": result.get("summary"),
+            "duration_ms": result.get("duration_ms"),
+            "changed": result.get("changed", []),
+            "tests": result.get("tests", []),
             "digest": digest[:12] if digest else None,
         })
+        if result and (node.get("attempts", 0) or result.get("run_id")):
+            answer = read_answer(workspace, result)
+            outputs.append({"node_id": node_id, "status": node.get("status"), "agent": result.get("agent") or node.get("agent"),
+                            **answer, "findings": findings(answer["text"])})
         if node.get("status") not in {"success", "pending", "running"}:
             for blocker in result.get("blockers") or []:
                 blockers.append({"node_id": node_id, "status": node.get("status"), "blocker": blocker})
 
     spans = [span for span in core.RunStore(workspace).traces(limit=10000) if span.get("trace_id") == run_id]
+    receipts = [node["result"] for node in nodes.values() if node.get("result") and node.get("attempts")]
+    cost_records = manifest.get("attempt_ledger") or spans or receipts
+    dependencies = {dependency for node in spec_nodes.values() for dependency in node.get("needs", [])}
+    primary_nodes = [item["node_id"] for item in outputs if item["node_id"] not in dependencies]
+    if not primary_nodes and outputs:
+        latest_wave = max(wave_of(item["node_id"]) for item in outputs)
+        primary_nodes = [item["node_id"] for item in outputs if wave_of(item["node_id"]) == latest_wave]
     status = manifest.get("status")
     error = manifest.get("error")
     return {
         "schema": "fusion.workflow.report.v1",
         "workflow_id": run_id,
+        "workspace": str(workspace),
         "status": status,
         "task": manifest.get("task"),
-        "spent_usd": sum(_result_cost(node.get("result") or {}) for node in nodes.values()),
+        "spent_usd": manifest.get("spent_usd", sum(_result_cost(node.get("result") or {}) for node in nodes.values())),
         "budget_usd": (manifest.get("spec") or {}).get("budget_usd") or 0,
         "waves": [{"wave": wave, "nodes": waves[wave]} for wave in sorted(waves)],
+        "node_ids": list(nodes),
+        "outputs": outputs,
+        "primary_nodes": primary_nodes,
+        "read_only": all(not node.get("write") for node in nodes.values()),
+        "cost": {"calls": len(cost_records), "reported_calls": sum(reported_cost(item.get("usage")) is not None for item in cost_records)},
         "lanes": manifest.get("lanes") or {},
-        "usage": core.usage_summary(spans),
+        "usage": core.usage_summary(spans or receipts),
         "blockers": blockers,
         "acceptance_problems": [item for item in (error or "").split("; ") if item],
         "artifacts": manifest.get("artifacts") or {},
         "resume_command": (
-            f"fusion --workspace {workspace} --json workflow resume {run_id}"
-            if status in {"paused_quota", "paused_budget", "running", "failed"}
+            command(workspace, "--progress", "workflow", "resume", run_id)
+            if status in {"paused_quota", "paused_budget", "interrupted", "failed"}
             else None
         ),
     }
