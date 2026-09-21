@@ -71,11 +71,13 @@ class CoherenceTest(unittest.TestCase):
         known = (fusion_workflow.TERMINAL_SUCCESS | fusion_workflow.TERMINAL_FAILURE
                  | fusion_workflow.TERMINAL_PAUSED | {"pending", "running"})
         source = (ROOT / "fusion_workflow.py").read_text(encoding="utf-8")
-        # Every literal the runner assigns to a node's status, however it is spelled.
+        # Only direct assignments to a node's status. A worker result and a trace
+        # span carry their own `status` -- "cache_hit" and "error" are valid there
+        # and never become a node status -- so matching every "status": literal in
+        # the module would report those as drift.
         assigned = set(re.findall(r'node\["status"\] = "([a-z_]+)"', source))
-        assigned |= set(re.findall(r'"status": "([a-z_]+)"', source))
-        assigned |= set(re.findall(r'status = "([a-z_]+)"', source))
-        unknown = assigned - known - {"error"}  # dispatch failures carry a result status, not a node status
+        self.assertTrue(assigned, "found no node status assignments; the pattern has gone stale")
+        unknown = assigned - known
         self.assertEqual(unknown, set(), f"node statuses outside every terminal set: {sorted(unknown)}")
 
     def test_final_status_classifies_every_terminal_status(self):
