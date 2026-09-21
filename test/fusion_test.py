@@ -85,6 +85,42 @@ print(json.dumps({{'type':'turn.completed','usage':{{'input_tokens':12,'output_t
         self.assertIn("resume", calls[1])
         self.assertIn("thread-123", calls[1])
 
+    def test_codex_command_execution_failure_is_surfaced_as_evidence(self):
+        # Matches the real command_execution item shape from a live
+        # `codex exec --json` run. A command failing mid-turn is structural
+        # evidence Fusion previously never looked at -- it's surfaced as a
+        # blocker so the contradiction is visible, but deliberately does not
+        # override status on its own: a nonzero exit isn't always a real
+        # failure (grep returning 1 for "no matches" is routine), so this is
+        # evidence for a human or acceptance gate to weigh, not a verdict.
+        codex = self.write_agent(
+            "codex-command-failure",
+            """
+import json
+print(json.dumps({'type':'thread.started','thread_id':'evidence-thread'}))
+print(json.dumps({'type':'item.completed','item':{'id':'item_0','type':'command_execution','command':'pytest','aggregated_output':'','exit_code':1,'status':'completed'}}))
+print(json.dumps({'type':'item.completed','item':{'id':'item_1','type':'command_execution','command':'ls','aggregated_output':'','exit_code':0,'status':'completed'}}))
+print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'STATUS: success\\nSUMMARY: all good\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}}))
+print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'output_tokens':5}}))
+""",
+        )
+        self.config(codex=codex)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                fusion_core.main(
+                    ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "codex", "--role", "implementation", "run tests"]
+                ),
+                0,
+            )
+        result = json.loads(output.getvalue())
+        # Self-reported STATUS still wins for the overall verdict...
+        self.assertEqual(result["status"], "success")
+        # ...but the contradicting evidence is visible, not silently lost.
+        self.assertEqual(len(result["blockers"]), 1)
+        self.assertIn("command exited 1", result["blockers"][0])
+        self.assertIn("pytest", result["blockers"][0])
+
     def test_claude_json_result_is_structured(self):
         claude = self.write_agent(
             "claude-fake",
