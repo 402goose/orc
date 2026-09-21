@@ -310,6 +310,63 @@ fusion trace --limit 50
 fusion usage --limit 1000
 ```
 
+To build a feature, start from the target project's directory and describe the
+outcome in one sentence:
+
+```sh
+orc fusion build "Let users export their filtered dashboard as CSV"
+fusion build --agent claude "Add saved searches with names and deletion"
+```
+
+`build` opens an interactive lead session (Codex by default) with the build
+instructions included. The lead is asked to inspect the repo, derive a brief
+and acceptance criteria, save its plan under `.fusion/builds/`, implement,
+run checks, delegate an independent review, and fix verified findings. It
+asks focused questions when a missing product decision changes the scope;
+you do not need to write the orchestration prompt or choose each worker.
+`build` also accepts a GitHub issue URL, preserves the full request and saves
+a runnable workflow. Planning-only requests keep the lead and workers in
+read-only/plan mode. Use `--plan-only` to prepare artifacts without starting
+an agent, or `--execute` to run the bounded workflow. The lead and workers
+use their configured accounts.
+Use `fusion status` and `fusion usage` to inspect delegated work.
+
+Optional local [Laya decisions](FUSION_DECISIONS.md) cover intake, automatic
+worker routing, bounded recovery, specialist review and learning from reviewed
+outcomes. They start in shadow mode, recording advice without applying it:
+
+```sh
+orc fusion decisions setup
+orc fusion decisions probe "Build a CSV export with tests"
+orc fusion build --execute "Add CSV export and test filtering and escaping"
+orc fusion decisions list
+```
+
+Learned actions require explicit activation and matching calibration from
+held-out reviewed tasks. Missing models or uncertain/truncated inputs fall
+back to deterministic policies. `FUSION_DECISIONS_MODE=off` disables the
+classifier; see the [setup and learning guide](FUSION_DECISIONS.md).
+
+Terminal runs show live progress: Laya startup and recommendations, stage and
+worker selection, public worker updates, acceptance results, and elapsed-time
+heartbeats every ten seconds. Worker stdout/stderr logs are written while the
+worker runs. Progress goes to stderr; `--json` keeps stdout machine-readable.
+Use `--progress` to force updates when redirecting output, or `--quiet` to
+hide them. Both are global flags, before the subcommand.
+
+```sh
+orc fusion --progress build --kind review --execute "Review opportunities to simplify this repository"
+orc fusion workflow watch                 # latest workflow/build --execute, including intake
+orc fusion workflow watch WORKFLOW_ID     # attach to a specific workflow or build ID
+orc fusion workflow watch --once          # one snapshot; no new workers
+```
+
+Builds register before fetching issues or loading Laya, so `watch` shows intake
+immediately and follows the resulting workflow automatically. Automatic attachment
+uses the most recently started run, even if an older run has updated since then.
+Ctrl-C in `watch` only detaches the viewer. Runs started before this update
+can show saved stages and blockers but cannot gain live worker logs retroactively.
+
 For a direct worker call:
 
 ```sh
@@ -408,12 +465,30 @@ fusion --workspace . --json workflow resume WORKFLOW_ID --spec workflow.json
 fusion --workspace . workflow report WORKFLOW_ID
 ```
 
-`workflow report` combines what previously took manually joining `status`,
-`trace`, and `usage` into one read-only view: nodes grouped into dependency
-waves, lane health, a token/cost/call summary from the trace ledger scoped to
-this run, every non-success node's blockers, and a ready-to-run resume
-command when the run is paused or failed. Add `--json` for the machine-
-readable form.
+`workflow report` shows the final worker deliverable, including findings,
+acceptance criteria, verification commands and caveats. It recovers full answers
+from older provider logs; new runs save a separate `answer.md`. The report shows
+actual workers, durations and blockers, and distinguishes unreported cost from
+an explicitly reported zero. Reporting starts no agents and leaves receipts intact.
+
+```sh
+orc 'fusion' workflow report WORKFLOW_ID                # final output
+orc 'fusion' workflow report WORKFLOW_ID --finding 3    # one recommendation + next command
+orc 'fusion' workflow report WORKFLOW_ID --node explore # supporting investigation
+orc 'fusion' workflow report WORKFLOW_ID --all          # every stage's full answer
+orc 'fusion' workflow report WORKFLOW_ID --brief        # compact status
+orc 'fusion' workflow report WORKFLOW_ID --output report.md
+orc 'fusion' --json workflow report WORKFLOW_ID         # structured outputs and provenance
+orc 'fusion' --progress build --from-workflow WORKFLOW_ID --finding 3 --plan-only
+```
+
+`--finding` recognizes numbered, bold Markdown recommendation headings. When
+multiple final stages have answers, select one with `--node` (or `--from-node`
+on `build`). Build preparation carries a reference to the original evidence and
+scopes the new request to the chosen recommendation. `--plan-only` saves a brief
+and workflow without launching coding agents; normal build execution options
+also apply. Follow the target repository's worktree and ownership rules before
+execution. Markdown export refuses to overwrite an existing file.
 
 Every node gets a durable artifact under `.fusion/workflows/WORKFLOW_ID/` and
 every worker still gets the existing `.fusion/runs/` trace. A node is accepted
