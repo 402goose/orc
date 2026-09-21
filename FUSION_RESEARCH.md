@@ -423,6 +423,53 @@ already has a *verified* `denied_actions` shape (PR #8) but was only
 surfacing it when a denial was the entire outcome -- a denial alongside an
 otherwise-successful turn was silently dropped, which is now fixed too.
 
+## Structural status vs self-reported status
+
+External research (a separate harness-comparison pass over `pyrosec/chadwick`
+and TypeSafe's `pi-warden`, outside this repo) named the same failure class
+this section has been chipping away at from a different angle: a worker's
+overall outcome in Fusion is a self-reported text label -- the prompt tells
+the model to return `STATUS: success|partial|blocked|error`, and (before the
+fixes above) quota detection was pure keyword-matching on the worker's own
+output. Chadwick's alternative is process-boundary exit codes (0/3/4/5 for
+finished/refused/truncated/context-exceeded) enforced by the harness, never
+self-reported.
+
+Checked that framing against Fusion's actual code rather than taking it at
+face value, since a secondhand summary of what a harness "isn't currently
+consuming" is exactly the kind of claim this document has been wrong about
+before (see the `model`/`model_id` and `total_cost_usd` sections above).
+Correction: `turn.failed`/`error` (Codex) and `is_error` (Claude) **already
+are** structural, process-level signals in `dispatch()` -- they set `failure`
+and override a self-reported "success" claim, and already did before this
+research pass. The real, narrower gap: Codex's per-item `command_execution`
+events carry their own exit code that was never inspected. Fixed: a failed
+command surfaces as blocker evidence (`command exited N: <command>`)
+alongside the self-reported status rather than staying invisible --
+deliberately *not* an automatic status override, since a nonzero exit isn't
+always a real failure (`grep` finding nothing exits 1; that's correct
+behavior, not a bug). Verified against a real `codex exec` call that
+intentionally ran `false`: status stayed the worker's own "success" claim,
+and the contradicting evidence appeared in blockers instead of vanishing.
+
+Quota detection staying keyword-matched is still the more open gap here --
+same conclusion the external research reached independently. Codex's `error`
+events do carry a structured `error.type` in at least one observed shape
+(`invalid_request_error`, from an unsupported-model rejection caught live
+during this session); whether provider quota/rate-limit responses carry an
+equally structured, reliably-distinguishable type needs a live quota-exceeded
+response to check, not a guess from one adjacent error shape.
+
+A pi-warden-style semantic Done-check -- structural evidence (which this
+section now partially builds toward) feeding a judge bounded to a few typed
+yes/no/classification questions, rather than trusting a free-text self-report
+-- was evaluated and deliberately not built yet: explicitly lower priority
+than the structural-signal gaps above, and adopting it via TypeSafe's hosted
+Jev SDK would be a new paid third-party dependency this harness doesn't
+currently have any of. Codex's own `--json-schema` flag (structured final
+response, already supported) is the more Fusion-shaped path if this gets
+built later, without taking on that dependency.
+
 ## How to try it
 
 See the README's [Fusion](README.md#fusion-claude-lead--codex-sidekick)

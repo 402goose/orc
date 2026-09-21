@@ -1,0 +1,408 @@
+"""Local, auditable decisions. Model suggestions never confer permissions."""
+from __future__ import annotations
+
+import atexit
+from collections import Counter
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import selectors
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+import fusion_progress as progress
+
+
+DEFAULTS = {
+    "mode": "shadow", "python": "", "device": "cpu", "model_path": "",
+    "timeout_seconds": 120, "auto_actions": [], "threshold": 0.90,
+    "calibration_file": "", "max_state_chars": 2200,
+}
+KINDS = {"intake", "routing", "recovery", "review"}
+INTAKE_QUESTIONS = {
+    "workflow": {"type": "choice", "instructions": "Which work is requested and permitted?",
+                 "criteria": {"discovery": "investigate or plan only", "build": "implement a feature",
+                              "debug": "diagnose and fix a defect", "review": "review existing work only"}},
+    "needs_clarification": {"type": "noul", "instructions": "Is a consequential product decision missing?"},
+}
+REVIEW_QUESTIONS = {
+    "specialty": {"type": "choice", "instructions": "Which reviewer should examine this work?",
+                  "criteria": {"general": "ordinary code correctness", "security": "identity, authorization or secrets",
+                               "payments": "money movement or accounting", "data": "schema, migrations or data integrity"}},
+    "needs_review": {"type": "noul", "instructions": "Does this handoff need an independent review before acceptance?"},
+}
+RECOVERY_QUESTIONS = {
+    "action": {"type": "choice", "instructions": "What should the coordinator do next given the actual outcome?",
+               "criteria": {"continue": "accepted result with no unresolved blocker", "repair": "repair or supply missing evidence",
+                            "switch": "worker unavailable; another permitted worker may help", "ask": "missing user decision or permission",
+                            "stop": "external blocker; do not retry now"}},
+}
+
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def config_for(config):
+    options = {**DEFAULTS, **(config.get("decisions") or {})}
+    if os.environ.get("FUSION_DECISIONS_MODE"):
+        options["mode"] = os.environ["FUSION_DECISIONS_MODE"]
+    if options["mode"] not in {"off", "shadow", "active"}:
+        raise ValueError("decisions.mode must be off, shadow, or active")
+    if not isinstance(options["auto_actions"], list) or set(options["auto_actions"]) - KINDS:
+        raise ValueError("decisions.auto_actions must contain only intake, routing, recovery, review")
+    if not 0 < float(options["threshold"]) <= 1:
+        raise ValueError("decisions.threshold must be in (0, 1]")
+    return options
+
+
+def runtime_python(options):
+    configured = options.get("python") or os.environ.get("FUSION_LAYA_PYTHON")
+    managed = Path.home() / ".local/share/orc/laya/bin/python"
+    return str(configured or (managed if managed.is_file() else sys.executable))
+
+
+class LayaRuntime:
+    """One resident SDK process; serialized requests, bounded waits, clean stdout."""
+    def __init__(self, options):
+        self.options = options
+        self.process = None
+        self.lock = threading.Lock()
+        self.error = None
+        self.buffer = b""
+
+    def close(self):
+        proc, self.process = self.process, None
+        if proc is not None:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            for stream in (proc.stdin, proc.stdout):
+                if stream:
+                    stream.close()
+        self.buffer = b""
+
+    def predict(self, state, questions):
+        with self.lock:
+            if self.error:
+                raise RuntimeError(self.error)
+            try:
+                if self.process is None:
+                    progress.emit("laya", f"starting local runtime on {self.options['device']}; the first checkpoint load may take tens of seconds")
+                    env = os.environ.copy()
+                    env.update(HF_HUB_OFFLINE="1", TOKENIZERS_PARALLELISM="false")
+                    self.process = subprocess.Popen(
+                        [runtime_python(self.options), "-u", str(Path(__file__).with_name("fusion_laya.py")), "serve"],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
+                    )
+                request = {"state": state, "questions": questions, "device": self.options["device"],
+                           "model_path": self.options["model_path"]}
+                self.process.stdin.write((json.dumps(request, ensure_ascii=False) + "\n").encode())
+                self.process.stdin.flush()
+                deadline = time.monotonic() + float(self.options["timeout_seconds"])
+                with selectors.DefaultSelector() as selector:
+                    selector.register(self.process.stdout, selectors.EVENT_READ)
+                    while b"\n" not in self.buffer:
+                        progress.check_cancelled()
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("Laya inference timed out")
+                        if not selector.select(min(.2, remaining)):
+                            continue
+                        chunk = os.read(self.process.stdout.fileno(), 65536)
+                        if not chunk:
+                            raise RuntimeError("Laya runtime exited; run fusion decisions setup")
+                        self.buffer += chunk
+                        if len(self.buffer) > 1_000_000:
+                            raise ValueError("Laya response exceeds limit")
+                line, self.buffer = self.buffer.split(b"\n", 1)
+                response = json.loads(line)
+                if response.get("error"):
+                    raise RuntimeError(response["error"])
+                return response
+            except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
+                self.error = str(exc)
+                self.close()
+                raise RuntimeError(self.error) from exc
+
+
+_runtimes = {}
+_runtime_lock = threading.Lock()
+
+
+def runtime_for(options):
+    key = digest(options)
+    with _runtime_lock:
+        if key not in _runtimes:
+            _runtimes[key] = LayaRuntime(options)
+        return _runtimes[key]
+
+
+@atexit.register
+def close_runtimes():
+    for runtime in _runtimes.values():
+        runtime.close()
+
+
+def append_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.write(json.dumps(value, ensure_ascii=False) + "\n")
+        handle.flush()
+        fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def read_jsonl(path):
+    if not path.exists():
+        return []
+    records = []
+    with path.open() as handle:
+        for line in handle:
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
+class DecisionStore:
+    def __init__(self, workspace):
+        self.root = Path(workspace) / ".fusion" / "decisions"
+        self.path = self.root / "events.jsonl"
+
+    def append(self, event, **payload):
+        append_json(self.path, {"schema": "fusion.decision.v1", "event": event,
+                               "time_ms": int(time.time() * 1000), **payload})
+
+    def records(self):
+        return [record for record in read_jsonl(self.path) if record.get("event") == "decision"]
+
+    def get(self, decision_id):
+        for record in reversed(self.records()):
+            if record.get("id") == decision_id:
+                return record
+        raise ValueError(f"unknown decision: {decision_id}")
+
+    def label(self, decision_id, answers, evidence):
+        record = self.get(decision_id)
+        if record.get("status") != "ok" or record.get("truncated"):
+            raise ValueError("label only successful, complete model inputs; shorten truncated inputs and run again")
+        if not evidence.strip() or not answers:
+            raise ValueError("reviewed labels require answers and verification evidence")
+        for key, label in answers.items():
+            question = record["questions"].get(key)
+            if not question or label not in labels_for(question):
+                raise ValueError(f"invalid label {key}={label}")
+        self.append("label", id=decision_id, answers=answers, evidence=evidence, verified=True)
+
+    def export(self, destination):
+        labels = {}
+        for event in read_jsonl(self.path):
+            if event.get("event") == "label" and event.get("verified"):
+                labels.setdefault(event["id"], {}).update(event["answers"])
+        rows = []
+        for record in self.records():
+            if record["id"] not in labels or record.get("status") != "ok":
+                continue
+            group = record.get("context", {}).get("group") or record.get("context", {}).get("task_id") or digest(record["state"])
+            split = "validation" if int(digest(group)[:8], 16) % 5 == 0 else "train"
+            rows.append({"schema": "fusion.training.v1", "id": record["id"], "group": group, "split": split,
+                         "kind": record["kind"], "state": record["state"], "questions": record["questions"],
+                         "labels": labels[record["id"]], "prediction": record["prediction"],
+                         "model_identity": record.get("model_identity"), "schema_hash": record["schema_hash"]})
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("x") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        destination.chmod(0o600)
+        return {"examples": len(rows), "splits": dict(Counter(row["split"] for row in rows)), "path": str(destination)}
+
+
+def labels_for(question):
+    if question["type"] == "noul":
+        return ["false", "true"]
+    if question["type"] == "score":
+        return [str(index) for index in range(len(question["criteria"]))]
+    return list(question["criteria"])
+
+
+def distribution(answer, question):
+    labels = labels_for(question)
+    if question["type"] == "noul":
+        p = answer.get("noul")
+        values = {"false": 1 - p, "true": p} if isinstance(p, (int, float)) and not isinstance(p, bool) else {}
+    else:
+        values = answer.get("probabilities") or {}
+    if set(values) != set(labels):
+        raise ValueError("model returned an unexpected label set")
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 1 for v in values.values()):
+        raise ValueError("model returned invalid probabilities")
+    total = sum(values.values())
+    if not 0.98 <= total <= 1.02:
+        raise ValueError("model returned an invalid probability sum")
+    return {key: value / total for key, value in values.items()}
+
+
+def temperature_scale(probs, temperature):
+    scores = {key: math.log(max(value, 1e-9)) / temperature for key, value in probs.items()}
+    maximum = max(scores.values())
+    values = {key: math.exp(value - maximum) for key, value in scores.items()}
+    total = sum(values.values())
+    return {key: value / total for key, value in values.items()}
+
+
+class DecisionEngine:
+    def __init__(self, workspace, config, backend=None):
+        self.workspace = Path(workspace)
+        self.options = config_for(config)
+        if self.options["model_path"]:
+            path = Path(self.options["model_path"]).expanduser()
+            self.options["model_path"] = str((self.workspace / path).resolve())
+        self.store = DecisionStore(workspace)
+        self.backend = backend
+
+    def calibration(self):
+        path = self.options.get("calibration_file")
+        if not path:
+            return {}
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.workspace / candidate
+        try:
+            report = json.loads(candidate.read_text())
+            if report.get("schema") != "fusion.calibration.v1" or not report.get("model_identity"):
+                return {}
+            for bucket in report.get("buckets", {}).values():
+                temperature, threshold = float(bucket["temperature"]), float(bucket["threshold"])
+                if not math.isfinite(temperature) or temperature <= 0 or not 0 < threshold <= 1 or not isinstance(bucket.get("qualified"), bool):
+                    return {}
+            return report
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return {}
+
+    def decide(self, kind, state, questions, context=None):
+        if kind not in KINDS:
+            raise ValueError(f"unknown decision kind: {kind}")
+        record = {"id": uuid.uuid4().hex, "kind": kind, "mode": self.options["mode"],
+                  "context": context or {}, "questions": questions, "schema_hash": digest(questions),
+                  "status": "off", "recommendations": {}, "prediction": {}}
+        if self.options["mode"] == "off":
+            return record
+        text = json.dumps(state, ensure_ascii=False, sort_keys=True)
+        cap = max(200, min(6000, int(self.options["max_state_chars"])))
+        record["state"] = text[:cap]
+        record["truncated"] = len(text) > cap or bool(isinstance(state, dict) and state.get("source_truncated"))
+        started = time.monotonic()
+        try:
+            with progress.activity("laya", f"{kind}: waiting for local classification ({self.options['mode']})"):
+                prediction = (self.backend or runtime_for(self.options)).predict(record["state"], questions)
+            answers = prediction.get("answers") or {}
+            record["model_identity"] = prediction["model_identity"]
+            record["routing"] = prediction.get("routing", {})
+            record["truncated"] |= bool(prediction.get("truncated"))
+            calibration = self.calibration()
+            for key, question in questions.items():
+                probs = distribution(answers.get(key, {}), question)
+                record["prediction"][key] = probs
+                bucket = calibration.get("buckets", {}).get(f"{kind}:{record['schema_hash']}:{key}", {})
+                if calibration.get("model_identity") == record["model_identity"]:
+                    probs = temperature_scale(probs, float(bucket.get("temperature", 1)))
+                selected = max(probs, key=probs.get)
+                record["recommendations"][key] = {"value": selected, "probability": probs[selected]}
+            record["status"] = "ok"
+        except (ImportError, OSError, RuntimeError, ValueError, KeyError, TypeError, ArithmeticError, AttributeError) as exc:
+            record.update(status="unavailable", error=str(exc), recommendations={})
+        record["duration_ms"] = round((time.monotonic() - started) * 1000)
+        self.store.append("decision", **record)
+        if record["status"] == "ok":
+            choices = ", ".join(f"{key}={value['value']} (p={value['probability']:.2f})" for key, value in record["recommendations"].items())
+            progress.emit("laya", f"{kind}: {choices}; {record['duration_ms']}ms" + ("; input truncated, automatic action disabled" if record["truncated"] else ""))
+        else:
+            progress.emit("laya", f"{kind}: unavailable; using deterministic policy — {record.get('error', 'unknown error')}")
+        return record
+
+    def allowed(self, record, question):
+        if (self.options["mode"] != "active" or record["kind"] not in self.options["auto_actions"]
+                or record.get("status") != "ok" or record.get("truncated")):
+            return False
+        report = self.calibration()
+        if report.get("model_identity") != record.get("model_identity"):
+            return False
+        bucket = report.get("buckets", {}).get(f"{record['kind']}:{record['schema_hash']}:{question}", {})
+        threshold = max(float(self.options["threshold"]), float(bucket.get("threshold", 1)))
+        return bool(bucket.get("qualified") and record["recommendations"].get(question, {}).get("probability", 0) >= threshold)
+
+    def applied(self, record, actual, applied=False, reason="shadow mode or unqualified recommendation"):
+        if record.get("status") != "off":
+            self.store.append("application", id=record["id"], kind=record["kind"], actual=actual, applied=applied, reason=reason)
+            progress.emit("laya", f"{record['kind']}: action={actual}; {'recommendation applied' if applied else 'advisory only'} ({reason})")
+
+
+def fit_calibration(dataset, output, threshold=0.9):
+    from fusion_laya import dataset_rows
+    rows = dataset_rows(dataset)
+    if not 0 < threshold <= 1:
+        raise ValueError("threshold must be in (0, 1]")
+    identities = {row["model_identity"] for row in rows}
+    if len(identities) != 1:
+        raise ValueError("calibration requires reviewed examples from exactly one model identity")
+    groups = {}
+    buckets = {}
+    for row in rows:
+        group, split = row["group"], row["split"]
+        if split not in {"train", "validation"} or group in groups and groups[group] != split:
+            raise ValueError("train/validation group leakage or invalid split")
+        groups[group] = split
+        for key, label in row["labels"].items():
+            probs = row["prediction"][key]
+            if label not in probs:
+                raise ValueError("label not present in model probabilities")
+            bucket = buckets.setdefault(f"{row['kind']}:{row['schema_hash']}:{key}", {"train": [], "validation": []})
+            if any(not isinstance(p, (int, float)) or not math.isfinite(p) or p < 0 or p > 1 for p in probs.values()) or abs(sum(probs.values()) - 1) > 0.02:
+                raise ValueError("invalid stored probabilities")
+            bucket[split].append((probs, label, group))
+    report = {"schema": "fusion.calibration.v1", "model_identity": next(iter(identities)),
+              "dataset_hash": hashlib.sha256(Path(dataset).read_bytes()).hexdigest(), "buckets": {}}
+    for key, samples in buckets.items():
+        train, validation = samples["train"], samples["validation"]
+        candidates = [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8]
+        temperature = min(candidates, key=lambda t: sum(-math.log(max(temperature_scale(p, t)[y], 1e-9)) for p, y, _ in train)) if train else 1
+        correct = confident = confident_correct = 0
+        confident_groups = set()
+        brier = 0.0
+        for probs, label, group in validation:
+            p = temperature_scale(probs, temperature)
+            selected = max(p, key=p.get)
+            correct += selected == label
+            brier += sum((v - (k == label)) ** 2 for k, v in p.items())
+            if p[selected] >= threshold:
+                confident += 1
+                confident_correct += selected == label
+                confident_groups.add(group)
+        selective_accuracy = confident_correct / confident if confident else None
+        report["buckets"][key] = {
+            "temperature": temperature, "threshold": threshold, "train": len(train), "validation": len(validation),
+            "accuracy": correct / len(validation) if validation else None,
+            "brier": brier / len(validation) if validation else None,
+            "coverage": confident / len(validation) if validation else 0,
+            "selective_accuracy": selective_accuracy,
+            "train_groups": len({group for _, _, group in train}), "confident_validation_groups": len(confident_groups),
+            "qualified": len({group for _, _, group in train}) >= 20 and len(confident_groups) >= 20 and selective_accuracy >= 0.95,
+        }
+    Path(output).parent.mkdir(parents=True, exist_ok=True)
+    with Path(output).open("x") as handle:
+        json.dump(report, handle, indent=2)
+    return report
