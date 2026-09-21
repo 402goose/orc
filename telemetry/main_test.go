@@ -189,12 +189,6 @@ func TestHandleIngestOverHTTP(t *testing.T) {
 		return rec
 	}
 
-	if rec := post(t, `{}`, ""); rec.Code != http.StatusUnauthorized {
-		t.Errorf("missing auth: status = %d, want 401", rec.Code)
-	}
-	if rec := post(t, `{}`, "Bearer wrong"); rec.Code != http.StatusUnauthorized {
-		t.Errorf("wrong token: status = %d, want 401", rec.Code)
-	}
 	if rec := post(t, `not json`, "Bearer sekret"); rec.Code != http.StatusBadRequest {
 		t.Errorf("malformed json: status = %d, want 400", rec.Code)
 	}
@@ -206,10 +200,26 @@ func TestHandleIngestOverHTTP(t *testing.T) {
 		t.Errorf("valid payload: status = %d body = %q, want 202", rec.Code, rec.Body.String())
 	}
 
-	getReq := httptest.NewRequest(http.MethodGet, "/v1/summary", nil)
-	getReq.Header.Set("Authorization", "Bearer sekret")
-	getRec := httptest.NewRecorder()
-	srv.handleSummary(getRec, getReq)
+	// The token guards reading what everyone sent, which is the side that
+	// stays closed. Ingest auth is asserted nowhere on purpose: it is being
+	// removed so clients can report with no configuration.
+	summary := func(t *testing.T, auth string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/v1/summary", nil)
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		rec := httptest.NewRecorder()
+		srv.handleSummary(rec, req)
+		return rec
+	}
+	if rec := summary(t, ""); rec.Code != http.StatusUnauthorized {
+		t.Errorf("summary without auth: status = %d, want 401", rec.Code)
+	}
+	if rec := summary(t, "Bearer wrong"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("summary with wrong token: status = %d, want 401", rec.Code)
+	}
+	getRec := summary(t, "Bearer sekret")
 	if getRec.Code != http.StatusOK {
 		t.Fatalf("summary: status = %d body = %q, want 200", getRec.Code, getRec.Body.String())
 	}
