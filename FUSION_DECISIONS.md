@@ -85,10 +85,12 @@ it. Interactive lead sessions use their own provider controls.
    review uses a fresh context on an available worker.
 5. **Acceptance:** a semantic Done-check on workflow nodes. It runs only
    after every structural check has already passed (required files exist and
-   changed, handoff fields present, acceptance commands exited 0) and asks one
-   `noul` question: does the reported success plausibly satisfy the node's
-   task? The structural checks own every fact; the classifier only judges
-   them. A qualified rejection adds a blocker and hands the node to recovery
+   changed, handoff fields present, acceptance commands exited 0) and asks two
+   `noul` questions of opposite polarity: does the reported success plausibly
+   satisfy the task, and is it off-task? A rejection requires both to agree;
+   each polarity has a blind spot the other covers. The structural checks own
+   every fact; the classifier only judges them. A qualified rejection adds a
+   blocker and hands the node to recovery
    like any other rejected result. It can never accept a node: a structural
    failure is decided before it is called, and there is no path back.
 6. **Learning:** local decisions and acceptance outcomes are logged. Only

@@ -468,8 +468,15 @@ Shape, and why it is this shape, drawn from the same research pass:
 - *Code owns every fact; the classifier only judges facts code already
   fixed* (stated independently by `jevmeter` and `youtube-sponsor-detection`).
   The structural checks decide what exists, what changed, and what exited 0;
-  the classifier sees the task, summary and changed-list and answers one
-  `noul`. It is never the source of a fact it could hallucinate.
+  the classifier sees the task, summary and changed-list and answers two
+  `noul`s of opposite polarity that must agree (`jev-shell-history`'s rule:
+  each question type has a blind spot the other covers). It is never the
+  source of a fact it could hallucinate. The pairing is not theoretical: a
+  first single, double-barreled phrasing ("does it satisfy the task, or is
+  it off-task?") inverted the live model on real workflow states -- a
+  legitimate success scored plausible=false 0.81, an obvious "did nothing"
+  claim only 0.67. Single-clause wording separated correctly (0.40 vs
+  0.11); the inverted noul separated correctly for its polarity too.
 - *One-directional by construction.* It is only called on a node that
   already passed structurally, and its only power is to add a blocker. A
   structural failure never reaches it, so a "plausible: true" verdict cannot
