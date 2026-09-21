@@ -47,6 +47,19 @@ CASES = {
         ("nm: investigate and fix", intake("Investigate why checkout retries loop, and fix the cause."), None),
         ("nm: phrased as a question", intake("Could we add saved searches to the dashboard?"), None),
     ]),
+    # Recovery scores 2/5 here with two distinct answers across eight states. Three
+    # interventions were measured against these same states and none moved it, so
+    # they are recorded rather than left for the next person to retry:
+    #   state as a dict / as mechanical prose / as the blocker text alone -> 2/5 each
+    #     (prose only changed which label it collapsed to: dict "stop", prose "switch")
+    #   5 options / 3 non-overlapping / 2 -> +0.1 confidence at best; at 2 options the
+    #     same label at ~0.60 for every state, including the quota one
+    #   the 5-way action choice replaced by binary recognition nouls -> "does this need
+    #     a person's decision" 7/8, "could a retry fix this" 4/7, "was the worker
+    #     unavailable" 3/8 (0.89 on a plain test failure)
+    # The pattern across all three: whether another attempt fixes "test failed: 3
+    # assertions" depends on why it failed, and the blocker text does not say. The
+    # kinds that score well ask questions their input fully determines.
     "recovery": (RECOVERY_QUESTIONS, "action", [
         ("continue", recovery_state([], failure=None, status="success", accepted=True), "continue"),
         ("repair", recovery_state(["test failed: 3 assertions in test_export.py"]), "repair"),
