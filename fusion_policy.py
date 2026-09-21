@@ -116,16 +116,18 @@ def route_task(config, task, store):
         }]
     if not candidates:
         raise ValueError("no healthy, permitted agent route is available")
-    questions = {"route": {"type": "choice", "instructions": "Choose a capable permitted worker for the goal and observed evidence; unknown metrics are unknown.",
-                           "criteria": {c["key"]: f"{c['agent']} {c.get('model') or 'configured default'}" for c in candidates}}}
-    record = engine.decide("routing", {"task": task.get("decision_context", task["task"]), "write": task["write"],
-                                      "goal": config.get("decisions", {}).get("routing_goal", "quality"),
-                                      "budget_remaining_usd": task.get("budget_remaining_usd"), "candidates": candidates}, questions, context(task))
-    selected, applied = candidates[0], False
-    if automatic and engine.allowed(record, "route"):
-        value = record["recommendations"]["route"]["value"]
-        selected = next(c for c in candidates if c["key"] == value)
-        applied = True
+    selected, applied, record = candidates[0], False, None
+    # A single candidate is not a choice: nothing to record, and Laya rejects one-option choices.
+    if len(candidates) > 1:
+        questions = {"route": {"type": "choice", "instructions": "Choose a capable permitted worker for the goal and observed evidence; unknown metrics are unknown.",
+                               "criteria": {c["key"]: f"{c['agent']} {c.get('model') or 'configured default'}" for c in candidates}}}
+        record = engine.decide("routing", {"task": task.get("decision_context", task["task"]), "write": task["write"],
+                                          "goal": config.get("decisions", {}).get("routing_goal", "quality"),
+                                          "budget_remaining_usd": task.get("budget_remaining_usd"), "candidates": candidates}, questions, context(task))
+        if automatic and engine.allowed(record, "route"):
+            value = record["recommendations"]["route"]["value"]
+            selected = next(c for c in candidates if c["key"] == value)
+            applied = True
     if automatic:
         task["requested_agent"] = "auto"
         task["agent"], task["route"] = selected["agent"], selected["route"]
@@ -133,8 +135,9 @@ def route_task(config, task, store):
         task["session_key"] += ":" + selected["key"] + ":" + str(selected.get("model", ""))
         if selected.get("model"):
             task["settings_overrides"] = {"model": selected["model"]}
-    task.setdefault("decisions", {})["routing"] = record["id"]
-    engine.applied(record, selected["key"], applied, "qualified automatic route" if applied else "explicit route or deterministic fallback")
+    if record:
+        task.setdefault("decisions", {})["routing"] = record["id"]
+        engine.applied(record, selected["key"], applied, "qualified automatic route" if applied else "explicit route or deterministic fallback")
 
 
 def review_task(config, task):

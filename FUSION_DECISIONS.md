@@ -71,7 +71,9 @@ it. Interactive lead sessions use their own provider controls.
    reported success, and observed workflow acceptance. Missing metrics stay
    unknown. ORC candidates require passing tool-fit evidence; read-only
    routes cannot become writers. Recent quota failures exclude equivalent
-   native lanes. Explicit agent/route selections stay pinned.
+   native lanes. Explicit agent/route selections stay pinned, and a lane
+   with a single candidate records no routing decision: there is nothing
+   to choose.
 3. **Recovery:** classifies actual acceptance results as continue, repair,
    switch, ask or stop. A classifier cannot accept a failed check, bypass a
    permission denial, increase attempts, or discard prior spend. A qualified
@@ -102,6 +104,15 @@ orc fusion decisions list --limit 10
 orc fusion decisions show DECISION_ID
 orc fusion delegate --agent auto --read-only "Map the checkout retry logic"
 ```
+
+`orc fusion workflow report ID` lists each node's recorded recommendations with
+their probabilities and whether they were applied or advisory, and a `Gate:`
+line counting accepted vs rejected nodes. The gate count comes from a trace
+span per acceptance decision (agent `gate`), so `fusion usage` and remote
+telemetry can see rejections; the worker's own span is written before the
+gate runs and only carries the worker's claim. A request the runtime rejects
+(for example a malformed question) abstains for that decision only; the
+runtime keeps serving later decisions in the same run.
 
 Interactive terminals also show each recommendation as it arrives, its selected
 label probability and inference time, followed by the action Fusion actually
