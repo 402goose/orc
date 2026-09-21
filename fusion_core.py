@@ -285,6 +285,19 @@ def usage_summary(spans: list[dict[str, Any]]) -> dict[str, Any]:
     return {"spans": len(spans), "total": total, "by_route": list(groups.values())}
 
 
+# One vocabulary for provider quota/rate-limit text, shared by lane cooldown,
+# recovery classification and telemetry so the three can never disagree.
+QUOTA_MARKERS = ("usage limit", "session limit", "rate limit", "quota", "credits",
+                 "resets at", "resets ", "too many requests")
+LANE_COOLDOWN_SECONDS = 900
+
+
+def quota_failure(result: dict[str, Any]) -> bool:
+    text = " ".join(str(item) for item in result.get("blockers", []))
+    text = f"{text} {result.get('summary', '')}".lower()
+    return any(marker in text for marker in QUOTA_MARKERS)
+
+
 def failure_class(result: dict[str, Any]) -> str | None:
     """Coarse, non-identifying category for a non-success result. Used both
     to make local `fusion usage` slicing easier and as the only failure
@@ -295,7 +308,7 @@ def failure_class(result: dict[str, Any]) -> str | None:
         return "permission_denied"
     if result.get("status") == "success":
         return None
-    if any(marker in text for marker in ("usage limit", "session limit", "rate limit", "quota", "resets at", "resets ")):
+    if quota_failure(result):
         return "quota"
     if result.get("exit_code") == 124 or "timeout" in text:
         return "timeout"
