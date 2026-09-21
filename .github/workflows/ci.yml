@@ -28,3 +28,40 @@ jobs:
         run: ./test/run.sh
       - name: run Fusion tests
         run: make test dogfood
+
+  telemetry-server:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: telemetry
+          POSTGRES_PASSWORD: telemetry
+          POSTGRES_DB: telemetry_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: telemetry/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+        working-directory: telemetry
+      - name: go vet
+        run: go vet ./...
+        working-directory: telemetry
+      - name: go build
+        run: go build ./...
+        working-directory: telemetry
+      - name: go test (unit + real Postgres integration)
+        run: go test ./... -v
+        working-directory: telemetry
+        env:
+          TEST_DATABASE_URL: postgres://telemetry:telemetry@localhost:5432/telemetry_test?sslmode=disable

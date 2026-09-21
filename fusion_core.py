@@ -363,6 +363,30 @@ def send_remote_telemetry(remote: dict[str, Any], span: dict[str, Any]) -> None:
         pass
 
 
+def _summary_endpoint(ingest_endpoint: str) -> str:
+    """The summary endpoint is always the ingest endpoint's sibling path
+    (.../v1/ingest -> .../v1/summary)."""
+    base, _, _ = ingest_endpoint.rstrip("/").rpartition("/")
+    return f"{base}/summary" if base else ingest_endpoint
+
+
+def fetch_remote_summary(remote: dict[str, Any], hours: int) -> dict[str, Any]:
+    """Unlike send_remote_telemetry, this is an explicit interactive request
+    (`fusion telemetry report`) so it surfaces errors instead of swallowing
+    them -- a user asking to see the group's aggregate data wants to know if
+    the collector is unreachable, not silently get nothing."""
+    endpoint = str(remote.get("endpoint") or "")
+    if not endpoint:
+        raise ValueError("telemetry.remote.endpoint is not configured")
+    url = f"{_summary_endpoint(endpoint)}?hours={int(hours)}"
+    request = urllib.request.Request(url, method="GET")
+    token = str(remote.get("token") or "")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 class RunStore:
     def __init__(self, workspace: Path):
         self.workspace = workspace
@@ -1411,6 +1435,10 @@ def build_parser() -> argparse.ArgumentParser:
     telemetry = sub.add_parser("telemetry", help="local and remote telemetry configuration")
     telemetry_sub = telemetry.add_subparsers(dest="telemetry_command", required=True)
     telemetry_sub.add_parser("status", help="show what remote telemetry is configured to send, if any")
+    telemetry_report = telemetry_sub.add_parser(
+        "report", help="fetch aggregate usage/failure patterns from the shared remote collector"
+    )
+    telemetry_report.add_argument("--hours", type=int, default=168, help="lookback window in hours (default: 168, 7 days)")
 
     sub.add_parser("mcp-serve", help=argparse.SUPPRESS)
     return parser
@@ -1440,6 +1468,28 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "telemetry":
         remote = (config.get("telemetry") or {}).get("remote") or {}
         enabled = bool(remote.get("enabled"))
+        if args.telemetry_command == "report":
+            if not enabled:
+                print("fusion telemetry report: telemetry.remote.enabled is not set; nothing to fetch", file=sys.stderr)
+                return 1
+            try:
+                summary = fetch_remote_summary(remote, args.hours)
+            except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+                print(f"fusion telemetry report: could not reach the collector: {exc}", file=sys.stderr)
+                return 1
+            if args.json:
+                print(json_text(summary))
+            else:
+                print(f"telemetry report: last {summary.get('window_hours')}h, {summary.get('total_spans')} calls from {summary.get('unique_installs')} installs")
+                for row in summary.get("by_group", []):
+                    label = f"{row.get('agent')}/{row.get('route')}/{row.get('model')}"
+                    print(
+                        f"  {label}: {row.get('status')}"
+                        + (f" ({row.get('failure_class')})" if row.get("failure_class") else "")
+                        + f" -- {row.get('calls')} calls, ${row.get('total_cost_usd', 0):.4f}, "
+                        + f"avg {row.get('avg_duration_ms', 0):.0f}ms"
+                    )
+            return 0
         payload = {
             "local_enabled": (config.get("telemetry") or {}).get("enabled", True),
             "local_path": str(workspace / ".fusion" / "traces.jsonl"),
