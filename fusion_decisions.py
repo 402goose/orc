@@ -43,12 +43,15 @@ RECOVERY_QUESTIONS = {
                             "switch": "worker unavailable; another permitted worker may help", "ask": "missing user decision or permission",
                             "stop": "external blocker; do not retry now"}},
 }
-# Two single-clause nouls of opposite polarity; a rejection needs both to agree.
-# A double-barreled "does it satisfy, or is it off-task?" phrasing inverted the
-# live model's answer on real workflow states.
+# Single-clause phrasings only: a double-barreled "does it satisfy, or is it
+# off-task?" inverted the live model on real workflow states. `plausible` is
+# the rejection signal; `failed_task` is recorded for calibration and training
+# but is not a gate -- on authored near-misses it detects "no work was done",
+# not "the wrong work was done", so requiring agreement blocked the one case
+# this check exists to catch.
 ACCEPTANCE_QUESTIONS = {
     "plausible": {"type": "noul", "instructions": "Does the worker's reported summary and evidence plausibly satisfy the task?"},
-    "off_task": {"type": "noul", "instructions": "Is the reported success off-task or substantively wrong for the task?"},
+    "failed_task": {"type": "noul", "instructions": "Did the worker fail to do what the task asked?"},
 }
 
 

@@ -267,7 +267,7 @@ class DecisionsTest(unittest.TestCase):
             self.assertEqual(node["excluded_routes"], ["codex"])
 
     def test_acceptance_check_is_advisory_in_shadow_mode(self):
-        engine = self.engine({"plausible": "false", "off_task": "true"})
+        engine = self.engine({"plausible": "false", "failed_task": "true"})
         self.qualify(engine, "acceptance", ACCEPTANCE_QUESTIONS)
         node = {"task": "Add CSV export", "attempts": 1}
         result = {"run_id": "r1", "status": "success", "summary": "Renamed a variable", "changed": ["a.py"], "tests": []}
@@ -281,8 +281,8 @@ class DecisionsTest(unittest.TestCase):
         self.assertEqual(applications[0]["actual"], "accept")
         self.assertFalse(applications[0]["applied"])
 
-    def test_acceptance_check_rejects_only_when_active_qualified_and_both_questions_agree(self):
-        engine = self.engine({"plausible": "false", "off_task": "true"}, "active")
+    def test_acceptance_check_rejects_only_on_a_qualified_implausible_verdict(self):
+        engine = self.engine({"plausible": "false", "failed_task": "false"}, "active")
         node = {"task": "Add CSV export", "attempts": 1}
         result = {"run_id": "r1", "status": "success", "summary": "Renamed a variable", "changed": ["a.py"], "tests": []}
         with patch("fusion_policy.DecisionEngine", return_value=engine):
@@ -290,15 +290,14 @@ class DecisionsTest(unittest.TestCase):
             self.qualify(engine, "acceptance", ACCEPTANCE_QUESTIONS)
             plausible, decision_id = accept_node(self.config, self.workspace, "w", node, result)
             self.assertFalse(plausible)
-            engine.backend.choices["off_task"] = "false"
-            self.assertTrue(accept_node(self.config, self.workspace, "w", node, result)[0])
-            engine.backend.choices.update(plausible="true", off_task="true")
+            # The second question is recorded, never a gate in either direction.
+            engine.backend.choices.update(plausible="true", failed_task="true")
             self.assertTrue(accept_node(self.config, self.workspace, "w", node, result)[0])
         applications = [e for e in read_jsonl(engine.store.path) if e.get("event") == "application" and e["id"] == decision_id]
         self.assertEqual((applications[0]["actual"], applications[0]["applied"]), ("reject", True))
 
     def test_workflow_acceptance_check_can_reject_but_never_accept(self):
-        engine = self.engine({"plausible": "false", "off_task": "true"}, "active")
+        engine = self.engine({"plausible": "false"}, "active")
         self.qualify(engine, "acceptance", ACCEPTANCE_QUESTIONS)
         spec = {"max_attempts": 1, "nodes": [{"id": "build", "agent": "codex", "task": "Add CSV export"}]}
         passing = {"run_id": "r1", "status": "success", "summary": "Renamed a variable", "changed": ["a.py"], "tests": [], "usage": {}}
