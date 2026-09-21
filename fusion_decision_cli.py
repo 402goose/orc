@@ -80,7 +80,14 @@ def run(args, workspace, config):
     elif command == "probe":
         questions = {"intake": INTAKE_QUESTIONS, "review": REVIEW_QUESTIONS, "recovery": RECOVERY_QUESTIONS,
                      "acceptance": ACCEPTANCE_QUESTIONS}[args.kind]
-        payload = DecisionEngine(workspace, config).decide(args.kind, args.state, questions)
+        state = args.state
+        # A JSON object probes with the same state shape a workflow sends; a plain string stays a string.
+        if state.lstrip().startswith("{"):
+            try:
+                state = json.loads(state)
+            except ValueError:
+                pass
+        payload = DecisionEngine(workspace, config).decide(args.kind, state, questions)
     elif command == "label":
         if any("=" not in answer for answer in args.answers):
             raise ValueError("answers must be question=value pairs")

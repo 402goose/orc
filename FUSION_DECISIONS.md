@@ -95,12 +95,14 @@ it. Interactive lead sessions use their own provider controls.
    review uses a fresh context on an available worker.
 5. **Acceptance:** a semantic Done-check on workflow nodes. It runs only
    after every structural check has already passed (required files exist and
-   changed, handoff fields present, acceptance commands exited 0) and asks two
-   `noul` questions of opposite polarity: does the reported success plausibly
-   satisfy the task, and is it off-task? A rejection requires both to agree;
-   each polarity has a blind spot the other covers. The structural checks own
-   every fact; the classifier only judges them. A qualified rejection adds a
-   blocker and hands the node to recovery
+   changed, handoff fields present, acceptance commands exited 0) and asks
+   two `noul` questions: does the reported success plausibly satisfy the
+   task, and did the worker fail to do what was asked? Only a qualified
+   "not plausible" rejects; the second answer is recorded for calibration
+   and training. On authored near-misses it detects "no work was done" but
+   not "the wrong work was done", so it is evidence, not a gate. The
+   structural checks own every fact; the classifier only judges them. A
+   qualified rejection adds a blocker and hands the node to recovery
    like any other rejected result. It can never accept a node: a structural
    failure is decided before it is called, and there is no path back.
 6. **Learning:** local decisions and acceptance outcomes are logged. Only
@@ -247,7 +249,6 @@ ordinary inference and training use cached/local files offline.
 ```sh
 make test dogfood
 make dogfood-paired
-~/.local/share/orc/laya/bin/python test/laya_smoke.py --train
 ```
 
 `dogfood-paired` runs the fixture fan-out workflow twice, with decisions off
@@ -255,6 +256,11 @@ and in shadow mode, and fails if shadow changed any node's status or attempt
 count, recorded fewer than one successful recovery decision per node, or left
 the verdicts and gate count out of `workflow report`. It needs the local Laya
 runtime and pays one cold start.
+
+`--acceptance` runs six authored acceptance states on the installed checkpoint
+and asserts only the clear-cut ones: a clean success reads plausible, a
+"did nothing" claim and a plausible-sounding off-task summary do not. The
+near-misses print for comparison and are not asserted.
 
 The standard tests use isolated fixtures and require no Laya installation
 or coding-agent calls. The optional smoke test exercises real cached-model

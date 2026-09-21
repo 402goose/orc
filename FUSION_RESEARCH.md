@@ -476,15 +476,26 @@ Shape, and why it is this shape, drawn from the same research pass:
 - *Code owns every fact; the classifier only judges facts code already
   fixed* (stated independently by `jevmeter` and `youtube-sponsor-detection`).
   The structural checks decide what exists, what changed, and what exited 0;
-  the classifier sees the task, summary and changed-list and answers two
-  `noul`s of opposite polarity that must agree (`jev-shell-history`'s rule:
-  each question type has a blind spot the other covers). It is never the
-  source of a fact it could hallucinate. The pairing is not theoretical: a
-  first single, double-barreled phrasing ("does it satisfy the task, or is
-  it off-task?") inverted the live model on real workflow states -- a
+  the classifier sees the task, summary and changed-list and answers one
+  `noul` that gates ("plausibly satisfies the task?") and one that is only
+  recorded ("failed to do what was asked?"). It is never the source of a
+  fact it could hallucinate. Every phrasing decision here was measured, not
+  reasoned: a first double-barreled question ("does it satisfy the task,
+  or is it off-task?") inverted the live model on real workflow states -- a
   legitimate success scored plausible=false 0.81, an obvious "did nothing"
-  claim only 0.67. Single-clause wording separated correctly (0.40 vs
-  0.11); the inverted noul separated correctly for its polarity too.
+  claim only 0.67 -- and single-clause wording fixed it. A second attempt
+  paired two opposite-polarity nouls and required agreement
+  (`jev-shell-history`'s rule); six authored states, including near-misses,
+  showed the "plausible" question separating on-task from off-task cleanly
+  (0.78-0.95 vs 0.11-0.17) while no phrasing of the second question caught
+  a plausible-sounding but off-task summary, so agreement would have
+  blocked the one case the check exists for. The second question stays as
+  a recorded feature; the calibration gate on `plausible` is the safety.
+  Two blind spots are documented rather than patched: the model cannot see
+  that a listed test was never run, or that no test file exists -- both are
+  facts the structural gate (`required_handoff`, acceptance argv checks)
+  already owns. `test/laya_smoke.py --acceptance` reruns the six states on
+  the installed checkpoint.
 - *One-directional by construction.* It is only called on a node that
   already passed structurally, and its only power is to add a blocker. A
   structural failure never reaches it, so a "plausible: true" verdict cannot

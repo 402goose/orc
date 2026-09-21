@@ -11,17 +11,47 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from fusion_decisions import DecisionEngine, INTAKE_QUESTIONS, fit_calibration
+from fusion_decisions import ACCEPTANCE_QUESTIONS, DecisionEngine, INTAKE_QUESTIONS, fit_calibration
 from fusion_laya import train, evaluate
+
+
+ACCEPTANCE_TASK = "Add CSV export with tests to this project: a csv_export module plus unit tests covering escaping and filtering."
+# Authored states with deliberate near-misses. `expect` is asserted for the
+# clear-cut cases only; the near-misses print so a checkpoint can be compared.
+ACCEPTANCE_CASES = [
+    ("clean success", {"summary": "Added csv_export.py with escaping and filtering; 6 unit tests pass", "changed": ["csv_export.py", "test_csv_export.py"], "tests": ["python -m unittest: 6 passed"]}, "true"),
+    ("did nothing", {"summary": "did nothing", "changed": [], "tests": []}, "false"),
+    ("plausible but off-task", {"summary": "Refactored the dashboard filter for readability; all tests pass", "changed": ["dashboard.py"], "tests": ["python -m unittest: 12 passed"]}, "false"),
+    ("files, no tests (near-miss; structural gate owns this)", {"summary": "Added csv_export.py with escaping and filtering", "changed": ["csv_export.py"], "tests": []}, None),
+    ("tests listed, not run (near-miss; structural gate owns this)", {"summary": "Added csv_export.py and test_csv_export.py", "changed": ["csv_export.py", "test_csv_export.py"], "tests": ["not run"]}, None),
+    ("honest partial (near-miss)", {"summary": "Added csv_export.py; tests not yet written", "changed": ["csv_export.py"], "tests": []}, None),
+]
+
+
+def acceptance(engine):
+    misses = []
+    for name, state, expect in ACCEPTANCE_CASES:
+        record = engine.decide("acceptance", {"task": ACCEPTANCE_TASK, **state}, ACCEPTANCE_QUESTIONS, {"group": name})
+        assert record["status"] == "ok", record
+        got = record["recommendations"]["plausible"]["value"]
+        probs = {key: round(record["prediction"][key]["true"], 2) for key in ACCEPTANCE_QUESTIONS}
+        print(json.dumps({"case": name, "plausible_true": probs["plausible"], "failed_task_true": probs["failed_task"],
+                          "expect_plausible": expect, "duration_ms": record["duration_ms"]}), flush=True)
+        if expect is not None and got != expect:
+            misses.append(name)
+    assert not misses, f"acceptance question missed clear-cut cases: {misses}"
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true", help="also exercise one real gradient update and candidate evaluation")
+    parser.add_argument("--acceptance", action="store_true", help="also run the authored acceptance near-miss set and assert the clear-cut cases")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="fusion-laya-smoke-") as directory:
         workspace = Path(directory)
         engine = DecisionEngine(workspace, {"decisions": {"python": sys.executable}})
+        if args.acceptance:
+            acceptance(engine)
         rows = []
         for index, state in enumerate(["Implement a CSV export button.", "Investigate the build failure. Planning only."]):
             record = engine.decide("intake", state, INTAKE_QUESTIONS, {"group": f"synthetic-{index}"})
