@@ -42,6 +42,8 @@ def add_parser(sub):
             action.add_argument("--epochs", type=int, default=1)
             action.add_argument("--learning-rate", type=float, default=0.0001)
             action.add_argument("--seed", type=int, default=42)
+        else:
+            action.add_argument("--control", action="store_true", help="also score held-out examples against a different example's state")
 
 
 def run(args, workspace, config):
@@ -65,6 +67,8 @@ def run(args, workspace, config):
                 "--model-path", str(Path(args.model_path).expanduser().resolve()) if args.model_path else options["model_path"]]
         if command == "train":
             argv += ["--epochs", str(args.epochs), "--learning-rate", str(args.learning_rate), "--seed", str(args.seed)]
+        elif getattr(args, "control", False):
+            argv.append("--control")
         return subprocess.run(argv, check=False).returncode
     if command == "status":
         report = DecisionEngine(workspace, config).calibration()
