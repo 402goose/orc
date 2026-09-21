@@ -1,7 +1,7 @@
 # Local decisions with Laya
 
-Fusion integrates [Laya](https://github.com/NandhaKishorM/laya) at four decision
-points and provides a fifth capability: learning from reviewed outcomes.
+Fusion integrates [Laya](https://github.com/NandhaKishorM/laya) at five decision
+points and provides a sixth capability: learning from reviewed outcomes.
 Laya classifies bounded inputs locally. Claude, Codex and agy still perform
 the coding work through their configured accounts.
 
@@ -83,7 +83,15 @@ it. Interactive lead sessions use their own provider controls.
    retain their independent review. The classifier cannot remove it or
    authorize writes. A different installed worker is preferred; otherwise
    review uses a fresh context on an available worker.
-5. **Learning:** local decisions and acceptance outcomes are logged. Only
+5. **Acceptance:** a semantic Done-check on workflow nodes. It runs only
+   after every structural check has already passed (required files exist and
+   changed, handoff fields present, acceptance commands exited 0) and asks one
+   `noul` question: does the reported success plausibly satisfy the node's
+   task? The structural checks own every fact; the classifier only judges
+   them. A qualified rejection adds a blocker and hands the node to recovery
+   like any other rejected result. It can never accept a node: a structural
+   failure is decided before it is called, and there is no path back.
+6. **Learning:** local decisions and acceptance outcomes are logged. Only
    explicitly reviewed labels with verification evidence enter training
    exports. Human review, candidate fine-tuning, held-out evaluation and
    calibration are separate steps; no model promotes itself.

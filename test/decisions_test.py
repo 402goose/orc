@@ -14,10 +14,10 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fusion_core as core
 from fusion_build import prepare
-from fusion_decisions import (DecisionEngine, DecisionStore, INTAKE_QUESTIONS, RECOVERY_QUESTIONS,
+from fusion_decisions import (DecisionEngine, DecisionStore, ACCEPTANCE_QUESTIONS, INTAKE_QUESTIONS, RECOVERY_QUESTIONS,
                               REVIEW_QUESTIONS, LayaRuntime, DEFAULTS, digest, fit_calibration, read_jsonl)
 from fusion_laya import dataset_rows
-from fusion_policy import route_task, route_candidates, recovery, review_task
+from fusion_policy import accept_node, route_task, route_candidates, recovery, review_task
 from fusion_workflow import WorkflowRunner, resume_workflow, workflow_report
 
 
@@ -57,7 +57,7 @@ class DecisionsTest(unittest.TestCase):
                        "agy": {"command": "missing-fusion-test-agent"}}
 
     def engine(self, choices=None, mode="shadow"):
-        config = {**self.config, "decisions": {"mode": mode, "auto_actions": ["intake", "routing", "recovery", "review"], "calibration_file": "calibration.json"}}
+        config = {**self.config, "decisions": {"mode": mode, "auto_actions": ["intake", "routing", "recovery", "review", "acceptance"], "calibration_file": "calibration.json"}}
         return DecisionEngine(self.workspace, config, Backend(choices))
 
     def qualify(self, engine, kind, questions, identity="fixture-model"):
@@ -265,6 +265,59 @@ class DecisionsTest(unittest.TestCase):
             node = {"agent": "auto", "attempts": 1}
             self.assertEqual(recovery(self.config, self.workspace, "w", node, result, False, 2)[0], "switch")
             self.assertEqual(node["excluded_routes"], ["codex"])
+
+    def test_acceptance_check_is_advisory_in_shadow_mode(self):
+        engine = self.engine({"plausible": "false"})
+        self.qualify(engine, "acceptance", ACCEPTANCE_QUESTIONS)
+        node = {"task": "Add CSV export", "attempts": 1}
+        result = {"run_id": "r1", "status": "success", "summary": "Renamed a variable", "changed": ["a.py"], "tests": []}
+        with patch("fusion_policy.DecisionEngine", return_value=engine):
+            plausible, decision_id = accept_node(self.config, self.workspace, "w", node, result)
+        self.assertTrue(plausible)
+        record = engine.store.get(decision_id)
+        self.assertEqual(record["kind"], "acceptance")
+        self.assertEqual(record["recommendations"]["plausible"]["value"], "false")
+        applications = [e for e in read_jsonl(engine.store.path) if e.get("event") == "application" and e["id"] == decision_id]
+        self.assertEqual(applications[0]["actual"], "accept")
+        self.assertFalse(applications[0]["applied"])
+
+    def test_acceptance_check_rejects_only_when_active_and_qualified(self):
+        engine = self.engine({"plausible": "false"}, "active")
+        node = {"task": "Add CSV export", "attempts": 1}
+        result = {"run_id": "r1", "status": "success", "summary": "Renamed a variable", "changed": ["a.py"], "tests": []}
+        with patch("fusion_policy.DecisionEngine", return_value=engine):
+            self.assertTrue(accept_node(self.config, self.workspace, "w", node, result)[0])
+            self.qualify(engine, "acceptance", ACCEPTANCE_QUESTIONS)
+            plausible, decision_id = accept_node(self.config, self.workspace, "w", node, result)
+            self.assertFalse(plausible)
+            engine.backend.choices["plausible"] = "true"
+            self.assertTrue(accept_node(self.config, self.workspace, "w", node, result)[0])
+        applications = [e for e in read_jsonl(engine.store.path) if e.get("event") == "application" and e["id"] == decision_id]
+        self.assertEqual((applications[0]["actual"], applications[0]["applied"]), ("reject", True))
+
+    def test_workflow_acceptance_check_can_reject_but_never_accept(self):
+        engine = self.engine({"plausible": "false"}, "active")
+        self.qualify(engine, "acceptance", ACCEPTANCE_QUESTIONS)
+        spec = {"max_attempts": 1, "nodes": [{"id": "build", "agent": "codex", "task": "Add CSV export"}]}
+        passing = {"run_id": "r1", "status": "success", "summary": "Renamed a variable", "changed": ["a.py"], "tests": [], "usage": {}}
+        with patch.object(core, "dispatch", return_value=dict(passing)), patch("fusion_policy.DecisionEngine", return_value=engine):
+            result = WorkflowRunner(self.workspace, self.config, spec).run()
+        node = result["nodes"][0]
+        self.assertEqual(node["status"], "invalid")
+        self.assertIn("Laya acceptance check: reported success does not plausibly match the task", node["result"]["blockers"])
+        self.assertIn("acceptance", node["result"]["decisions"])
+        self.assertNotIn("digest", node["result"])
+        # A structural failure never reaches the classifier, so a "true" verdict cannot rescue it.
+        engine.backend.choices["plausible"] = "true"
+        engine.backend.calls = 0
+        failing = {**passing, "run_id": "r2", "blockers": ["test failed"]}
+        with patch.object(core, "dispatch", return_value=dict(failing)), patch("fusion_policy.DecisionEngine", return_value=engine):
+            result = WorkflowRunner(self.workspace, self.config, spec).run()
+        node = result["nodes"][0]
+        self.assertEqual(node["status"], "invalid")
+        self.assertNotIn("acceptance", node["result"].get("decisions", {}))
+        kinds = [e["kind"] for e in engine.store.records() if e["context"].get("task_id") == "r2"]
+        self.assertEqual(kinds, ["recovery"])
 
     def test_retry_costs_survive_budget_pause_and_resume(self):
         config = {**self.config, "decisions": {"mode": "off"}}

@@ -24,7 +24,7 @@ DEFAULTS = {
     "timeout_seconds": 120, "auto_actions": [], "threshold": 0.90,
     "calibration_file": "", "max_state_chars": 2200,
 }
-KINDS = {"intake", "routing", "recovery", "review"}
+KINDS = {"intake", "routing", "recovery", "review", "acceptance"}
 INTAKE_QUESTIONS = {
     "workflow": {"type": "choice", "instructions": "Which work is requested and permitted?",
                  "criteria": {"discovery": "investigate or plan only", "build": "implement a feature",
@@ -43,6 +43,13 @@ RECOVERY_QUESTIONS = {
                             "switch": "worker unavailable; another permitted worker may help", "ask": "missing user decision or permission",
                             "stop": "external blocker; do not retry now"}},
 }
+ACCEPTANCE_QUESTIONS = {
+    "plausible": {"type": "noul", "instructions": "This node's structural checks already passed (required files "
+                  "exist and changed, required handoff fields present, acceptance commands exited 0). Given the "
+                  "node's task and the worker's reported summary/changed evidence, does the reported success "
+                  "plausibly satisfy the task, or does it look like a syntactically valid but substantively wrong "
+                  "or off-task result?"},
+}
 
 
 def digest(value):
@@ -56,7 +63,7 @@ def config_for(config):
     if options["mode"] not in {"off", "shadow", "active"}:
         raise ValueError("decisions.mode must be off, shadow, or active")
     if not isinstance(options["auto_actions"], list) or set(options["auto_actions"]) - KINDS:
-        raise ValueError("decisions.auto_actions must contain only intake, routing, recovery, review")
+        raise ValueError("decisions.auto_actions must contain only intake, routing, recovery, review, acceptance")
     if not 0 < float(options["threshold"]) <= 1:
         raise ValueError("decisions.threshold must be in (0, 1]")
     return options
