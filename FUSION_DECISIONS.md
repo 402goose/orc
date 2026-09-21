@@ -1,7 +1,7 @@
 # Local decisions with Laya
 
-Fusion integrates [Laya](https://github.com/NandhaKishorM/laya) at four decision
-points and provides a fifth capability: learning from reviewed outcomes.
+Fusion integrates [Laya](https://github.com/NandhaKishorM/laya) at five decision
+points and provides a sixth capability: learning from reviewed outcomes.
 Laya classifies bounded inputs locally. Claude, Codex and agy still perform
 the coding work through their configured accounts.
 
@@ -88,7 +88,19 @@ it. Interactive lead sessions use their own provider controls.
    retain their independent review. The classifier cannot remove it or
    authorize writes. A different installed worker is preferred; otherwise
    review uses a fresh context on an available worker.
-5. **Learning:** local decisions and acceptance outcomes are logged. Only
+5. **Acceptance:** a semantic Done-check on workflow nodes. It runs only
+   after every structural check has already passed (required files exist and
+   changed, handoff fields present, acceptance commands exited 0) and asks
+   two `noul` questions: does the reported success plausibly satisfy the
+   task, and did the worker fail to do what was asked? Only a qualified
+   "not plausible" rejects; the second answer is recorded for calibration
+   and training. On authored near-misses it detects "no work was done" but
+   not "the wrong work was done", so it is evidence, not a gate. The
+   structural checks own every fact; the classifier only judges them. A
+   qualified rejection adds a blocker and hands the node to recovery
+   like any other rejected result. It can never accept a node: a structural
+   failure is decided before it is called, and there is no path back.
+6. **Learning:** local decisions and acceptance outcomes are logged. Only
    explicitly reviewed labels with verification evidence enter training
    exports. Human review, candidate fine-tuning, held-out evaluation and
    calibration are separate steps; no model promotes itself.
@@ -103,6 +115,8 @@ uncached models, timeouts and invalid predictions cause abstention.
 ```sh
 orc fusion decisions status
 orc fusion decisions probe "Implement CSV export with tests"
+orc fusion decisions probe --kind acceptance \
+  '{"task": "Add CSV export with tests", "summary": "did nothing", "changed": [], "tests": []}'
 orc fusion decisions list --limit 10
 orc fusion decisions show DECISION_ID
 orc fusion delegate --agent auto --read-only "Map the checkout retry logic"
@@ -238,6 +252,13 @@ and in shadow mode, and fails if shadow changed any node's status or attempt
 count, recorded fewer than one successful recovery decision per node, or left
 the verdicts and gate count out of `workflow report`. It needs the local Laya
 runtime and pays one cold start.
+~/.local/share/orc/laya/bin/python test/laya_smoke.py --train --acceptance
+```
+
+`--acceptance` runs six authored acceptance states on the installed checkpoint
+and asserts only the clear-cut ones: a clean success reads plausible, a
+"did nothing" claim and a plausible-sounding off-task summary do not. The
+near-misses print for comparison and are not asserted.
 
 The standard tests use isolated fixtures and require no Laya installation
 or coding-agent calls. The optional smoke test exercises real cached-model
