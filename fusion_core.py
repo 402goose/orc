@@ -598,6 +598,7 @@ def parse_codex_events(stdout: str) -> tuple[str | None, str, str | None, dict[s
     failure: str | None = None
     usage: dict[str, Any] = {}
     non_json: list[str] = []
+    command_evidence: list[str] = []
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -613,6 +614,19 @@ def parse_codex_events(stdout: str) -> tuple[str | None, str, str | None, dict[s
             item = event.get("item") or {}
             if item.get("type") == "agent_message" and item.get("text"):
                 messages.append(str(item["text"]))
+            elif item.get("type") == "command_execution":
+                # A structural signal Fusion previously never looked at: the
+                # turn can complete and the worker's own STATUS line can
+                # still claim success while a command it actually ran
+                # failed. Surfaced as evidence (a blocker), not an automatic
+                # status override -- a nonzero exit isn't always a real
+                # failure (grep returning 1 for "no matches" is routine),
+                # so this is data for a human or an acceptance gate to
+                # weigh, the same way permission denials already are.
+                exit_code = item.get("exit_code")
+                if isinstance(exit_code, int) and exit_code != 0:
+                    command = compact(str(item.get("command") or "command"), 200)
+                    command_evidence.append(f"command exited {exit_code}: {command}")
         elif event_type == "turn.completed":
             usage = event.get("usage") or {}
         elif event_type == "turn.failed":
@@ -620,7 +634,7 @@ def parse_codex_events(stdout: str) -> tuple[str | None, str, str | None, dict[s
         elif event_type == "error":
             failure = str(event.get("message") or "Codex emitted an error")
     text = messages[-1] if messages else "\n".join(non_json)
-    return thread_id, text, failure, usage, model, []
+    return thread_id, text, failure, usage, model, command_evidence
 
 
 def parse_claude_output(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None, list[str]]:
@@ -879,7 +893,7 @@ def dispatch(
     usage: dict[str, Any] = {}
     model = metadata.get("model")
     handoff: dict[str, Any] = {}
-    denial_notes: list[str] = []
+    evidence_notes: list[str] = []
     exit_code = 1
     try:
         with writer_lock(Path(task["workspace"]), task["write"]):
@@ -898,11 +912,11 @@ def dispatch(
         stdout_path.write_text(completed.stdout, encoding="utf-8")
         stderr_path.write_text(completed.stderr, encoding="utf-8")
         if task["agent"] == "codex":
-            new_session, summary, failure, usage, event_model, denial_notes = parse_codex_events(completed.stdout)
+            new_session, summary, failure, usage, event_model, evidence_notes = parse_codex_events(completed.stdout)
         elif task["agent"] == "agy":
-            new_session, summary, failure, usage, event_model, denial_notes = parse_agy_output(completed.stdout)
+            new_session, summary, failure, usage, event_model, evidence_notes = parse_agy_output(completed.stdout)
         else:
-            new_session, summary, failure, usage, event_model, denial_notes = parse_claude_output(completed.stdout)
+            new_session, summary, failure, usage, event_model, evidence_notes = parse_claude_output(completed.stdout)
         model = event_model or model
         handoff = parse_handoff(summary)
         if new_session:
@@ -940,7 +954,7 @@ def dispatch(
         "summary": compact(str(handoff.get("summary") or summary).strip(), int(config.get("max_result_chars", 12000))),
         "changed": handoff.get("changed", []),
         "tests": handoff.get("tests", []),
-        "blockers": handoff.get("blockers", []) + denial_notes + ([failure] if failure else []),
+        "blockers": handoff.get("blockers", []) + evidence_notes + ([failure] if failure else []),
         "exit_code": exit_code,
         "duration_ms": duration_ms,
         "usage": usage,

@@ -323,6 +323,19 @@ fusion ultra --harness codex 'Run the full bounded pipeline through Codex.'
 
 `fusion` uses a single writer lock for a workspace, so two write tasks cannot edit the same checkout at once. Use separate Git worktrees when you want parallel write tasks. Read-only tasks can run independently. The default Codex sidekick uses `codex exec --json`; the default Claude sidekick uses Claude Code print mode with structured JSON output.
 
+A worker's overall status (`STATUS: success|partial|blocked|error`) is still a
+self-reported label, but Fusion doesn't trust it blindly: `turn.failed`/`error`
+events (Codex) and `is_error` (Claude) are structural, process-level signals
+that override a self-reported "success" claim. On top of that, Codex's
+`command_execution` items carry their own per-command exit code — if a
+command a worker actually ran fails but the worker's final text still claims
+success, that contradiction is surfaced as a blocker (`command exited N:
+<command>`) rather than silently trusted. This doesn't override the
+self-reported status on its own — a nonzero exit isn't always a real failure
+(`grep` returning 1 for "no matches" is routine) — it makes the evidence
+visible for a human or an acceptance gate to weigh, the same way permission
+denials already are.
+
 ### Antigravity (agy) workers
 
 `agy` — the Google Antigravity CLI — is a third worker harness. It runs as a
