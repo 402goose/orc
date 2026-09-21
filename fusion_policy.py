@@ -169,9 +169,7 @@ def accept_node(config, workspace, workflow_id, node, result):
                                          "tests": result.get("tests", [])},
                            ACCEPTANCE_QUESTIONS, {"task_id": result.get("run_id"), "group": workflow_id})
     plausible, applied = True, False
-    answers = record["recommendations"]
-    if (engine.allowed(record, "plausible") and engine.allowed(record, "off_task")
-            and answers["plausible"]["value"] == "false" and answers["off_task"]["value"] == "true"):
+    if engine.allowed(record, "plausible") and record["recommendations"]["plausible"]["value"] == "false":
         plausible, applied = False, True
     engine.applied(record, "accept" if plausible else "reject", applied,
                    "qualified active classification" if applied else "shadow mode or unqualified recommendation; structural acceptance stands")
