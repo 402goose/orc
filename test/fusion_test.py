@@ -1132,12 +1132,26 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
             span = body["spans"][0]
             self.assertEqual(span["status"], "success")
             self.assertIsNone(span["failure_class"])
-            # The risky, potentially project-identifying fields never leave
-            # the local trace even when remote telemetry is enabled.
-            self.assertNotIn("changed", span)
-            self.assertNotIn("tests", span)
-            self.assertNotIn("blockers", span)
-            self.assertNotIn("artifacts", span)
+            # A whitelist, not a spot check: a field added to the span has to
+            # be added here too, which is the moment to ask whether it should
+            # be leaving the machine at all.
+            self.assertEqual(set(span), {
+                "trace_id", "span_id", "parent_span_id", "agent", "role", "route", "model",
+                "write", "status", "failure_class", "start_time_ms", "end_time_ms",
+                "duration_ms", "usage",
+            })
+            self.assertEqual(set(body), {"schema", "install_id", "spans"})
+            # And nothing project-identifying anywhere in the serialized payload,
+            # whatever field it might have travelled in.
+            wire = json.dumps(body)
+            for secret in ("secret/path.py", "pytest", "do secret/path.py work",
+                           str(self.workspace), str(self.temp.name), "claude-remote-telemetry"):
+                self.assertNotIn(secret, wire, f"{secret!r} reached the collector")
+            # `telemetry status` promises a field list; it must be the real one.
+            status = io.StringIO()
+            with contextlib.redirect_stdout(status):
+                fusion_core.main(["--workspace", str(self.workspace), "telemetry", "status"])
+            self.assertEqual(set(json.loads(status.getvalue())["fields_sent"]), set(span))
         finally:
             server.shutdown()
             server.server_close()
