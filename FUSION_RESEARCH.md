@@ -449,15 +449,67 @@ during this session); whether provider quota/rate-limit responses carry an
 equally structured, reliably-distinguishable type needs a live quota-exceeded
 response to check, not a guess from one adjacent error shape.
 
-A pi-warden-style semantic Done-check -- structural evidence (which this
-section now partially builds toward) feeding a judge bounded to a few typed
-yes/no/classification questions, rather than trusting a free-text self-report
--- was evaluated and deliberately not built yet: explicitly lower priority
-than the structural-signal gaps above, and adopting it via TypeSafe's hosted
-Jev SDK would be a new paid third-party dependency this harness doesn't
-currently have any of. Codex's own `--json-schema` flag (structured final
-response, already supported) is the more Fusion-shaped path if this gets
-built later, without taking on that dependency.
+A pi-warden-style semantic Done-check -- structural evidence feeding a judge
+bounded to a few typed yes/no/classification questions, rather than trusting
+a free-text self-report -- was originally evaluated and deliberately not
+built, because adopting it via TypeSafe's hosted Jev SDK would have been a
+new paid third-party dependency this harness didn't have any of. That premise
+no longer holds: the local Laya `DecisionEngine` (`FUSION_DECISIONS.md`) is
+exactly a $0, offline, typed-question judge with shadow/active modes and a
+calibration gate already in place. So the Done-check now exists as the
+`acceptance` decision kind (`fusion_policy.accept_node`), wired into
+`WorkflowRunner._execute()` immediately after `_accept_node`'s structural
+checks pass and before recovery runs.
+
+What it closes, precisely: the branch at `dispatch()` that reads
+`status = handoff.get("reported_status") or "success"` when the process
+exited 0 and no structural failure fired. `turn.failed`/`error`/`is_error`
+already cover the crash/refusal axis (above); `_accept_node` proves files
+changed and commands exited 0; nothing until now judged whether a
+structurally clean "success" was actually responsive to the task. That is
+the failure class pi-warden's Done-check guard targets (its published eval:
+6/150 project-rule violations unsupervised vs 0/150 supervised; a 13,952-case
+overnight run with no score drift).
+
+Shape, and why it is this shape, drawn from the same research pass:
+
+- *Code owns every fact; the classifier only judges facts code already
+  fixed* (stated independently by `jevmeter` and `youtube-sponsor-detection`).
+  The structural checks decide what exists, what changed, and what exited 0;
+  the classifier sees the task, summary and changed-list and answers two
+  `noul`s of opposite polarity that must agree (`jev-shell-history`'s rule:
+  each question type has a blind spot the other covers). It is never the
+  source of a fact it could hallucinate. The pairing is not theoretical: a
+  first single, double-barreled phrasing ("does it satisfy the task, or is
+  it off-task?") inverted the live model on real workflow states -- a
+  legitimate success scored plausible=false 0.81, an obvious "did nothing"
+  claim only 0.67. Single-clause wording separated correctly (0.40 vs
+  0.11); the inverted noul separated correctly for its polarity too.
+- *One-directional by construction.* It is only called on a node that
+  already passed structurally, and its only power is to add a blocker. A
+  structural failure never reaches it, so a "plausible: true" verdict cannot
+  rescue anything -- the same rule `FUSION_DECISIONS.md` already states for
+  recovery ("cannot accept a failed check").
+- *Confidence floor and cost cap are inherited, not reinvented* (`HA-Jev`'s
+  two-setting pattern). `engine.allowed()` gates any active rejection behind
+  mode, `auto_actions`, a qualified calibration bucket for the exact schema
+  and model identity, and the threshold; the classifier call is spent only
+  on structurally-passing nodes, so it adds at most one inference per
+  accepted node and none per rejected one.
+- *Human correction feeds calibration, not a rule table*
+  (`Jev-Moderation-Bot`'s false-flag precedent, done Fusion's way). A wrong
+  shadow-mode verdict is labeled through `decisions label` with evidence and
+  enters the next calibration/training export; nothing changes runtime
+  behavior until a bucket qualifies.
+
+Chadwick's contribution stays where it was: its four harness-enforced exit
+codes are the model for keeping the crash/refusal axis structural. This leg
+is for the axis exit codes cannot see -- a process that finished cleanly and
+said the wrong thing.
+
+Default is shadow: every `acceptance` verdict is recorded and none applied,
+so the first useful output is a labeled dataset of "structurally clean but
+implausible" nodes, which is the evidence needed before anyone turns it on.
 
 ## How to try it
 

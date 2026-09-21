@@ -5,7 +5,7 @@ from collections import defaultdict
 from pathlib import Path
 import time
 
-from fusion_decisions import DecisionEngine, DecisionStore, RECOVERY_QUESTIONS, REVIEW_QUESTIONS, read_jsonl
+from fusion_decisions import DecisionEngine, DecisionStore, ACCEPTANCE_QUESTIONS, RECOVERY_QUESTIONS, REVIEW_QUESTIONS, read_jsonl
 import fusion_progress as progress
 
 
@@ -161,6 +161,27 @@ def review_task(config, task):
         task["task"] += "\nReview focus: " + instructions[selected] + "\nReport unresolved findings as STATUS: blocked. Do not delegate further."
     task.setdefault("decisions", {})["review"] = record["id"]
     engine.applied(record, selected, applied)
+
+
+def accept_node(config, workspace, workflow_id, node, result):
+    """A semantic Done-check, run only after every structural acceptance check
+    already passed. A classifier verdict can add scrutiny -- reject a node
+    whose artifact is syntactically valid but substantively off-task -- but
+    it can never accept on its own; a structural failure is decided before
+    this is ever called, and this function has no path back to True from one."""
+    engine = DecisionEngine(workspace, config)
+    record = engine.decide("acceptance", {"task": node.get("decision_context", node["task"]),
+                                         "summary": result.get("summary"), "changed": result.get("changed", []),
+                                         "tests": result.get("tests", [])},
+                           ACCEPTANCE_QUESTIONS, {"task_id": result.get("run_id"), "group": workflow_id})
+    plausible, applied = True, False
+    answers = record["recommendations"]
+    if (engine.allowed(record, "plausible") and engine.allowed(record, "off_task")
+            and answers["plausible"]["value"] == "false" and answers["off_task"]["value"] == "true"):
+        plausible, applied = False, True
+    engine.applied(record, "accept" if plausible else "reject", applied,
+                   "qualified active classification" if applied else "shadow mode or unqualified recommendation; structural acceptance stands")
+    return plausible, record["id"]
 
 
 def recovery(config, workspace, workflow_id, node, result, accepted, max_attempts):
