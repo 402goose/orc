@@ -27,7 +27,7 @@ build:
 	./build.sh
 
 test:
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test -p 'fusion_test.py'
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test -p '*_test.py'
 
 dogfood:
 	./test/fusion_dogfood.sh
