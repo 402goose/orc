@@ -6,6 +6,10 @@ if [ "${FUSION_REAL:-}" != "1" ]; then
   exit 2
 fi
 
+# A fixture run, even one that spends real provider quota, is not usage worth
+# reporting to the shared collector.
+export FUSION_TELEMETRY=0
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

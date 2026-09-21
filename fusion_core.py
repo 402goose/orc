@@ -35,13 +35,17 @@ DEFAULTS: dict[str, Any] = {
     "telemetry": {
         "enabled": True,
         "include_content": False,
-        # Off by default for anyone who just clones the repo -- there is no
-        # collector to send to unless a project's own .fusion.json sets
-        # remote.enabled + remote.endpoint (and remote.token, for the shared
-        # ingestion secret out-of-band; never commit a real token here).
+        # On by default so a collaborator gets aggregate usage without
+        # configuring anything. The payload is reduced before it leaves the
+        # machine (see send_remote_telemetry) and the first send announces
+        # itself. FUSION_TELEMETRY=0 or remote.enabled false stops the send
+        # and keeps the local trace; telemetry.enabled false stops both. The
+        # collector needs no token to accept a span -- publishing one in a
+        # public repo would only be theatre -- so this stays empty; a token
+        # here is sent if present, and is what read endpoints require.
         "remote": {
-            "enabled": False,
-            "endpoint": "",
+            "enabled": True,
+            "endpoint": "https://orc-telemetry.fly.dev/v1/ingest",
             "token": "",
         },
     },
@@ -325,6 +329,32 @@ def telemetry_install_id() -> str:
     return new_id
 
 
+def announce_remote_telemetry(endpoint: str) -> None:
+    """Say it out loud, once per machine, the first time anything is sent.
+
+    On-by-default collection that never announces itself is the thing
+    people are right to resent, and this ships in a public repo where the
+    sender may be a stranger rather than a collaborator.
+    """
+    home = Path(os.environ.get("ORC_HOME") or (Path.home() / ".config" / "orc")).expanduser()
+    marker = home / "telemetry_announced"
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        if marker.exists():
+            return
+        marker.write_text(endpoint + "\n", encoding="utf-8")
+    except OSError:
+        return
+    print(
+        f"fusion: sending anonymous usage telemetry to {endpoint}\n"
+        f"        agent, model, outcome, timing and token counts -- never prompts,\n"
+        f"        output, file paths or repository names. Stop it with\n"
+        f"        FUSION_TELEMETRY=0 -- your local traces keep working.\n"
+        f"        Said once; see `fusion telemetry status` any time.",
+        file=sys.stderr,
+    )
+
+
 def send_remote_telemetry(remote: dict[str, Any], span: dict[str, Any]) -> None:
     """Best-effort, deliberately reduced telemetry send. Never raises: a
     down or misconfigured collector must never affect the actual dispatch.
@@ -336,6 +366,7 @@ def send_remote_telemetry(remote: dict[str, Any], span: dict[str, Any]) -> None:
     endpoint = str(remote.get("endpoint") or "")
     if not endpoint:
         return
+    announce_remote_telemetry(endpoint)
     payload = {
         "schema": TELEMETRY_SCHEMA,
         "install_id": telemetry_install_id(),
@@ -435,7 +466,10 @@ class RunStore:
         if run_dir:
             Path(run_dir, "trace.json").write_text(json_text(span) + "\n", encoding="utf-8")
         remote = telemetry.get("remote") or {}
-        if remote.get("enabled"):
+        # FUSION_TELEMETRY=0 stops the send without touching the local trace:
+        # lane cooldown, resume and `fusion usage` all read that file, and
+        # opting out of reporting should not cost the machine its own records.
+        if remote.get("enabled") and os.environ.get("FUSION_TELEMETRY") != "0":
             send_remote_telemetry(remote, span)
 
     def traces(self, limit: int = 100) -> list[dict[str, Any]]:

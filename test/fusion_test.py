@@ -20,10 +20,18 @@ from fusion_workflow import WorkflowRunner, run_workflow, resume_workflow, workf
 
 class FusionHarnessTest(unittest.TestCase):
     def setUp(self):
-        environment = patch.dict(os.environ, {"FUSION_DECISIONS_MODE": "off"})
+        self.temp = tempfile.TemporaryDirectory()
+        # Remote telemetry is on by default and points at the live collector, so
+        # the suite must opt out or `make test` would report from every machine
+        # that runs it. ORC_HOME is redirected too, to keep the install id and
+        # the first-send notice out of the real one.
+        environment = patch.dict(os.environ, {
+            "FUSION_DECISIONS_MODE": "off",
+            "FUSION_TELEMETRY": "0",
+            "ORC_HOME": str(Path(self.temp.name) / "orc-home"),
+        })
         environment.start()
         self.addCleanup(environment.stop)
-        self.temp = tempfile.TemporaryDirectory()
         self.workspace = Path(self.temp.name) / "repo"
         self.workspace.mkdir()
         self.bin_dir = Path(self.temp.name) / "bin"
@@ -32,6 +40,13 @@ class FusionHarnessTest(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def allow_telemetry(self):
+        """Undo setUp's opt-out for the tests that exercise sending."""
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("FUSION_TELEMETRY", None)
 
     def write_agent(self, name: str, body: str) -> Path:
         path = self.bin_dir / name
@@ -1047,16 +1062,23 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
             )
             value = {
                 "claude": {"command": str(claude)},
-                # remote.enabled deliberately omitted -- must default to off.
+                # remote.enabled deliberately omitted -- must default to on.
                 "telemetry": {"remote": {"endpoint": f"http://127.0.0.1:{port}/v1/ingest"}},
             }
             (self.workspace / ".fusion.json").write_text(json.dumps(value), encoding="utf-8")
+            self.allow_telemetry()
             output = io.StringIO()
-            with contextlib.redirect_stdout(output):
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
                 fusion_core.main(
                     ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "do it"]
                 )
-            self.assertEqual(received, [])
+            self.assertEqual(len(received), 1, "an unconfigured workspace must still report")
+            # ...and one switch stops it, with no config edit.
+            with patch.dict(os.environ, {"FUSION_TELEMETRY": "0"}), contextlib.redirect_stdout(io.StringIO()):
+                fusion_core.main(
+                    ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "again"]
+                )
+            self.assertEqual(len(received), 1, "FUSION_TELEMETRY=0 must stop the send")
         finally:
             server.shutdown()
             server.server_close()
@@ -1094,8 +1116,9 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
                 "telemetry": {"remote": {"enabled": True, "endpoint": f"http://127.0.0.1:{port}/v1/ingest", "token": "sekret"}},
             }
             (self.workspace / ".fusion.json").write_text(json.dumps(value), encoding="utf-8")
+            self.allow_telemetry()
             output = io.StringIO()
-            with contextlib.redirect_stdout(output):
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(
                     fusion_core.main(
                         ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "do secret/path.py work"]
@@ -1125,9 +1148,26 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
         with contextlib.redirect_stdout(output):
             self.assertEqual(fusion_core.main(["--workspace", str(self.workspace), "telemetry", "status"]), 0)
         result = json.loads(output.getvalue())
-        self.assertFalse(result["remote_enabled"])
-        self.assertIsNone(result["install_id"])
-        self.assertEqual(result["fields_sent"], [])
+        self.assertTrue(result["remote_enabled"])
+        self.assertEqual(result["remote_endpoint"], "https://orc-telemetry.fly.dev/v1/ingest")
+        self.assertIsNotNone(result["install_id"])
+        self.assertIn("agent", result["fields_sent"])
+        self.assertNotIn("blockers", result["fields_sent"])
+        self.assertIn("prompt/task text", result["fields_never_sent"])
+
+    def test_first_send_announces_itself_once_per_machine(self):
+        home = Path(os.environ["ORC_HOME"])
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            fusion_core.announce_remote_telemetry("https://example.invalid/v1/ingest")
+        first = errors.getvalue()
+        self.assertIn("anonymous usage telemetry", first)
+        self.assertIn("FUSION_TELEMETRY=0", first)
+        self.assertTrue((home / "telemetry_announced").exists())
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            fusion_core.announce_remote_telemetry("https://example.invalid/v1/ingest")
+        self.assertEqual(errors.getvalue(), "", "the notice must not repeat on later runs")
 
 
 if __name__ == "__main__":

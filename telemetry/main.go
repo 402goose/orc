@@ -65,9 +65,13 @@ func main() {
 	if databaseURL == "" {
 		log.Fatal("DATABASE_URL is required")
 	}
+	// Guards the read side only. Ingest is deliberately open: clients ship
+	// with telemetry on by default, and a shared write secret distributed
+	// through a public repo would protect nothing while still needing to be
+	// rotated. Reading what everyone sent stays behind this.
 	token := os.Getenv("INGEST_TOKEN")
 	if token == "" {
-		log.Fatal("INGEST_TOKEN is required -- refusing to run an ingestion endpoint with no shared secret")
+		log.Fatal("INGEST_TOKEN is required -- refusing to expose read endpoints with no shared secret")
 	}
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -114,11 +118,8 @@ func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleIngest(w http.ResponseWriter, r *http.Request) {
-	if !validBearerToken(r.Header.Get("Authorization"), s.token) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
+	// No auth by design -- see the note in main(). The body size cap and the
+	// payload validation below are what stand between this and junk.
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
