@@ -155,3 +155,20 @@ printf '%s\n' "$AGY_DELEGATE" | jq -e '
 ' >/dev/null
 
 printf 'fusion dogfood passed: claude/codex/agy subprocesses, handoffs, traces, usage, ledger, and fan-out workflow\n'
+
+# Paired run: the same graph and fixtures again with Laya in shadow mode. Shadow
+# must record one recovery decision per node and change no node outcome.
+if [ "${FUSION_DOGFOOD_PAIRED:-0}" = "1" ]; then
+  LAYA_PYTHON="$HOME/.local/share/orc/laya/bin/python"
+  test -x "$LAYA_PYTHON" || { printf 'dogfood-paired: run `orc fusion decisions setup` first\n' >&2; exit 1; }
+  PAIRED_RESULT="$(FUSION_DECISIONS_MODE=shadow PYTHONDONTWRITEBYTECODE=1 "$ROOT/fusion" --workspace "$WORKSPACE" --json workflow run "$WORKSPACE/workflow.json")"
+  diff <(printf '%s\n' "$WORKFLOW_RESULT" | jq -S '[.nodes[] | {id, status, attempts}]') \
+       <(printf '%s\n' "$PAIRED_RESULT" | jq -S '[.nodes[] | {id, status, attempts}]')
+  printf '%s\n' "$PAIRED_RESULT" | jq -e 'all(.nodes[]; .result.decisions.recovery != null)' >/dev/null
+  jq -s -e '[.[] | select(.event == "decision" and .kind == "recovery")] | length == 6 and all(.[]; .status == "ok")' \
+    "$WORKSPACE/.fusion/decisions/events.jsonl" >/dev/null
+  PAIRED_REPORT="$(PYTHONDONTWRITEBYTECODE=1 "$ROOT/fusion" --workspace "$WORKSPACE" workflow report "$(printf '%s\n' "$PAIRED_RESULT" | jq -r .workflow_id)" --brief)"
+  printf '%s\n' "$PAIRED_REPORT" | grep -q 'laya recovery: action='
+  printf '%s\n' "$PAIRED_REPORT" | grep -q '^Gate: 6 accepted, 0 rejected'
+  printf 'fusion dogfood paired: shadow recorded 6 recovery decisions and changed no node outcome\n'
+fi

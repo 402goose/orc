@@ -14,7 +14,7 @@ CMNDCNTR ?= $(HOME)/code/hathbanger/cmndcntr
 FETCHER := $(CMNDCNTR)/scripts/fetch-artificial-analysis-leaderboard.mjs
 OUT     := data/quality.json
 
-.PHONY: refresh-quality build test dogfood dogfood-real
+.PHONY: refresh-quality build test dogfood dogfood-paired dogfood-real
 
 refresh-quality:
 	@command -v node >/dev/null || { echo "node required" >&2; exit 1; }
@@ -31,6 +31,9 @@ test:
 
 dogfood:
 	./test/fusion_dogfood.sh
+
+dogfood-paired:
+	FUSION_DOGFOOD_PAIRED=1 ./test/fusion_dogfood.sh
 
 dogfood-real:
 	FUSION_REAL=$${FUSION_REAL:-0} ./test/fusion_real_smoke.sh
