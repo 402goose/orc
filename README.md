@@ -584,9 +584,15 @@ What gets sent, per dispatch: agent, role, route, model, whether it was a
 write, status, a coarse `failure_class` (`quota` / `permission_denied` /
 `timeout` / `missing_executable` / `worker_error` — never the raw blocker
 text), timing, and token/cost usage, tagged with a random per-machine
-`install_id` that isn't tied to identity. Never sent: prompts, model output,
-changed file paths, test commands, raw blocker text, or any local filesystem
-or workspace path. Run `fusion telemetry status` any time to see exactly
+`install_id` that isn't tied to identity. A workflow node reused from a
+digest-matched receipt on resume (see digests above) never actually
+dispatches, so it emits its own `cache_hit` status rather than `success` —
+otherwise "how much is caching actually saving the group" would be
+invisible in the exact data source built to answer that.
+
+Never sent: prompts, model output, changed file paths, test commands, raw
+blocker text, or any local filesystem or workspace path. Run `fusion
+telemetry status` any time to see exactly
 what is currently configured to send. A send is always best-effort with a
 short timeout — a down or misconfigured collector never blocks or fails the
 actual dispatch.
