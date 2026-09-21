@@ -226,8 +226,15 @@ ordinary inference and training use cached/local files offline.
 
 ```sh
 make test dogfood
+make dogfood-paired
 ~/.local/share/orc/laya/bin/python test/laya_smoke.py --train
 ```
+
+`dogfood-paired` runs the fixture fan-out workflow twice, with decisions off
+and in shadow mode, and fails if shadow changed any node's status or attempt
+count, recorded fewer than one successful recovery decision per node, or left
+the verdicts and gate count out of `workflow report`. It needs the local Laya
+runtime and pays one cold start.
 
 The standard tests use isolated fixtures and require no Laya installation
 or coding-agent calls. The optional smoke test exercises real cached-model
