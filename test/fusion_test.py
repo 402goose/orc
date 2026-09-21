@@ -1025,6 +1025,59 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
         self.assertIsNone(result["install_id"])
         self.assertEqual(result["fields_sent"], [])
 
+    def test_telemetry_report_fetches_and_prints_remote_summary(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path != "/v1/summary?hours=24" or self.headers.get("Authorization") != "Bearer sekret":
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                body = json.dumps({
+                    "window_hours": 24,
+                    "total_spans": 2,
+                    "unique_installs": 1,
+                    "by_group": [
+                        {"agent": "claude", "route": "orc-free", "model": "claude-sonnet-5",
+                         "status": "success", "failure_class": None, "calls": 2,
+                         "total_cost_usd": 0.1, "avg_duration_ms": 500},
+                    ],
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            value = {
+                "telemetry": {"remote": {"enabled": True, "endpoint": f"http://127.0.0.1:{port}/v1/ingest", "token": "sekret"}},
+            }
+            (self.workspace / ".fusion.json").write_text(json.dumps(value), encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(
+                    fusion_core.main(["--workspace", str(self.workspace), "--json", "telemetry", "report", "--hours", "24"]),
+                    0,
+                )
+            result = json.loads(output.getvalue())
+            self.assertEqual(result["total_spans"], 2)
+            self.assertEqual(result["by_group"][0]["agent"], "claude")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_telemetry_report_fails_clearly_when_remote_disabled(self):
+        self.config()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(fusion_core.main(["--workspace", str(self.workspace), "telemetry", "report"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

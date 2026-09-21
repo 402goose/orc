@@ -80,6 +80,24 @@ configured to be sent (or confirm it's off).
 
 ## Querying
 
+The easy way, from any machine that has the shared token (no Fly/DB access
+needed):
+
+```sh
+fusion telemetry report              # last 7 days
+fusion telemetry report --hours 24   # last 24 hours
+fusion --json telemetry report       # machine-readable
+```
+
+This hits `GET /v1/summary` on the collector, which returns spans grouped
+by agent/route/model/status/failure_class with call counts, total cost, and
+average duration, plus a distinct-install count -- so anyone with the
+shared token can see the group's aggregate patterns without ever touching
+Postgres directly.
+
+For anything the summary endpoint doesn't cover, direct SQL still works for
+whoever has `jfl` org access:
+
 ```sh
 fly postgres connect --app orc-telemetry-db
 ```
