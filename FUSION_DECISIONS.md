@@ -223,9 +223,14 @@ orc fusion decisions calibrate .fusion/decisions/candidate-predictions.jsonl \
 Exports group by workflow/task so related examples stay in the same split;
 approximately 20% of groups are held out. Training uses only train groups
 and supervised cross-entropy on the decision head. Evaluation reports
-held-out accuracy; calibration fits temperature on train and reports
-held-out accuracy, Brier score, coverage and selective accuracy. Duplicate
-examples and train/validation group leakage are rejected.
+held-out accuracy; `evaluate --control` also scores each held-out example
+against a different example's state, and a model that scores about the
+same on that control is answering from the question, not the state,
+whatever its accuracy says. Calibration fits temperature on train and
+reports held-out accuracy, Brier score, expected calibration error with a
+ten-bin reliability table, the count of confident wrong answers at 0.9,
+0.95 and 0.99, coverage and selective accuracy. Duplicate examples and
+train/validation group leakage are rejected.
 
 A bucket qualifies only with at least 20 independent training groups,
 20 confident validation groups, and at least 95% selective validation
