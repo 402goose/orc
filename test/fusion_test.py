@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,9 @@ from fusion_workflow import WorkflowRunner, run_workflow, resume_workflow, workf
 
 class FusionHarnessTest(unittest.TestCase):
     def setUp(self):
+        environment = patch.dict(os.environ, {"FUSION_DECISIONS_MODE": "off"})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.workspace = Path(self.temp.name) / "repo"
         self.workspace.mkdir()
@@ -43,6 +47,70 @@ class FusionHarnessTest(unittest.TestCase):
             "timeout_seconds": 30,
         }
         (self.workspace / ".fusion.json").write_text(json.dumps(value), encoding="utf-8")
+
+    def test_build_launches_interactive_lead_with_feature_and_fusion_tools(self):
+        idea = 'Export "filtered rows" as CSV; preserve $labels and `literal text`.\nInclude empty results.'
+        for agent in ("codex", "claude"):
+            with self.subTest(agent=agent):
+                harness = self.write_agent(
+                    f"{agent}-lead",
+                    f"""
+import json, os, pathlib, sys
+argv = sys.argv[1:]
+payload = {{'argv': argv, 'cwd': os.getcwd(), 'workspace': os.environ.get('FUSION_WORKSPACE')}}
+if '--mcp-config' in argv:
+    payload['mcp'] = json.loads(pathlib.Path(argv[argv.index('--mcp-config') + 1]).read_text())
+pathlib.Path({str(self.calls)!r}).write_text(json.dumps(payload))
+sys.exit(7)
+""",
+                )
+                self.config(**{agent: harness})
+                config_path = self.workspace / ".fusion.json"
+                original_config = config_path.read_bytes()
+                # Exercise the default Codex lead and explicit Claude override
+                # through the CLI, without invoking a real provider.
+                args = [] if agent == "codex" else ["--agent", agent]
+                proc = subprocess.run(
+                    [sys.executable, str(ROOT / "fusion"), "--workspace", str(self.workspace), "build", *args, idea],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 7, proc.stderr)
+                call = json.loads(self.calls.read_text())
+                self.assertEqual(Path(call["cwd"]).resolve(), self.workspace.resolve())
+                self.assertEqual(Path(call["workspace"]).resolve(), self.workspace.resolve())
+                argv = call["argv"]
+                self.assertIn(idea, argv[-1])
+                self.assertIn("Prepared workflow:", argv[-1])
+                self.assertIn("fusion_delegate", argv[-1])
+                self.assertEqual(config_path.read_bytes(), original_config)
+                if agent == "codex":
+                    self.assertNotIn("exec", argv)
+                    self.assertIn("mcp_servers.fusion.command=", " ".join(argv))
+                    self.assertIn("mcp-serve", " ".join(argv))
+                    self.assertEqual(argv[argv.index("-a") + 1], "on-request")
+                else:
+                    self.assertNotIn("-p", argv)
+                    self.assertIn("--append-system-prompt", argv)
+                    self.assertEqual(call["mcp"]["mcpServers"]["fusion"]["args"][-1], "mcp-serve")
+                    self.assertFalse(Path(argv[argv.index("--mcp-config") + 1]).exists())
+
+    def test_build_rejects_blank_idea_before_launch(self):
+        harness = self.write_agent(
+            "unused-lead",
+            f"import pathlib\npathlib.Path({str(self.calls)!r}).touch()\n",
+        )
+        self.config(codex=harness)
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "fusion"), "--workspace", str(self.workspace), "build", " \n "],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("feature idea must not be empty", proc.stderr)
+        self.assertFalse(self.calls.exists())
 
     def test_codex_result_is_structured_and_session_is_resumed(self):
         calls = str(self.calls)
@@ -267,10 +335,10 @@ print(json.dumps({'conversation_id':'conv-partial','status':'SUCCESS','response'
                 fusion_core.main(
                     ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "agy", "--fresh", "run something"]
                 ),
-                0,
+                1,
             )
         result = json.loads(output.getvalue())
-        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["status"], "error")
         self.assertIn("RunCommand", " ".join(result["blockers"]))
 
     def test_claude_permission_denials_are_surfaced_as_blockers(self):
@@ -296,10 +364,10 @@ print(json.dumps({
                 fusion_core.main(
                     ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "do it"]
                 ),
-                0,
+                1,
             )
         result = json.loads(output.getvalue())
-        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["status"], "error")
         self.assertIn("Bash", " ".join(result["blockers"]))
         self.assertIn("command not in allowlist", " ".join(result["blockers"]))
 
@@ -323,7 +391,7 @@ print(json.dumps({
                 fusion_core.main(
                     ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "do it"]
                 ),
-                0,
+                1,
             )
         result = json.loads(output.getvalue())
         # Doesn't crash or silently drop the entry when the shape doesn't
@@ -364,7 +432,7 @@ print(json.dumps({
         responses = [json.loads(line) for line in proc.stdout.splitlines()]
         self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "fusion")
         names = {tool["name"] for tool in responses[1]["result"]["tools"]}
-        self.assertEqual(names, {"fusion_delegate", "fusion_status"})
+        self.assertEqual(names, {"fusion_delegate", "fusion_status", "fusion_decisions"})
 
     def test_mcp_delegates_with_the_task_contract(self):
         codex = self.write_agent(
