@@ -127,13 +127,14 @@ class LayaRuntime:
                             raise ValueError("Laya response exceeds limit")
                 line, self.buffer = self.buffer.split(b"\n", 1)
                 response = json.loads(line)
-                if response.get("error"):
-                    raise RuntimeError(response["error"])
-                return response
             except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
                 self.error = str(exc)
                 self.close()
                 raise RuntimeError(self.error) from exc
+            # The runtime answered, so it is still serving; only this request failed.
+            if response.get("error"):
+                raise RuntimeError(response["error"])
+            return response
 
 
 _runtimes = {}
@@ -194,6 +195,21 @@ class DecisionStore:
             if record.get("id") == decision_id:
                 return record
         raise ValueError(f"unknown decision: {decision_id}")
+
+    def summaries(self, decisions):
+        """Recommendation and application per kind for a receipt's decision ids."""
+        by_id = {str(identifier): kind for kind, identifier in (decisions or {}).items()}
+        found = {}
+        for event in read_jsonl(self.path):
+            kind = by_id.get(event.get("id"))
+            if kind is None:
+                continue
+            entry = found.setdefault(kind, {"id": event["id"]})
+            if event.get("event") == "decision":
+                entry.update(status=event.get("status"), recommendations=event.get("recommendations") or {})
+            elif event.get("event") == "application":
+                entry.update(actual=event.get("actual"), applied=bool(event.get("applied")))
+        return found
 
     def label(self, decision_id, answers, evidence):
         record = self.get(decision_id)
@@ -307,6 +323,9 @@ class DecisionEngine:
         record["truncated"] = len(text) > cap or bool(isinstance(state, dict) and state.get("source_truncated"))
         started = time.monotonic()
         try:
+            for key, question in questions.items():
+                if question.get("type") == "choice" and len(question.get("criteria") or {}) < 2:
+                    raise ValueError(f"choice question {key} needs at least two options")
             with progress.activity("laya", f"{kind}: waiting for local classification ({self.options['mode']})"):
                 prediction = (self.backend or runtime_for(self.options)).predict(record["state"], questions)
             answers = prediction.get("answers") or {}
