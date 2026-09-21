@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export FUSION_DECISIONS_MODE=off
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
