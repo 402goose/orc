@@ -144,7 +144,10 @@ def review_task(config, task):
     engine = DecisionEngine(task["workspace"], config)
     record = engine.decide("review", {"task": task.get("decision_context", task["task"]), "role": task["role"], "write": task["write"]}, REVIEW_QUESTIONS, context(task))
     selected = "general"
-    applied = engine.allowed(record, "specialty")
+    # The choice is trusted only when the paired noul agrees a review is warranted;
+    # each question type has a blind spot the other covers.
+    applied = (engine.allowed(record, "specialty") and engine.allowed(record, "needs_review")
+               and record["recommendations"]["needs_review"]["value"] == "true")
     if applied:
         selected = record["recommendations"]["specialty"]["value"]
     instructions = {

@@ -236,7 +236,7 @@ class DecisionsTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--mode") + 1], "plan")
 
     def test_specialist_review_adds_scrutiny_only_when_qualified(self):
-        engine = self.engine({"specialty": "payments"}, "active")
+        engine = self.engine({"specialty": "payments", "needs_review": "true"}, "active")
         self.qualify(engine, "review", REVIEW_QUESTIONS)
         task = self.task("claude")
         task["role"] = "review"
@@ -244,6 +244,30 @@ class DecisionsTest(unittest.TestCase):
             review_task(self.config, task)
         self.assertIn("idempotency", task["task"])
         self.assertFalse(task["write"])
+
+    def test_specialty_is_not_applied_when_the_paired_noul_disagrees(self):
+        engine = self.engine({"specialty": "payments", "needs_review": "false"}, "active")
+        self.qualify(engine, "review", REVIEW_QUESTIONS)
+        task = self.task("claude")
+        task["role"] = "review"
+        with patch("fusion_policy.DecisionEngine", return_value=engine):
+            review_task(self.config, task)
+        self.assertNotIn("idempotency", task["task"])
+        self.assertIn("review", task["decisions"])
+
+    def test_qualified_clarification_flag_removes_the_writer_but_never_overrides_explicit_kind(self):
+        engine = self.engine({"workflow": "build", "needs_clarification": "true"}, "active")
+        self.qualify(engine, "intake", INTAKE_QUESTIONS)
+        with patch("fusion_build.DecisionEngine", return_value=engine):
+            prepared = prepare(self.workspace, self.config, "Add saved searches")
+            self.assertEqual((prepared["kind"], prepared["read_only"], prepared["needs_clarification"]), ("discovery", True, True))
+            self.assertIn("Clarification flagged", Path(prepared["brief"]).read_text())
+            explicit = prepare(self.workspace, self.config, "Add saved searches", kind="build")
+            self.assertEqual((explicit["kind"], explicit["needs_clarification"]), ("build", False))
+        shadow = self.engine({"workflow": "build", "needs_clarification": "true"})
+        with patch("fusion_build.DecisionEngine", return_value=shadow):
+            advisory = prepare(self.workspace, self.config, "Add saved searches")
+        self.assertEqual((advisory["kind"], advisory["needs_clarification"]), ("build", False))
 
     def test_recovery_never_converts_failed_check_to_success_or_retries_denial(self):
         engine = self.engine({"action": "continue"}, "active")
