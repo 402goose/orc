@@ -368,6 +368,32 @@ class WorkflowRunner:
                 self._event("node.stale", {"node_id": node_id, "reason": "definition or dependency evidence changed"})
                 continue
             current_digest[node_id] = expected
+            self._event("node.reused", {"node_id": node_id})
+            self._emit_cache_hit_telemetry(node_id, node)
+
+    def _emit_cache_hit_telemetry(self, node_id: str, node: dict[str, Any]) -> None:
+        """A digest-matched node skips dispatch entirely, so it would
+        otherwise never produce a trace span -- locally or remotely. Without
+        this, "how much is caching actually saving the group" is invisible
+        in the exact data source built to answer questions like that."""
+        result = node.get("result") or {}
+        resolved = result.get("resolved") or {}
+        now = core.now_ms()
+        task = {
+            "agent": node["agent"],
+            "role": node["role"],
+            "route": node.get("route"),
+            "run_id": f"{self.run_id}:{node_id}:cached",
+            "trace_id": self.run_id,
+            "parent_task_id": self.run_id,
+            "write": node["write"],
+        }
+        cache_result = {"status": "cache_hit", "usage": {}, "changed": [], "tests": [], "blockers": [], "artifacts": {}}
+        metadata = {"model": resolved.get("model")}
+        try:
+            core.RunStore(self.workspace).trace_span(self.config, task, cache_result, now, now, metadata)
+        except OSError:
+            pass  # telemetry is best-effort; never let it break a resume.
 
     @property
     def manifest_id(self) -> str:
