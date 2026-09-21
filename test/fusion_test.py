@@ -85,6 +85,22 @@ print(json.dumps({{'type':'turn.completed','usage':{{'input_tokens':12,'output_t
         self.assertIn("resume", calls[1])
         self.assertIn("thread-123", calls[1])
 
+    def test_normalized_usage_maps_codex_cache_write_input_tokens(self):
+        # Matches the real `codex exec --json` turn.completed usage shape
+        # (verified live, post quota-reset): cache_write_input_tokens, not
+        # cache_creation_input_tokens or a cache_creation sub-object. This is
+        # applied when aggregating (usage_summary/fusion usage) and when
+        # sending remote telemetry -- the raw per-dispatch result keeps the
+        # provider's own field names unnormalized.
+        normalized = fusion_core.normalized_usage({
+            "input_tokens": 28442,
+            "cached_input_tokens": 26112,
+            "cache_write_input_tokens": 512,
+            "output_tokens": 72,
+            "reasoning_output_tokens": 0,
+        })
+        self.assertEqual(normalized["cache_creation_input_tokens"], 512)
+
     def test_claude_json_result_is_structured(self):
         claude = self.write_agent(
             "claude-fake",
