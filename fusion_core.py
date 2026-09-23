@@ -216,7 +216,9 @@ def parse_handoff(text: str) -> dict[str, Any]:
         # Only the leading clause decides, so an explanation after it is not
         # comma-split into phantom entries. A trailing comma-split on a real
         # answer is fine; a phantom blocker fails a node that actually passed.
-        lead = re.split(r"[.;:,—-]", value, maxsplit=1)[0].strip().lower()
+        # Require a prose boundary: names such as none.py and nil-cache.json
+        # are real changed files, not a statement that nothing changed.
+        lead = re.split(r"[.;:,—-](?:\s+|$)", value, maxsplit=1)[0].strip().lower()
         if lead in NONE_ANSWERS:
             return []
         return [item.strip() for item in value.split(",") if item.strip()]
