@@ -1,17 +1,54 @@
-# 🧌 orc — OpenRouter × Claude
+# 🧌 ORC — Orchestrate · Review · Commit
 
-Run Claude Code against any OpenRouter model — GPT, Gemini, Kimi, DeepSeek, free
-stealth previews like `stealth/ox-alpha` — with one command. `orc` handles the
-env wiring, model selection, key management, and keeps its Claude state fully
-isolated from your normal Anthropic login.
+> Big tusks. Small diffs. Show your work.
+
+**Orchestrate** a fleet of coding agents across a dependency graph. **Review**
+every stage against structural evidence before it counts as done. **Commit** the
+result as a pull request from an isolated worktree — when you ask for it;
+publishing is off by default.
+
+ORC is two tools that grew together:
+
+- **The guild** — a local orchestration harness. Point it at a request or an
+  open GitHub issue and it plans the work, fans it out across Claude Code,
+  Codex, Antigravity and Grok, gates every stage on declared files and
+  acceptance checks, has an independent worker review the result, and leaves a
+  receipt for all of it. It comes with a browser control room, a persisted
+  workflow graph that resumes on content digests, and an optional on-device
+  classifier that learns your routing and acceptance calls.
+- **The launcher** — the original `orc`: run Claude Code against any OpenRouter
+  model with one command, with live pricing, a cost HUD, and Claude state kept
+  fully isolated from your normal Anthropic login.
+
+Everything runs locally against your own agent accounts. There is no hosted
+service and no npm install — the runtime is Python's standard library.
+
+| I want to… | Start here |
+| --- | --- |
+| Run agents against a task or a GitHub issue | [The guild](#the-guild) |
+| Watch runs in a browser | [Control room](#control-room) |
+| Turn open issues into reviewed PRs | [Truffle pig](#truffle-pig) |
+| Run Claude Code on a non-Anthropic model | [The launcher](#the-launcher) |
+| See what it all cost | [Stats](#stats) · [The HUD](#the-hud) |
 
 ## Requirements
 
-- macOS or Linux
-- [Claude Code](https://claude.com/claude-code) (`claude` on PATH)
-- `jq`, `curl`, `fzf` — `brew install jq fzf` on macOS, e.g.
-  `sudo apt-get install jq curl fzf` on Debian/Ubuntu
-- An [OpenRouter](https://openrouter.ai) API key
+Both halves need macOS or Linux and Python 3 (standard library only — nothing
+to `pip install`).
+
+[Claude Code](https://claude.com/claude-code) (`claude`) is required by
+`install.sh` regardless of which workers you plan to use — it exits if `claude`
+is not on PATH.
+
+**For the guild**, add `git` and whichever workers you want to dispatch to:
+Codex (`codex`), Antigravity (`agy`) or Grok Build (`grok`). Snout and PR
+publishing also need an authenticated [GitHub CLI](https://cli.github.com)
+(`gh`).
+
+**For the launcher**, you need `jq`, `curl` and an
+[OpenRouter](https://openrouter.ai) API key. `fzf` is optional but the
+interactive model picker needs it (`brew install jq fzf`, or `sudo apt-get
+install jq curl fzf`).
 
 ## Install
 
@@ -20,7 +57,11 @@ isolated from your normal Anthropic login.
 ```
 
 Copies `orc` to `~/.local/bin` (override with `DEST=/somewhere ./install.sh`)
-and checks dependencies. Then:
+and checks dependencies. To go straight to the guild, run `orc fusion ui` from
+a repository — the control room needs no OpenRouter key unless you use the
+`orc-free` / `orc-best` routes.
+
+To set up the launcher:
 
 ```bash
 orc
@@ -29,7 +70,8 @@ orc
 First run launches the setup wizard: it finds your API key (or helps you set
 one up), fetches the live OpenRouter model catalog, and gives you an fzf
 picker with per-model pricing and context sizes. It also offers a launch
-permission mode (default / auto / acceptEdits / plan / dontAsk / yolo).
+permission mode (default / auto / acceptEdits / plan / dontAsk / yolo /
+bypassPermissions).
 Choices are saved; the next run shows the resolved model + mode (and
 `@profile` / `.orc.json` when those apply) and lets you launch with Enter
 or change this invocation first:
@@ -43,42 +85,46 @@ orc → stealth/ox-alpha · mode: auto · @work · .orc.json
 in effect — then they override this launch only. `[s]` snapshots the
 resolved combo as a named profile.
 
-## Usage
+## The guild
+
+Six characters, one pipeline. They appear by name in the control room under
+**Meet the guild**.
+
+| Who | Role | What it actually is |
+| --- | --- | --- |
+| **Gruk** | the forgekeeper | the control room — watches every run and keeps the receipts |
+| **Fusion** | the forge | the harness: leads, workers, the workflow graph, acceptance gates |
+| **Snout** | the truffle scout | reads open GitHub issues and shortlists the tractable ones |
+| **Laya** | the lorekeeper | optional on-device classifier that learns routing and acceptance |
+| **The council** | keepers of the seal | two to four workers that must agree unanimously before a label is approved |
+| **The garden** | where lessons grow | continuous label drafting, quality checks, and example curation |
+
+A run moves left to right, and nothing advances on a worker's say-so alone:
 
 ```
-orc                     launch (first run starts the setup wizard)
-orc [claude args...]    pass args through to claude (orc -c, orc -p "...", orc --resume)
-orc -m <model> [...]    one-off model override (not saved)
-orc @<profile> [...]    launch with a saved profile (one-off, not saved as default)
-orc setup               re-run the setup wizard (key + model)
-orc model [query]       pick + save a new default model
-orc model --set <id>    set the default model non-interactively
-orc free [query]        pick + save a currently free model
-orc mode                pick + save the launch permission mode
-orc small [query]       pick + save a small/fast model for background tasks
-orc small --set <id>    set the small model non-interactively
-orc save <name>         snapshot the resolved model/small/mode as profile @<name>
-orc profiles [rm <n>]   list saved profiles / remove one
-orc status [--json]     print the resolved launch (model/mode/profile/source)
-orc stats               token + cost totals across all orc transcripts
-     [--json] [--by model|project|day]
-orc hud [on|off|demo]   toggle the statusline HUD / preview it on the newest transcript
-orc models [query]      list models with pricing + context + tool + fit
-orc models --free [...] list only currently free models
-orc models --tools [..] list only models advertising tool support
-orc models --fit [...]  list only models that passed orc probe --fit
-orc quality             dump the Artificial Analysis quality cache as a table
-orc key                 configure key source (env var name or key store)
-orc env                 print the export lines launch uses (contains your key)
-orc refresh             force-refresh the cached model list
-orc doctor              check everything end to end (resolved model + fit)
-orc probe [model]       smoke-test the launch path (1-token request)
-orc probe --fit [model] tool-loop smoke test; result cached 24h as FIT/FAIL
-orc config              open config in $EDITOR
-orc fusion ui           open the local browser control room
+ request or issue
+        │
+     intake ──► routing ──► workers ──► acceptance ──► review ──► publish
+                            (parallel)   (declared     (separate   (opt-in,
+                                           files +       worker)     off by
+                                           checks)                  default)
 ```
 
-### Browser control room
+`STATUS: success` from a worker is a self-report. A stage is accepted only when
+its declared `required_files` exist and its acceptance commands exit zero — and
+structural signals (`turn.failed`, `is_error`, a nonzero `command_execution`
+exit code) override a "success" claim outright. The gap between what a worker
+says it did and what the run can actually prove is the point of the whole thing.
+
+Start here, from the repository you want worked on:
+
+```sh
+orc fusion ui                       # the control room, in your browser
+orc fusion build "Add CSV export to the dashboard, with tests"
+orc fusion --progress truffle hunt --count 5 --search 'label:bug'
+```
+
+### Control room
 
 The control room wears the ORC guild identity: the supplied tusked logo, a
 forgekeeper and truffle-scout illustration, and 16 local vector sigils across
@@ -90,9 +136,9 @@ reduced-motion preferences. Assets and the illustration prompt live in
 
 ```sh
 cd /path/to/your/repository
-orc 'fusion' ui
+orc fusion ui
 # Or select the repository explicitly:
-orc 'fusion' --workspace /path/to/repository ui --port 8765
+orc fusion --workspace /path/to/repository ui --port 8765
 ```
 
 The control room opens in your browser and reads the same `.fusion` artifacts
@@ -122,8 +168,9 @@ as the CLI. Existing terminal runs appear automatically. It includes:
   by default; expanded details stay open across refreshes.
 
 UI launches use the existing CLI and its permissions, writer lock, attempt limits
-and acceptance checks. Build/debug runs require the **Allow workspace edits**
-checkbox; preparation starts no coding workers. Jobs continue when the browser
+and acceptance checks. Build/debug runs require the **Allow this run to edit workspace files**
+checkbox (worded per surface: "this workflow" for custom graphs, "the selected
+fixes" for Snout's queue); preparation starts no coding workers. Jobs continue when the browser
 or UI server closes. Restart the UI against the same workspace to reconnect.
 Runs started outside the UI are observable; stop those from their original terminal.
 Training and calibration never promote a model or enable active decisions automatically.
@@ -236,9 +283,9 @@ training a candidate and selecting a checkpoint remain separate actions.
 CLI equivalents (draft-only unless `--approval council` is explicit):
 
 ```sh
-orc 'fusion' decisions suggest DECISION_ID --agent codex
-orc 'fusion' decisions suggest --council codex claude agy -- DECISION_ID
-orc 'fusion' decisions suggest --approval council --council codex claude -- DECISION_ID
+orc fusion decisions suggest DECISION_ID --agent codex
+orc fusion decisions suggest --council codex claude agy -- DECISION_ID
+orc fusion decisions suggest --approval council --council codex claude -- DECISION_ID
 ```
 
 Completed implementation workflows have an **Open PR** action. Choose a target
@@ -273,14 +320,14 @@ These modes apply to persisted workflows (`build --execute` / `workflow run`).
 
 ```sh
 # Override publishing defaults for one bounded implementation run:
-orc 'fusion' --progress build --kind build --execute \
+orc fusion --progress build --kind build --execute \
   --publish auto --base staging --draft 'Implement the requested feature with tests'
 
 # Preview a completed workflow without committing, pushing, or opening a PR:
-orc 'fusion' --json workflow publish WORKFLOW_ID --base staging --preview
+orc fusion --json workflow publish WORKFLOW_ID --base staging --preview
 
 # Publish a run with a saved review snapshot, or retry its failed publication:
-orc 'fusion' --progress workflow publish WORKFLOW_ID
+orc fusion --progress workflow publish WORKFLOW_ID
 # Older runs additionally require --accept-legacy-diff after inspecting the preview.
 ```
 
@@ -330,7 +377,7 @@ stage, worker or named route, and an explicit attempt limit; accepted stages are
 reused when their inputs still match. For example:
 
 ```sh
-orc 'fusion' workflow resume RUN_ID --node review --agent codex --max-attempts 3
+orc fusion workflow resume RUN_ID --node review --agent codex --max-attempts 3
 ```
 
 Native workers are Codex, Claude, Antigravity (`agy`), and Grok Build (`grok`).
@@ -343,7 +390,8 @@ Named ORC routes can use other configured models; automatic ORC selection still
 requires passing tool-fit evidence.
 
 The server binds only to `127.0.0.1`. Use the complete URL printed in your terminal
-to connect a browser; its fragment contains a per-server access capability.
+to connect a browser; its fragment carries a per-machine access capability, stored at
+`$ORC_HOME/ui-token` and reused across restarts.
 `--no-open` prints that URL without opening a browser. `--port 0` chooses a free
 port. The runtime needs only Python's standard library; Markdown rendering and
 sanitization assets ship locally. There is no npm install, CDN, or hosted UI service.
@@ -355,6 +403,7 @@ Development verification:
 
 ```sh
 make test dogfood
+./test/run.sh
 npm install --prefix /tmp/orc-ui-tools --no-audit --no-fund @playwright/test@1.63.0
 /tmp/orc-ui-tools/node_modules/.bin/playwright install chromium
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/ui_browser.cjs
@@ -363,52 +412,14 @@ NODE_PATH=/tmp/orc-ui-tools/node_modules node test/laya_tabs_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/council_approval_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/ui_connection_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/truffle_browser.cjs
+NODE_PATH=/tmp/orc-ui-tools/node_modules node test/publish_browser.cjs
 ```
 
 Browser checks use disposable workspaces and fake coding workers. They exercise
 rendering, launches, settings, cancellation, reviewed labels and mobile layouts
 without paid agent calls. Browser tools are needed only to run these checks.
 
-The model picker shows live OpenRouter input/output prices per million tokens.
-Free models are marked `FREE`; type `FREE` in the regular picker or use
-`orc free` to search only models whose current usage prices are all zero.
-Every row also carries a tool-support flag read from the catalog's
-`supported_parameters`: models marked `NO TOOLS` tend to feel broken under
-Claude Code, which leans hard on tools. `orc models --tools` lists only
-tool-capable models, and `orc doctor` warns when the *resolved* model
-(not just the global default) lacks tool support.
-
-**Ranking.** The picker is sorted by the Artificial Analysis
-Intelligence Index, a 0–~63 score for general model capability.
-Within a score, ties break on prompt price (cheaper first), then
-`FIT` over `UNTESTED` over `FAIL`, then model id. A bundled snapshot
-of the leaderboard ships with orc at `data/quality.json`; on first
-launch it is copied into `$ORC_HOME/quality.json` and used for
-ranking without any network call. `orc refresh` re-fetches both
-the OpenRouter catalog and the quality snapshot; `make refresh-quality`
-(from the orc source) re-runs the cmndcntr fetcher and copies a
-fresh snapshot into `data/quality.json` for the next release.
-
-Use `orc quality` to inspect the current cache as a sorted table:
-
-```
-OR_ID                            II    CODE   AGENT  CREATOR          SLUG
-anthropic/claude-opus-5          63.05  77.98  59.17  Anthropic        claude-opus-5
-anthropic/claude-fable-5         62.07  76.49  56.59  Anthropic        claude-fable-5
-openai/gpt-5.6-sol               60.92  77.38  57.78  OpenAI           gpt-5.6-sol
-x-ai/grok-4.6                    60.92  76.78  58.67  SpaceXAI         grok-4-6
-...
-```
-
-A second column, `FIT` / `FAIL` / `UNTESTED`, is orc's own measurement:
-`orc probe --fit` forces a one-tool round trip through OpenRouter's
-Anthropic-compatible endpoint and caches the result for 24h. The picker
-sorts last-known-good models first; `orc models --fit` lists only those.
-`orc doctor` runs the fit probe when the cache is empty (`ORC_NO_FIT=1`
-skips it). Catalog `tools` is an advertisement; FIT is whether the model
-survived a Claude Code-shaped loop.
-
-### Truffle pig · from open issues to reviewed fixes
+### Truffle pig
 
 Open **Overview → Send in the Truffle pig**, or **Truffle pig → New hunt**.
 Choose a target count (default 5), pool size (default 40), worker, and optional
@@ -435,199 +446,24 @@ are reused, not repeated. Jobs survive closing the browser, and records live und
 `.fusion/truffle/` alongside the usual workflow artifacts.
 
 ```sh
-orc 'fusion' --progress truffle hunt --count 5 --scan-limit 40 --search 'label:bug'
-orc 'fusion' truffle show truffle-0123456789ab
+orc fusion --progress truffle hunt --count 5 --scan-limit 40 --search 'label:bug'
+orc fusion truffle show truffle-0123456789ab
 # Use the saved hunt ID and only the issue numbers you chose from its shortlist:
-orc 'fusion' --progress truffle run truffle-0123456789ab --issues 123 456 --base staging --publish manual
+orc fusion --progress truffle run truffle-0123456789ab --issues 123 456 --base staging --publish manual
 ```
 
 Use `--publish auto` to publish accepted fixes automatically; PRs default to drafts.
 Each stage has an attempt limit (`--max-attempts`, default 2). Queue execution pauses
 at the first unresolved workflow instead of consuming more attempts across the pool.
 
-## Profiles
+## Fusion — the forge
 
-A profile is a named snapshot of the *resolved* `model` + `small_model` +
-`mode` — including a one-off `-m`, `ORC_MODE`, or `.orc.json` pin. Keep one
-combo for real work and one for throwaway experiments, and switch per launch
-without touching your saved default. `orc status` prints the combo that
-would launch from this directory. `orc env` prints the same exports
-`launch` would set (including context window and gateway discovery).
-
-```bash
-orc status              # what would launch right now
-orc status --json       # same object, for wrappers
-```
-
-Resolution order for each of `model` / `small_model` / `mode`:
-
-1. one-off flags: `-m` / `ORC_MODEL_OVERRIDE` / `ORC_MODE`
-2. `orc @<profile>` / `ORC_PROFILE`
-3. `.orc.json` inline keys
-4. the profile named by `.orc.json`'s `"profile"`
-5. `~/.config/orc/config.json`
-
-```bash
-orc save work           # snapshot the current setup as @work
-orc @work               # launch with it (default config unchanged)
-orc @work -c            # profile + claude args compose
-orc profiles            # list; orc profiles rm work removes
-```
-
-`ORC_PROFILE=work orc` is equivalent to `orc @work` — useful for wrappers.
-
-## Per-project config: .orc.json
-
-Drop a `.orc.json` in a repo (found by walking up from the current directory)
-to pin settings for that project:
-
-```json
-{ "profile": "work" }
-```
-
-or inline, without needing a profile:
-
-```json
-{ "model": "moonshotai/kimi-k2", "mode": "plan" }
-```
-
-Resolution is the same stack `orc status` prints — see above. The launch
-menu, `orc env`, `orc save`, `orc doctor`, and `orc probe` all consume
-that object, so a project pin or `@work` is never silently ignored.
-
-## Stats
-
-`orc stats` aggregates every transcript orc has ever produced (they all live
-under orc's isolated state dir) and prices them against the cached catalog —
-the same math as the HUD, across all sessions, subagent transcripts included:
-
-```
-MODEL                     MSGS  IN       OUT     CACHE  COST
-anthropic/claude-opus-5   185   11.74M   143.7k  93%    $13.8608
-stealth/ox-alpha          1024  184.86M  533.3k  94%    $0
-TOTAL                     1246  200.48M  737.5k  94%    $24.5181
-```
-
-`--by project` or `--by day` regroups the table; `--json` emits the full
-structured breakdown (totals plus all three groupings) for scripts. Responses
-from models missing from the cached catalog are flagged `+?` rather than
-silently priced at zero. Unlike the OpenRouter dashboard, this splits spend
-per project and per model as seen from your machine.
-
-## How the key is resolved
-
-1. The env var named in your config — `OPENROUTER_API_KEY` by default,
-   changeable via `orc key`.
-2. The system key store, where the key wizard stores pasted keys: the macOS
-   Keychain (service `orc-openrouter`) on macOS; on Linux a file at
-   `~/.config/orc/key`, created with `0600` permissions and never made
-   group/world readable (orc warns if it is). Nothing is ever written to a
-   plaintext config file.
-
-If neither is found, **orc refuses to launch** (fail closed) and tells you how
-to fix it.
-
-`orc doctor` goes further than static checks: as a final step it probes the
-real launch path — a 1-token request to OpenRouter's Anthropic-compatible
-endpoint (`/api/v1/messages`) with your resolved key and saved model — and
-reports HTTP status and latency, so breakage surfaces before you are inside a
-session. The probe costs a fraction of a cent on paid models; skip it with
-`ORC_NO_PROBE=1`, or run it standalone against any model with `orc probe <id>`.
-
-## What it sets for Claude Code
-
-- `ANTHROPIC_BASE_URL` → OpenRouter's Anthropic-compatible endpoint
-- `ANTHROPIC_AUTH_TOKEN` → your resolved key (`ANTHROPIC_API_KEY` is set to
-  an empty string to avoid conflicts)
-- `ANTHROPIC_MODEL` / `ANTHROPIC_SMALL_FAST_MODEL` → your saved models
-- `CLAUDE_CODE_MAX_CONTEXT_TOKENS` → the model's real context window from the
-  OpenRouter catalog (Claude Code otherwise assumes 200k for unknown models)
-- `CLAUDE_CONFIG_DIR` → `~/.config/orc/claude-state`, so orc never touches
-  your real `~/.claude` login and you never have to `/logout` between
-  Anthropic and OpenRouter sessions
-
-The base URL and model are additionally forced via `claude --settings` (CLI
-settings outrank directory settings), so a project-level
-`.claude/settings.json` with its own `env.ANTHROPIC_BASE_URL` — a proxy, a
-gateway — can't silently hijack an orc session.
-
-## The HUD
-
-Every orc launch injects a Claude Code statusline (on by default, your real
-`~/.claude` settings are never touched). It renders one line:
-
-```
-stealth/ox-alpha │ ↑ 3.50M ↓ 45.8k │ cache 89% │ ctx ▓▓░░░░░░░░░ 11% │ $0.8412 │ +$0.31 agents
-```
-
-- **↑ / ↓** — total tokens in (including cached) and out on the parent
-  transcript. Subagent tokens are priced separately so the parent window
-  stays honest.
-- **cache** — share of parent input tokens served from prompt cache
-- **ctx** — context gauge of the parent window; green under 60%, yellow
-  under 85%, red at the top. Prefers Claude Code's own context reading,
-  falls back to the last parent API call over the catalog context length
-- **cost** — parent-transcript cost from usage × live OpenRouter catalog
-  prices, joined per response (mid-session model switches price correctly).
-  Shows `FREE` for zero-priced models, `$—` when a model isn't in the
-  cached catalog. After `orc -c` / `/resume`, a second figure appears:
-  `$0.12 this $1.24 file` — spend since this join vs the whole file
-- **+agents** — sibling spend from `<session>/subagents/agent-*.jsonl`,
-  same math as `orc stats`. Shown only when a subagent has billed tokens
-
-The HUD keeps an incremental cache at `~/.config/orc/sessions/<id>.json`
-and only reads new bytes on each statusline tick, so a multi-megabyte
-transcript does not get fully reparsed every time. `orc` stamps
-`~/.config/orc/last-launch` at exec so a resume can split "this join"
-from "the file".
-
-Claude Code's built-in cost figure is deliberately ignored: it prices tokens
-at Anthropic list rates, which is wrong when you're billed OpenRouter rates.
-
-The script is generated at `~/.config/orc/hud.sh` on launch (self-contained
-bash + jq, no extra dependencies); its source of truth is `hud.sh` in this
-repo. Toggle with `orc hud off` / `orc hud on`, preview against your newest
-transcript with `orc hud demo`, or disable for a single launch with
-`ORC_HUD=0`.
-
-The HUD now folds sibling subagent transcripts and splits resume spend
-as `$this` vs `$file`. Compacted / rewritten transcript files reset the
-byte-offset cache automatically.
-
-## Config
-
-`~/.config/orc/config.json`:
-
-```json
-{
-  "key_env": "OPENROUTER_API_KEY",
-  "model": "stealth/ox-alpha",
-  "small_model": "google/gemini-2.5-flash",
-  "hud": "on",
-  "profiles": {
-    "work": { "model": "anthropic/claude-opus-5", "mode": "plan" }
-  }
-}
-```
-
-`ORC_YES=1` skips the launch confirmation (for scripts). `ORC_HOME` moves the
-config dir. `ORC_HUD=0` hides the statusline HUD for one invocation.
-`ORC_NO_PROBE=1` skips doctor's launch probe. `ORC_NO_FIT=1` skips doctor's
-tool-loop fit probe. `ORC_MODE` overrides the launch permission mode for
-one invocation (`default` / `auto` / `acceptEdits` / `plan` / `dontAsk` /
-`yolo`) without touching the saved config — this is how wrappers like
-cmndcntr launch orc with their own per-run policy. `ORC_PROFILE` does the
-same for profiles. `ORC_MODEL_OVERRIDE` is the env form of `-m`. The model
-catalog and fit cache both live 24h (`orc refresh` / `orc probe --fit`
-to force). The Artificial Analysis quality cache lives 24h too;
-`orc refresh` re-checks it but won't re-fetch the leaderboard (the
-scraper is in cmndcntr; run `make refresh-quality` from the orc source
-to update the bundled snapshot, then `./build.sh` and reinstall).
-`orc env` is `launch` without the `exec`.
-
-## Fusion: Claude lead + Codex sidekick
-
-`fusion` adds a small lead/sidekick harness beside `orc`. It keeps the lead agent in charge of the user conversation and final review, then delegates bounded work to Claude Code, Codex, or Antigravity through a shared task contract. Each run records its task, JSONL events, stdout, stderr, result, and reusable session id under `.fusion/` in the workspace.
+Fusion is the harness the rest of the guild is built on. It keeps a lead agent
+in charge of the conversation and the final review, then delegates bounded work
+to Claude Code, Codex, Antigravity or Grok through a shared task contract. Each
+run records its task, JSONL events, stdout, stderr, result, and reusable session
+id under `.fusion/` in the workspace — so every claim in a report has a receipt
+behind it.
 
 The lead can call the other agent through an MCP server:
 
@@ -771,7 +607,9 @@ Ultra is an explicit bounded pipeline modeled after the useful part of
 review, and synthesize. It uses fresh stage contexts and JSON handoff files in
 `.fusion/ultra/`, so later stages read evidence instead of inheriting every
 earlier transcript. The stage count is capped, writes are serialized, and the
-example routes cap each ORC-backed Claude call with `--max-budget-usd`.
+`orc-best` route caps its Claude call with `--max-budget-usd`. `orc-free` is
+deliberately left uncapped: that flag prices tokens at Anthropic list rates,
+which would only sabotage a free lane.
 
 Copy `.fusion.json.example` to `.fusion.json` in a project, then make sure ORC
 has a current model catalog and key. The `orc-free` route selects the highest
@@ -827,14 +665,14 @@ actual workers, durations and blockers, and distinguishes unreported cost from
 an explicitly reported zero. Reporting starts no agents and leaves receipts intact.
 
 ```sh
-orc 'fusion' workflow report WORKFLOW_ID                # final output
-orc 'fusion' workflow report WORKFLOW_ID --finding 3    # one recommendation + next command
-orc 'fusion' workflow report WORKFLOW_ID --node explore # supporting investigation
-orc 'fusion' workflow report WORKFLOW_ID --all          # every stage's full answer
-orc 'fusion' workflow report WORKFLOW_ID --brief        # compact status
-orc 'fusion' workflow report WORKFLOW_ID --output report.md
-orc 'fusion' --json workflow report WORKFLOW_ID         # structured outputs and provenance
-orc 'fusion' --progress build --from-workflow WORKFLOW_ID --finding 3 --plan-only
+orc fusion workflow report WORKFLOW_ID                # final output
+orc fusion workflow report WORKFLOW_ID --finding 3    # one recommendation + next command
+orc fusion workflow report WORKFLOW_ID --node explore # supporting investigation
+orc fusion workflow report WORKFLOW_ID --all          # every stage's full answer
+orc fusion workflow report WORKFLOW_ID --brief        # compact status
+orc fusion workflow report WORKFLOW_ID --output report.md
+orc fusion --json workflow report WORKFLOW_ID         # structured outputs and provenance
+orc fusion --progress build --from-workflow WORKFLOW_ID --finding 3 --plan-only
 ```
 
 `--finding` recognizes numbered, bold Markdown recommendation headings. When
@@ -877,19 +715,19 @@ receipt for provenance but deliberately excluded from the digest itself, so
 `orc-free`/`orc-best` re-resolving to a different model over time does not
 by itself invalidate a cached node.
 
-For the Saloon integration smoke, use the included read-only graph against a
-disposable checkout or the existing `~/saloon` workspace:
+For a first integration smoke, use the bundled read-only graph against a
+disposable checkout:
 
 ```sh
-fusion --workspace ~/saloon --json workflow run \
-  /path/to/orc/examples/saloon-readonly.workflow.json
+fusion --workspace /path/to/checkout --json workflow run \
+  /path/to/orc/examples/readonly.workflow.json
 ```
 
 Start with this graph before adding implementation writers. It intentionally
 uses three Claude inventory nodes, two Codex counterchecks, and one Claude
 reviewer. If a provider reaches a session or usage limit, the command exits
-with status 2 and leaves a resumable manifest under
-`~/saloon/.fusion/workflows/`.
+with status 2 and leaves a resumable manifest under the workspace's
+`.fusion/workflows/`.
 
 ### Traces and dogfood
 
@@ -902,7 +740,8 @@ that detail. Set `telemetry.enabled` to `false` in `.fusion.json` to disable
 the trace ledger.
 
 ```sh
-make test                 # deterministic unit tests
+make test                 # deterministic Python unit tests
+./test/run.sh             # the launcher + HUD suite (separate; CI runs both)
 make dogfood               # actual fusion CLI + fake Claude/Codex subprocesses
 fusion trace --limit 50   # inspect spans
 fusion usage              # aggregate tokens, latency, and reported costs
@@ -941,7 +780,8 @@ Or set this in the project's `.fusion.json`:
 
 What gets sent, per dispatch: agent, role, route, model, whether it was a
 write, status, a coarse `failure_class` (`quota` / `permission_denied` /
-`timeout` / `missing_executable` / `worker_error` — never the raw blocker
+`timeout` / `missing_executable` / `worker_error` / `coordinator_error` —
+never the raw blocker
 text), timing, and token/cost usage, tagged with a random per-machine
 `install_id` that isn't tied to identity. A workflow node reused from a
 digest-matched receipt on resume (see digests above) never actually
@@ -971,6 +811,274 @@ The collector itself (a small Fly + Postgres app) lives in
 [`telemetry/`](telemetry/).
 
 The architecture and source map are in [FUSION_RESEARCH.md](FUSION_RESEARCH.md).
+
+## The launcher
+
+The original `orc`: one command to run Claude Code against any OpenRouter model
+— GPT, Gemini, Kimi, DeepSeek, free stealth previews like `stealth/ox-alpha`. It
+handles env wiring, model selection and key management, and keeps its Claude
+state fully isolated from your normal Anthropic login, so you never have to
+`/logout` between Anthropic and OpenRouter sessions.
+
+The guild uses it too: the `orc-free` and `orc-best` workflow routes resolve
+through this catalog at run time.
+
+### Command reference
+
+```
+orc                     launch (first run starts the setup wizard)
+orc [claude args...]    pass args through to claude (orc -c, orc -p "...", orc --resume)
+orc -m <model> [...]    one-off model override (not saved)
+orc @<profile> [...]    launch with a saved profile (one-off, not saved as default)
+orc setup               re-run the setup wizard (key + model)
+orc model [query]       pick + save a new default model
+orc model --set <id>    set the default model non-interactively
+orc free [query]        pick + save a currently free model
+orc mode                pick + save the launch permission mode
+orc small [query]       pick + save a small/fast model for background tasks
+orc small --set <id>    set the small model non-interactively
+orc save <name>         snapshot the resolved model/small/mode as profile @<name>
+orc profiles [rm <n>]   list saved profiles / remove one
+orc status [--json]     print the resolved launch (model/mode/profile/source)
+orc stats               token + cost totals across all orc transcripts
+     [--json] [--by model|project|day]
+orc hud [on|off|demo]   toggle the statusline HUD / preview it on the newest transcript
+orc models [query]      list models with pricing + context + tool + fit
+orc models --free [...] list only currently free models
+orc models --tools [..] list only models advertising tool support
+orc models --fit [...]  list only models that passed orc probe --fit
+orc quality             dump the Artificial Analysis quality cache as a table
+orc key                 configure key source (env var name or key store)
+orc env                 print the export lines launch uses (contains your key)
+orc refresh             force-refresh the cached model list
+orc doctor              check everything end to end (resolved model + fit)
+orc probe [model]       smoke-test the launch path (1-token request)
+orc probe --fit [model] tool-loop smoke test; result cached 24h as FIT/FAIL
+orc config              open config in $EDITOR
+orc fusion ui           open the local browser control room
+```
+
+### Choosing a model
+
+The model picker shows live OpenRouter input/output prices per million tokens.
+Free models are marked `FREE`; type `FREE` in the regular picker or use
+`orc free` to search only models whose current usage prices are all zero.
+Every row also carries a tool-support flag read from the catalog's
+`supported_parameters`: models marked `NO TOOLS` tend to feel broken under
+Claude Code, which leans hard on tools. `orc models --tools` lists only
+tool-capable models, and `orc doctor` warns when the *resolved* model
+(not just the global default) lacks tool support.
+
+**Ranking.** The picker is sorted by the Artificial Analysis
+Intelligence Index, a 0–~63 score for general model capability.
+Within a score, ties break on prompt price (cheaper first), then
+`FIT` first, then tool-capable models, then everything else, then model id. A bundled snapshot
+of the leaderboard ships with orc at `data/quality.json`; on first
+launch it is copied into `$ORC_HOME/quality.json` and used for
+ranking without any network call. `orc refresh` re-fetches both
+the OpenRouter catalog and the quality snapshot; `make refresh-quality`
+(from the orc source) re-runs the cmndcntr fetcher and copies a
+fresh snapshot into `data/quality.json` for the next release.
+
+Use `orc quality` to inspect the current cache as a sorted table:
+
+```
+OR_ID                            II    CODE   AGENT  CREATOR          SLUG
+anthropic/claude-opus-5          63.05  77.98  59.17  Anthropic        claude-opus-5
+anthropic/claude-fable-5         62.07  76.49  56.59  Anthropic        claude-fable-5
+openai/gpt-5.6-sol               60.92  77.38  57.78  OpenAI           gpt-5.6-sol
+x-ai/grok-4.6                    60.92  76.78  58.67  SpaceXAI         grok-4-6
+...
+```
+
+A second column, `FIT` / `FAIL` / `UNTESTED`, is orc's own measurement:
+`orc probe --fit` forces a one-tool round trip through OpenRouter's
+Anthropic-compatible endpoint and caches the result for 24h. The picker
+sorts last-known-good models first; `orc models --fit` lists only those.
+`orc doctor` runs the fit probe when the cache is empty (`ORC_NO_FIT=1`
+skips it). Catalog `tools` is an advertisement; FIT is whether the model
+survived a Claude Code-shaped loop.
+
+### Profiles
+
+A profile is a named snapshot of the *resolved* `model` + `small_model` +
+`mode` — including a one-off `-m`, `ORC_MODE`, or `.orc.json` pin. Keep one
+combo for real work and one for throwaway experiments, and switch per launch
+without touching your saved default. `orc status` prints the combo that
+would launch from this directory. `orc env` prints the same exports
+`launch` would set (including context window and gateway discovery).
+
+```bash
+orc status              # what would launch right now
+orc status --json       # same object, for wrappers
+```
+
+Resolution order for each of `model` / `small_model` / `mode`:
+
+1. one-off flags: `-m` / `ORC_MODEL_OVERRIDE` / `ORC_MODE`
+2. `orc @<profile>` / `ORC_PROFILE`
+3. `.orc.json` inline keys
+4. the profile named by `.orc.json`'s `"profile"`
+5. `~/.config/orc/config.json`
+
+```bash
+orc save work           # snapshot the current setup as @work
+orc @work               # launch with it (default config unchanged)
+orc @work -c            # profile + claude args compose
+orc profiles            # list; orc profiles rm work removes
+```
+
+`ORC_PROFILE=work orc` is equivalent to `orc @work` — useful for wrappers.
+
+### Per-project config: `.orc.json`
+
+Drop a `.orc.json` in a repo (found by walking up from the current directory)
+to pin settings for that project:
+
+```json
+{ "profile": "work" }
+```
+
+or inline, without needing a profile:
+
+```json
+{ "model": "moonshotai/kimi-k2", "mode": "plan" }
+```
+
+Resolution is the same stack `orc status` prints — see above. The launch
+menu, `orc env`, `orc save`, `orc doctor`, and `orc probe` all consume
+that object, so a project pin or `@work` is never silently ignored.
+
+### Stats
+
+`orc stats` aggregates every transcript orc has ever produced (they all live
+under orc's isolated state dir) and prices them against the cached catalog —
+the same math as the HUD, across all sessions, subagent transcripts included:
+
+```
+MODEL                     MSGS  IN       OUT     CACHE  COST
+anthropic/claude-opus-5   185   11.74M   143.7k  93%    $13.8608
+stealth/ox-alpha          1024  184.86M  533.3k  94%    $0
+TOTAL                     1246  200.48M  737.5k  94%    $24.5181
+```
+
+`--by project` or `--by day` regroups the table; `--json` emits the full
+structured breakdown (totals plus all three groupings) for scripts. Responses
+from models missing from the cached catalog are flagged `+?` rather than
+silently priced at zero. Unlike the OpenRouter dashboard, this splits spend
+per project and per model as seen from your machine.
+
+### How the key is resolved
+
+1. The env var named in your config — `OPENROUTER_API_KEY` by default,
+   changeable via `orc key`.
+2. The system key store, where the key wizard stores pasted keys: the macOS
+   Keychain (service `orc-openrouter`) on macOS; on Linux a file at
+   `~/.config/orc/key`, created with `0600` permissions and never made
+   group/world readable (orc warns if it is). Nothing is ever written to a
+   plaintext config file.
+
+If neither is found, **orc refuses to launch** (fail closed) and tells you how
+to fix it.
+
+`orc doctor` goes further than static checks: as a final step it probes the
+real launch path — a 1-token request to OpenRouter's Anthropic-compatible
+endpoint (`/api/v1/messages`) with your resolved key and saved model — and
+reports HTTP status and latency, so breakage surfaces before you are inside a
+session. The probe costs a fraction of a cent on paid models; skip it with
+`ORC_NO_PROBE=1`, or run it standalone against any model with `orc probe <id>`.
+
+### What it sets for Claude Code
+
+- `ANTHROPIC_BASE_URL` → OpenRouter's Anthropic-compatible endpoint
+- `ANTHROPIC_AUTH_TOKEN` → your resolved key (`ANTHROPIC_API_KEY` is set to
+  an empty string to avoid conflicts)
+- `ANTHROPIC_MODEL` / `ANTHROPIC_SMALL_FAST_MODEL` → your saved models
+- `CLAUDE_CODE_MAX_CONTEXT_TOKENS` → the model's real context window from the
+  OpenRouter catalog (Claude Code otherwise assumes 200k for unknown models)
+- `ANTHROPIC_DEFAULT_HAIKU_MODEL` → your saved small model
+- `CLAUDE_CONFIG_DIR` → `~/.config/orc/claude-state`, so orc never touches
+  your real `~/.claude` login and you never have to `/logout` between
+  Anthropic and OpenRouter sessions
+
+The base URL and model are additionally forced via `claude --settings` (CLI
+settings outrank directory settings), so a project-level
+`.claude/settings.json` with its own `env.ANTHROPIC_BASE_URL` — a proxy, a
+gateway — can't silently hijack an orc session.
+
+### The HUD
+
+Every orc launch injects a Claude Code statusline (on by default, your real
+`~/.claude` settings are never touched). It renders one line:
+
+```
+stealth/ox-alpha │ ↑ 3.50M ↓ 45.8k │ cache 89% │ ctx ▓▓░░░░░░░░░ 11% │ $0.8412 │ +$0.31 agents
+```
+
+- **↑ / ↓** — total tokens in (including cached) and out on the parent
+  transcript. Subagent tokens are priced separately so the parent window
+  stays honest.
+- **cache** — share of parent input tokens served from prompt cache
+- **ctx** — context gauge of the parent window; green under 60%, yellow
+  under 85%, red at the top. Prefers Claude Code's own context reading,
+  falls back to the last parent API call over the catalog context length
+- **cost** — parent-transcript cost from usage × live OpenRouter catalog
+  prices, joined per response (mid-session model switches price correctly).
+  Shows `FREE` for zero-priced models, `$—` when a model isn't in the
+  cached catalog. After `orc -c` / `/resume`, a second figure appears:
+  `$0.12 this $1.24 file` — spend since this join vs the whole file
+- **+agents** — sibling spend from `<session>/subagents/agent-*.jsonl`,
+  same math as `orc stats`. Shown only when a subagent has billed tokens
+
+The HUD keeps an incremental cache at `~/.config/orc/sessions/<id>.json`
+and only reads new bytes on each statusline tick, so a multi-megabyte
+transcript does not get fully reparsed every time. `orc` stamps
+`~/.config/orc/last-launch` at exec so a resume can split "this join"
+from "the file".
+
+Claude Code's built-in cost figure is deliberately ignored: it prices tokens
+at Anthropic list rates, which is wrong when you're billed OpenRouter rates.
+
+The script is generated at `~/.config/orc/hud.sh` on launch (self-contained
+bash + jq, no extra dependencies); its source of truth is `hud.sh` in this
+repo. Toggle with `orc hud off` / `orc hud on`, preview against your newest
+transcript with `orc hud demo`, or disable for a single launch with
+`ORC_HUD=0`.
+
+The HUD now folds sibling subagent transcripts and splits resume spend
+as `$this` vs `$file`. Compacted / rewritten transcript files reset the
+byte-offset cache automatically.
+
+### Config
+
+`~/.config/orc/config.json`:
+
+```json
+{
+  "key_env": "OPENROUTER_API_KEY",
+  "model": "stealth/ox-alpha",
+  "small_model": "google/gemini-2.5-flash",
+  "hud": "on",
+  "profiles": {
+    "work": { "model": "anthropic/claude-opus-5", "mode": "plan" }
+  }
+}
+```
+
+`ORC_YES=1` skips the launch confirmation (for scripts). `ORC_HOME` moves the
+config dir. `ORC_HUD=0` hides the statusline HUD for one invocation.
+`ORC_NO_PROBE=1` skips doctor's launch probe. `ORC_NO_FIT=1` skips doctor's
+tool-loop fit probe. `ORC_MODE` overrides the launch permission mode for
+one invocation (`default` / `auto` / `acceptEdits` / `plan` / `dontAsk` /
+`yolo`) without touching the saved config — this is how wrappers like
+cmndcntr launch orc with their own per-run policy. `ORC_PROFILE` does the
+same for profiles. `ORC_MODEL_OVERRIDE` is the env form of `-m`. The model
+catalog and fit cache both live 24h (`orc refresh` / `orc probe --fit`
+to force). The Artificial Analysis quality cache lives 24h too;
+`orc refresh` re-checks it but won't re-fetch the leaderboard (the
+scraper is in cmndcntr; run `make refresh-quality` from the orc source
+to update the bundled snapshot, then `./build.sh` and reinstall).
+`orc env` is `launch` without the `exec`.
 
 ## Development
 
