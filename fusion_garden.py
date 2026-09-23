@@ -1,13 +1,14 @@
-"""Opt-in automatic label drafts. Human approval remains a separate operation."""
+"""Opt-in drafting and unanimous council approval, with persisted policy and progress."""
 import contextlib
 import fcntl
 from pathlib import Path
 import time
 
 from fusion_learning import decision_rows, read_object
+from fusion_decisions import digest
 
 DEFAULTS = {'enabled': False, 'agent': 'auto', 'since_ms': 0,
-            'labeling_mode': 'single', 'council_agents': []}
+            'labeling_mode': 'single', 'council_agents': [], 'approval_mode': 'human', 'approval_since_ms': 0}
 
 
 @contextlib.contextmanager
@@ -33,7 +34,7 @@ def save(app, workspace, body):
     from fusion_ui import atomic_json
     if type(body.get('enabled')) is not bool:
         raise ValueError('Choose whether automatic drafting is enabled')
-    from fusion_labeling import labeling_options
+    from fusion_labeling import labeling_options, approval_options
     agent = body.get('agent', 'auto')
     if agent not in {'auto', 'codex', 'claude', 'agy', 'grok'}:
         raise ValueError('Choose an installed labeling worker')
@@ -41,11 +42,15 @@ def save(app, workspace, body):
         old = settings(workspace)
         options = labeling_options(body.get('labeling_mode', old['labeling_mode']),
                                    body.get('council_agents', old['council_agents']))
+        approval = approval_options(body.get('approval_mode', old['approval_mode']), options['labeling_mode'])
         since = old['since_ms'] if old.get('configured') else int(time.time() * 1000)
+        approval_since = old['approval_since_ms'] if old['approval_mode'] == approval else int(time.time() * 1000)
         if body.get('include_existing') is True:
             since = 0
+            approval_since = 0
         value = {'enabled': body['enabled'], 'agent': agent, **options,
-                 'since_ms': since, 'configured': True}
+                 'since_ms': since, 'configured': True, 'approval_mode': approval, 'approval_since_ms': approval_since}
+        value['policy_id'] = digest({key: value[key] for key in ('approval_mode', 'approval_since_ms', 'labeling_mode', 'council_agents')})
         atomic_json(Path(workspace) / '.fusion/decisions/garden.json', value)
     return status(app, workspace)
 
@@ -56,9 +61,19 @@ def status(app, workspace, rows=None):
     now = int(time.time() * 1000)
     garden_jobs = [j for j in jobs if j.get('garden')]
     attempted = {j.get('decision_id') for j in jobs if j.get('action') == 'suggest-labels'}
-    queue = [r for r in (decision_rows(workspace) if rows is None else rows)
-             if r['garden_state'] == 'needs_draft' and r['id'] not in attempted
-             and r.get('time_ms', 0) >= value['since_ms']]
+    automatic = value['approval_mode'] == 'council'
+    attempted_policy = {j.get('decision_id') for j in jobs if j.get('action') == 'suggest-labels' and j.get('garden_policy') == value.get('policy_id')}
+    queue = []
+    for row in (decision_rows(workspace) if rows is None else rows):
+        if row.get('time_ms', 0) < max(value['since_ms'], value['approval_since_ms'] if automatic else 0):
+            continue
+        if automatic:
+            human_reviewed = any(e.get('verified') and e.get('source') != 'council_approved_suggestion' for e in row.get('labels', []))
+            eligible = row['garden_state'] in {'needs_draft', 'needs_review', 'needs_evidence', 'needs_attention'} and not human_reviewed
+            if eligible and row['id'] not in attempted_policy:
+                queue.append(row)
+        elif row['garden_state'] == 'needs_draft' and row['id'] not in attempted:
+            queue.append(row)
     used = sum(j.get('started_at_ms', 0) // 86400000 == now // 86400000 for j in garden_jobs)
     active = next((j for j in jobs if j.get('action') == 'suggest-labels' and j.get('status') in {'queued', 'running', 'stopping'}), None)
     latest = garden_jobs[0] if garden_jobs else None
@@ -77,4 +92,5 @@ def tick(app, workspace):
             return
         app.launch(workspace, {'action': 'suggest-labels', 'decision_id': current['next_id'],
                                'agent': current['agent'], 'labeling_mode': current['labeling_mode'],
-                               'council_agents': current['council_agents']}, garden=True)
+                               'council_agents': current['council_agents'], 'approval_mode': current['approval_mode'],
+                               'garden_policy': current.get('policy_id')}, garden=True)

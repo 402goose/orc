@@ -80,6 +80,14 @@ orc fusion ui           open the local browser control room
 
 ### Browser control room
 
+The control room wears the ORC guild identity: the supplied tusked logo, a
+forgekeeper and truffle-scout illustration, and 16 local vector sigils across
+navigation, workflows and Laya. **Meet the guild** opens the characters' field
+guide. All ten palettes tint the artwork and icons, including the favicon;
+light/dark/system settings still persist locally. Decorative motion respects
+reduced-motion preferences. Assets and the illustration prompt live in
+[`fusion_ui_assets/brand`](fusion_ui_assets/brand/README.md).
+
 ```sh
 cd /path/to/your/repository
 orc 'fusion' ui
@@ -123,7 +131,17 @@ URL printed by `orc fusion ui`. Successful credentials are remembered for that
 local origin; opening the current URL in one tab reconnects other tabs in the same
 browser. Unsaved label edits remain intact, and failed actions are never replayed.
 
-In **Laya lab**, select a decision and click **Suggest labels**. Choose Auto or an
+Laya lab has six focused tabs: **Overview** (model and teaching progress),
+**Review** (decisions and labels), **Garden** (automation and live council runs),
+**Training** (exports, candidates, and evaluation jobs), **Quality** (data health),
+and **Results** (measured model comparisons). Tabs update the URL without reloading
+and support browser Back/Forward. Reload or share a link to return to the same
+registered workspace and tab; Review links also retain the decision and queue filter.
+For example, `#decisions/garden?w=<workspace-id>` opens the garden directly.
+Unsaved review edits survive tab changes within the open page; save them before
+reloading. Use Left/Right or Home/End while a tab is focused to move between sections.
+
+In **Laya lab → Review**, select a decision and click **Suggest labels**. Choose Auto or an
 installed Codex, Claude, AGY, or Grok worker. A background job reads a snapshot of
 the original input and that attempt's saved result/answer, then drafts labels with
 reasons and evidence references. The teacher does not receive Laya's predictions,
@@ -131,7 +149,13 @@ policy choices, or previous labels. It can abstain when evidence is missing.
 No repository changes or new verification runs are requested. This uses your
 configured worker account and can incur provider usage.
 
-Review the evidence, edit any answers or explanation, and click **Approve labels**.
+Individual label editors inherit the garden’s drafting and approval settings unless
+you choose different settings for that decision. Choose **Label approval → Council
+approves unanimous answers** to switch an existing draft to council assessment,
+then click **Run council & approve**. Already approved labels show their saved status;
+the correction form does not require another approval.
+
+By default, review the evidence, edit any answers or explanation, and click **Approve labels**.
 Drafts never enter training exports. Approval records the worker/model/run, draft
 identity, final labels and human evidence; regenerating does not replace existing
 approved labels. In-progress edits survive polling and navigation within the tab.
@@ -156,35 +180,51 @@ ancestry; evaluation flags overlapping inputs or groups and withholds improvemen
 claims for known leakage. Older candidates without this metadata show an unknown
 audit status. Repeated use of a small benchmark still does not prove generalization.
 
-**Data garden → Enable auto-drafts** queues incoming complete decisions for a
+**Laya lab → Garden → Enable auto-drafts** queues incoming complete decisions for a
 labeling worker. There is **no daily cap**, including for gardens with an old saved
-limit. Optionally include existing decisions without a prior attempt.
-Garden runs one draft at a time while the control-room server is running, even
+limit. Optionally include existing eligible decisions and drafts in the selected setup.
+Garden runs one assessment at a time while the control-room server is running, even
 with the browser closed. Settings, attempted decisions and daily usage survive
-restart. Pausing stops new calls; an existing draft can finish or be cancelled
-from its activity view. Provider usage may be charged to your worker account.
+restart. Pausing stops new calls and withdraws automatic approval from the active
+garden run; its assessment can finish as a draft or be cancelled from the live view.
+Provider usage may be charged to your worker account.
 
 Choose **Agent council** in Garden settings or an individual label editor to use
 two to four distinct local workers. Every member receives the same evidence in a
 fresh session, without prior votes, predictions, or labels. Members run sequentially;
 each uses one worker call. Only unanimous, evidence-citing answers become suggested
 labels. Disagreements, abstentions, and member failures remain visible with individual
-reasons and run/model provenance. They require a human assessment, and agreement
-alone is not proof of correctness. Council mode never approves labels automatically.
+reasons and run/model provenance. Agreement alone is not proof of correctness.
+
+To run labeling end to end, choose **Label approval → Council approves unanimous
+answers**. This is opt-in, in Garden settings or for an individual assessment.
+Only answers supported unanimously by every selected member enter the approved
+dataset automatically. Disagreements, missing evidence and failed members remain
+pending. Existing human approvals are preserved. Changing the council settings or
+pausing the garden withdraws permission to approve an in-flight garden assessment.
+Council approvals carry their own source, member/run identities and evidence into
+training exports and data-quality reports, separately from human approvals.
+
+The live council view shows the active worker, public updates when available,
+completed assessments, per-question votes and the approval result. Recent runs
+stay inspectable after completion. New results animate gently; reduced-motion
+preferences are respected. Updates continue while you edit review notes.
 
 The **Ready to review** queue contains suggested answers awaiting approval;
 all-abstention drafts appear under **Needs evidence**, and unsuccessful drafts
-under **Failed drafts**. Garden does not retry them automatically. **Exclude
+under **Failed drafts**. Garden attempts each decision once per council approval
+setup; selecting an existing backlog can reassess prior drafts. **Exclude
 example** removes a decision from automatic drafting and future training exports;
 **Restore example** brings its existing reviewed answers back. Existing exported
-datasets and model weights are unchanged. Drafts are never approved, trained or
-promoted automatically.
+datasets and model weights are unchanged. Automatic approval adds labels only;
+training a candidate and selecting a checkpoint remain separate actions.
 
-The CLI equivalent, which also only saves a draft, is:
+CLI equivalents (draft-only unless `--approval council` is explicit):
 
 ```sh
 orc 'fusion' decisions suggest DECISION_ID --agent codex
 orc 'fusion' decisions suggest --council codex claude agy -- DECISION_ID
+orc 'fusion' decisions suggest --approval council --council codex claude -- DECISION_ID
 ```
 
 Completed implementation workflows have an **Open PR** action. Choose a target
@@ -305,6 +345,8 @@ npm install --prefix /tmp/orc-ui-tools --no-audit --no-fund @playwright/test@1.6
 /tmp/orc-ui-tools/node_modules/.bin/playwright install chromium
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/ui_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/garden_browser.cjs
+NODE_PATH=/tmp/orc-ui-tools/node_modules node test/laya_tabs_browser.cjs
+NODE_PATH=/tmp/orc-ui-tools/node_modules node test/council_approval_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/ui_connection_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/truffle_browser.cjs
 ```

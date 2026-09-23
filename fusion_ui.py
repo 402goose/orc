@@ -154,6 +154,7 @@ def run_job(directory):
     state = {"id": directory.name, "action": request["action"], "title": request["title"],
              "decision_id": request.get("decision_id"),
              "garden": request.get("garden", False),
+             "garden_policy": request.get("garden_policy"),
              "started_at_ms": core.now_ms(), "status": "running", "supervisor_pid": os.getpid()}
     atomic_json(directory / "job.json", state)
     environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "FUSION_PROGRESS": "1"}
@@ -286,14 +287,44 @@ class ControlRoom:
     def decisions(self, workspace):
         rows = decision_rows(workspace)
         jobs = self.jobs(workspace, limit=None)
+        label_runs = self.label_runs(workspace)
         for row in rows:
             row['suggestions'] = row['suggestions'][-5:]
             row['suggestion_job'] = next((j for j in jobs if j.get('decision_id') == row['id']), None)
-            if row['garden_state'] == 'needs_draft' and row['suggestion_job']:
-                row['garden_state'] = 'drafting' if row['suggestion_job']['status'] in ACTIVE else 'needs_attention'
+            row['label_run'] = next((r for r in label_runs if r['decision_id'] == row['id']), None)
+            if row['suggestion_job'] and row['garden_state'] not in {'excluded', 'ineligible'}:
+                if row['suggestion_job']['status'] in ACTIVE:
+                    row['garden_state'] = 'drafting'
+                elif row['garden_state'] == 'needs_draft':
+                    row['garden_state'] = 'needs_attention'
         config, _ = core.load_config(workspace)
-        return {'records': rows, 'learning': learning_summary(workspace, config, rows),
+        return {'records': rows, 'learning': learning_summary(workspace, config, rows), 'label_runs': label_runs,
                 'garden': {**garden.status(self, workspace, rows), 'error': self.garden_errors.get(str(workspace))}}
+
+    def label_runs(self, workspace, decision_id=None, since=0):
+        paths = sorted((workspace / '.fusion/decisions/assessments').glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True)
+        runs = []
+        for path in paths:
+            run = read_json(path)
+            if not run or run.get('started_at_ms', 0) < since or (decision_id and run.get('decision_id') != decision_id):
+                continue
+            if run.get('status') == 'running' and not alive(run.get('pid')):
+                run.update(status='interrupted', phase='interrupted')
+                for member in run.get('members', []):
+                    if member.get('status') == 'running':
+                        member['status'] = 'interrupted'
+            for member in run.get('members', []):
+                if member.get('status') != 'running' or not member.get('run_id'):
+                    continue
+                directory = inside(workspace / '.fusion', 'runs/' + identifier(member['run_id']))
+                member['activity'] = read_json(directory / 'activity.json')
+                stdout = tail(directory / 'stdout.log', 60000)
+                member['messages'] = [message for line in stdout.splitlines() if (message := core.progress.worker_message(line))][-6:]
+                member['stderr'] = tail(directory / 'stderr.log', 4000)
+            runs.append(run)
+            if len(runs) >= (1 if decision_id else 12):
+                break
+        return runs
 
     def garden_tick(self):
         with self.lock:
@@ -398,6 +429,8 @@ class ControlRoom:
         job = read_json(directory / "job.json")
         job["console"] = tail(directory / "stderr.log", 60000)
         job["output"] = tail(directory / "stdout.log", 80000)
+        if job.get('action') == 'suggest-labels':
+            job['label_run'] = next(iter(self.label_runs(workspace, job.get('decision_id'), job.get('started_at_ms', 0))), None)
         if job.get("status") in ACTIVE and job.get("supervisor_pid") and not alive(job["supervisor_pid"]):
             job["status"] = "interrupted"
         return job
@@ -520,13 +553,16 @@ class ControlRoom:
                 raise ValueError("Choose a classifier and provide input")
             argv += ["decisions", "probe", "--kind", kind, "--", text]
         elif action == "suggest-labels":
-            from fusion_labeling import labelable, labeling_options
+            from fusion_labeling import labelable, labeling_options, approval_options
             labelable(DecisionStore(workspace), body.get("decision_id"))
             agent = body.get("agent", "auto")
             if agent not in {"auto", "codex", "claude", "agy", "grok"}:
                 raise ValueError("Choose a labeling worker")
             options = labeling_options(body.get("labeling_mode", "single"), body.get("council_agents"))
-            argv += ["decisions", "suggest", "--agent", agent]
+            approval = approval_options(body.get("approval_mode", "human"), options['labeling_mode'])
+            argv += ["decisions", "suggest", "--agent", agent, "--approval", approval]
+            if garden and body.get('garden_policy'):
+                argv += ['--garden-policy', body['garden_policy']]
             if options["labeling_mode"] == "council":
                 argv += ["--council", *options["council_agents"]]
             argv += ["--", body["decision_id"]]
@@ -569,8 +605,10 @@ class ControlRoom:
             decision_id = body.get("decision_id") if action == "suggest-labels" else None
             learning = {"dataset": str(dataset) if action in {"train", "evaluate", "calibrate"} else "",
                         "model_path": body.get("model_path", "")}
-            atomic_json(directory / "request.json", {"action": action, "title": title, "argv": argv, "workspace": str(workspace), "mode": mode, "decision_id": decision_id, "garden": garden, "learning": learning})
-            atomic_json(directory / "job.json", {"id": job_id, "action": action, "title": title, "status": "queued", "started_at_ms": core.now_ms(), "decision_id": decision_id, "garden": garden})
+            atomic_json(directory / "request.json", {"action": action, "title": title, "argv": argv, "workspace": str(workspace), "mode": mode, "decision_id": decision_id, "garden": garden, "learning": learning,
+                                                      "garden_policy": body.get('garden_policy') if garden else None})
+            atomic_json(directory / "job.json", {"id": job_id, "action": action, "title": title, "status": "queued", "started_at_ms": core.now_ms(), "decision_id": decision_id, "garden": garden,
+                                                  "garden_policy": body.get('garden_policy') if garden else None})
             with (directory / "supervisor.log").open("wb") as log:
                 proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--job", str(directory)],
                                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
@@ -755,7 +793,8 @@ class Handler(BaseHTTPRequestHandler):
                 store.get(body.get('id'))
                 if type(body.get('excluded')) is not bool:
                     raise ValueError('Choose whether to exclude this decision')
-                store.append('label_exclusion', id=body['id'], excluded=body['excluded'], source='human')
+                with store.review_lock():
+                    store.append('label_exclusion', id=body['id'], excluded=body['excluded'], source='human')
                 result = {'saved': True}
             else:
                 self.send(404, {"error": "Unknown API route"})

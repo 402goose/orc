@@ -124,6 +124,8 @@
       amber: dark ? "#e9c47b" : "#82570d",
       green: dark ? "#bbdc91" : "#42701e",
       backdrop: dark ? "#00000099" : "#19223255",
+      "brand-hue": `${theme.hue - 105}deg`,
+      "brand-paper": surface(94),
     };
     for (const [name, value] of Object.entries(values))
       root.style.setProperty("--" + name, value);

@@ -1,0 +1,58 @@
+/* Guild artwork stays on theme; operational status colors keep their meaning. */
+:root { --brand-hue: 0deg; --brand-paper: #f1f5e9; --sigil-fill: var(--accent-soft); }
+.sigil { width: 24px; height: 24px; flex: 0 0 auto; vertical-align: middle; color: var(--lime); }
+.sigil-fill { fill: var(--sigil-fill); }
+.sigil-tusk { fill: var(--panel); }
+.sidebar { overflow-y:auto; scrollbar-width:thin; }
+.sidebar > * { flex-shrink:0; }
+.brand { flex-direction: column; align-items: flex-start; gap: 9px; margin-bottom: 28px; }
+.brand-crest { display:block; width:100%; padding:7px 13px; background:var(--brand-paper); border:1px solid var(--accent-line); border-radius:14px 5px 14px 5px; }
+.brand-crest svg { display:block; width:100%; height:auto; filter:hue-rotate(var(--brand-hue)); }
+.brand-label { width:auto; font-size:9px; letter-spacing:2px; margin-left:8px; color:var(--muted); }
+.nav-item [data-brand-icon] { display:inline-flex; width:21px; flex:0 0 auto; }
+.nav-item [data-brand-icon] .sigil { width:21px; height:21px; color:inherit; }
+.sidebar-bottom .guild-guide-link { display:flex; align-items:center; gap:8px; margin-bottom:16px; font-size:12px; }
+.page-intro .eyebrow, .guild-hero .eyebrow { display:flex; align-items:center; gap:9px; }
+.page-intro .eyebrow .sigil { width:23px; height:23px; }
+.guild-hero { display:grid; grid-template-columns:1.2fr 1fr; align-items:center; min-height:310px; border:1px solid var(--accent-line); border-radius:22px 6px 22px 6px; background:linear-gradient(125deg,var(--accent-soft),var(--panel) 65%); margin:0 0 30px; overflow:hidden; position:relative; }
+.guild-hero-copy { padding:34px 0 34px 36px; position:relative; z-index:1; }
+.guild-hero h1 { font-size:clamp(36px,3.9vw,64px); line-height:1.04; letter-spacing:-.055em; margin:19px 0 16px; }
+.guild-hero p { max-width:460px; line-height:1.75; font-size:14px; }
+.guild-guide-link { display:inline-flex; align-items:center; gap:9px; }
+.guild-guide-link .sigil { width:18px; height:18px; }
+.guild-hero-art { position:relative; align-self:stretch; display:flex; align-items:center; justify-content:center; min-width:0; padding:12px 8px 30px 0; isolation:isolate; }
+.guild-hero-art img { width:100%; height:auto; max-height:330px; object-fit:contain; filter:hue-rotate(var(--brand-hue)); z-index:1; }
+.rune-ring { position:absolute; width:70%; aspect-ratio:1; border:1px solid var(--accent-line); border-radius:50%; transform:rotate(-15deg); opacity:.7; }
+.rune-ring::before, .rune-ring::after { content:""; position:absolute; inset:9%; border:1px dashed var(--accent-line); transform:rotate(45deg); border-radius:16%; }
+.rune-ring::after { inset:-8%; border-style:solid; border-radius:50%; }
+.guild-art-caption { position:absolute; bottom:17px; font:9px var(--mono); letter-spacing:1.7px; color:var(--muted); z-index:2; text-align:center; }
+.forge-spark { position:absolute; color:var(--lime); font-size:24px; z-index:2; animation:guild-glimmer 5s ease-in-out infinite; }
+.spark-one { top:13%; right:17%; }.spark-two { top:33%; left:9%; font-size:17px; animation-delay:1.8s; }
+@keyframes guild-glimmer { 0%,100% { opacity:.35; transform:scale(.85) rotate(-8deg); } 50% { opacity:.9; transform:scale(1.1) rotate(8deg); } }
+.template-icon .sigil { width:27px; height:27px; }
+.template:hover .sigil { transform:translateY(-2px) rotate(-4deg); }
+.template .sigil { transition:transform 180ms ease; }
+.empty-symbol .sigil { width:58px; height:58px; }
+.guild-section-emblem { display:inline-flex; align-items:center; gap:9px; }
+.guild-section-emblem .sigil { width:27px; height:27px; }
+.stage-sigil { width:26px; height:26px; margin-right:8px; }
+.stage h3 { display:flex; align-items:center; }
+.decision-kind .sigil { width:17px; height:17px; margin-right:5px; }
+.member-avatar .sigil { width:26px; height:26px; }
+.guild-motto { font-size:clamp(25px,3vw,37px); letter-spacing:-.045em; line-height:1.15; font-weight:650; color:var(--text); margin-bottom:12px; }
+.guild-cast { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:26px 0; }
+.guild-member { position:relative; padding:23px; background:var(--panel2); border:1px solid var(--line); border-radius:16px 4px 16px 4px; }
+.guild-member-mark { width:52px; height:52px; display:grid; place-items:center; border:1px solid var(--accent-line); border-radius:14px; background:var(--accent-soft); margin-bottom:20px; }
+.guild-member-mark .sigil { width:34px; height:34px; }
+.guild-member h3 { margin:8px 0 10px; font-size:24px; }
+.guild-member p { line-height:1.7; margin-bottom:16px; }
+.guild-member-function { font-size:12px; color:var(--text-soft); border-top:1px solid var(--line); padding-top:14px; margin-bottom:15px; }
+.guild-seals { display:flex; flex-wrap:wrap; gap:14px; border-top:1px solid var(--line); padding-top:23px; }
+.guild-seals span { display:grid; place-items:center; width:34px; height:34px; }
+.theme-preview .sigil { color:var(--swatch-dark); width:28px; height:28px; --sigil-fill:transparent; }
+.theme-preview { display:flex; align-items:center; justify-content:center; }
+@media(min-width:1500px) { .guild-hero { min-height:340px; }.guild-hero-art img { max-height:360px; } }
+@media(max-width:780px) { .brand { flex-direction:row; align-items:center; margin-bottom:17px; gap:16px; }.brand-crest { width:150px; padding:3px 10px; }.brand-label { max-width:100px; line-height:1.6; margin-left:0; }.nav-item > .sigil { width:18px; height:18px; }.guild-hero { grid-template-columns:1.15fr 1fr; min-height:250px; }.guild-hero-copy { padding:25px 0 25px 24px; }.guild-hero h1 { font-size:38px; }.guild-hero p { font-size:12px; }.guild-art-caption { font-size:8px; letter-spacing:1px; }.guild-hero .eyebrow { font-size:8px; letter-spacing:1.2px; } }
+@media(max-width:520px) { .guild-hero { grid-template-columns:1fr; }.guild-hero-copy { padding:25px 24px 0; }.guild-hero h1 { font-size:43px; }.guild-hero-art { height:220px; padding:0 12px 26px; }.guild-hero-art img { width:90%; height:100%; }.rune-ring { width:48%; }.spark-one { right:23%; }.guild-cast { grid-template-columns:1fr; }.guild-member { padding:20px; }.guild-hero .eyebrow { font-size:9px; } }
+@media(prefers-reduced-motion:reduce) { .forge-spark { animation:none; opacity:.65; }.template .sigil { transition:none; }.template:hover .sigil { transform:none; } }
+@media(max-width:360px) { .topbar .breadcrumb { display:none; }.topbar .top-actions { width:100%; justify-content:space-between; } }

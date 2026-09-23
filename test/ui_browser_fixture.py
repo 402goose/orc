@@ -54,6 +54,13 @@ print(json.dumps({'type': 'result', 'result': message, 'is_error': False}))
                  recommendations={"plausible":{"value":"false","probability":.88}},
                  prediction={"plausible":{"false":.88,"true":.12}}, model_identity="fixture-model", schema_hash="fixture", context={})
     store.append("application", id="fixture-decision", actual="accept", applied=False)
+    if os.environ.get('FUSION_FIXTURE_LIVE_COUNCIL') == '1':
+        store.append('label_exclusion', id='abstained-review', excluded=True)
+        codex = workspace / 'codex-fixture'
+        codex.write_text(codex.read_text().replace("if 'LABEL_SUGGESTION_V1' in prompt:", "if 'LABEL_SUGGESTION_V1' in prompt:\n    from pathlib import Path\n    print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'Checking the original evidence independently.'}}),flush=True)\n    while not Path(" + repr(str(root / 'release-codex')) + ").exists(): time.sleep(.05)"))
+        claude = workspace / 'claude-fixture'
+        claude.write_text(claude.read_text().replace('import json', 'import json, sys, time\nfrom pathlib import Path\nprompt=" ".join(sys.argv)')
+                         .replace("message = 'STATUS:", "while not Path(" + repr(str(root / 'release-claude')) + ").exists(): time.sleep(.05)\nif 'fixture disputed' in prompt: suggestion['answers']['plausible']['value']='true'\nmessage = 'STATUS:"))
     server = Server(0, app)
     print(json.dumps({"url":server.url,"workspace":str(workspace),"workflow_id":result["workflow_id"],"root":str(root)}),flush=True)
     try:

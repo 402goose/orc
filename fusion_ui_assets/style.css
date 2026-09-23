@@ -1866,3 +1866,70 @@ summary {
 .truffle-history small { display:block; margin:8px 0; color:var(--muted); }
 @media(max-width:1000px) { .truffle-candidates { grid-template-columns:1fr; } }
 @media(max-width:650px) { .truffle-stats { grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; } .truffle-toolbar { align-items:stretch; flex-direction:column; } .truffle-history { padding:16px; flex-wrap:wrap; } }
+/* Live labeling: only arriving results animate; running members have a quiet pulse. */
+.garden-live { margin:0 0 28px; }
+.council-live { border:1px solid var(--line); background:var(--panel); border-radius:14px; padding:26px; margin:18px 0; }
+.council-live.is-live { border-color:var(--accent-line); }
+.council-live-head, .live-member-heading { display:flex; align-items:center; justify-content:space-between; gap:16px; }
+.council-live-head h3 { margin:10px 0; font-size:22px; }
+.council-live-head p { margin:0; overflow-wrap:anywhere; }
+.live-orbit { display:inline-block; width:7px; height:7px; margin-right:7px; border-radius:50%; background:var(--lime); box-shadow:0 0 0 4px var(--accent-soft); animation:label-breathe 2.2s ease-in-out infinite; }
+.council-progress { height:4px; background:var(--line); border-radius:8px; overflow:hidden; margin:22px 0; }
+.council-progress i { display:block; height:100%; background:var(--lime); border-radius:inherit; }
+.live-member-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr)); gap:14px; }
+.live-member { min-width:0; background:var(--panel2); border:1px solid var(--line); border-radius:10px; padding:18px; }
+.live-member.running { background:var(--accent-soft); border-color:var(--accent-line); }
+.live-member.success .member-status { color:var(--green); }
+.live-member.error .member-status { color:var(--red); }
+.member-avatar { display:grid; place-items:center; flex-shrink:0; width:34px; height:34px; border-radius:9px; background:var(--panel); border:1px solid var(--line); font:11px var(--mono); color:var(--purple); }
+.live-member-heading > div { flex:1; }
+.live-member-heading small { display:block; margin-top:5px; color:var(--muted); font-size:11px; }
+.member-status { font-size:19px; }
+.live-member.running .member-status { animation:label-breathe 2.2s ease-in-out infinite; color:var(--lime); }
+.live-member details { margin-top:16px; font-size:12px; }
+.live-member details p { overflow-wrap:anywhere; }
+.live-worker-update { color:var(--text-soft); line-height:1.5; max-height:108px; overflow:auto; font-size:12px; margin:16px 0 0; white-space:pre-wrap; overflow-wrap:anywhere; }
+.live-votes { margin-top:20px; }
+.live-vote { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:12px 0; border-top:1px solid var(--line); font-size:12px; }
+.live-vote > div { display:flex; flex-wrap:wrap; gap:8px; }
+.vote-chip { display:inline-flex; gap:8px; padding:6px 9px; border:1px solid var(--line); border-radius:6px; color:var(--muted); }
+.vote-chip.answered b { color:var(--text); }
+.council-result { display:flex; flex-direction:column; gap:8px; margin-top:18px; border:1px solid var(--line); padding:16px; border-radius:9px; font-size:13px; }
+.council-result.has-approval { background:var(--accent-soft); border-color:var(--accent-line); }
+.council-result span,.council-result small { color:var(--muted); }
+.live-run-actions { display:flex; gap:10px; flex-wrap:wrap; }
+.label-run-history { margin-top:20px; }
+.label-run-row { display:flex; gap:14px; justify-content:space-between; align-items:center; width:100%; border:0; border-bottom:1px solid var(--line); background:transparent; color:var(--text); padding:16px 0; text-align:left; cursor:pointer; font-size:12px; }
+.label-run-row > span:first-child { flex:1; min-width:0; overflow-wrap:anywhere; }
+.label-run-row small { display:block; color:var(--muted); margin-top:5px; }
+@keyframes label-breathe { 0%,100% { opacity:.5; } 50% { opacity:1; } }
+@media(prefers-reduced-motion:reduce) { .council-live * { animation:none !important; transition:none !important; } }
+@media(max-width:650px) { .council-live { padding:18px; } .council-live-head { align-items:flex-start; } .council-live-head h3 { font-size:19px; } .live-vote { align-items:flex-start; flex-direction:column; } .label-run-row { flex-wrap:wrap; } }
+
+/* Laya lab: one focused workspace at a time. */
+.lab-tabs { display:flex; gap:6px; overflow-x:auto; scrollbar-width:thin; border-bottom:1px solid var(--line); margin:0 0 28px; padding:0 0 1px; }
+.lab-tabs [role=tab] { display:inline-flex; align-items:center; justify-content:center; gap:9px; flex:none; min-height:48px; padding:12px 20px; background:transparent; color:var(--muted); border:0; border-bottom:3px solid transparent; border-radius:8px 8px 0 0; font:inherit; font-weight:600; cursor:pointer; transition:color .18s, background .18s, border-color .18s; }
+.lab-tabs [role=tab]:hover { color:var(--text); background:var(--panel2); }
+.lab-tabs [aria-selected=true] { color:var(--lime); border-bottom-color:var(--lime); background:var(--accent-soft); }
+.lab-tabs small { font:11px var(--mono); border:1px solid var(--line); border-radius:5px; padding:2px 5px; }
+.lab-live-dot { width:7px; height:7px; border-radius:50%; background:var(--lime); box-shadow:0 0 0 4px var(--accent-soft); }
+.lab-panel { min-width:0; }
+.lab-panel > .learning-dashboard { margin-bottom:0; }
+.lab-panel > .garden-panel { margin-bottom:24px; }
+.training-dashboard { display:grid; gap:24px; }
+.learning-training { padding:28px 32px; }
+.learning-training h2 { margin:10px 0; }
+.learning-training > p { color:var(--muted); max-width:750px; }
+.training-dashboard details { margin-top:18px; }
+.lab-exports .evaluation-row { gap:16px; }
+.lab-exports .evaluation-row strong { overflow-wrap:anywhere; }
+@media (max-width:700px) {
+  .lab-tabs { margin-bottom:20px; gap:0; }
+  .lab-tabs [role=tab] { padding:12px 15px; }
+  .learning-training { padding:22px; }
+  .training-dashboard { gap:16px; }
+  .lab-exports .evaluation-row { align-items:flex-start; flex-direction:column; }
+}
+@media (prefers-reduced-motion:reduce) { .lab-tabs [role=tab] { transition:none; } }
+.label-saved-status { display:flex; align-items:center; gap:12px; color:var(--green); border:1px solid var(--success-line); background:var(--success-soft); padding:14px 18px; border-radius:10px; margin:18px 0; }
+.label-saved-status .guild-icon { flex:none; }

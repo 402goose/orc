@@ -3,7 +3,7 @@ from collections import Counter, defaultdict
 import json
 from pathlib import Path
 
-from fusion_decisions import DecisionEngine, DecisionStore, digest, read_jsonl, reviewed_labels
+from fusion_decisions import DecisionEngine, DecisionStore, digest, read_jsonl, reviewed_labels, label_provenance
 
 
 def read_object(path):
@@ -17,6 +17,7 @@ def read_object(path):
 def decision_rows(workspace):
     events = read_jsonl(DecisionStore(workspace).path)
     answers, excluded = reviewed_labels(events)
+    provenance = label_provenance(events)
     rows = {e['id']: {**e, 'applications': [], 'labels': [], 'suggestions': []}
             for e in events if e.get('event') == 'decision'}
     fields = {'application': 'applications', 'label': 'labels', 'label_suggestion': 'suggestions'}
@@ -26,6 +27,7 @@ def decision_rows(workspace):
             row[fields[event['event']]].append(event)
     for key, row in rows.items():
         row['reviewed_answers'] = answers.get(key, {})
+        row['label_provenance'] = provenance.get(key, {})
         row['excluded'] = excluded.get(key, False)
         suggestion = row['suggestions'][-1] if row['suggestions'] else None
         approved_at = max((e.get('time_ms', 0) for e in row['labels'] if e.get('verified')), default=-1)
@@ -33,8 +35,11 @@ def decision_rows(workspace):
             state = 'excluded'
         elif row.get('status') != 'ok' or row.get('truncated'):
             state = 'ineligible'
-        elif suggestion and suggestion.get('time_ms', 0) > approved_at:
-            state = 'needs_review' if suggestion.get('answers') else 'needs_evidence'
+        elif suggestion and (suggestion.get('time_ms', 0) > approved_at or
+                             any(e.get('source') == 'council_approved_suggestion' and e.get('suggestion_id') == suggestion.get('suggestion_id') for e in row['labels'])
+                             and set(row['questions']) - set(row['reviewed_answers'])):
+            disputed = any(q.get('state') == 'disputed' for q in suggestion.get('council', {}).get('questions', {}).values())
+            state = 'needs_review' if suggestion.get('answers') or disputed else 'needs_evidence'
         elif row['reviewed_answers']:
             state = 'approved'
         else:
@@ -101,7 +106,7 @@ def learning_summary(workspace, config, rows=None):
             if prediction:
                 compared += 1
                 agreed += max(prediction, key=prediction.get) == value
-        # First human review date, current retained question count (not duplicate approvals).
+        # First approval date, current retained question count (not duplicate approvals).
         first_review = next((e for e in row['labels'] if e.get('verified')), {})
         growth[first_review.get('time_ms', row.get('time_ms', 0)) // 86400000] += len(answers)
     artifacts = learning_artifacts(workspace)

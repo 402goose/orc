@@ -10,11 +10,13 @@ def input_key(row):
 
 def dataset_quality(rows):
     inputs, distribution, contracts = defaultdict(list), defaultdict(Counter), {}
+    approval_sources = Counter()
     groups = defaultdict(set)
     for row in rows:
         inputs[input_key(row)].append(row)
         groups[row["split"]].add(row["group"])
         for question, value in row["labels"].items():
+            approval_sources[row.get("label_provenance", {}).get(question, {}).get("source", "unrecorded")] += 1
             key = f"{row['kind']} · {question} · {digest(row['questions'][question])[:8]}"
             distribution[key][value] += 1
             contracts[key] = labels_for(row["questions"][question])
@@ -36,7 +38,7 @@ def dataset_quality(rows):
                 "answers": sum(counts.values()), "dominant_share": max(counts.values()) / sum(counts.values()),
                 "missing_labels": [label for label in contracts[key] if not counts[label]]}
                for key, counts in sorted(distribution.items())]
-    return {"examples": len(rows), "answers": sum(len(r["labels"]) for r in rows),
+    return {"examples": len(rows), "answers": sum(len(r["labels"]) for r in rows), "approval_sources": dict(approval_sources),
             "unique_inputs": len(inputs), "duplicate_examples": sum(len(ids) - 1 for ids in duplicates),
             "duplicate_sets": duplicates, "conflicts": conflicts, "cross_split_duplicates": leakage,
             "groups": {split: len(groups[split]) for split in ("train", "validation")},
@@ -74,7 +76,7 @@ def review_quality(rows):
         for key in answers:
             event = effective.get(key, {})
             evidence += bool(str(event.get("evidence", "")).strip())
-            source = event.get("suggested_by", {}).get("agent") or "human"
+            source = "council_auto" if event.get("source") == "council_approved_suggestion" else event.get("suggested_by", {}).get("agent") or "human"
             sources[source] += 1
         # Count the latest retained review of each suggestion once, not per answer.
         seen = set()

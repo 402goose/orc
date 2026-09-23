@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 from collections import Counter
 import fcntl
 import hashlib
@@ -189,7 +190,7 @@ def read_jsonl(path):
 
 
 def reviewed_labels(events):
-    """Effective human answers and explicit exclusions, shared by UI and export."""
+    """Effective approved answers and explicit exclusions, shared by UI and export."""
     labels, exclusions = {}, {}
     for event in events:
         key = event.get("id")
@@ -202,6 +203,21 @@ def reviewed_labels(events):
     return labels, exclusions
 
 
+def label_provenance(events):
+    effective = {}
+    for event in events:
+        if event.get("event") != "label" or not event.get("verified"):
+            continue
+        if event.get("replace"):
+            effective[event["id"]] = {}
+        for key in event["answers"]:
+            effective.setdefault(event["id"], {})[key] = {
+                "source": event.get("source", "human"), "suggestion_id": event.get("suggestion_id"),
+                "reviewers": event.get("reviewers", []), "time_ms": event.get("time_ms"),
+            }
+    return effective
+
+
 class DecisionStore:
     def __init__(self, workspace):
         self.root = Path(workspace) / ".fusion" / "decisions"
@@ -210,6 +226,16 @@ class DecisionStore:
     def append(self, event, **payload):
         append_json(self.path, {"schema": "fusion.decision.v1", "event": event,
                                "time_ms": int(time.time() * 1000), **payload})
+
+    @contextlib.contextmanager
+    def review_lock(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / "reviews.lock").open("a") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream, fcntl.LOCK_UN)
 
     def records(self):
         return [record for record in read_jsonl(self.path) if record.get("event") == "decision"]
@@ -236,6 +262,10 @@ class DecisionStore:
         return found
 
     def label(self, decision_id, answers, evidence, suggestion_id=None, replace=False):
+        with self.review_lock():
+            return self._label(decision_id, answers, evidence, suggestion_id, replace)
+
+    def _label(self, decision_id, answers, evidence, suggestion_id=None, replace=False):
         record = self.get(decision_id)
         if record.get("status") != "ok" or record.get("truncated"):
             raise ValueError("label only successful, complete model inputs; shorten truncated inputs and run again")
@@ -254,6 +284,7 @@ class DecisionStore:
     def export(self, destination):
         events = read_jsonl(self.path)
         labels, exclusions = reviewed_labels(events)
+        provenance = label_provenance(events)
         rows = []
         records = {e["id"]: e for e in events if e.get("event") == "decision"}
         for record in records.values():
@@ -264,6 +295,7 @@ class DecisionStore:
             rows.append({"schema": "fusion.training.v1", "id": record["id"], "group": group, "split": split,
                          "kind": record["kind"], "state": record["state"], "questions": record["questions"],
                          "labels": labels[record["id"]], "prediction": record["prediction"],
+                         "label_provenance": provenance.get(record["id"], {}),
                          "model_identity": record.get("model_identity"), "schema_hash": record["schema_hash"]})
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
