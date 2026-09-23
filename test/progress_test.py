@@ -121,6 +121,24 @@ print(json.dumps({{'type':'item.completed','item':{{'type':'agent_message','text
         self.assertFalse(sentinel.exists())
         self.assertEqual(json.loads((self.workspace / "activity.json").read_text())["status"], "timed_out")
 
+    def test_unsignalable_process_group_still_reports_the_timeout(self):
+        """Teardown must not raise over the timeout it is cleaning up after.
+
+        A process group can stop being signalable by us between the timeout and
+        the kill — leader already reaped, or its pid recycled into a group we do
+        not own — which the OS reports as EPERM. CI hit this for real: the
+        PermissionError escaped _stop_process and the caller saw it instead of
+        TimeoutExpired, so a handled timeout became a crash.
+        """
+        script = "import time; print('partial',flush=True); time.sleep(30)"
+        with patch("fusion_progress.os.killpg", side_effect=PermissionError(1, "Operation not permitted")):
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                progress.run_logged([sys.executable, "-c", script], cwd=self.workspace, env=self.env, input=None,
+                                    timeout=.2, stdout_path=self.workspace / "stdout.log",
+                                    stderr_path=self.workspace / "stderr.log", label="fixture")
+        self.assertIn("partial", raised.exception.output)
+        self.assertEqual(json.loads((self.workspace / "activity.json").read_text())["status"], "timed_out")
+
     def test_interrupt_cleans_up_workflow_worker_and_saves_interrupted_status(self):
         self.fake_worker("import sys,time; sys.stdin.read(); print('started',flush=True); time.sleep(30)\n")
         spec = self.workspace / "workflow.json"
