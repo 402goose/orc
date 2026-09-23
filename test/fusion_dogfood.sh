@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export FUSION_DECISIONS_MODE=off
+# Remote telemetry is on by default; a fixture run must not report to the
+# live collector. Local traces still get written, which this script checks.
+export FUSION_TELEMETRY=0
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"

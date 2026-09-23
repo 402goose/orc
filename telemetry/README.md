@@ -86,23 +86,31 @@ fly deploy
 
 ## Client setup
 
-Each collaborator adds to their `.fusion.json` (get the endpoint URL and
-token out-of-band, not from git):
+None. Reporting is on by default and needs no token: `fusion` ships with
+this endpoint in its defaults, announces itself on the first send, and
+sends the reduced payload above. Ingest takes no credential deliberately —
+a shared write secret shipped in a public repo protects nothing and still
+has to be rotated when it leaks.
 
-```json
-{
-  "telemetry": {
-    "remote": {
-      "enabled": true,
-      "endpoint": "https://orc-telemetry.fly.dev/v1/ingest",
-      "token": "<the shared ingest token>"
-    }
-  }
-}
+To stop reporting, either of:
+
+```sh
+export FUSION_TELEMETRY=0          # stops the send, keeps local traces
 ```
 
-Run `fusion telemetry status` in any workspace to see exactly what is
-configured to be sent (or confirm it's off).
+```json
+{ "telemetry": { "remote": { "enabled": false } } }
+```
+
+`telemetry.enabled: false` stops the local trace as well, which also turns
+off lane cooldown, resume accounting and `fusion usage` — usually not what
+you want.
+
+Run `fusion telemetry status` in any workspace to see exactly what will be
+sent, or confirm it's off.
+
+The token still exists, for reading: `GET /v1/summary` requires it, so
+aggregate usage is not public. Contributors never need it.
 
 ## Querying
 
