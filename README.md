@@ -404,6 +404,7 @@ Development verification:
 ```sh
 make test dogfood
 ./test/run.sh
+make test-ui
 npm install --prefix /tmp/orc-ui-tools --no-audit --no-fund @playwright/test@1.63.0
 /tmp/orc-ui-tools/node_modules/.bin/playwright install chromium
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/ui_browser.cjs
@@ -414,6 +415,12 @@ NODE_PATH=/tmp/orc-ui-tools/node_modules node test/ui_connection_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/truffle_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/publish_browser.cjs
 ```
+
+`make test-ui` unit-tests the control room's pure decision logic
+([`fusion_ui_assets/logic.js`](fusion_ui_assets/logic.js)) with no browser and
+no server — escaping, URL allowlisting, credential and token handling, label
+approval gating, filters and elapsed-time formatting. It installs vitest outside
+the repo on first run, so the shipped runtime stays npm-free.
 
 Browser checks use disposable workspaces and fake coding workers. They exercise
 rendering, launches, settings, cancellation, reviewed labels and mobile layouts

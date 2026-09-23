@@ -14,7 +14,7 @@ CMNDCNTR ?= $(HOME)/code/hathbanger/cmndcntr
 FETCHER := $(CMNDCNTR)/scripts/fetch-artificial-analysis-leaderboard.mjs
 OUT     := data/quality.json
 
-.PHONY: refresh-quality build test dogfood dogfood-paired dogfood-real
+.PHONY: refresh-quality build test test-ui dogfood dogfood-paired dogfood-real
 
 refresh-quality:
 	@command -v node >/dev/null || { echo "node required" >&2; exit 1; }
@@ -31,6 +31,16 @@ build:
 # run_python.py checks its exact test ID and reason, and reports it explicitly.
 test:
 	PYTHONDONTWRITEBYTECODE=1 python3 test/run_python.py
+
+# Unit tests for the control room's pure logic (fusion_ui_assets/logic.js).
+# No browser, no server: the Playwright checks in test/*_browser.cjs stay the
+# end-to-end layer. Dev-only tooling installs outside the repo, like Playwright,
+# so the shipped runtime stays npm-free.
+UI_TOOLS ?= /tmp/orc-ui-tools
+test-ui:
+	@test -x $(UI_TOOLS)/node_modules/.bin/vitest || \
+	  npm install --prefix $(UI_TOOLS) --no-audit --no-fund vitest@3.2.4
+	@$(UI_TOOLS)/node_modules/.bin/vitest run test/logic.test.js --root .
 
 dogfood:
 	./test/fusion_dogfood.sh
