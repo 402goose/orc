@@ -127,7 +127,7 @@ orc fusion --progress truffle hunt --count 5 --search 'label:bug'
 ### Control room
 
 The control room wears the ORC guild identity: the supplied tusked logo, a
-forgekeeper and truffle-scout illustration, and 16 local vector sigils across
+forgekeeper and truffle-scout illustration, and local vector sigils across
 navigation, workflows and Laya. **Meet the guild** opens the characters' field
 guide. All ten palettes tint the artwork and icons, including the favicon;
 light/dark/system settings still persist locally. Decorative motion respects
@@ -182,7 +182,7 @@ browser. Unsaved label edits remain intact, and failed actions are never replaye
 
 Laya lab has six focused tabs: **Overview** (model and teaching progress),
 **Review** (decisions and labels), **Garden** (automation and live council runs),
-**Training** (exports, candidates, and evaluation jobs), **Quality** (data health),
+**Training** (automatic rounds, live training, and saved candidates), **Quality** (data health),
 and **Results** (measured model comparisons). Tabs update the URL without reloading
 and support browser Back/Forward. Reload or share a link to return to the same
 registered workspace and tab; Review links also retain the decision and queue filter.
@@ -212,8 +212,8 @@ Failed or cancelled jobs retain logs and can be retried with another worker.
 The Laya tab tracks retained approved answers, coverage by decision type, label
 balance, workflow-group splits, dataset exports, trained candidates and evaluations.
 The configured checkpoint is shown separately from candidate models. Approval
-does not retrain Laya: export reviewed labels, train a separate candidate, and
-evaluate it before choosing a checkpoint in project settings. Candidate cards
+feeds automatic training when enabled; manual export, training, and evaluation
+remain available. Choose a checkpoint in project settings after evaluation. Candidate cards
 show held-out accuracy and the shuffled-state control; improvement is reported
 only when the source model was evaluated on the same held-out benchmark. Historical
 prediction/label agreement is explicitly separate from held-out evaluation.
@@ -228,6 +228,35 @@ jobs save data-quality snapshots. New candidates record their local training
 ancestry; evaluation flags overlapping inputs or groups and withholds improvement
 claims for known leakage. Older candidates without this metadata show an unknown
 audit status. Repeated use of a small benchmark still does not prove generalization.
+
+**Laya lab → Training → Enable auto-training** starts a persistent local learning
+loop. Each round exports approved answers, cleans the dataset, measures the configured
+source model, trains a separate candidate, evaluates it on the same held-out benchmark,
+and saves calibration. The first eligible round starts immediately; subsequent rounds
+need ten new or changed approved answers by default, configurable in **Training settings**.
+Reapproving unchanged answers does not trigger another round. There is no daily cap.
+
+The training grounds show knowledge XP (retained approved answers), levels, animated
+round stages, live optimizer steps and loss, and paired source/candidate accuracy
+charts. Loss measures training fit; held-out trials measure improvement. Regressions
+and flat results stay visible. A changed benchmark gets its own comparison instead of
+a misleading trend line. Receipts show sample counts, shuffled-state and majority
+controls, exact model identities, dataset cleanup, and links to every job.
+
+Automatic rounds keep one copy of identical inputs, preferring an existing held-out
+copy, and withhold conflicting inputs. Original labels and exports stay intact.
+At least two training and two held-out workflow groups must remain after cleanup.
+Small samples are identified as early measurements; duplicate removal alone does
+not establish generalization. Known leakage or unknown model lineage prevents an
+improvement claim. Candidates are never automatically promoted.
+
+The loop runs while the control-room server is running, including with the browser
+closed. Pausing prevents subsequent steps; the active job may finish. A failed or
+cancelled job waits for **Retry this step**. Saved rounds resume after a server restart,
+and manual and automatic learning jobs share one workspace slot. Settings, curated
+datasets, progress, and round receipts live under `.fusion/decisions/training`;
+individual jobs remain under `.fusion/ui/jobs`. **Manual training tools & saved
+candidates** keeps the original controls available below the training grounds.
 
 **Laya lab → Garden → Enable auto-drafts** queues incoming complete decisions for a
 labeling worker. There is **no daily cap**, including for gardens with an old saved
@@ -277,8 +306,9 @@ under **Failed drafts**. Garden attempts each decision once per council approval
 setup; selecting an existing backlog can reassess prior drafts. **Exclude
 example** removes a decision from automatic drafting and future training exports;
 **Restore example** brings its existing reviewed answers back. Existing exported
-datasets and model weights are unchanged. Automatic approval adds labels only;
-training a candidate and selecting a checkpoint remain separate actions.
+datasets and model weights are unchanged. Automatic approval adds labels; enabled
+automatic training can use those labels in its next candidate. Selecting an active
+checkpoint remains a separate action.
 
 CLI equivalents (draft-only unless `--approval council` is explicit):
 
@@ -410,9 +440,11 @@ npm install --prefix /tmp/orc-ui-tools --no-audit --no-fund @playwright/test@1.6
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/ui_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/garden_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/laya_tabs_browser.cjs
+NODE_PATH=/tmp/orc-ui-tools/node_modules node test/training_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/council_approval_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/ui_connection_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/truffle_browser.cjs
+NODE_PATH=/tmp/orc-ui-tools/node_modules node test/truffle_survey_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/publish_browser.cjs
 ```
 
@@ -428,7 +460,47 @@ without paid agent calls. Browser tools are needed only to run these checks.
 
 ### Truffle pig
 
-Open **Overview → Send in the Truffle pig**, or **Truffle pig → New hunt**.
+Open **Truffle pig → Map every open issue** to give Snout the whole backlog.
+The woodland follows every page of the repository’s open issues. Epics, trackers,
+linked-issue checklists, and native GitHub parents become **patches**; their linked
+open issues are the **truffles** inside. Standalone issues appear in **the wilds**.
+Parent links and tracker references remain inspectable; closed parent issues can
+still provide a patch for open children. Linking is inferred from explicit issue
+references, so inspect tracker scope before choosing overlapping fixes.
+
+Mapping alone makes no coding-worker calls. **Grade all issues** inspects source
+in batches of eight using your configured worker account. Results appear live;
+stopping or a worker failure preserves completed batches. **Resume grading** only
+assesses remaining issues. A changed checkout or changed pending issue requires a
+fresh sync; previous snapshots remain in **Field journals**.
+
+| Grade | Meaning |
+| --- | --- |
+| A · Ripe | Small, low-risk fix with checked source quotes and a concrete regression plan |
+| B · Promising | Bounded small/medium work with evidence and a verification plan |
+| C · Needs digging | More evidence or clearer acceptance criteria needed |
+| D · Leave for now | Too broad, blocked, assigned (unless included), or already covered |
+| P · Patch | Epic/tracker container; assess and queue the child issues |
+| U · Unassessed | Still waiting for source investigation |
+
+Every issue stays visible, including C/D grades and policy exclusions. Grades are
+suitability judgments, not success probabilities. Click a truffle for the evidence
+and proposed implementation. Select A/B candidates into the basket and use **Queue
+selected fixes**. Implementation still needs its own tests and independent review.
+Woodland/All issues/Field journals, patch, grade and search filters use shallow URL
+routing and survive reload. The map uses the active theme and honors reduced motion.
+
+```sh
+# Inventory only: no coding-worker calls.
+orc fusion --progress truffle survey --sync-only
+# Inventory and grade the whole backlog in saved batches.
+orc fusion --progress truffle survey --agent codex
+# Resume only unassessed issues in a saved survey.
+orc fusion --progress truffle survey --resume truffle-0123456789ab --agent codex
+```
+
+For a smaller targeted expedition, use **Overview → Send in the Truffle pig**,
+or **Truffle pig → Quick hunt**.
 Choose a target count (default 5), pool size (default 40), worker, and optional
 GitHub search filter such as `label:bug sort:updated-desc`. The repository comes
 from the selected Git remote, using your authenticated `gh` CLI. Scouting uses a

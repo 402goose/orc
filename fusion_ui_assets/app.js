@@ -45,11 +45,14 @@ const state = {
   report: null,
   scout: null,
   truffleSelection: {},
+  forest: {tab:"woodland", patch:"all", grade:"all", query:""},
   decisions: [],
   decision: null,
   labTab: "overview",
   labelDrafts: {},
   learning: null,
+  trainingLoop: null,
+  learningRound: null,
   garden: null,
   labelRuns: [],
   gardenFilter: "all",
@@ -412,9 +415,10 @@ function openHunt() {
 }
 function truffleSelected(hunt) {
   const key = state.workspace + ":" + hunt.id;
-  return state.truffleSelection[key] ||= new Set(hunt.selected || hunt.candidates.filter(c => !c.workflow_id && c.status !== "skipped").map(c => c.number));
+  return state.truffleSelection[key] ||= new Set(hunt.selected || (hunt.kind === "survey" ? [] : hunt.candidates.filter(c => !c.workflow_id && c.status !== "skipped").map(c => c.number)));
 }
 function truffleView() {
+  if (!state.scout || state.scout.kind === "survey") return woodlandView(state.scout);
   const h = state.id ? state.scout : null;
   const hunts = state.overview.hunts || [];
   if (!h) {
@@ -761,7 +765,7 @@ function trainingDashboard() {
   const l = state.learning;
   if (!l) return "";
   const model = l.model, latestExport = l.exports[0];
-  return `<section class="training-dashboard"><div class="panel learning-training"><div class="eyebrow guild-section-emblem">${sigil("forge")} TRAIN A CANDIDATE</div><h2>Turn approved lessons into new weights.</h2><p>Export your labels, train a separate candidate, then compare it with the current model in Results.</p><div class="learning-actions">${button("Export approved labels", "learning-step", 'data-step="export"', "primary")}${button("Train candidate", "learning-step", `data-step="train" ${!l.can_train || !latestExport ? 'disabled title="Export labels from both train and validation groups first"' : ""}`)}${button("Evaluate configured model", "learning-step", `data-step="evaluate" ${!latestExport ? "disabled" : ""}`)}</div><p class="help-copy">${l.labeled_questions} approved answers · ${l.groups.train} training / ${l.groups.validation} held-out groups. Your active checkpoint stays unchanged until you select a new one in Settings.</p></div>
+  return `<section class="training-dashboard">${trainingQuest()}<details class="manual-learning" data-disclosure-key="manual-learning"><summary>Manual training tools &amp; saved candidates</summary><div class="panel learning-training"><div class="eyebrow guild-section-emblem">${sigil("forge")} TRAIN A CANDIDATE</div><h2>Turn approved lessons into new weights.</h2><p>Export your labels, train a separate candidate, then compare it with the current model in Results.</p><div class="learning-actions">${button("Export approved labels", "learning-step", 'data-step="export"', "primary")}${button("Train candidate", "learning-step", `data-step="train" ${!l.can_train || !latestExport ? 'disabled title="Export labels from both train and validation groups first"' : ""}`)}${button("Evaluate configured model", "learning-step", `data-step="evaluate" ${!latestExport ? "disabled" : ""}`)}</div><p class="help-copy">${l.labeled_questions} approved answers · ${l.groups.train} training / ${l.groups.validation} held-out groups. Your active checkpoint stays unchanged until you select a new one in Settings.</p></div>
     <section class="panel lab-exports"><div class="panel-header"><h3>Dataset exports</h3><span class="pill">${l.exports.length} saved</span></div><div class="panel-body">${l.exports.length ? l.exports.slice(0,8).map(e=>`<div class="evaluation-row"><div><strong>${esc(e.id)}</strong><small>${date(e.started_at_ms)}</small></div>${button("View export", "job", `data-id="${esc(e.id)}"`, "small")}</div>`).join("") : '<p class="help-copy">Your first export creates a saved dataset from the approved labels.</p>'}</div></section>
     ${l.candidates.length ? `<section class="panel candidate-panel"><div class="panel-header"><h3>Your trained candidates</h3><span class="pill">${l.candidates.length} saved</span></div><div class="candidate-grid">${l.candidates.slice(0,6).map(c=>{
       const evaluation = l.evaluations.find(e=>e.result.model_identities?.length === 1 && e.result.model_identities[0] === c.training.model_identity);
@@ -771,7 +775,7 @@ function trainingDashboard() {
       return `<article class="candidate-card"><div class="article-head"><strong>${esc(c.id)}</strong><span class="pill">${model.path === c.path ? "Configured" : "Candidate"}</span></div><p class="help-copy">${date(c.started_at_ms)} · ${esc(c.training.steps ?? "?")} steps · ${esc(c.training.train_groups ?? "?")} training groups</p><div class="candidate-score"><strong>${percent(score?.accuracy)}</strong><span>held-out accuracy${score ? ` · ${esc(score.validation_questions)} questions` : ""}</span></div><p class="help-copy">Shuffled-state control: ${percent(score?.control_accuracy)}${delta !== null ? `<br>${delta >= 0 ? "+" : ""}${delta.toFixed(1)} percentage points vs source model on the same held-out benchmark.` : "<br>Evaluate the source model on the same dataset to measure improvement."}</p><div class="actions">${button("Evaluate candidate", "learning-step", `data-step="evaluate" data-model="${esc(c.path)}" data-dataset="${esc(c.dataset)}"`, "small")}${button("Training activity", "job", `data-id="${esc(c.id)}"`, "small")}</div><details><summary>Training lineage</summary><pre class="console">${esc(pretty(c.training))}</pre><p class="mono">${esc(c.path)}</p></details></article>`;
     }).join("")}</div></section>` : ""}
     ${l.evaluations.length || l.jobs.length ? `<details class="learning-history"><summary>Learning history · ${l.jobs.length} recent jobs</summary>${l.evaluations.slice(0,6).map(e=>`<div class="evaluation-row"><div><strong>${e.result.model_path ? "Custom checkpoint" : "Configured / bundled model"}</strong><small>${esc(e.id)} · ${esc(e.result.validation_questions ?? 0)} held-out questions</small></div><div>${percent(e.result.accuracy)}<small>Control: ${percent(e.result.control_accuracy)}</small></div>${button("View activity", "job", `data-id="${esc(e.id)}"`, "small")}</div>`).join("")}${jobRows(l.jobs)}</details>` : ""}
-  </section>`;
+  </details></section>`;
 }
 function gardenPanel() {
   const g = state.garden;
@@ -800,12 +804,12 @@ function decisions() {
   const tabScroll = $(".lab-tabs")?.scrollLeft || 0;
   const selected = labTabs.find(([id]) => id === state.labTab) || labTabs[0];
   let body = "";
-  if (state.labTab === "overview") body = learningDashboard();
+  if (state.labTab === "overview") body = trainingQuest(true) + learningDashboard();
   else if (state.labTab === "review") body = decisionReview();
   else if (state.labTab === "garden") body = gardenPanel() + `<div id="garden-live-region">${gardenLive() || empty("The garden is quiet.", "Enable automatic drafts to follow new labeling runs here. You can inspect decisions in Review at any time.")}</div>`;
   else if (state.labTab === "training") body = trainingDashboard();
   else if (state.labTab === "quality" && state.learning) body = qualityDashboard(state.learning);
-  else if (state.labTab === "results" && state.learning) body = impactDashboard(state.learning);
+  else if (state.labTab === "results" && state.learning) body = trainingQuest() + impactDashboard(state.learning);
   const ready = state.decisions.filter(r => r.garden_state === "needs_review").length;
   mount(intro("LOCAL INTELLIGENCE", "Laya lab.", selected[2], `<div class="actions">${button("Learning tools", "learning")}${button("New probe", "probe", "", "primary")}</div>`) +
     `<div class="lab-tabs" role="tablist" aria-label="Laya lab sections">${labTabs.map(([id, label]) => `<button type="button" id="lab-tab-${id}" role="tab" aria-selected="${state.labTab === id}" aria-controls="lab-panel" tabindex="${state.labTab === id ? 0 : -1}" data-action="lab-tab" data-tab="${id}">${label}${id === "review" && ready ? `<small aria-label="${ready} ready to review">${ready}</small>` : ""}${id === "garden" && state.garden?.active_job ? '<i class="lab-live-dot" aria-label="Labeling in progress"></i>' : ""}</button>`).join("")}</div>` +
@@ -1148,9 +1152,19 @@ function readRoute() {
   try { id = parts[1] ? decodeURIComponent(parts[1]) : null; } catch {}
   return {view, id: view === "decisions" ? null : id, workspace: params.get("w"),
     labTab: labTabs.some(([key]) => key === id) ? id : "overview",
+    forestTab: params.get("tab"), patch: params.get("patch"), grade: params.get("grade"), query: params.get("q"),
     decision: params.get("decision"), filter: labFilters.includes(params.get("filter")) ? params.get("filter") : "all"};
 }
 function routeHash() {
+  if (state.view === "truffle") {
+    const params = new URLSearchParams(), f = state.forest;
+    if (state.workspace) params.set("w", state.workspace);
+    if (f.tab !== "woodland") params.set("tab", f.tab);
+    if (f.patch !== "all") params.set("patch", f.patch);
+    if (f.grade !== "all") params.set("grade", f.grade);
+    if (f.query) params.set("q", f.query);
+    return "#truffle" + (state.id ? "/" + encodeURIComponent(state.id) : "") + (params.size ? "?" + params : "");
+  }
   if (state.view !== "decisions") return "#" + state.view + (state.id ? "/" + encodeURIComponent(state.id) : "");
   const params = new URLSearchParams();
   if (state.workspace) params.set("w", state.workspace);
@@ -1223,10 +1237,11 @@ async function refresh(force = false) {
           : "Restricted runtime";
     }
     let signature = pretty({ ...data, now_ms: 0 });
-    if (state.view === "truffle" && state.id) {
-      state.scout = await api("truffle?id=" + encodeURIComponent(state.id), undefined, w);
+    if (state.view === "truffle") {
+      const scout = await api("truffle" + (state.id ? "?id=" + encodeURIComponent(state.id) : ""), undefined, w);
       if (epoch !== state.epoch) return;
-      signature = pretty(state.scout);
+      state.scout = scout;
+      signature = pretty({scout, hunts:data.hunts, jobs:data.jobs});
     }
     if (state.view === "workflow") {
       const report = await api(
@@ -1245,6 +1260,7 @@ async function refresh(force = false) {
       if (epoch !== state.epoch) return;
       state.decisions = d.records;
       state.learning = d.learning;
+      state.trainingLoop = d.training_loop;
       state.garden = d.garden;
       state.labelRuns = d.label_runs || [];
       signature = pretty(d);
@@ -1286,9 +1302,12 @@ async function refresh(force = false) {
 }
 async function chooseWorkspace(id, route = null) {
   state.workspace = id;
+  state.scout = null;
+  forestRoute(route || {});
   localStorage.setItem("fusion-workspace", id);
   state.config = null;
-  state.learning = state.garden = null;
+  state.learning = state.garden = state.trainingLoop = null;
+  state.learningRound = null;
   state.labelRuns = [];
   state.gardenFilter = route?.filter || "all";
   state.decision = route?.decision || null;
@@ -1334,9 +1353,16 @@ document.addEventListener("click", async (event) => {
     else if (a === "close") closeModal();
     else if (a === "template") target.dataset.template === "truffle" ? openHunt() : openLaunch(templates[target.dataset.template]);
     else if (a === "truffle-hunt") openHunt();
-    else if (a === "truffle-open") { closeModal(); await navigate("truffle", target.dataset.id || null); }
+    else if (a === "truffle-open") { closeModal(); forestRoute(); await navigate("truffle", target.dataset.id || null); }
+    else if (a === "forest-sync") openSurvey();
+    else if (a === "forest-grade") openSurvey(true);
+    else if (a === "forest-tab") forestNavigate({tab:target.dataset.tab});
+    else if (a === "forest-patch") { closeModal(); forestNavigate({tab:"issues",patch:target.dataset.patch,grade:"all",query:""}); }
+    else if (a === "forest-clear") forestNavigate({patch:"all",grade:"all",query:""});
+    else if (a === "forest-filter") forestNavigate({tab:"issues",grade:state.forest.grade === target.dataset.grade ? "all" : target.dataset.grade});
+    else if (a === "forest-issue") openForestIssue(Number(target.dataset.number));
     else if (a === "truffle-queue") openTruffleQueue();
-    else if (a === "run") await navigate("workflow", target.dataset.id);
+    else if (a === "run") { closeModal(); await navigate("workflow", target.dataset.id); }
     else if (a === "stage") {
       state.node = target.dataset.node;
       workflow();
@@ -1421,6 +1447,11 @@ document.addEventListener("click", async (event) => {
       openLearning({action: target.dataset.step, dataset: target.dataset.dataset, model_path: target.dataset.model});
     } else if (a === "probe") openProbe();
     else if (a === "learning") openLearning();
+    else if (a === "training-settings") openTrainingSettings();
+    else if (a === "training-toggle" || a === "training-retry") {
+      await api("training-loop", {enabled:a === "training-retry" || target.dataset.enabled === "true", retry:a === "training-retry"});
+      await refresh(true);
+    } else if (a === "learning-round") { state.learningRound=target.dataset.id; decisions(); }
     else if (a === "orc") await loadOrc(target.dataset.command);
     else if (a === "job") await openJob(target.dataset.id);
     else if (a === "job-workflow") {
@@ -1497,6 +1528,10 @@ document.addEventListener("submit", async (event) => {
       await reconnectWithURL(values.url.trim());
       closeModal();
       toast("Reconnected. Your other tabs can use this connection too.");
+    } else if (form.id === "truffle-survey-form") {
+      await api("launch", {...values, action:"truffle-survey", sync_only:!values.resume && !values.grade_now, include_assigned:!!values.include_assigned});
+      closeModal(); forestRoute(); await navigate("truffle", values.resume || null);
+      toast("Expedition started. The map updates live; you can leave this tab.");
     } else if (form.id === "truffle-hunt-form") {
       await launch({...values, action: "truffle-hunt", include_assigned: !!values.include_assigned});
     } else if (form.id === "truffle-queue-form") {
@@ -1523,6 +1558,10 @@ document.addEventListener("submit", async (event) => {
     } else if (form.id === "probe-form")
       await launch({ ...values, action: "probe", mode: "shadow" });
     else if (form.id === "learning-form") await launch(values);
+    else if (form.id === "training-loop-form") {
+      await api("training-loop", {enabled:!!values.enabled, min_new_answers:Number(values.min_new_answers)});
+      closeModal(); await refresh(true); toast("Training settings saved.");
+    }
     else if (form.id === "garden-form") {
       const options = labelingValues("garden");
       await api("garden", {enabled: !!values.enabled, ...options, include_existing: !!values.include_existing});
@@ -1575,6 +1614,13 @@ document.addEventListener("submit", async (event) => {
   }
 });
 document.addEventListener("input", (event) => {
+  if (event.target.id === "forest-search") {
+    state.forest.query = event.target.value;
+    const start = event.target.selectionStart, end = event.target.selectionEnd;
+    writeRoute("replace");
+    replaceContent($("#forest-results"), forestResults(state.scout), "forest-results:" + state.workspace + ":" + state.scout.id);
+    $("#forest-search").focus(); $("#forest-search").setSelectionRange(start, end);
+  }
   if (event.target.closest("#label-form")) captureLabelEdits();
   if (event.target.id === "run-search") {
     state.search = event.target.value;
@@ -1591,9 +1637,13 @@ document.addEventListener("input", (event) => {
   }
 });
 document.addEventListener("change", (event) => {
+  if (event.target.id === "forest-grade") forestNavigate({grade:event.target.value});
+  if (event.target.id === "forest-patch") forestNavigate({patch:event.target.value});
   if (event.target.matches("[data-truffle-number]") && state.scout) {
     const selected = truffleSelected(state.scout), n = Number(event.target.dataset.truffleNumber);
     if (event.target.checked) selected.add(n); else selected.delete(n);
+    if ($("#forest-basket-count")) $("#forest-basket-count").textContent = selected.size;
+    $$(`[data-truffle-number="${n}"]`).forEach(el => { el.checked = selected.has(n); });
   }
   if (event.target.id.startsWith("settings-publish-")) {
     try {
@@ -1756,6 +1806,7 @@ window.addEventListener("hashchange", async () => {
     } else if (route.view === "decisions" && state.view === "decisions") {
       openLabTab(route.labTab, {decision: route.decision, filter: route.filter, history: "replace"});
     } else {
+      forestRoute(route);
       state.labTab = route.labTab;
       state.decision = route.decision;
       state.gardenFilter = route.filter;

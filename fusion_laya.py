@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 
 def checkpoint(name="english", online=False):
@@ -110,10 +111,31 @@ def dataset_rows(path):
     return rows
 
 
+def learning_progress(args, phase, **value):
+    """A small atomic sidecar for UI polling, plus human-readable job logs."""
+    destination = Path(str(args.output) + '.progress.json')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix('.tmp')
+    temporary.write_text(json.dumps({'phase':phase, 'time_ms':int(time.time()*1000), **value}))
+    temporary.chmod(0o600)
+    temporary.replace(destination)
+    message = value.get('message') or f"{value.get('done', 0)} / {value.get('total', 0)}"
+    print(f"laya {phase}: {message}", file=sys.stderr, flush=True)
+
+
+def loss_curve(losses):
+    stride = max(1, (len(losses) + 199) // 200)
+    indices = sorted(set(range(0,len(losses),stride)) | ({len(losses)-1} if losses else set()))
+    return [{'step':i+1, 'loss':losses[i]} for i in indices]
+
+
 def evaluate(args):
     from fusion_decisions import distribution, digest
     from fusion_quality import dataset_quality, input_key
     rows = dataset_rows(args.dataset)
+    validation = [row for row in rows if row["split"] == "validation"]
+    total_work = len(rows) + (len(validation) if getattr(args, "control", False) and len(validation)>1 else 0)
+    learning_progress(args, 'loading', done=0, total=total_work, message='Loading local checkpoint for evaluation')
     backend, output = Backend(), Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     # Predict both partitions: temperature fitting uses train; qualification uses validation.
@@ -144,6 +166,7 @@ def evaluate(args):
                     majority_total += 1
                     majority_correct += sorted(counts, key=lambda v: (-counts[v], v))[0] == label
         results.append({**row, "prediction": prediction, "model_identity": result["model_identity"]})
+        learning_progress(args, "evaluation", done=len(results), total=total_work)
     # Control: score each held-out example against another example's state. A model
     # that scores the same here is answering from the question, not the state.
     control_correct = control_total = 0
@@ -159,6 +182,7 @@ def evaluate(args):
             for key, label in row["labels"].items():
                 control_total += 1
                 control_correct += max(prediction[key], key=prediction[key].get) == label
+            learning_progress(args, "control", done=len(rows)+index+1, total=total_work)
     with output.open("x") as handle:
         for row in results:
             handle.write(json.dumps(row) + "\n")
@@ -188,11 +212,13 @@ def evaluate(args):
               "benchmark_hash": digest(benchmark), "data_quality": quality, "holdout": holdout,
               "model_path": args.model_path, "model_identities": sorted({r['model_identity'] for r in results})}
     output.with_suffix('.report.json').write_text(json.dumps(report, indent=2))
+    learning_progress(args, 'complete', done=total_work, total=total_work)
     return report
 
 
 def train(args):
     """Supervised decision-head adaptation; holdout groups never enter optimization."""
+    learning_progress(args, 'loading', message='Loading local checkpoint for training')
     import torch
     from laya.common import QTYPES, build_sequence, collate_items
     from safetensors.torch import save_file
@@ -237,6 +263,7 @@ def train(args):
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
             steps += 1
+            learning_progress(args, 'training', done=steps, total=args.epochs*len(train_rows), loss=losses[-1], loss_curve=loss_curve(losses))
     output.mkdir(parents=True)
     agent.model.encoder.config.save_pretrained(output / "encoder")
     agent.tok.save_pretrained(output / "tokenizer")
@@ -249,13 +276,14 @@ def train(args):
     report = {"method": "supervised decision-head fine-tuning", "source_identity": source_id,
               "model_identity": identity(output),
               "dataset_hash": hashlib.sha256(Path(args.dataset).read_bytes()).hexdigest(),
-              "seed": args.seed, "epochs": args.epochs, "steps": steps, "mean_loss": sum(losses) / steps,
+              "seed": args.seed, "epochs": args.epochs, "steps": steps, "mean_loss": sum(losses) / steps, "loss_curve": loss_curve(losses),
               "data_quality": dataset_quality(train_rows),
               "seen_train_groups": sorted(set(parent.get('seen_train_groups', [])) | {digest(r['group']) for r in train_rows}),
               "seen_train_inputs": sorted(set(parent.get('seen_train_inputs', [])) | {input_key(r) for r in train_rows}),
               "lineage_complete": not args.model_path or parent.get('lineage_complete') is True,
               "train_groups": len({row["group"] for row in train_rows}), "promoted": False}
     (output / "training.json").write_text(json.dumps(report, indent=2))
+    learning_progress(args, "complete", done=steps, total=steps, loss_curve=loss_curve(losses))
     return {**report, "path": str(output)}
 
 
