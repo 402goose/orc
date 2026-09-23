@@ -1042,16 +1042,7 @@ def effective_status(manifest: dict[str, Any]) -> str | None:
     status = manifest.get("status")
     if status != "running":
         return status
-    pid = manifest.get("coordinator_pid")
-    if pid is None:
-        return status
-    try:
-        os.kill(int(pid), 0)
-    except PermissionError:
-        return status  # owned by another user, so still alive
-    except (OSError, TypeError, ValueError):
-        return "interrupted"
-    return status
+    return "interrupted" if core.process_alive(manifest.get("coordinator_pid")) is False else status
 
 
 def workflow_report(workspace: Path, run_id: str) -> dict[str, Any]:
