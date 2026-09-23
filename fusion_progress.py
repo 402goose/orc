@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, ExitStack
 import json
+import codecs
 import os
 from pathlib import Path
 import re
@@ -130,6 +131,14 @@ def worker_message(line):
     item = event.get("item") or {}
     if not isinstance(item, dict):
         return None
+    if kind == "text" and isinstance(event.get("data"), str):
+        return clean(event["data"])
+    if kind in {"tool_call", "tool_call_update"}:
+        status = event.get("status", "in_progress")
+        name = clean(str(event.get("toolName") or (str(event.get("kind")) + " tool" if event.get("kind") else "tool")), 60)
+        return f"{name}: {status.replace('_', ' ')}"
+    if kind == "end":
+        return "worker turn completed; checking handoff"
     if kind == "thread.started":
         return "worker session connected"
     if kind in {"item.started", "item.completed"}:
@@ -168,7 +177,7 @@ def _stop_process(proc):
     proc.wait()
 
 
-def run_logged(argv, *, cwd, env, input, timeout, stdout_path, stderr_path, label):
+def run_logged(argv, *, cwd, env, input, timeout, stdout_path, stderr_path, label, plain_output=False):
     """Write worker output as it arrives, retaining the original result parsers."""
     check_cancelled()
     started = time.monotonic()
@@ -197,11 +206,17 @@ def run_logged(argv, *, cwd, env, input, timeout, stdout_path, stderr_path, labe
         pending = b""
         last_saved = 0.0
         last_message = ""
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
         def inspect_output():
             nonlocal pending, last_message
             # Read bounded chunks; logs themselves remain complete on disk.
             chunk = reader.read(65536)
+            if plain_output:
+                message = clean(decoder.decode(chunk, final=not chunk and proc.poll() is not None))
+                if message:
+                    emit(label, message)
+                return bool(chunk)
             pending += chunk
             lines = pending.split(b"\n")
             pending = lines.pop()

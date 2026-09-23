@@ -247,7 +247,7 @@ import json, pathlib, sys
 pathlib.Path({str(self.calls)!r}).write_text(json.dumps(sys.argv[1:]))
 print('STATUS: success\\nSUMMARY: Grok review complete\\nCHANGED: none\\nTESTS: fixture check passed\\nBLOCKERS: none')
 ''')
-        config = fusion_core.deep_merge(fusion_core.DEFAULTS, {"grok":{"command":str(grok)}})
+        config = fusion_core.deep_merge(fusion_core.DEFAULTS, {"grok":{"command":str(grok), "output_format":"plain"}})
         task = fusion_core.make_task(self.workspace, "grok", "Review fixture", "review", [], [], None, False, False)
         result = fusion_core.dispatch(config, task, fusion_core.RunStore(self.workspace))
         self.assertEqual(result["status"], "success")

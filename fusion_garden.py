@@ -8,7 +8,7 @@ from fusion_learning import decision_rows, read_object
 from fusion_decisions import digest
 
 DEFAULTS = {'enabled': False, 'agent': 'auto', 'since_ms': 0,
-            'labeling_mode': 'single', 'council_agents': [], 'approval_mode': 'human', 'approval_since_ms': 0}
+            'labeling_mode': 'single', 'council_agents': [], 'council_rule': 'unanimous', 'approval_mode': 'human', 'approval_since_ms': 0}
 
 
 @contextlib.contextmanager
@@ -34,7 +34,7 @@ def save(app, workspace, body):
     from fusion_ui import atomic_json
     if type(body.get('enabled')) is not bool:
         raise ValueError('Choose whether automatic drafting is enabled')
-    from fusion_labeling import labeling_options, approval_options
+    from fusion_labeling import labeling_options, approval_options, council_rule
     agent = body.get('agent', 'auto')
     if agent not in {'auto', 'codex', 'claude', 'agy', 'grok'}:
         raise ValueError('Choose an installed labeling worker')
@@ -43,14 +43,15 @@ def save(app, workspace, body):
         options = labeling_options(body.get('labeling_mode', old['labeling_mode']),
                                    body.get('council_agents', old['council_agents']))
         approval = approval_options(body.get('approval_mode', old['approval_mode']), options['labeling_mode'])
+        rule = council_rule(body.get('council_rule', old['council_rule']))
         since = old['since_ms'] if old.get('configured') else int(time.time() * 1000)
-        approval_since = old['approval_since_ms'] if old['approval_mode'] == approval else int(time.time() * 1000)
+        approval_since = old['approval_since_ms'] if old['approval_mode'] == approval and old['council_rule'] == rule else int(time.time() * 1000)
         if body.get('include_existing') is True:
             since = 0
             approval_since = 0
-        value = {'enabled': body['enabled'], 'agent': agent, **options,
+        value = {'enabled': body['enabled'], 'agent': agent, **options, 'council_rule': rule,
                  'since_ms': since, 'configured': True, 'approval_mode': approval, 'approval_since_ms': approval_since}
-        value['policy_id'] = digest({key: value[key] for key in ('approval_mode', 'approval_since_ms', 'labeling_mode', 'council_agents')})
+        value['policy_id'] = digest({key: value[key] for key in ('approval_mode', 'approval_since_ms', 'labeling_mode', 'council_agents', 'council_rule')})
         atomic_json(Path(workspace) / '.fusion/decisions/garden.json', value)
     return status(app, workspace)
 
@@ -93,4 +94,5 @@ def tick(app, workspace):
         app.launch(workspace, {'action': 'suggest-labels', 'decision_id': current['next_id'],
                                'agent': current['agent'], 'labeling_mode': current['labeling_mode'],
                                'council_agents': current['council_agents'], 'approval_mode': current['approval_mode'],
+                               'council_rule': current['council_rule'],
                                'garden_policy': current.get('policy_id')}, garden=True)

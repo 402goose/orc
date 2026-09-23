@@ -116,7 +116,9 @@ as the CLI. Existing terminal runs appear automatically. It includes:
   follow output smoothly while preserving your position when you scroll up.
   Worker updates render as Markdown cards; consecutive commands collapse into
   groups with expandable command/output receipts. **Latest** catches up to the
-  live tail. Technical logs and stage history live under **Run details**, closed
+  live tail. Grok uses structured message/tool updates; older plain-text runs
+  remain visible, and **Last output** shows when worker logs last changed.
+  Technical logs and stage history live under **Run details**, closed
   by default; expanded details stay open across refreshes.
 
 UI launches use the existing CLI and its permissions, writer lock, attempt limits
@@ -198,12 +200,24 @@ reasons and run/model provenance. Agreement alone is not proof of correctness.
 
 To run labeling end to end, choose **Label approval → Council approves unanimous
 answers**. This is opt-in, in Garden settings or for an individual assessment.
-Only answers supported unanimously by every selected member enter the approved
-dataset automatically. Disagreements, missing evidence and failed members remain
-pending. Existing human approvals are preserved. Changing the council settings or
+The default agreement rule requires every selected member. Choose **Council agreement
+→ Available members agree · minimum two** to keep going when a member hits a quota,
+times out, lacks a runtime, or cannot get permission. At least two independent members
+must supply matching, evidence-citing answers; every participating member must agree.
+Disagreements, abstentions and invalid assessments remain pending. Recent quota failures
+use the existing 15-minute cooldown. Failed/skipped members and the selected agreement
+rule stay in the audit trail and training provenance. CLI equivalent:
+`fusion decisions suggest --council codex claude agy grok --approval council --council-rule available -- DECISION_ID`.
+Existing human approvals are preserved. Changing the council settings or
 pausing the garden withdraws permission to approve an in-flight garden assessment.
 Council approvals carry their own source, member/run identities and evidence into
 training exports and data-quality reports, separately from human approvals.
+
+Snout’s field guide lives beside Truffle pig hunts, with a theme-colored journey from
+issue inspection to accepted fixes and PRs. Hunt status follows linked workflow recovery:
+completed selected fixes clear a stale pause, a running recovery shows waiting, and a
+recovered queue with unstarted issues offers **Continue queue**. Viewing a hunt never
+starts additional work. Published fixes link directly to their PRs.
 
 The live council view shows the active worker, public updates when available,
 completed assessments, per-question votes and the approval result. Recent runs
@@ -1005,3 +1019,7 @@ resolved object. CI runs shellcheck on every script plus the test suite.
 - The HUD cost is an estimate: it trusts the catalog's per-token price fields,
   including OpenRouter's separate 5-minute/1-hour cache-write multipliers,
   which may not match what your route actually serves.
+
+Grok workers default to `streaming-json` output. For an older CLI without that
+format, set `grok.output_format` to `plain` in `.fusion.json`; public text still
+appears live, but that format does not provide individual tool receipts or usage.

@@ -56,3 +56,19 @@
 @media(max-width:520px) { .guild-hero { grid-template-columns:1fr; }.guild-hero-copy { padding:25px 24px 0; }.guild-hero h1 { font-size:43px; }.guild-hero-art { height:220px; padding:0 12px 26px; }.guild-hero-art img { width:90%; height:100%; }.rune-ring { width:48%; }.spark-one { right:23%; }.guild-cast { grid-template-columns:1fr; }.guild-member { padding:20px; }.guild-hero .eyebrow { font-size:9px; } }
 @media(prefers-reduced-motion:reduce) { .forge-spark { animation:none; opacity:.65; }.template .sigil { transition:none; }.template:hover .sigil { transform:none; } }
 @media(max-width:360px) { .topbar .breadcrumb { display:none; }.topbar .top-actions { width:100%; justify-content:space-between; } }
+
+/* Snout's field guide uses the active theme in both light and dark modes. */
+.snout-field { display:grid; grid-template-columns:100px minmax(0,1fr); gap:24px; padding:28px; margin:24px 0; border:1px solid var(--accent-line); border-radius:18px 5px 18px 5px; background:var(--accent-soft); }
+.snout-portrait { display:flex; flex-direction:column; align-items:center; justify-content:center; color:var(--lime); }
+.snout-portrait > .sigil { width:88px; height:88px; transform:rotate(-7deg); }
+.snout-scent { font-size:22px; letter-spacing:7px; opacity:.6; }
+.snout-copy h2 { margin:9px 0; font-size:23px; }.snout-copy p { color:var(--text-soft); line-height:1.7; max-width:850px; }
+.snout-copy details { margin-top:12px; }.snout-copy summary { color:var(--text); cursor:pointer; }.snout-copy details p { margin:14px 0; }.snout-copy ul { padding-left:20px; line-height:1.8; color:var(--text-soft); }.snout-copy li { margin:7px 0; }.snout-copy strong { color:var(--text); }.snout-motto { font-style:italic; }
+.snout-trail { grid-column:1 / -1; list-style:none; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); padding:18px 0 0; margin:0; border-top:1px solid var(--accent-line); gap:14px; }
+.snout-trail li { display:flex; gap:12px; align-items:center; padding:10px; border:1px solid transparent; border-radius:10px; color:var(--muted); }.snout-trail .sigil { flex-shrink:0; width:26px; height:26px; }.snout-trail strong,.snout-trail small { display:block; }.snout-trail small { font-size:11px; margin-top:4px; line-height:1.5; }.snout-trail [aria-current] { background:var(--panel); border-color:var(--accent-line); color:var(--text); }.snout-trail [aria-current] .sigil { color:var(--lime); }
+.truffle-pr { margin-left:10px; }.truffle-pr .sigil { width:17px; height:17px; }
+.live-member.unavailable { border-style:dashed; }.live-member.unavailable .blocker { color:var(--text-soft); background:var(--panel2); border-color:var(--line); }
+.is-sniffing .snout-portrait > .sigil { animation:snout-sniff 3.2s ease-in-out infinite; }.is-sniffing .snout-scent { animation:guild-glimmer 3.2s ease-in-out infinite; }
+@keyframes snout-sniff { 0%,65%,100% { transform:rotate(-7deg) translateY(0); } 75%,90% { transform:rotate(-12deg) translateY(3px); } 82% { transform:rotate(-8deg) translateY(1px); } }
+@media(max-width:700px) { .snout-field { grid-template-columns:60px minmax(0,1fr); padding:20px; gap:16px; }.snout-portrait > .sigil { width:60px; height:60px; }.snout-copy h2 { font-size:21px; }.snout-trail { grid-template-columns:1fr 1fr; }.snout-trail li { padding:5px; gap:8px; }.snout-copy details { margin-left:-76px; padding-top:8px; }.truffle-pr { margin:10px 0 0; } }
+@media(prefers-reduced-motion:reduce) { .is-sniffing .snout-portrait > .sigil,.is-sniffing .snout-scent { animation:none; } }

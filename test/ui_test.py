@@ -165,6 +165,22 @@ class ControlRoomTest(unittest.TestCase):
         self.assertEqual(self.wait_job(resumed["id"])["status"], "success")
         self.assertEqual(len(list((self.workspace / ".fusion/runs").iterdir())), len(before))
 
+    def test_legacy_grok_workflow_displays_unterminated_plain_output(self):
+        job = self.app.launch(self.workspace, {"action":"build", "kind":"discovery", "text":"Inspect fixture", "mode":"off", "attempts":1})
+        finished = self.wait_job(job["id"])
+        report = self.app.workflow(self.workspace, finished["workflow_id"])
+        run = Path(report['live_nodes'][0]['result']['artifacts']['run_dir'])
+        task = read_json(run / 'task.json')
+        task['agent'] = 'grok'
+        task['resolved'].pop('output_format', None)  # Existing run from before streaming support.
+        atomic_json(run / 'task.json', task)
+        (run / 'stdout.log').write_text('Inspected the diff. Running **Postgres** checks.')
+        node = self.app.workflow(self.workspace, finished['workflow_id'])['live_nodes'][0]
+        self.assertEqual(node['output_format'], 'plain')
+        self.assertIn('Postgres', node['activity_entries'][0]['text'])
+        self.assertIn('Postgres', node['messages'][0])
+        self.assertGreater(node['last_output_at_ms'], 0)
+
     def test_activity_pairs_public_commands_and_keeps_failures_inspectable(self):
         events = [
             {"type": "item.completed", "item": {"id": "private", "type": "reasoning", "text": "not public"}},

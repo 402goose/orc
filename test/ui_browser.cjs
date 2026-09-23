@@ -6,6 +6,29 @@ const path = require("node:path");
 const fs = require("node:fs");
 const root = path.resolve(__dirname, "..");
 
+async function checkGrokActivity(page) {
+  let revision = 0;
+  await page.route('**/api/workflow?*', async route => {
+    const response = await route.fetch(), report = await response.json();
+    for (const node of report.live_nodes) {
+      node.agent = 'grok'; node.status = 'running'; node.output_format = 'plain';
+      node.last_output_at_ms = Date.now() - 65000;
+      node.messages = [];
+      node.activity_entries = [{id:'plain-output',kind:'message',text:'Inspected the **diff**. Running checks on Node 22.' + (revision ? '\n\nPostgres regression passed.' : '')}];
+    }
+    await route.fulfill({response,json:report});
+  });
+  await page.getByRole('button',{name:'Activity',exact:true}).click();
+  await expect(page.locator('.worker-timeline')).toContainText('Running checks on Node 22.');
+  await expect(page.locator('.worker-activity')).toContainText('Last output');
+  await expect(page.locator('.worker-activity')).not.toContainText('Waiting for the first update');
+  await expect(page.locator('.activity-follow-hint')).toContainText('individual tool receipts were not recorded');
+  revision++;
+  await expect(page.locator('.worker-timeline')).toContainText('Postgres regression passed.',{timeout:8000});
+  await page.screenshot({path:'/tmp/orc-grok-live-activity.png',fullPage:true});
+  await page.unroute('**/api/workflow?*');
+}
+
 async function checkActivityScrolling(page) {
   let revision = 0;
   await page.route("**/api/workflow?*", async (route) => {
@@ -204,6 +227,7 @@ async function checkActivityLayout(page) {
       "Inspecting fixture source files",
     );
     await checkActivityLayout(page);
+    await checkGrokActivity(page);
     await checkActivityScrolling(page);
 
     await page.route('**/api/workflow?*', async route => {

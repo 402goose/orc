@@ -41,7 +41,7 @@ const path = require('node:path');
     await expect(page.locator('.council-assessment')).toContainText('2 members');
     await expect(page.locator('.council-outcomes')).toContainText('agreed');
     await tab('Quality');
-    await expect(page.locator('.quality-panel')).toContainText('100.0% unanimous');
+    await expect(page.locator('.quality-panel')).toContainText('100.0% agreed under the selected rule');
     await tab('Garden');
     const gardenSettings = path.join(info.workspace,'.fusion/decisions/garden.json');
     const originalSettings = fs.readFileSync(gardenSettings,'utf8');

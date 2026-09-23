@@ -61,10 +61,16 @@ def atomic_json(path, value):
         temporary.unlink(missing_ok=True)
 
 
-def activity_entries(stdout):
+def activity_entries(stdout, *, plain=False):
     """Public updates and tool receipts only; pair starts/completions by item ID."""
+    if plain:
+        # Older Grok runs stream public prose, often without a newline until exit.
+        text = terminal_text(stdout).strip()
+        return [{"id": "plain-output", "kind": "message", "text": text[-32000:]}] if text else []
     entries = {}
     occurrences = {}
+    text_group = "start"
+
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -73,6 +79,34 @@ def activity_entries(stdout):
         if not isinstance(event, dict):
             continue
         kind, item = event.get("type"), event.get("item") or {}
+        if kind == "text" and isinstance(event.get("data"), str):
+            key = f"grok-text-{text_group}"
+            previous = entries.get(key, {}).get("text", "")
+            entries[key] = {"id": key, "kind": "message", "text": (previous + terminal_text(event["data"]))[-32000:]}
+            continue
+        if kind in {"tool_call", "tool_call_update"}:
+            if kind == "tool_call":
+                text_group = str(event.get("toolCallId") or hashlib.sha256(line.encode()).hexdigest()[:20])
+            key = str(event.get("toolCallId") or hashlib.sha256(line.encode()).hexdigest()[:20])
+            previous = entries.get(key, {})
+            raw = event.get("rawInput") if isinstance(event.get("rawInput"), dict) else {}
+            tool_kind = event.get("kind") or previous.get("tool_kind")
+            command = raw.get("command") or previous.get("command") or (event.get("title") if tool_kind == "execute" else "")
+            output = event.get("rawOutput")
+            if output is not None:
+                output = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
+            else:
+                output = "\n".join(str(c.get("content", {}).get("text", "")) for c in event.get("content", []) if isinstance(c, dict) and isinstance(c.get("content"), dict)) or previous.get("output", "")
+            status = event.get("status") or previous.get("native_status") or "in_progress"
+            entries[key] = {"id": key, "kind": "command" if tool_kind == "execute" else "tool", "tool_kind": tool_kind,
+                            "name": str(event.get("toolName") or previous.get("name") or event.get("title") or "Tool"),
+                            "command": terminal_text(str(command))[:8000], "output": terminal_text(output)[-12000:],
+                            "status": "finished" if status in {"completed", "failed"} else "running", "native_status": status,
+                            "exit_code": None, "failed": status == "failed"}
+            continue
+        if kind == "end":
+            entries["grok-end"] = {"id": "grok-end", "kind": "status", "text": "Worker returned its handoff. Open Deliverable to read the result."}
+            continue
         if not isinstance(item, dict):
             continue
         item_type = item.get("type")
@@ -405,7 +439,13 @@ class ControlRoom:
                 task = read_json(directory / "task.json")
                 current["agent"] = task.get("agent", current.get("agent"))
                 stdout = tail(directory / "stdout.log", 500_000)
-                current["activity_entries"] = activity_entries(stdout)
+                plain = current["agent"] == "grok" and task.get("resolved", {}).get("output_format", "plain") == "plain"
+                current["activity_entries"] = activity_entries(stdout, plain=plain)
+                current["output_format"] = "plain" if plain else "events"
+                current["last_output_at_ms"] = max((int(p.stat().st_mtime * 1000) for p in (directory / "stdout.log", directory / "stderr.log") if p.is_file() and p.stat().st_size), default=None)
+                if plain and stdout.strip():
+                    current["messages"] = [core.progress.clean(stdout[-2000:])]
+
                 for line in stdout.splitlines():
                     message = core.progress.worker_message(line)
                     if message:
@@ -553,14 +593,15 @@ class ControlRoom:
                 raise ValueError("Choose a classifier and provide input")
             argv += ["decisions", "probe", "--kind", kind, "--", text]
         elif action == "suggest-labels":
-            from fusion_labeling import labelable, labeling_options, approval_options
+            from fusion_labeling import labelable, labeling_options, approval_options, council_rule
             labelable(DecisionStore(workspace), body.get("decision_id"))
             agent = body.get("agent", "auto")
             if agent not in {"auto", "codex", "claude", "agy", "grok"}:
                 raise ValueError("Choose a labeling worker")
             options = labeling_options(body.get("labeling_mode", "single"), body.get("council_agents"))
             approval = approval_options(body.get("approval_mode", "human"), options['labeling_mode'])
-            argv += ["decisions", "suggest", "--agent", agent, "--approval", approval]
+            argv += ["decisions", "suggest", "--agent", agent, "--approval", approval,
+                     "--council-rule", council_rule(body.get("council_rule", "unanimous"))]
             if garden and body.get('garden_policy'):
                 argv += ['--garden-policy', body['garden_policy']]
             if options["labeling_mode"] == "council":
