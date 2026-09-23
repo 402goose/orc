@@ -85,31 +85,26 @@ fly deploy
 
 ## Client setup
 
-None. Reporting is on by default and needs no token: `fusion` ships with
-this endpoint in its defaults, announces itself on the first send, and
-sends the reduced payload above. Ingest takes no credential deliberately —
-a shared write secret shipped in a public repo protects nothing and still
-has to be rotated when it leaks.
-
-To stop reporting, either of:
+None, and no token. Reporting is on by default with the endpoint in `fusion`'s
+own defaults, and reading back what you sent needs no credential either: this
+machine already holds an unguessable install id (`$ORC_HOME/telemetry_id`) and
+already sends it with every span, so it can ask for its own rows back.
 
 ```sh
-export FUSION_TELEMETRY=0          # stops the send, keeps local traces
+fusion telemetry report            # your rows, zero configuration
+fusion telemetry off               # stop reporting; local traces keep working
+fusion telemetry status            # exactly which fields leave the machine
 ```
 
-```json
-{ "telemetry": { "remote": { "enabled": false } } }
-```
+`FUSION_TELEMETRY=0` does the same as `off` for one invocation.
+`telemetry.enabled: false` stops the local trace too, which also disables lane
+cooldown, resume accounting and `fusion usage` — usually not what you want.
 
-`telemetry.enabled: false` stops the local trace as well, which also turns
-off lane cooldown, resume accounting and `fusion usage` — usually not what
-you want.
-
-Run `fusion telemetry status` in any workspace to see exactly what will be
-sent, or confirm it's off.
-
-The token still exists, for reading: `GET /v1/summary` requires it, so
-aggregate usage is not public. Contributors never need it.
+The shared token survives for exactly one thing: `fusion telemetry report --all`,
+the cross-install view. That is the only view worth guarding, because it reveals
+how many people are running this and what they spend. Ingest takes no credential
+at all — a shared write secret shipped in a public repo protects nothing and
+still has to be rotated when it leaks.
 
 ## Querying
 

@@ -126,7 +126,7 @@ func TestInsertAndQuerySummaryIntegration(t *testing.T) {
 		t.Fatalf("insertSpans (install-b): %v", err)
 	}
 
-	resp, err := srv.querySummary(ctx, defaultWindowHours)
+	resp, err := srv.querySummary(ctx, defaultWindowHours, "")
 	if err != nil {
 		t.Fatalf("querySummary: %v", err)
 	}
@@ -135,6 +135,30 @@ func TestInsertAndQuerySummaryIntegration(t *testing.T) {
 	}
 	if resp.UniqueInstalls != 2 {
 		t.Errorf("UniqueInstalls = %d, want 2", resp.UniqueInstalls)
+	}
+	if resp.Scope != "all installs" {
+		t.Errorf("Scope = %q, want %q", resp.Scope, "all installs")
+	}
+
+	// An install sees its own rows and nobody else's, which is what lets the
+	// client read its data with no credential to carry.
+	scoped, err := srv.querySummary(ctx, defaultWindowHours, "install-a")
+	if err != nil {
+		t.Fatalf("querySummary(install-a): %v", err)
+	}
+	if scoped.TotalSpans != 2 || scoped.UniqueInstalls != 1 {
+		t.Errorf("install-a scope = %d spans / %d installs, want 2 / 1", scoped.TotalSpans, scoped.UniqueInstalls)
+	}
+	if scoped.Scope != "this install" {
+		t.Errorf("scoped Scope = %q, want %q", scoped.Scope, "this install")
+	}
+	for _, row := range scoped.ByGroup {
+		if row.Status != nil && *row.Status == "error" {
+			t.Errorf("install-a scope leaked install-b's error row")
+		}
+	}
+	if empty, err := srv.querySummary(ctx, defaultWindowHours, "nobody"); err != nil || empty.TotalSpans != 0 {
+		t.Errorf("unknown install = %v spans (err %v), want 0", empty.TotalSpans, err)
 	}
 	if len(resp.ByGroup) != 2 {
 		t.Fatalf("ByGroup has %d rows, want 2 (claude/success group + codex/error group)", len(resp.ByGroup))
@@ -165,7 +189,7 @@ func TestInsertAndQuerySummaryIntegration(t *testing.T) {
 
 	// A zero-hour-old window should report nothing: proves the time filter
 	// in the SQL is actually applied, not just present in the query text.
-	narrow, err := srv.querySummary(ctx, 1)
+	narrow, err := srv.querySummary(ctx, 1, "")
 	if err != nil {
 		t.Fatalf("querySummary(1): %v", err)
 	}
@@ -217,6 +241,14 @@ func TestHandleIngestOverHTTP(t *testing.T) {
 	}
 	if rec := summary(t, "Bearer wrong"); rec.Code != http.StatusUnauthorized {
 		t.Errorf("summary with wrong token: status = %d, want 401", rec.Code)
+	}
+	// ...but an install_id alone is enough for that install's own rows, so a
+	// client never needs a token to read what it sent.
+	ownReq := httptest.NewRequest(http.MethodGet, "/v1/summary?install_id=http-test", nil)
+	ownRec := httptest.NewRecorder()
+	srv.handleSummary(ownRec, ownReq)
+	if ownRec.Code != http.StatusOK {
+		t.Errorf("summary by install_id: status = %d body = %q, want 200", ownRec.Code, ownRec.Body.String())
 	}
 	getRec := summary(t, "Bearer sekret")
 	if getRec.Code != http.StatusOK {

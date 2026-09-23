@@ -1360,13 +1360,20 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
         self.assertEqual(errors.getvalue(), "", "the notice must not repeat on later runs")
 
     def test_telemetry_report_fetches_and_prints_remote_summary(self):
+        seen = []
+
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path != "/v1/summary?hours=24" or self.headers.get("Authorization") != "Bearer sekret":
+                seen.append((self.path, self.headers.get("Authorization")))
+                scoped = "install_id=" in self.path
+                # The collector mirrors the real one: your own rows need only
+                # the install id, every install needs the shared token.
+                if not scoped and self.headers.get("Authorization") != "Bearer sekret":
                     self.send_response(401)
                     self.end_headers()
                     return
                 body = json.dumps({
+                    "scope": "this install" if scoped else "all installs",
                     "window_hours": 24,
                     "total_spans": 2,
                     "unique_installs": 1,
@@ -1402,9 +1409,70 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
             result = json.loads(output.getvalue())
             self.assertEqual(result["total_spans"], 2)
             self.assertEqual(result["by_group"][0]["agent"], "claude")
+            # Reading your own rows carried the install id and needed no token.
+            self.assertIn("install_id=", seen[0][0])
+            self.assertEqual(result["scope"], "this install")
+
+            # --all asks for every install and is the only path that needs one.
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(
+                    fusion_core.main(["--workspace", str(self.workspace), "--json", "telemetry", "report", "--hours", "24", "--all"]),
+                    0,
+                )
+            self.assertNotIn("install_id=", seen[1][0])
+            self.assertEqual(seen[1][1], "Bearer sekret")
+            self.assertEqual(json.loads(output.getvalue())["scope"], "all installs")
+
+            # Without a token, --all refuses locally instead of 401ing remotely.
+            no_token = {"telemetry": {"remote": {"enabled": True, "endpoint": f"http://127.0.0.1:{port}/v1/ingest"}}}
+            (self.workspace / ".fusion.json").write_text(json.dumps(no_token), encoding="utf-8")
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    fusion_core.main(["--workspace", str(self.workspace), "telemetry", "report", "--all"]),
+                    1,
+                )
+            self.assertIn("telemetry.remote.token", errors.getvalue())
+            self.assertEqual(len(seen), 2, "--all without a token must not hit the network")
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_telemetry_on_off_persists_without_hand_editing_json(self):
+        (self.workspace / ".fusion.json").write_text(json.dumps({"claude": {"command": "claude"}}), encoding="utf-8")
+        for command, expected in (("off", False), ("on", True)):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(fusion_core.main(["--workspace", str(self.workspace), "telemetry", command]), 0)
+            saved = json.loads((self.workspace / ".fusion.json").read_text())
+            self.assertIs(saved["telemetry"]["remote"]["enabled"], expected)
+            self.assertEqual(saved["claude"]["command"], "claude", "unrelated config must survive")
+
+    def test_doctor_never_prints_a_token(self):
+        value = {"claude": {"command": "claude"},
+                 "telemetry": {"remote": {"enabled": True, "endpoint": "https://x/v1/ingest", "token": "sekret-do-not-print"}}}
+        (self.workspace / ".fusion.json").write_text(json.dumps(value), encoding="utf-8")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            fusion_core.main(["--workspace", str(self.workspace), "doctor"])
+        printed = output.getvalue()
+        self.assertNotIn("sekret-do-not-print", printed)
+        self.assertIn("https://x/v1/ingest", printed, "only secrets are masked, not the whole block")
+
+    def test_unwritable_home_never_breaks_a_run(self):
+        # Reporting is on by default, so telemetry touching an unwritable
+        # ORC_HOME must not reach the dispatch path.
+        blocked = Path(self.temp.name) / "blocked"
+        blocked.write_text("not a directory", encoding="utf-8")
+        with patch.dict(os.environ, {"ORC_HOME": str(blocked / "orc")}):
+            first = fusion_core.telemetry_install_id()
+            self.assertEqual(first, fusion_core.telemetry_install_id(), "one install, not one per span")
+            with contextlib.redirect_stderr(io.StringIO()):
+                fusion_core.announce_remote_telemetry("https://example.invalid/v1/ingest")
+            fusion_core.send_remote_telemetry(
+                {"enabled": True, "endpoint": "https://127.0.0.1:1/v1/ingest"},
+                {"agent": "claude", "status": "success", "usage": {}},
+            )
 
     def test_telemetry_report_fails_clearly_when_remote_disabled(self):
         (self.workspace / ".fusion.json").write_text(json.dumps({"telemetry": {"remote": {"enabled": False}}}))

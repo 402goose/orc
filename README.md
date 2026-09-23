@@ -763,10 +763,11 @@ Fusion sends a small, deliberately reduced copy of each span to
 the first send. Reporting needs no token. The shared collector shows
 aggregate agent/route/model/failure patterns across installations.
 
-To disable sending while keeping local traces:
+To stop sending while keeping local traces:
 
 ```sh
-export FUSION_TELEMETRY=0
+fusion telemetry off          # persists in .fusion.json
+export FUSION_TELEMETRY=0     # same, for one invocation
 ```
 
 Or set this in the project's `.fusion.json`:
@@ -798,12 +799,16 @@ what is currently configured to send. A send is always best-effort with a
 short timeout — a down or misconfigured collector never blocks or fails the
 actual dispatch.
 
-`fusion telemetry report [--hours N]` (default 168, i.e. 7 days) fetches
-the group's aggregate patterns back from the collector — calls, cost, and
-average duration grouped by agent/route/model/status/failure_class, plus
-how many distinct installs contributed. Reading aggregates requires the
-shared token in `.fusion.json` under `telemetry.remote.token`; distribute
-it privately and never commit it. Add `--json` for the machine-readable form.
+`fusion telemetry report [--hours N]` (default 168, i.e. 7 days) reads your
+own rows back — calls, cost, and average duration grouped by
+agent/route/model/status/failure_class. It needs no token: this machine
+already holds an unguessable install id and already sends it with every
+span, so it can ask for its own rows back.
+
+`--all` widens that to every install, and is the only thing that needs the
+shared token in `.fusion.json` under `telemetry.remote.token` — that view
+reveals how many people are running this and what they spend, so it stays
+guarded. Add `--json` for the machine-readable form.
 
 The collector itself (a small Fly + Postgres app) lives in
 [`telemetry/`](telemetry/).
