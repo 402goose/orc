@@ -1,5 +1,5 @@
 {
-  "task": "Review this Saloon repository snapshot and return an evidence-backed takeover inventory. Do not edit tracked files.",
+  "task": "Review this repository and return an evidence-backed inventory. Do not edit tracked files.",
   "max_parallel": 3,
   "max_parallel_writers": 0,
   "max_attempts": 1,
@@ -8,29 +8,26 @@
     {
       "id": "inventory",
       "items": [
-        "repository structure and active worktrees",
-        "knowledge and evidence artifacts",
-        "existing agent-generated work and gaps"
+        "repository structure and entry points",
+        "tests, fixtures and what they actually cover",
+        "documentation against the behaviour the code implements"
       ],
       "task_template": "Inspect {item}. Report concrete paths and distinguish observed facts from inferences. Do not edit files.",
       "agent": "claude",
-      "route": "orc-free",
       "role": "read-only investigator"
     },
     {
       "id": "countercheck",
-      "items": ["source and evidence consistency", "missing deliverables from prior workflows"],
-      "task_template": "Adversarially check {item} in the repository snapshot. Report corrections and supporting paths. Do not edit files.",
+      "items": ["source and evidence consistency", "gaps the inventory is likely to miss"],
+      "task_template": "Adversarially check {item} in this repository. Report corrections and supporting paths. Do not edit files.",
       "agent": "codex",
-      "route": "codex-read",
       "role": "read-only verifier"
     },
     {
       "id": "synthesize",
       "needs": ["inventory", "countercheck"],
-      "task": "Read the prior node receipts and produce a concise takeover inventory in your structured handoff. Do not edit files.",
+      "task": "Read the prior node receipts and produce a concise inventory in your structured handoff. Do not edit files.",
       "agent": "claude",
-      "route": "orc-best",
       "role": "read-only lead reviewer"
     }
   ],
