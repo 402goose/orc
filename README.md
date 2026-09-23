@@ -482,6 +482,34 @@ fusion trace --limit 50
 fusion usage --limit 1000
 ```
 
+### Driving ORC from a chat client (MCP)
+
+`fusion mcp-serve` exposes ORC over the Model Context Protocol, so an agent in a
+chat client drives the same `.fusion/` artifacts the CLI and control room read.
+Three primitives, mapped onto what ORC already is:
+
+| Primitive | What it exposes |
+| --- | --- |
+| **Prompts** | the verbs — `where-am-i`, `ship-feature`, `review-changes`, `explain-run`, surfaced as slash commands |
+| **Resources** | the evidence — `orc://here`, `orc://workflows`, `orc://workflow/{id}/manifest`, `.../report` |
+| **Tools** | the operations — `fusion_here`, `fusion_run_start`, `fusion_run_status`, `fusion_run_cancel`, plus `fusion_delegate` |
+
+Long-running work uses **durable handles rather than blocking calls**.
+`fusion_run_start` returns a `workflow_id` immediately; poll `fusion_run_status`
+with it. The handle is the workflow directory on disk, so it survives a restart
+of both the server and the client, and a result hands back `resource_link`
+evidence URIs instead of inlining artifacts.
+
+`fusion_here` answers "where am I" for a workspace — active workflows, what
+failed, what it cost, Laya's mode, and the next command — reading artifacts only.
+It starts nothing and contacts no provider.
+
+This deliberately does **not** use the MCP tasks extension. Tasks has the right
+shape, but as of spec revision `2026-07-28` it sits outside core, is absent from
+the official client matrix, and no mainstream client implements it — and tasks
+cannot carry `notifications/progress`. Handles work in every client today, and
+`tasks/get` / `tasks/update` / `tasks/cancel` adapt onto them when that changes.
+
 To build a feature, start from the target project's directory and describe the
 outcome in one sentence:
 

@@ -632,8 +632,24 @@ print(json.dumps({
         self.assertEqual(proc.returncode, 0, proc.stderr)
         responses = [json.loads(line) for line in proc.stdout.splitlines()]
         self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "fusion")
-        names = {tool["name"] for tool in responses[1]["result"]["tools"]}
-        self.assertEqual(names, {"fusion_delegate", "fusion_status", "fusion_decisions"})
+        tools = responses[1]["result"]["tools"]
+        names = {tool["name"] for tool in tools}
+        self.assertEqual(
+            names,
+            {
+                "fusion_delegate",
+                "fusion_status",
+                "fusion_decisions",
+                "fusion_here",
+                "fusion_run_start",
+                "fusion_run_status",
+                "fusion_run_cancel",
+            },
+        )
+        # Every advertised tool must be usable: a described name and a schema.
+        for tool in tools:
+            self.assertTrue(tool.get("description", "").strip(), tool["name"])
+            self.assertEqual(tool.get("inputSchema", {}).get("type"), "object", tool["name"])
 
     def test_mcp_delegates_with_the_task_contract(self):
         codex = self.write_agent(
