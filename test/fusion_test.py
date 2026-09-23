@@ -1568,5 +1568,58 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
         self.assertIn("nothing to fetch", errors.getvalue())
 
 
+class HandoffParsingTest(unittest.TestCase):
+    """A worker that reports no blockers must not be failed for saying so.
+
+    Regression: `BLOCKERS: None. The `ls` alias points to `eza`, which isn't
+    installed, so I used `/bin/ls` instead.` was comma-split into three phantom
+    blockers, marking a successful node invalid and blocking every node that
+    depended on it. One real workflow failed this way after spending $1.90.
+    """
+
+    def blockers(self, value: str) -> list[str]:
+        return fusion_core.parse_handoff(f"STATUS: success\nBLOCKERS: {value}")["blockers"]
+
+    def test_none_answers_are_not_blockers(self):
+        for value in (
+            "none",
+            "None",
+            "NONE",
+            "none.",
+            "N/A",
+            "N/A.",
+            "nothing",
+            "nil",
+            "-",
+            "none - read-only node",
+            "None. The `ls` alias points to `eza`, which isn't installed, so I used `/bin/ls`.",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(self.blockers(value), [])
+
+    def test_real_blockers_survive(self):
+        self.assertEqual(
+            self.blockers("the suite fails and I could not fix it"),
+            ["the suite fails and I could not fix it"],
+        )
+        self.assertEqual(
+            self.blockers("missing fixture, broken import"),
+            ["missing fixture", "broken import"],
+        )
+
+    def test_none_prefixed_prose_is_still_a_blocker(self):
+        # "none of the tests pass" starts with "none" but is a real failure.
+        self.assertEqual(
+            self.blockers("none of the tests pass"),
+            ["none of the tests pass"],
+        )
+
+    def test_tests_field_uses_the_same_rule(self):
+        parsed = fusion_core.parse_handoff(
+            "STATUS: success\nTESTS: none. This node is read-only; I only ran `git status`."
+        )
+        self.assertEqual(parsed["tests"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
