@@ -4,7 +4,7 @@ from pathlib import Path
 import shutil
 import subprocess
 
-from fusion_decisions import (DecisionEngine, DecisionStore, INTAKE_QUESTIONS, RECOVERY_QUESTIONS,
+from fusion_decisions import (DecisionEngine, DecisionStore, ACCEPTANCE_QUESTIONS, INTAKE_QUESTIONS, RECOVERY_QUESTIONS,
                               REVIEW_QUESTIONS, fit_calibration, runtime_python)
 
 
@@ -21,7 +21,7 @@ def add_parser(sub):
     show.add_argument("id")
     probe = commands.add_parser("probe", help="run a local classifier without starting coding agents")
     probe.add_argument("state")
-    probe.add_argument("--kind", choices=["intake", "review", "recovery"], default="intake")
+    probe.add_argument("--kind", choices=["intake", "review", "recovery", "acceptance"], default="intake")
     label = commands.add_parser("label", help="record human-reviewed answers with verification evidence")
     label.add_argument("id")
     label.add_argument("answers", nargs="+", help="question=value pairs")
@@ -78,8 +78,16 @@ def run(args, workspace, config):
     elif command == "show":
         payload = store.get(args.id)
     elif command == "probe":
-        questions = {"intake": INTAKE_QUESTIONS, "review": REVIEW_QUESTIONS, "recovery": RECOVERY_QUESTIONS}[args.kind]
-        payload = DecisionEngine(workspace, config).decide(args.kind, args.state, questions)
+        questions = {"intake": INTAKE_QUESTIONS, "review": REVIEW_QUESTIONS, "recovery": RECOVERY_QUESTIONS,
+                     "acceptance": ACCEPTANCE_QUESTIONS}[args.kind]
+        state = args.state
+        # A JSON object probes with the same state shape a workflow sends; a plain string stays a string.
+        if state.lstrip().startswith("{"):
+            try:
+                state = json.loads(state)
+            except ValueError:
+                pass
+        payload = DecisionEngine(workspace, config).decide(args.kind, state, questions)
     elif command == "label":
         if any("=" not in answer for answer in args.answers):
             raise ValueError("answers must be question=value pairs")

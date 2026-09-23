@@ -332,7 +332,8 @@ use their configured accounts.
 Use `fusion status` and `fusion usage` to inspect delegated work.
 
 Optional local [Laya decisions](FUSION_DECISIONS.md) cover intake, automatic
-worker routing, bounded recovery, specialist review and learning from reviewed
+worker routing, bounded recovery, specialist review, a semantic acceptance
+check on structurally-passing workflow nodes, and learning from reviewed
 outcomes. They start in shadow mode, recording advice without applying it:
 
 ```sh
