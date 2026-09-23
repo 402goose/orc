@@ -245,6 +245,23 @@ Compare candidate and baseline reports before setting `model_path`,
 settings is changed by train, evaluate or calibrate. Output commands refuse
 to overwrite existing datasets, reports or candidates.
 
+The control room can run this sequence automatically: **Laya lab → Training →
+Enable auto-training**. A round exports effective approvals, removes duplicate
+inputs (preserving held-out copies), withholds conflicting inputs, evaluates the
+configured source, trains a candidate, evaluates that candidate, and saves
+calibration. Round receipts and settings are stored in `.fusion/decisions/training`.
+Ten new or changed approved answers trigger the next round by default; the threshold
+is configurable. Unchanged reapprovals do not trigger training. At least two train
+and two held-out workflow groups must survive cleanup.
+
+The UI shows live optimizer loss, paired held-out scores, controls, sample sizes,
+and lineage checks. Comparisons require identical source/candidate benchmarks and
+verified independent holdouts. Loss or knowledge XP is not evidence of improved
+generalization. Small-sample and changing-benchmark limitations remain visible.
+The server must remain running to advance the loop; detached steps and saved rounds
+survive restarts. Errors wait for an explicit retry. Automatic rounds do not change
+the configured checkpoint, calibration file, decision mode, or permitted actions.
+
 Decision states and labels live locally in `.fusion/decisions/events.jsonl`
 with private file permissions. They may contain project text; they are
 excluded from remote Fusion telemetry and ignored by Git. Export is an

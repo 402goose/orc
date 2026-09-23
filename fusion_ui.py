@@ -30,6 +30,7 @@ import fusion_core as core
 import fusion_publish as publishing
 import fusion_garden as garden
 import fusion_truffle as truffle
+import fusion_training_loop as training_loop
 from fusion_learning import decision_rows, learning_summary
 from fusion_decisions import DecisionEngine, DecisionStore, config_for, read_jsonl
 from fusion_report import finding_request, format_report, reported_cost, select_report, terminal_text
@@ -189,6 +190,7 @@ def run_job(directory):
              "decision_id": request.get("decision_id"),
              "garden": request.get("garden", False),
              "garden_policy": request.get("garden_policy"),
+             "learning_round": request.get("learning_round"), "learning_dispatch": request.get("learning_dispatch"),
              "started_at_ms": core.now_ms(), "status": "running", "supervisor_pid": os.getpid()}
     atomic_json(directory / "job.json", state)
     environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "FUSION_PROGRESS": "1"}
@@ -333,7 +335,8 @@ class ControlRoom:
                     row['garden_state'] = 'needs_attention'
         config, _ = core.load_config(workspace)
         return {'records': rows, 'learning': learning_summary(workspace, config, rows), 'label_runs': label_runs,
-                'garden': {**garden.status(self, workspace, rows), 'error': self.garden_errors.get(str(workspace))}}
+                'garden': {**garden.status(self, workspace, rows), 'error': self.garden_errors.get(str(workspace))},
+                'training_loop': training_loop.status(self, workspace, rows)}
 
     def label_runs(self, workspace, decision_id=None, since=0):
         paths = sorted((workspace / '.fusion/decisions/assessments').glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -366,6 +369,7 @@ class ControlRoom:
         for workspace in workspaces:
             try:
                 garden.tick(self, workspace)
+                training_loop.tick(self, workspace)
                 self.garden_errors.pop(str(workspace), None)
             except Exception as exc:
                 self.garden_errors[str(workspace)] = str(exc)
@@ -467,6 +471,8 @@ class ControlRoom:
         if not (directory / "job.json").exists():
             raise ValueError("Job does not exist")
         job = read_json(directory / "job.json")
+        if job.get("action") in {"train", "evaluate"}:
+            job["progress"] = read_json(directory / ("candidate.progress.json" if job["action"] == "train" else "dataset.jsonl.progress.json"))
         job["console"] = tail(directory / "stderr.log", 60000)
         job["output"] = tail(directory / "stdout.log", 80000)
         if job.get('action') == 'suggest-labels':
@@ -519,6 +525,21 @@ class ControlRoom:
                 raise ValueError("Describe the task or paste a GitHub issue URL")
             argv += ["--", text]
             writes = kind in {"build", "debug"} and not prepare
+        elif action == "truffle-survey":
+            agent, remote = body.get("agent", "auto"), body.get("remote", "origin")
+            truffle.hunt_options(agent=agent, remote=remote)
+            argv += ["truffle", "survey", "--agent", agent, "--remote", remote]
+            if body.get("resume"):
+                saved = truffle.receipt(workspace, body["resume"])
+                if saved.get("kind") != "survey":
+                    raise ValueError("Choose an issue woodland to resume")
+                argv += ["--resume", saved["id"]]
+            for key in ("sync_only", "include_assigned"):
+                if key in body and type(body[key]) is not bool:
+                    raise ValueError(f"{key} must be boolean")
+                if body.get(key) is True:
+                    argv += ["--" + key.replace("_", "-")]
+            text = "Truffle pig · " + ("map all open issues" if body.get("sync_only") else "grade every open issue")
         elif action == "truffle-hunt":
             settings = truffle.hunt_options(count=int(body.get("count", 5)), scan_limit=int(body.get("scan_limit", 40)),
                                             search=body.get("search", ""), agent=body.get("agent", "auto"),
@@ -631,11 +652,13 @@ class ControlRoom:
         if writes and body.get("allow_write") is not True:
             raise ValueError("This workflow includes implementation. Enable workspace edits before launching.")
         with self.lock, garden_lock(workspace, action):
+            if action in {"export", "train", "evaluate", "calibrate"} and any(j["status"] in ACTIVE and j["action"] in {"export", "train", "evaluate", "calibrate"} for j in self.jobs(workspace, limit=None)):
+                raise ValueError("A local learning job is already active. Follow or stop it before starting another.")
             if action == "publish" and any(j["status"] in ACTIVE and j["action"] == "publish" for j in self.jobs(workspace)):
                 raise ValueError("A publication job is already active in this workspace")
             if action == "suggest-labels" and any(j["status"] in ACTIVE and j.get("decision_id") == body["decision_id"] for j in self.jobs(workspace, limit=None)):
                 raise ValueError("Labels are already being drafted for this decision")
-            if action in {"build", "delegate", "resume", "workflow", "truffle-hunt", "truffle-run"} and any(j["status"] in ACTIVE and j["action"] in {"build", "delegate", "resume", "workflow", "truffle-hunt", "truffle-run"} for j in self.jobs(workspace)):
+            if action in {"build", "delegate", "resume", "workflow", "truffle-hunt", "truffle-run", "truffle-survey"} and not (action == "truffle-survey" and body.get("sync_only") and not body.get("resume")) and any(j["status"] in ACTIVE and j["action"] in {"build", "delegate", "resume", "workflow", "truffle-hunt", "truffle-run", "truffle-survey"} for j in self.jobs(workspace)):
                 raise ValueError("A UI workflow is already active in this workspace. Follow or stop it before launching another.")
             directory.mkdir(parents=True, mode=0o700)
             if spec:
@@ -647,9 +670,11 @@ class ControlRoom:
             learning = {"dataset": str(dataset) if action in {"train", "evaluate", "calibrate"} else "",
                         "model_path": body.get("model_path", "")}
             atomic_json(directory / "request.json", {"action": action, "title": title, "argv": argv, "workspace": str(workspace), "mode": mode, "decision_id": decision_id, "garden": garden, "learning": learning,
-                                                      "garden_policy": body.get('garden_policy') if garden else None})
+                                                      "garden_policy": body.get('garden_policy') if garden else None,
+                                                  "learning_round": body.get("learning_round"), "learning_dispatch": body.get("learning_dispatch")})
             atomic_json(directory / "job.json", {"id": job_id, "action": action, "title": title, "status": "queued", "started_at_ms": core.now_ms(), "decision_id": decision_id, "garden": garden,
-                                                  "garden_policy": body.get('garden_policy') if garden else None})
+                                                  "garden_policy": body.get('garden_policy') if garden else None,
+                                                  "learning_round": body.get("learning_round"), "learning_dispatch": body.get("learning_dispatch")})
             with (directory / "supervisor.log").open("wb") as log:
                 proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--job", str(directory)],
                                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
@@ -758,7 +783,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/overview":
                 result = app.overview(workspace)
             elif path == "/api/truffle":
-                result = truffle.receipt(workspace, query.get("id"))
+                from fusion_truffle_survey import latest
+                result = truffle.receipt(workspace, query["id"]) if query.get("id") else latest(workspace)
             elif path == "/api/workflow":
                 result = app.workflow(workspace, query.get("id"))
             elif path == "/api/job":
@@ -827,6 +853,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Suggested labels require explicit human approval")
                 DecisionStore(workspace).label(body.get("id"), body.get("answers", {}), body.get("evidence", ""), body.get("suggestion_id"), replace=True)
                 result = {"saved": True}
+            elif path == "/api/training-loop":
+                result = training_loop.configure(app, workspace, body)
             elif path == "/api/garden":
                 result = garden.save(app, workspace, body)
             elif path == "/api/label-exclusion":

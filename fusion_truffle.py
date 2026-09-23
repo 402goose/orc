@@ -115,6 +115,19 @@ def receipt(workspace, scout_id):
             if blocked:
                 problem = "PR publication pending or failed" if blocked.get("workflow_status") == "success" else blocked.get("workflow_status", "interrupted")
                 record.update(status="paused", message=f"Queue waiting at #{blocked['number']}: {problem}. Open its workflow. Resume it or retry PR publication, then continue the queue.")
+    if record.get("kind") == "survey":
+        counts = {grade: sum(i.get("grade", "U") == grade for i in record.get("issues", [])) for grade in ("A", "B", "C", "D", "P", "U")}
+        record["grade_counts"] = counts
+        record["assessed"] = sum(counts.values()) - counts["U"]
+        candidates = {c["number"]: c for c in record.get("candidates", [])}
+        for row in record.get("issues", []):
+            if row["number"] in candidates:
+                row["candidate"] = candidates[row["number"]]
+        for patch in record.get("patches", []):
+            children = [i for i in record["issues"] if i["number"] in patch["children"]]
+            patch["ripe"] = sum(i["grade"] == "A" for i in children)
+            patch["promising"] = sum(i["grade"] == "B" for i in children)
+            patch["assessed"] = sum(i["grade"] != "U" for i in children)
     return record
 
 
@@ -122,7 +135,7 @@ def history(workspace):
     rows = []
     for path in (Path(workspace) / ".fusion/truffle").glob("truffle-*/hunt.json"):
         record = receipt(workspace, path.parent.name)
-        rows.append({k: record.get(k) for k in ("id", "repo", "status", "started_at_ms", "target", "scanned", "message")}
+        rows.append({k: record.get(k) for k in ("id", "kind", "repo", "status", "started_at_ms", "target", "scanned", "message")}
                     | {"found": len(record.get("candidates", []))})
     return sorted(rows, key=lambda r: r["started_at_ms"], reverse=True)[:50]
 
@@ -393,6 +406,12 @@ def add_parser(sub):
     scout.add_argument("--agent", choices=sorted(WORKERS), default="auto")
     scout.add_argument("--remote", default="origin")
     scout.add_argument("--include-assigned", action="store_true")
+    survey = commands.add_parser("survey", help="map every open issue into tracking patches and grade in resumable batches")
+    survey.add_argument("--agent", choices=sorted(WORKERS), default="auto")
+    survey.add_argument("--remote", default="origin")
+    survey.add_argument("--resume", help="continue a saved survey's unassessed issues")
+    survey.add_argument("--sync-only", action="store_true", help="map all issues without starting grading workers")
+    survey.add_argument("--include-assigned", action="store_true")
     show = commands.add_parser("show")
     show.add_argument("scout_id")
     queue = commands.add_parser("run", help="implement selected issues sequentially; accepted review required before PR publication")
@@ -406,7 +425,10 @@ def add_parser(sub):
 
 
 def command(workspace, config, args):
-    if args.truffle_command == "hunt":
+    if args.truffle_command == "survey":
+        from fusion_truffle_survey import survey
+        result = survey(workspace, config, **{k: getattr(args, k) for k in ("agent", "remote", "resume", "sync_only", "include_assigned")})
+    elif args.truffle_command == "hunt":
         result = hunt(workspace, config, **{k: getattr(args, k) for k in ("count", "scan_limit", "search", "agent", "remote", "include_assigned")})
     elif args.truffle_command == "show":
         result = receipt(workspace, args.scout_id)

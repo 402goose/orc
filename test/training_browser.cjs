@@ -1,0 +1,43 @@
+const {chromium,expect}=require('@playwright/test');
+const {spawn}=require('node:child_process');
+const fs=require('node:fs'),path=require('node:path');
+(async()=>{
+ const fixture=spawn('python3',['-u',path.join(__dirname,'training_browser_fixture.py')],{env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'}});
+ let browser,stderr='';fixture.stderr.on('data',b=>stderr+=b);
+ try {
+  const info=await new Promise((resolve,reject)=>{let out='';const timer=setTimeout(()=>reject(Error('Fixture timeout '+stderr)),20000);fixture.stdout.on('data',b=>{out+=b;const line=out.split('\n').find(l=>l.startsWith('{"url"'));if(line){clearTimeout(timer);resolve(JSON.parse(line));}});fixture.on('exit',c=>{clearTimeout(timer);reject(Error('Fixture exit '+c+' '+stderr));});});
+  browser=await chromium.launch({headless:true});const page=await browser.newPage({viewport:{width:1500,height:1100}});
+  const errors=[];page.on('pageerror',e=>errors.push(e.message));
+  await page.goto(info.url);await page.locator('nav [data-view=decisions]').click();
+  await page.getByRole('tab',{name:'Training',exact:true}).click();
+  await expect(page.locator('.quest-level')).toContainText('40');
+  await expect(page.locator('.trial-empty')).toBeVisible();
+  await page.getByRole('button',{name:'Enable auto-training',exact:true}).click();
+  await expect(page.locator('.quest-live')).toContainText('2 / 12',{timeout:25000});
+  await expect(page.locator('.training-loss')).toContainText('0.6200');
+  await expect(page.locator('.quest-stages li.current')).toContainText('Forge');
+  const url=page.url();await page.reload();await expect(page.locator('.quest-live')).toContainText('2 / 12');expect(page.url()).toBe(url);
+  await page.getByRole('button',{name:'Pause auto-training',exact:true}).click();
+  fs.writeFileSync(info.release,'go');
+  await expect(page.getByRole('button',{name:'Enable auto-training',exact:true})).toBeVisible();
+  await page.getByRole('button',{name:'Enable auto-training',exact:true}).click();
+  await expect(page.locator('.quest-verdict-score')).toContainText('+20.0 pp',{timeout:25000});
+  await expect(page.locator('.quest-score-grid')).toContainText('60.0%');
+  await expect(page.locator('.quest-score-grid')).toContainText('80.0%');
+  await expect(page.locator('.quest-verdict')).toContainText('Small held-out sample');
+  await expect(page.locator('.trial-candidate')).toHaveCount(1);
+  await expect(page.locator('.quest-automation-state')).toContainText('0 / 10');
+  await page.evaluate(()=>ORCAppearance.set({theme:'grove',mode:'dark'}));
+  await page.screenshot({path:'/tmp/orc-training-dark.png',fullPage:true,animations:'disabled'});
+  await page.evaluate(()=>ORCAppearance.set({theme:'glacier',mode:'light'}));
+  await page.screenshot({path:'/tmp/orc-training-light.png',fullPage:true,animations:'disabled'});
+  await page.setViewportSize({width:390,height:844});expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+  await page.emulateMedia({reducedMotion:'reduce'});expect(await page.locator('.quest-rune>.sigil').evaluate(el=>getComputedStyle(el).animationName)).toBe('none');
+  await page.screenshot({path:'/tmp/orc-training-mobile.png',fullPage:true,animations:'disabled'});
+  await page.getByRole('button',{name:'Training settings',exact:true}).click();
+  await page.locator('#training-new-answers').fill('5');await page.getByRole('button',{name:'Save training settings',exact:true}).click();
+  await expect(page.locator('.quest-automation-state')).toContainText('0 / 5');
+  expect(errors).toEqual([]);
+  console.log('Training grounds passed: opt-in auto round, live optimizer loss, pause/reload/resume, paired measured scores and sample caveat, no repeat training, settings, themes, mobile and reduced motion.');
+ } finally {if(browser)await browser.close();fixture.kill('SIGINT');await new Promise(resolve=>fixture.once('exit',resolve));}
+})().catch(e=>{console.error(e);process.exitCode=1;});
