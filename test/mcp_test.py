@@ -146,47 +146,69 @@ class RunHandleTest(unittest.TestCase):
         self.workspace = Path(self.tmp.name)
         self.addCleanup(self.tmp.cleanup)
 
-    def fake_spawn(self, created: str | None):
+    def fake_spawn(self, register: bool):
+        """A launcher that registers the id start_run chose, via the env."""
+        outer = self
+
         class Proc:
             pid = 4242
+            def poll(self):
+                return None
 
         def spawn(argv, **kwargs):
-            self.argv = argv
-            if created:
-                write_manifest(self.workspace, created, status="running")
+            outer.argv = argv
+            outer.env = kwargs.get("env") or {}
+            if register:
+                from fusion_workflow import WORKFLOW_ID_ENV
+                write_manifest(outer.workspace, outer.env[WORKFLOW_ID_ENV], status="running")
             return Proc()
 
         return spawn
 
-    def test_returns_a_handle_once_the_run_registers(self):
+    def test_names_the_run_up_front_and_passes_it_down(self):
+        from fusion_workflow import WORKFLOW_ID_ENV
+
         result = fusion_mcp.start_run(
             self.workspace, "add tests", "build",
-            spawn=self.fake_spawn("wf-new"), sleep=lambda _s: None,
+            spawn=self.fake_spawn(True), sleep=lambda _s: None,
         )
-        self.assertEqual(result["workflow_id"], "wf-new")
         self.assertEqual(result["status"], "running")
-        self.assertIn("orc://workflow/wf-new/report", result["evidence"])
+        # The handle is the id we chose, not whatever appeared on disk.
+        self.assertEqual(result["workflow_id"], self.env[WORKFLOW_ID_ENV])
+        self.assertIn(f"orc://workflow/{result['workflow_id']}/report", result["evidence"])
 
-    def test_does_not_claim_a_pre_existing_workflow_as_the_new_one(self):
-        write_manifest(self.workspace, "wf-older")
+    def test_a_concurrent_run_cannot_steal_the_handle(self):
+        # The old implementation returned "newest directory that appeared",
+        # so a run started by someone else in the same moment won the handle.
+        def spawn_with_interloper(argv, **kwargs):
+            from fusion_workflow import WORKFLOW_ID_ENV
+            self.env = kwargs.get("env") or {}
+            write_manifest(self.workspace, "zzz-someone-elses-run", status="running")
+            write_manifest(self.workspace, self.env[WORKFLOW_ID_ENV], status="running")
+
+            class Proc:
+                pid = 1
+                def poll(self):
+                    return None
+
+            return Proc()
+
         result = fusion_mcp.start_run(
             self.workspace, "add tests", "build",
-            spawn=self.fake_spawn("wf-newer"), sleep=lambda _s: None,
+            spawn=spawn_with_interloper, sleep=lambda _s: None,
         )
-        self.assertEqual(result["workflow_id"], "wf-newer")
+        self.assertNotEqual(result["workflow_id"], "zzz-someone-elses-run")
 
-    def test_reports_starting_rather_than_lying_when_nothing_registers(self):
+    def test_still_returns_a_usable_handle_when_registration_is_slow(self):
         ticks = iter([0.0, 1.0, 99.0])
         result = fusion_mcp.start_run(
             self.workspace, "add tests", "build",
-            spawn=self.fake_spawn(None), now=lambda: next(ticks), sleep=lambda _s: None,
+            spawn=self.fake_spawn(False), now=lambda: next(ticks), sleep=lambda _s: None,
         )
-        self.assertIsNone(result["workflow_id"])
         self.assertEqual(result["status"], "starting")
+        self.assertTrue(result["workflow_id"])  # chosen, not guessed — always usable
 
     def test_reports_failed_when_the_launch_dies_before_registering(self):
-        # Found by dogfooding: a null handle with no explanation left the client
-        # with nothing. A dead launch and a slow one are different answers.
         class DeadProc:
             pid = 1
             def poll(self):
@@ -201,9 +223,9 @@ class RunHandleTest(unittest.TestCase):
 
     def test_rejects_an_empty_request_and_an_unknown_kind(self):
         with self.assertRaises(ValueError):
-            fusion_mcp.start_run(self.workspace, "   ", "build", spawn=self.fake_spawn(None))
+            fusion_mcp.start_run(self.workspace, "   ", "build", spawn=self.fake_spawn(False))
         with self.assertRaises(ValueError):
-            fusion_mcp.start_run(self.workspace, "x", "destroy", spawn=self.fake_spawn(None))
+            fusion_mcp.start_run(self.workspace, "x", "destroy", spawn=self.fake_spawn(False))
 
     def test_status_marks_terminal_runs_done(self):
         write_manifest(self.workspace, "wf-1", status="success", spent_usd=2.0,
@@ -227,6 +249,26 @@ class RunHandleTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             fusion_mcp.run_status(self.workspace, "nope")
 
+    def test_cancel_refuses_a_pid_that_is_no_longer_the_coordinator(self):
+        # A recorded pid can be recycled onto an unrelated program; signalling
+        # it would interrupt something that has nothing to do with ORC.
+        import os
+
+        write_manifest(self.workspace, "wf-1", status="running", coordinator_pid=os.getpid())
+        sent = []
+        result = fusion_mcp.cancel_run(
+            self.workspace, "wf-1",
+            kill=lambda pid, sig: sent.append(pid),
+            matches=lambda pid, wf: False,
+        )
+        self.assertFalse(result["cancelled"])
+        self.assertIn("no longer", result["reason"])
+        self.assertEqual(sent, [])
+
+    def test_process_matches_rejects_a_stranger_and_a_dead_pid(self):
+        self.assertFalse(fusion_mcp.process_matches(1, "wf-1"))        # launchd/init
+        self.assertFalse(fusion_mcp.process_matches(999999, "wf-1"))   # not a process
+
     def test_cancel_reports_honestly_when_the_coordinator_is_gone(self):
         write_manifest(self.workspace, "wf-1", status="running", coordinator_pid=None)
         result = fusion_mcp.cancel_run(self.workspace, "wf-1")
@@ -243,7 +285,9 @@ class RunHandleTest(unittest.TestCase):
         write_manifest(self.workspace, "wf-1", status="running", coordinator_pid=os.getpid())
         sent = []
         result = fusion_mcp.cancel_run(
-            self.workspace, "wf-1", kill=lambda pid, sig: sent.append((pid, sig))
+            self.workspace, "wf-1",
+            kill=lambda pid, sig: sent.append((pid, sig)),
+            matches=lambda pid, wf: True,
         )
         self.assertTrue(result["cancelled"])
         self.assertEqual(sent, [(os.getpid(), signal.SIGINT)])
