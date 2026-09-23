@@ -7,6 +7,7 @@ so closing the browser or restarting the server does not stop a workflow.
 from __future__ import annotations
 
 import hashlib
+import contextlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
@@ -26,6 +27,8 @@ import webbrowser
 
 import fusion_core as core
 import fusion_publish as publishing
+import fusion_garden as garden
+from fusion_learning import decision_rows, learning_summary
 from fusion_decisions import DecisionEngine, DecisionStore, config_for, read_jsonl
 from fusion_report import finding_request, format_report, reported_cost, select_report, terminal_text
 from fusion_workflow import validate_spec, workflow_report, workflow_status
@@ -55,6 +58,46 @@ def atomic_json(path, value):
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def activity_entries(stdout):
+    """Public updates and tool receipts only; pair starts/completions by item ID."""
+    entries = {}
+    occurrences = {}
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue  # A bounded log tail can begin or end inside a JSON line.
+        if not isinstance(event, dict):
+            continue
+        kind, item = event.get("type"), event.get("item") or {}
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        fallback = hashlib.sha256(line.encode()).hexdigest()[:20]
+        occurrences[fallback] = occurrences.get(fallback, 0) + 1
+        key = str(item.get("id") or f"{fallback}-{occurrences[fallback]}")
+        if kind == "item.completed" and item_type == "agent_message" and item.get("text"):
+            entries[key] = {"id": key, "kind": "message", "text": terminal_text(str(item["text"]))[:16000]}
+        elif kind in {"item.started", "item.completed"} and item_type in {"command_execution", "mcp_tool_call", "file_change"}:
+            previous = entries.get(key, {})
+            command = terminal_text(str(item.get("command") or previous.get("command") or ""))[:8000]
+            output = terminal_text(str(item.get("aggregated_output") or previous.get("output") or ""))
+            if len(output) > 12000:
+                output = "[Earlier output omitted]\n" + output[-12000:]
+            entries[key] = {"id": key, "kind": "command" if item_type == "command_execution" else "tool",
+                            "name": "Command" if item_type == "command_execution" else str(item.get("tool") or "File changes"),
+                            "status": "running" if kind == "item.started" else "finished",
+                            "command": command, "output": output, "exit_code": item.get("exit_code"),
+                            "failed": item.get("status") == "failed" or item.get("exit_code") not in (None, 0)}
+        elif kind in {"error", "turn.failed"}:
+            error = event.get("error") or {}
+            text = event.get("message") or (error.get("message") if isinstance(error, dict) else error)
+            entries[key] = {"id": key, "kind": "error", "text": terminal_text(str(text or "Worker reported an error"))[:4000]}
+        elif kind == "result":
+            entries[key] = {"id": key, "kind": "status", "text": "Worker returned its handoff. Open Deliverable to read the result."}
+    return list(entries.values())[-100:]
 
 
 def identifier(value):
@@ -120,6 +163,7 @@ def run_job(directory):
     request = read_json(directory / "request.json")
     state = {"id": directory.name, "action": request["action"], "title": request["title"],
              "decision_id": request.get("decision_id"),
+             "garden": request.get("garden", False),
              "started_at_ms": core.now_ms(), "status": "running", "supervisor_pid": os.getpid()}
     atomic_json(directory / "job.json", state)
     environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "FUSION_PROGRESS": "1"}
@@ -172,6 +216,7 @@ class ControlRoom:
                 self.add_workspace(path, save=False)
         self.default = self.add_workspace(str(workspace), save=False)["id"]
         self.children = []
+        self.garden_errors = {}
 
     def add_workspace(self, path, save=True):
         if not isinstance(path, str) or not path.strip():
@@ -234,7 +279,7 @@ class ControlRoom:
             atomic_json(path, value)
         return self.config(workspace)
 
-    def jobs(self, workspace):
+    def jobs(self, workspace, limit=100):
         results = []
         for path in (workspace / ".fusion/ui/jobs").glob("*/job.json"):
             job = read_json(path)
@@ -246,7 +291,29 @@ class ControlRoom:
             if isinstance(result, dict):
                 job["workflow_id"] = job.get("workflow_id") or result.get("workflow_id")
             results.append(job)
-        return sorted(results, key=lambda row: row.get("started_at_ms", 0), reverse=True)[:100]
+        return sorted(results, key=lambda row: row.get("started_at_ms", 0), reverse=True)[:limit]
+
+    def decisions(self, workspace):
+        rows = decision_rows(workspace)
+        jobs = self.jobs(workspace, limit=None)
+        for row in rows:
+            row['suggestions'] = row['suggestions'][-5:]
+            row['suggestion_job'] = next((j for j in jobs if j.get('decision_id') == row['id']), None)
+            if row['garden_state'] == 'needs_draft' and row['suggestion_job']:
+                row['garden_state'] = 'drafting' if row['suggestion_job']['status'] in ACTIVE else 'needs_attention'
+        config, _ = core.load_config(workspace)
+        return {'records': rows, 'learning': learning_summary(workspace, config, rows),
+                'garden': {**garden.status(self, workspace, rows), 'error': self.garden_errors.get(str(workspace))}}
+
+    def garden_tick(self):
+        with self.lock:
+            workspaces = list(self.workspaces.values())
+        for workspace in workspaces:
+            try:
+                garden.tick(self, workspace)
+                self.garden_errors.pop(str(workspace), None)
+            except Exception as exc:
+                self.garden_errors[str(workspace)] = str(exc)
 
     def overview(self, workspace):
         workflows = []
@@ -297,6 +364,11 @@ class ControlRoom:
                 current["quota"] = {"agent": result.get("agent", node.get("agent")),
                                     "route": result.get("route") or "native", "message": result.get("summary", "Provider quota exhausted")}
             result = node.get("result") or {}
+            if core.failure_class(result) == "coordinator_error":
+                current["coordinator_failure"] = {
+                    "phase": result.get("failure_phase"), "message": result.get("summary"),
+                    "detail": next(iter(result.get("blockers", [])), "Git snapshot failed"),
+                }
             if core.failure_class(result) == "permission_denied":
                 current["permission_failure"] = {
                     "agent": result.get("agent", node.get("agent")),
@@ -305,12 +377,15 @@ class ControlRoom:
             active = read_json(inside(workspace / ".fusion", f"workflows/{run_id}/nodes/{key}/active.json"))
             worker_id = active.get("run_id") or (node.get("result") or {}).get("run_id")
             current["messages"] = []
+            current["activity_entries"] = []
             if worker_id:
                 directory = inside(workspace / ".fusion", "runs/" + identifier(worker_id))
                 current["activity"] = read_json(directory / "activity.json")
                 task = read_json(directory / "task.json")
                 current["agent"] = task.get("agent", current.get("agent"))
-                for line in tail(directory / "stdout.log").splitlines():
+                stdout = tail(directory / "stdout.log", 500_000)
+                current["activity_entries"] = activity_entries(stdout)
+                for line in stdout.splitlines():
                     message = core.progress.worker_message(line)
                     if message:
                         current["messages"].append(message)
@@ -337,7 +412,7 @@ class ControlRoom:
             job["status"] = "interrupted"
         return job
 
-    def launch(self, workspace, body):
+    def launch(self, workspace, body, *, garden=False):
         action = body.get("action", "build")
         job_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
         directory = inside(workspace / ".fusion", "ui/jobs/" + job_id)
@@ -425,12 +500,16 @@ class ControlRoom:
                 raise ValueError("Choose a classifier and provide input")
             argv += ["decisions", "probe", "--kind", kind, "--", text]
         elif action == "suggest-labels":
-            from fusion_labeling import labelable
+            from fusion_labeling import labelable, labeling_options
             labelable(DecisionStore(workspace), body.get("decision_id"))
             agent = body.get("agent", "auto")
             if agent not in {"auto", "codex", "claude", "agy", "grok"}:
                 raise ValueError("Choose a labeling worker")
-            argv += ["decisions", "suggest", "--agent", agent, "--", body["decision_id"]]
+            options = labeling_options(body.get("labeling_mode", "single"), body.get("council_agents"))
+            argv += ["decisions", "suggest", "--agent", agent]
+            if options["labeling_mode"] == "council":
+                argv += ["--council", *options["council_agents"]]
+            argv += ["--", body["decision_id"]]
             mode = "off"
         elif action == "setup":
             checkpoint = body.get("checkpoint", "english")
@@ -454,10 +533,10 @@ class ControlRoom:
             raise ValueError("Unsupported action")
         if writes and body.get("allow_write") is not True:
             raise ValueError("This workflow includes implementation. Enable workspace edits before launching.")
-        with self.lock:
+        with self.lock, garden_lock(workspace, action):
             if action == "publish" and any(j["status"] in ACTIVE and j["action"] == "publish" for j in self.jobs(workspace)):
                 raise ValueError("A publication job is already active in this workspace")
-            if action == "suggest-labels" and any(j["status"] in ACTIVE and j.get("decision_id") == body["decision_id"] for j in self.jobs(workspace)):
+            if action == "suggest-labels" and any(j["status"] in ACTIVE and j.get("decision_id") == body["decision_id"] for j in self.jobs(workspace, limit=None)):
                 raise ValueError("Labels are already being drafted for this decision")
             if action in {"build", "delegate", "resume", "workflow"} and any(j["status"] in ACTIVE and j["action"] in {"build", "delegate", "resume", "workflow"} for j in self.jobs(workspace)):
                 raise ValueError("A UI workflow is already active in this workspace. Follow or stop it before launching another.")
@@ -468,13 +547,19 @@ class ControlRoom:
                 atomic_json(directory / "publication-request.json", {k: body[k] for k in ("snapshot_id", "title", "body", "draft", "accept_legacy_diff") if k in body})
             title = text[:200] or (f"Resume {body.get('run_id')}" if action == "resume" else f"{action.title()} · {body.get('kind', 'Laya')}")
             decision_id = body.get("decision_id") if action == "suggest-labels" else None
-            atomic_json(directory / "request.json", {"action": action, "title": title, "argv": argv, "workspace": str(workspace), "mode": mode, "decision_id": decision_id})
-            atomic_json(directory / "job.json", {"id": job_id, "action": action, "title": title, "status": "queued", "started_at_ms": core.now_ms(), "decision_id": decision_id})
+            learning = {"dataset": str(dataset) if action in {"train", "evaluate", "calibrate"} else "",
+                        "model_path": body.get("model_path", "")}
+            atomic_json(directory / "request.json", {"action": action, "title": title, "argv": argv, "workspace": str(workspace), "mode": mode, "decision_id": decision_id, "garden": garden, "learning": learning})
+            atomic_json(directory / "job.json", {"id": job_id, "action": action, "title": title, "status": "queued", "started_at_ms": core.now_ms(), "decision_id": decision_id, "garden": garden})
             with (directory / "supervisor.log").open("wb") as log:
                 proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--job", str(directory)],
                                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
             self.children = [child for child in self.children if child.poll() is None] + [proc]
         return self.job(workspace, job_id)
+
+
+def garden_lock(workspace, action):
+    return garden.locked(workspace, 'label-jobs') if action == 'suggest-labels' else contextlib.nullcontext()
 
 
 class Server(ThreadingHTTPServer):
@@ -486,6 +571,12 @@ class Server(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", port), Handler)
         self.origin = f"http://127.0.0.1:{self.server_port}"
         self.url = self.origin + "/#token=" + self.token
+        self.garden_checked_at = 0
+
+    def service_actions(self):
+        if time.monotonic() - self.garden_checked_at >= 3:
+            self.garden_checked_at = time.monotonic()
+            self.app.garden_tick()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -545,17 +636,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/config":
                 result = app.config(workspace)
             elif path == "/api/decisions":
-                store = DecisionStore(workspace)
-                events = read_jsonl(store.path)
-                records = store.records()[-200:][::-1]
-                for record in records:
-                    record["applications"] = [e for e in events if e.get("id") == record["id"] and e.get("event") == "application"]
-                    record["labels"] = [e for e in events if e.get("id") == record["id"] and e.get("event") == "label"]
-                    record["suggestions"] = [e for e in events if e.get("id") == record["id"] and e.get("event") == "label_suggestion"][-5:]
-                jobs = app.jobs(workspace)
-                for record in records:
-                    record["suggestion_job"] = next((j for j in jobs if j.get("decision_id") == record["id"]), None)
-                result = {"records": records}
+                result = app.decisions(workspace)
             elif path == "/api/file":
                 file = inside(workspace, query.get("path", ""))
                 relative = file.relative_to(workspace)
@@ -616,6 +697,15 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Suggested labels require explicit human approval")
                 DecisionStore(workspace).label(body.get("id"), body.get("answers", {}), body.get("evidence", ""), body.get("suggestion_id"), replace=True)
                 result = {"saved": True}
+            elif path == "/api/garden":
+                result = garden.save(app, workspace, body)
+            elif path == "/api/label-exclusion":
+                store = DecisionStore(workspace)
+                store.get(body.get('id'))
+                if type(body.get('excluded')) is not bool:
+                    raise ValueError('Choose whether to exclude this decision')
+                store.append('label_exclusion', id=body['id'], excluded=body['excluded'], source='human')
+                result = {'saved': True}
             else:
                 self.send(404, {"error": "Unknown API route"})
                 return

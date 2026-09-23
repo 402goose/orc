@@ -150,6 +150,51 @@ class LabelingTest(unittest.TestCase):
         self.store.export(path)
         self.assertEqual(json.loads(path.read_text())["labels"], {"specialty": "payments"})
 
+    def test_council_independent_prompts_consensus_and_approval_provenance(self):
+        import fusion_core as core
+        tasks = []
+        def dispatch(config, task, store):
+            tasks.append(task)
+            directory = self.workspace / '.fusion/runs' / task['agent']
+            directory.mkdir(parents=True)
+            (directory / 'answer.md').write_text(self.block(self.valid))
+            return {'status': 'success', 'exit_code': 0, 'agent': task['agent'], 'run_id': task['agent']}
+        with patch.object(core, 'dispatch', side_effect=dispatch):
+            draft = suggest(self.workspace, core.DEFAULTS, 'decision', labeling_mode='council', council_agents=['codex', 'claude'])
+        self.assertEqual(tasks[0]['task'], tasks[1]['task'])
+        self.assertNotEqual(tasks[0]['session_key'], tasks[1]['session_key'])
+        self.assertTrue(all(not task['write'] and not task['resume'] for task in tasks))
+        self.assertNotIn('prediction', tasks[0]['task'])
+        self.assertEqual(draft['answers']['specialty']['value'], 'payments')
+        self.assertEqual(draft['council']['questions']['needs_review']['state'], 'insufficient')
+        self.assertEqual(len(draft['council']['members']), 2)
+        self.assertEqual(self.store.export(self.workspace / 'before.jsonl')['examples'], 0)
+        self.store.label('decision', {'specialty': 'payments'}, 'Checked E1', draft['suggestion_id'])
+        event = read_jsonl(self.store.path)[-1]
+        self.assertEqual(event['suggested_by']['labeling_mode'], 'council')
+        self.assertFalse(event['answers_edited'])
+
+    def test_council_disagreement_and_failure_cannot_silently_become_single_worker(self):
+        import fusion_core as core
+        good = {**self.valid, 'status': 'success', 'requested_agent': 'codex', 'agent': 'codex'}
+        other = copy.deepcopy(good)
+        other.update(requested_agent='claude', agent='claude')
+        other['answers']['specialty']['value'] = 'general'
+        for member, expected in [(other, 'disputed'), ({'requested_agent': 'claude', 'status': 'error', 'error': 'quota'}, 'insufficient')]:
+            with patch('fusion_labeling.assessment', side_effect=[good, member]):
+                draft = suggest(self.workspace, core.DEFAULTS, 'decision', labeling_mode='council', council_agents=['codex', 'claude'])
+            self.assertEqual(draft['answers'], {})
+            self.assertEqual(draft['council']['questions']['specialty']['state'], expected)
+            self.assertIn('specialty', draft['abstentions'])
+        self.assertEqual(self.store.export(self.workspace / 'none.jsonl')['examples'], 0)
+
+    def test_invalid_council_never_dispatches(self):
+        import fusion_core as core
+        for members in ([], ['codex'], ['codex', 'codex'], ['auto', 'claude'], 'codex,claude'):
+            with patch.object(core, 'dispatch') as dispatch, self.assertRaises(ValueError):
+                suggest(self.workspace, core.DEFAULTS, 'decision', labeling_mode='council', council_agents=members)
+            dispatch.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

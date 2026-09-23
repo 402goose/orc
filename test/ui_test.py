@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from fusion_ui import ControlRoom, Server, atomic_json, read_json, MASK
+from fusion_ui import ControlRoom, Server, atomic_json, read_json, activity_entries, MASK
 
 
 def seed_workspace(workspace):
@@ -158,11 +158,33 @@ class ControlRoomTest(unittest.TestCase):
         self.assertIn("| Impact | Effort | Risk |", report["outputs"][-1]["text"])
         self.assertEqual(report["outputs"][-1]["findings"][0]["number"], 1)
         self.assertIn("Inspecting fixture source files", report["live_nodes"][0]["messages"])
+        self.assertEqual(report["live_nodes"][0]["activity_entries"][0]["kind"], "message")
         self.assertEqual(len(report["live_nodes"]), 2)
         before = list((self.workspace / ".fusion/runs").iterdir())
         resumed = self.app.launch(self.workspace, {"action":"resume","run_id":finished["workflow_id"],"mode":"off"})
         self.assertEqual(self.wait_job(resumed["id"])["status"], "success")
         self.assertEqual(len(list((self.workspace / ".fusion/runs").iterdir())), len(before))
+
+    def test_activity_pairs_public_commands_and_keeps_failures_inspectable(self):
+        events = [
+            {"type": "item.completed", "item": {"id": "private", "type": "reasoning", "text": "not public"}},
+            {"type": "item.completed", "item": {"id": "note", "type": "agent_message", "text": "Checking **tests**.\n\nNext step."}},
+            {"type": "item.started", "item": {"id": "cmd", "type": "command_execution", "command": "pytest"}},
+            {"type": "item.completed", "item": {"id": "cmd", "type": "command_execution", "exit_code": 1, "aggregated_output": "x" * 13000}},
+            {"type": "item.started", "item": {"id": "next", "type": "command_execution", "command": "pytest -q"}},
+            {"type": "item.completed", "item": "malformed"},
+        ]
+        entries = activity_entries('partial-json\n' + '\n'.join(map(json.dumps, events)) + '\n{"type":')
+        self.assertEqual([e['id'] for e in entries], ['note', 'cmd', 'next'])
+        self.assertIn('\n\n', entries[0]['text'])
+        self.assertEqual(entries[1]['command'], 'pytest')
+        self.assertTrue(entries[1]['failed'])
+        self.assertEqual(entries[1]['exit_code'], 1)
+        self.assertTrue(entries[1]['output'].startswith('[Earlier output omitted]'))
+        self.assertLess(len(entries[1]['output']), 12100)
+        self.assertEqual(entries[2]['status'], 'running')
+        self.assertNotIn('not public', json.dumps(entries))
+        self.assertEqual(activity_entries(json.dumps(events[3]))[0]['id'], 'cmd')
 
     def test_cancellation_survives_server_reconstruction_and_cleans_worker(self):
         job = self.app.launch(self.workspace, {"action":"delegate","agent":"codex","text":"wait fixture","mode":"off"})
@@ -237,9 +259,38 @@ class ControlRoomTest(unittest.TestCase):
         self.wait_job(job["id"], lambda j: "worker started" in j.get("console", ""))
         with self.assertRaisesRegex(ValueError, "already being drafted"):
             self.app.launch(self.workspace, {"action": "suggest-labels", "decision_id": "label-test"})
+        other_app = ControlRoom(self.workspace, self.root / 'registry.json')
+        with self.assertRaisesRegex(ValueError, "already being drafted"):
+            other_app.launch(self.workspace, {"action": "suggest-labels", "decision_id": "label-test"})
         self.assertEqual(self.request("/api/cancel", {"id": job["id"]})[0], 200)
         self.assertEqual(self.wait_job(job["id"])["status"], "cancelled")
         self.assertEqual(store.export(self.root / "cancelled.jsonl")["examples"], 0)
+
+    def test_garden_runs_without_browser_polling_and_requires_human_approval(self):
+        from fusion_decisions import read_jsonl
+        store = self.seed_decision()
+        self.assertEqual(self.request('/api/garden', {'enabled': True}, {'X-Fusion-Token': ''})[0], 401)
+        status, response, _ = self.request('/api/garden', {'enabled': True, 'agent': 'codex', 'daily_limit': 1, 'include_existing': True})
+        self.assertEqual(status, 200, response)
+        # The server scheduler, not an open/polling browser, starts the draft.
+        deadline = time.monotonic() + 10
+        while not self.app.jobs(self.workspace) and time.monotonic() < deadline:
+            time.sleep(.05)
+        job = self.wait_job(self.app.jobs(self.workspace)[0]['id'])
+        self.assertEqual(job['status'], 'success', job)
+        self.assertTrue(job['garden'])
+        self.assertEqual(store.export(self.root / 'draft-only.jsonl')['examples'], 0)
+        _, response, _ = self.request('/api/decisions')
+        view = json.loads(response)
+        self.assertEqual(view['learning']['counts']['needs_review'], 1)
+        self.assertEqual(view['learning']['labeled_questions'], 0)
+        draft = next(e for e in read_jsonl(store.path) if e.get('event') == 'label_suggestion')
+        self.request('/api/label', {'id': 'label-test', 'answers': {'plausible': 'false'}, 'evidence': 'Checked original task', 'suggestion_id': draft['suggestion_id'], 'approved': True})
+        self.assertEqual(self.request('/api/label-exclusion', {'id': 'label-test', 'excluded': True})[0], 200)
+        self.assertEqual(store.export(self.root / 'excluded.jsonl')['examples'], 0)
+        self.assertEqual(self.request('/api/label-exclusion', {'id': 'label-test', 'excluded': False})[0], 200)
+        self.assertEqual(store.export(self.root / 'restored.jsonl')['examples'], 1)
+        self.assertEqual(self.request('/api/garden', {'enabled': False})[0], 200)
 
 
 if __name__ == "__main__":

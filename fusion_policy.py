@@ -184,8 +184,11 @@ def accept_node(config, workspace, workflow_id, node, result):
 
 def recovery(config, workspace, workflow_id, node, result, accepted, max_attempts):
     import fusion_core as core
-    engine = DecisionEngine(workspace, config)
     failure = core.failure_class(result)
+    if failure == "coordinator_error":
+        progress.emit(node.get("id", "workflow"), "Fusion snapshot failed; repair the coordinator error, then resume this stage. Accepted stages remain saved.")
+        return "stop", None
+    engine = DecisionEngine(workspace, config)
     repeated = bool(node.get("repeated_failure"))
     can_retry = node["attempts"] < max_attempts and not repeated
     actual = "continue" if accepted else "stop" if failure in {"quota", "permission_denied"} or not can_retry else "repair"
