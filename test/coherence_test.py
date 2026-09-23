@@ -109,5 +109,41 @@ class CoherenceTest(unittest.TestCase):
         self.assertIn("permission_denied", seen)
 
 
+class ShippedPromptsParseCleanTest(unittest.TestCase):
+    """Every prompt we ship must survive our own handoff parser.
+
+    A prompt tells a worker how to write its BLOCKERS line, and parse_handoff
+    reads that line back. When the two disagree the run fails on a worker that
+    did exactly what it was told. This has happened twice: once from a model
+    phrasing "none." in prose, and once from SURVEY_PROMPT instructing a
+    worker to write "BLOCKERS: none when assessment is complete." - which
+    parses to one phantom blocker. Both lost real work.
+    """
+
+    def shipped_prompts(self):
+        import fusion_core
+        import fusion_truffle
+        import fusion_truffle_survey
+
+        for module in (fusion_core, fusion_truffle, fusion_truffle_survey):
+            for name, value in vars(module).items():
+                if name.isupper() and isinstance(value, str) and "BLOCKERS:" in value:
+                    yield f"{module.__name__}.{name}", value
+
+    def test_every_blockers_line_we_instruct_parses_to_no_blockers(self):
+        from fusion_core import parse_handoff
+
+        found = 0
+        for name, prompt in self.shipped_prompts():
+            for line in re.findall(r"BLOCKERS:.*", prompt):
+                found += 1
+                with self.subTest(prompt=name, line=line):
+                    self.assertEqual(
+                        parse_handoff("STATUS: success\n" + line)["blockers"], [],
+                        f"{name} instructs a BLOCKERS line our own parser reads as a blocker",
+                    )
+        self.assertTrue(found, "no shipped prompts were checked - did the modules move?")
+
+
 if __name__ == "__main__":
     unittest.main()
