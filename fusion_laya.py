@@ -129,11 +129,25 @@ def evaluate(args):
                 total += 1
                 correct += max(prediction[key], key=prediction[key].get) == label
         results.append({**row, "prediction": prediction, "model_identity": result["model_identity"]})
+    # Control: score each held-out example against another example's state. A model
+    # that scores the same here is answering from the question, not the state.
+    control_correct = control_total = 0
+    validation = [row for row in rows if row["split"] == "validation"]
+    if getattr(args, "control", False) and len(validation) > 1:
+        for index, row in enumerate(validation):
+            foreign = validation[(index + 1) % len(validation)]["state"]
+            result = backend.predict({"state": foreign, "questions": row["questions"],
+                                      "model_path": args.model_path, "device": args.device})
+            prediction = {key: distribution(result["answers"][key], q) for key, q in row["questions"].items()}
+            for key, label in row["labels"].items():
+                control_total += 1
+                control_correct += max(prediction[key], key=prediction[key].get) == label
     with output.open("x") as handle:
         for row in results:
             handle.write(json.dumps(row) + "\n")
     output.chmod(0o600)
-    return {"path": str(output), "validation_questions": total, "accuracy": correct / total if total else None}
+    return {"path": str(output), "validation_questions": total, "accuracy": correct / total if total else None,
+            "control_accuracy": control_correct / control_total if control_total else None}
 
 
 def train(args):
@@ -206,6 +220,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=0.0001)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--control", action="store_true", help="evaluate: also score held-out examples against a different example's state")
     args = parser.parse_args()
     if args.command != "warmup":
         os.environ["HF_HUB_OFFLINE"] = "1"
