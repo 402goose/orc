@@ -26,10 +26,12 @@ def add_parser(sub):
     label.add_argument("id")
     label.add_argument("answers", nargs="+", help="question=value pairs")
     label.add_argument("--evidence", required=True)
-    suggest = commands.add_parser("suggest", help="draft evidence-backed labels using a worker; requires human approval")
+    suggest = commands.add_parser("suggest", help="draft evidence-backed labels, with optional unanimous council approval")
     suggest.add_argument("id")
     suggest.add_argument("--agent", choices=["auto", "codex", "claude", "agy", "grok"], default="auto")
     suggest.add_argument("--council", nargs="+", choices=["codex", "claude", "agy", "grok"], help="independent workers; unanimous answers become a draft")
+    suggest.add_argument("--approval", choices=["human", "council"], default="human", help="opt in to automatic approval of unanimous council answers")
+    suggest.add_argument("--garden-policy", help="saved garden policy; changes or pausing revoke pending automatic approvals")
     export = commands.add_parser("export", help="export reviewed labels, split by workflow group")
     export.add_argument("output")
     calibrate = commands.add_parser("calibrate", help="fit temperature on train and assess held-out groups")
@@ -99,7 +101,8 @@ def run(args, workspace, config):
     elif command == "suggest":
         from fusion_labeling import suggest
         members = getattr(args, "council", None)
-        payload = suggest(workspace, config, args.id, args.agent, "council" if members else "single", members)
+        payload = suggest(workspace, config, args.id, args.agent, "council" if members else "single", members,
+                          getattr(args, "approval", "human"), getattr(args, "garden_policy", None))
     elif command == "label":
         if any("=" not in answer for answer in args.answers):
             raise ValueError("answers must be question=value pairs")

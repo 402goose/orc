@@ -172,7 +172,7 @@ async function checkActivityLayout(page) {
     });
     await page.goto(info.url);
     await expect(
-      page.getByRole("heading", { name: "Everything in motion." }),
+      page.getByRole("heading", { name: "Good work. Forged here." }),
     ).toBeVisible();
     await expect(page.locator(".run-row")).toHaveCount(1);
     await page.screenshot({ path: "/tmp/orc-ui-overview.png", fullPage: true });
@@ -226,8 +226,9 @@ async function checkActivityLayout(page) {
 
     await page.locator("[data-view=decisions]").click();
     await expect(
-      page.getByRole("heading", { name: "Meet the decision layer." }),
+      page.getByRole("heading", { name: "Laya lab." }),
     ).toBeVisible();
+    await page.getByRole("tab", {name: /^Review/}).click();
     await page.selectOption("#label-worker", "codex");
     await page.getByRole("button", { name: "Suggest labels", exact: true }).click();
     await expect(page.getByRole("heading", { name: "Suggested assessment" })).toBeVisible({ timeout: 15000 });
@@ -257,6 +258,9 @@ async function checkActivityLayout(page) {
     await expect(page.locator("#label-form")).toContainText(
       "1 review(s) saved",
     );
+    await expect(page.locator('.label-saved-status')).toContainText('No further approval is required.');
+    await expect(page.locator('.review-form')).not.toContainText('Waiting for human approval');
+    await expect(page.getByRole('button', {name:'Save label changes',exact:true})).toBeDisabled();
     const label = decisionEvents().filter(e => e.event === "label").at(-1);
     expect(label.source).toBe("human_approved_suggestion");
     expect(label.verified).toBe(true);
@@ -361,7 +365,7 @@ async function checkActivityLayout(page) {
     await page.locator("[data-view=overview]").click();
     await page.setViewportSize({ width: 390, height: 844 });
     await expect(
-      page.getByRole("heading", { name: "Everything in motion." }),
+      page.getByRole("heading", { name: "Good work. Forged here." }),
     ).toBeVisible();
     expect(
       await page.evaluate(

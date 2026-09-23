@@ -29,7 +29,7 @@ const path = require('node:path');
   await expect(fresh.locator('#connection')).toHaveText('live');
   await expect(old.locator('.learning-dashboard')).toBeVisible();
   await expect(old.locator('#error-banner')).toBeHidden();
-  expect(new URL(old.url()).hash).toBe('#decisions');
+  expect(new URL(old.url()).hash).toMatch(/^#decisions\/overview\?w=/);
   const bookmark=await context.newPage();
   await bookmark.goto(origin+'/#workflows');
   await expect(bookmark.locator('#connection')).toHaveText('live');
@@ -37,13 +37,15 @@ const path = require('node:path');
 
   // Reconnection must not discard label edits, change view, or replay a POST.
   await old.bringToFront();
+  await old.getByRole('tab',{name:/^Review/}).click();
+  const reviewURL=old.url();
   await old.locator('#label-evidence').fill('Keep my unsaved evidence');
   await old.evaluate(()=>{token='expired';state.authRequired=true;});
   await fresh.evaluate(()=>localStorage.removeItem('fusion-token'));
   await fresh.evaluate(()=>api('bootstrap'));
   await expect(old.locator('#connection')).toHaveText('live');
   await expect(old.locator('#label-evidence')).toHaveValue('Keep my unsaved evidence');
-  expect(new URL(old.url()).hash).toBe('#decisions');
+  expect(old.url()).toBe(reviewURL);
   let posts=0;
   await old.route('**/api/garden?*',route=>{posts++;return route.fulfill({status:401,json:{error:'Expired connection'}});});
   const result=await old.evaluate(async()=>{token='expired';try{await api('garden',{enabled:false});return 'unexpected success';}catch(e){return e.message;}});

@@ -8,16 +8,18 @@
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
     <script src="/appearance.js"></script>
     <link rel="stylesheet" href="/style.css" />
+    <link rel="stylesheet" href="/brand.css" />
+    <script src="/brand.js" defer></script>
     <script src="/vendor/marked.js" defer></script>
     <script src="/vendor/purify.js" defer></script>
     <script src="/app.js" defer></script>
   </head>
   <body>
     <aside class="sidebar">
-      <a class="brand" href="#overview" aria-label="ORC home"
-        ><span class="brand-mark">o<span>r</span>c</span
-        ><span class="brand-label">CONTROL ROOM</span></a
-      >
+      <a class="brand" href="#overview" aria-label="ORC home">
+        <span class="brand-crest"><svg viewBox="250 150 1280 595" role="img" aria-label="ORC — tusked orc emblem and wordmark"><image href="/brand/orc-logo.png" width="1774" height="887" /></svg></span>
+        <span class="brand-label">THE GUILD · CONTROL ROOM</span>
+      </a>
       <div class="workspace-label">
         WORKSPACE
         <button
@@ -32,25 +34,26 @@
       <div id="workspace-path" class="workspace-path"></div>
       <nav aria-label="Main navigation">
         <button data-view="overview" class="nav-item active">
-          <span>◫</span> Overview <kbd>1</kbd>
+          <span data-brand-icon="orc" aria-hidden="true"></span> Overview <kbd>1</kbd>
         </button>
         <button data-view="workflows" class="nav-item">
-          <span>⌘</span> Workflows <kbd>2</kbd>
+          <span data-brand-icon="forge" aria-hidden="true"></span> Workflows <kbd>2</kbd>
         </button>
         <button data-view="truffle" class="nav-item">
-          <span>🐽</span> Truffle pig
+          <span data-brand-icon="truffle" aria-hidden="true"></span> Truffle pig
         </button>
         <button data-view="decisions" class="nav-item">
-          <span>◇</span> Laya lab <kbd>3</kbd>
+          <span data-brand-icon="rune" aria-hidden="true"></span> Laya lab <kbd>3</kbd>
         </button>
         <button data-view="models" class="nav-item">
-          <span>▤</span> ORC models <kbd>4</kbd>
+          <span data-brand-icon="library" aria-hidden="true"></span> ORC models <kbd>4</kbd>
         </button>
         <button data-view="settings" class="nav-item">
-          <span>⚙</span> Settings <kbd>5</kbd>
+          <span data-brand-icon="gear" aria-hidden="true"></span> Settings <kbd>5</kbd>
         </button>
       </nav>
       <div class="sidebar-bottom">
+        <button class="subtle guild-guide-link" data-action="guild-guide"><span data-brand-icon="scroll" aria-hidden="true"></span> Meet the guild</button>
         <button
           id="appearance"
           class="appearance-shortcut"
@@ -61,7 +64,7 @@
         <div class="local-status">
           <i></i> Local connection <span id="connection">live</span>
         </div>
-        <p>Your agents. Your machine.<br />Your work, in one place.</p>
+        <p>Big tusks. Small diffs.<br />Show your work.</p>
         <button id="shortcuts" class="subtle">
           Keyboard shortcuts <kbd>?</kbd>
         </button>

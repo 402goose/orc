@@ -1,10 +1,12 @@
-"""Evidence-backed label drafts. Only a separate human approval creates labels."""
+"""Evidence-backed label drafts with human or explicitly enabled council approval."""
 from __future__ import annotations
 
 import json
+import contextlib
 import os
 from pathlib import Path
 import re
+import time
 import uuid
 
 from fusion_decisions import DecisionStore, digest, labels_for, read_jsonl
@@ -107,7 +109,15 @@ def labeling_options(mode="single", members=None):
     return {"labeling_mode": mode, "council_agents": members}
 
 
-def assessment(workspace, config, record, sources, agent):
+def approval_options(mode="human", labeling_mode="single"):
+    if mode not in {"human", "council"}:
+        raise ValueError("Choose human or unanimous council approval")
+    if mode == "council" and labeling_mode != "council":
+        raise ValueError("Automatic approval requires an agent council with at least two members")
+    return mode
+
+
+def assessment(workspace, config, record, sources, agent, on_started=None):
     import fusion_core as core
     prompt = """Draft training labels for a human to review. This is LABEL_SUGGESTION_V1.
 Judge the original decision input against each question's exact instructions and criteria.
@@ -134,6 +144,8 @@ BLOCKERS: none when your assessment is complete, including when evidence is insu
     task = core.make_task(Path(workspace), agent, prompt, "labeling", [],
                           ["Assess the supplied evidence only; do not edit or delegate."],
                           "label-suggestion:" + uuid.uuid4().hex, False, False)
+    if on_started:
+        on_started(task["run_id"])
     # Labeling must not recursively invoke the classifier being trained.
     worker_config = core.deep_merge(config, {"decisions": {"mode": "off"}})
     previous_mode = os.environ.get("FUSION_DECISIONS_MODE")
@@ -176,28 +188,50 @@ def council_consensus(record, members):
     return {"answers": answers, "abstentions": abstentions, "questions": questions}
 
 
-def suggest(workspace, config, decision_id, agent="auto", labeling_mode="single", council_agents=None):
+def suggest(workspace, config, decision_id, agent="auto", labeling_mode="single", council_agents=None,
+            approval_mode="human", garden_policy=None):
     import sys
+    from fusion_publish import save
     if agent not in WORKERS | {"auto"}:
         raise ValueError("Choose an installed labeling worker")
     options = labeling_options(labeling_mode, council_agents)
+    approval_options(approval_mode, labeling_mode)
     store = DecisionStore(workspace)
     record = labelable(store, decision_id)
     sources = evidence_bundle(workspace, record)
     members = []
     selected = options["council_agents"] if labeling_mode == "council" else [agent]
     assessment_id = uuid.uuid4().hex
-    for index, worker in enumerate(selected):
-        print(f"Label assessment {index + 1}/{len(selected)} · {worker}: reading the original evidence independently", file=sys.stderr, flush=True)
-        try:
-            member = assessment(workspace, config, record, sources, worker)
-        except (OSError, ValueError, RuntimeError) as exc:
-            member = {"requested_agent": worker, "agent": worker, "status": "error", "error": str(exc)}
-        members.append(member)
-        # Retain individual outcomes even if a later worker fails or the job is stopped.
-        store.append("label_assessment", id=decision_id, assessment_id=assessment_id, **member)
-        print(f"Label assessment {index + 1}/{len(selected)} · {worker}: {member['status']}", file=sys.stderr, flush=True)
+    live = {"id": assessment_id, "decision_id": decision_id, "status": "running", "phase": "assessing",
+            "pid": os.getpid(), "started_at_ms": int(time.time() * 1000), "labeling_mode": labeling_mode,
+            "approval_mode": approval_mode, "members": [{"requested_agent": worker, "status": "pending"} for worker in selected]}
+    live_path = store.root / "assessments" / (assessment_id + ".json")
+    save(live_path, live)
+    try:
+        for index, worker in enumerate(selected):
+            print(f"Label assessment {index + 1}/{len(selected)} · {worker}: reading the original evidence independently", file=sys.stderr, flush=True)
+            live["members"][index].update(status="running", started_at_ms=int(time.time() * 1000))
+            save(live_path, live)
+            def started(run_id):
+                live["members"][index]["run_id"] = run_id
+                save(live_path, live)
+            try:
+                member = assessment(workspace, config, record, sources, worker, on_started=started)
+            except (OSError, ValueError, RuntimeError) as exc:
+                member = {"requested_agent": worker, "agent": worker, "status": "error", "error": str(exc)}
+            members.append(member)
+            live["members"][index].update(**member, finished_at_ms=int(time.time() * 1000))
+            save(live_path, live)
+            # Retain individual outcomes even if a later worker fails or the job is stopped.
+            store.append("label_assessment", id=decision_id, assessment_id=assessment_id, **member)
+            print(f"Label assessment {index + 1}/{len(selected)} · {worker}: {member['status']}", file=sys.stderr, flush=True)
+    except BaseException as exc:
+        live.update(status="interrupted", phase="interrupted", error=str(exc) or "Assessment stopped; no automatic approval", finished_at_ms=int(time.time() * 1000))
+        save(live_path, live)
+        raise
     if not any(m["status"] == "success" for m in members):
+        live.update(status="failed", phase="failed", finished_at_ms=int(time.time() * 1000))
+        save(live_path, live)
         raise ValueError("; ".join(m["error"] for m in members))
     if labeling_mode == "council":
         consensus = council_consensus(record, members)
@@ -209,9 +243,68 @@ def suggest(workspace, config, decision_id, agent="auto", labeling_mode="single"
         metadata = {k: members[0].get(k) for k in ("agent", "model", "run_id", "usage")}
     suggestion = {"suggestion_id": uuid.uuid4().hex, "decision_hash": digest({k: record.get(k) for k in ("state", "questions", "schema_hash")}),
                   **parsed, **metadata, "sources": sources, "assessment_id": assessment_id,
-                  "labeling_mode": labeling_mode, "verified": False}
+                  "labeling_mode": labeling_mode, "approval_mode": approval_mode, "verified": False}
     store.append("label_suggestion", id=decision_id, **suggestion)
-    return {"decision_id": decision_id, **suggestion}
+    live.update(phase="approval" if approval_mode == "council" else "needs_review", suggestion_id=suggestion["suggestion_id"],
+                questions=metadata.get("council", {}).get("questions", {}))
+    save(live_path, live)
+    approval = {"status": "needs_review", "answers": {}, "reason": "Waiting for human approval"}
+    if approval_mode == "council":
+        try:
+            approval = approve_council(workspace, decision_id, suggestion["suggestion_id"], garden_policy)
+        except (OSError, ValueError, RuntimeError) as exc:
+            approval = {"status": "needs_review", "answers": {}, "reason": str(exc)}
+        print(f"Council approval: {approval['status']} · {approval['reason']}", file=sys.stderr, flush=True)
+    live.update(status="success", phase=approval["status"], approval=approval, finished_at_ms=int(time.time() * 1000))
+    save(live_path, live)
+    return {"decision_id": decision_id, **suggestion, "approval": approval}
+
+
+def approve_council(workspace, decision_id, suggestion_id, garden_policy=None):
+    """Explicitly enabled council approvals never overwrite a human review."""
+    from fusion_decisions import reviewed_labels
+    from fusion_garden import locked, settings
+    store = DecisionStore(workspace)
+    with (locked(workspace) if garden_policy else contextlib.nullcontext()), store.review_lock():
+        if garden_policy:
+            current = settings(workspace)
+            if not current['enabled'] or current['approval_mode'] != 'council' or current.get('policy_id') != garden_policy:
+                return {"status": "needs_review", "answers": {}, "reason": "Automatic approval was paused or its settings changed"}
+        record = labelable(store, decision_id)
+        events = read_jsonl(store.path)
+        own = [e for e in events if e.get('id') == decision_id]
+        _, exclusions = reviewed_labels(own)
+        if exclusions.get(decision_id):
+            return {"status": "needs_review", "answers": {}, "reason": "Example was excluded; no approval saved"}
+        labels = [e for e in own if e.get('event') == 'label' and e.get('verified')]
+        existing = next((e for e in labels if e.get('suggestion_id') == suggestion_id and e.get('source') == 'council_approved_suggestion'), None)
+        if any(e.get('source') != 'council_approved_suggestion' for e in labels):
+            return {"status": "needs_review", "answers": {}, "reason": "Human-reviewed labels were preserved"}
+        if existing:
+            pending = sorted(set(record['questions']) - set(existing['answers']))
+            return {"status": "partial" if pending else "approved", "answers": existing['answers'], "pending": pending, "reason": "Council approval already saved"}
+        suggestions = [e for e in own if e.get('event') == 'label_suggestion']
+        if not suggestions or suggestions[-1].get('suggestion_id') != suggestion_id:
+            raise ValueError("A newer draft exists; old drafts cannot be automatically approved")
+        suggestion = suggestions[-1]
+        approval_provenance(store, record, suggestion_id, {})  # Reject changed decision inputs.
+        members = suggestion.get('council', {}).get('members', [])
+        labeling_options('council', [m.get('requested_agent') for m in members])
+        for member in members:
+            if member.get('status') == 'success':
+                parse_suggestion('```label-suggestion\n' + json.dumps({k: member[k] for k in ('answers', 'abstentions')}) + '\n```', record, suggestion['sources'])
+        consensus = council_consensus(record, members)
+        answers = {key: item['value'] for key, item in consensus['answers'].items()}
+        if not answers:
+            return {"status": "needs_review", "answers": {}, "reason": "No unanimous, evidence-backed answers; review the disagreements or missing evidence"}
+        evidence = '\n\n'.join(f"{key} = {item['value']}: {item['reason']} [{', '.join(item['evidence'])}]" for key, item in consensus['answers'].items())
+        reviewers = [{k: m.get(k) for k in ('requested_agent', 'agent', 'model', 'run_id')} for m in members]
+        store.append('label', id=decision_id, answers=answers, evidence=evidence, verified=True, replace=False,
+                     source='council_approved_suggestion', suggestion_id=suggestion_id, approval_rule='unanimous',
+                     reviewers=reviewers, suggested_by={'agent': 'council', 'labeling_mode': 'council', 'assessment_id': suggestion.get('assessment_id')})
+        pending = sorted(set(record['questions']) - set(answers))
+        return {"status": "partial" if pending else "approved", "answers": answers, "pending": pending,
+                "reason": f"{len(answers)} answers approved by {len(members)} unanimous council members" + (f"; {len(pending)} still need review" if pending else "")}
 
 
 def approval_provenance(store, record, suggestion_id, answers):
