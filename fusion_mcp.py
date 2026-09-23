@@ -75,9 +75,12 @@ def orientation(workspace: Path) -> dict[str, Any]:
     Deliberately cheap: reads artifacts already on disk, starts nothing, and
     never contacts a provider.
     """
-    manifests = _manifests(workspace)
+    # Scan a wider window than is displayed: a long run can be older than the
+    # ten most recent and still be going, and hiding it is the one mistake an
+    # orientation command must not make.
+    manifests = _manifests(workspace, limit=60)
     workflows = []
-    for manifest in manifests[:10]:
+    for manifest in manifests:
         workflows.append(
             {
                 "workflow_id": manifest.get("workflow_id"),
@@ -90,6 +93,7 @@ def orientation(workspace: Path) -> dict[str, Any]:
             }
         )
     active = [w for w in workflows if w["status"] in {"running", "queued"}]
+    recent = workflows[:10]
 
     laya: dict[str, Any] = {"mode": "unknown"}
     try:
@@ -109,10 +113,10 @@ def orientation(workspace: Path) -> dict[str, Any]:
     return {
         "workspace": str(workspace),
         "active_workflows": active,
-        "recent_workflows": workflows,
+        "recent_workflows": recent,
         "workflow_spend_usd": round(spend, 4),
         "laya": laya,
-        "next": _suggest(active, workflows),
+        "next": _suggest(active, recent),
     }
 
 
@@ -490,12 +494,17 @@ def cancel_run(workspace: Path, workflow_id: str, *, kill=None) -> dict[str, Any
     pid = manifest.get("coordinator_pid")
     if not pid or process_alive(pid) is False:
         return {"workflow_id": workflow_id, "cancelled": False, "reason": "coordinator is not running"}
-    killer = kill or (lambda target: os.kill(target, signal.SIGTERM))
+    # SIGINT, not SIGTERM. The coordinator installs a handler for SIGINT only
+    # (fusion_progress.py), which sets the cancelled flag and unwinds through
+    # the cleanup path that stops each worker. Workers start their own session,
+    # so killing the coordinator does not cascade to them: a SIGTERM here would
+    # take down the coordinator and leave its workers running, still billing.
+    killer = kill or (lambda target, sig: os.kill(target, sig))
     try:
-        killer(int(pid))
+        killer(int(pid), signal.SIGINT)
     except (OSError, ValueError) as exc:
         return {"workflow_id": workflow_id, "cancelled": False, "reason": str(exc)}
-    return {"workflow_id": workflow_id, "cancelled": True, "pid": pid}
+    return {"workflow_id": workflow_id, "cancelled": True, "pid": pid, "signal": "SIGINT"}
 
 
 ASYNC_TOOLS: list[dict[str, Any]] = [

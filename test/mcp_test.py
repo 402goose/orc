@@ -232,14 +232,42 @@ class RunHandleTest(unittest.TestCase):
         result = fusion_mcp.cancel_run(self.workspace, "wf-1")
         self.assertFalse(result["cancelled"])
 
-    def test_cancel_signals_a_live_coordinator(self):
+    def test_cancel_sends_sigint_so_workers_are_cleaned_up(self):
+        # Found by having ORC review this file: the coordinator installs a
+        # handler for SIGINT only, and workers run in their own session. A
+        # SIGTERM kills the coordinator outright and orphans its workers, which
+        # keep running and keep billing. The signal is the whole fix.
         import os
+        import signal
 
         write_manifest(self.workspace, "wf-1", status="running", coordinator_pid=os.getpid())
         sent = []
-        result = fusion_mcp.cancel_run(self.workspace, "wf-1", kill=sent.append)
+        result = fusion_mcp.cancel_run(
+            self.workspace, "wf-1", kill=lambda pid, sig: sent.append((pid, sig))
+        )
         self.assertTrue(result["cancelled"])
-        self.assertEqual(sent, [os.getpid()])
+        self.assertEqual(sent, [(os.getpid(), signal.SIGINT)])
+
+
+class ActiveWorkflowVisibilityTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_a_running_workflow_older_than_the_display_window_is_still_active(self):
+        # Orientation shows ten runs but must never hide a live one behind them.
+        import os
+
+        for index in range(14):
+            write_manifest(self.workspace, f"wf-{index:03d}", status="success")
+        write_manifest(
+            self.workspace, "wf-000-long", status="running", coordinator_pid=os.getpid()
+        )
+        state = fusion_mcp.orientation(self.workspace)
+        self.assertEqual(len(state["recent_workflows"]), 10)
+        self.assertIn("wf-000-long", [w["workflow_id"] for w in state["active_workflows"]])
+        self.assertIn("running", state["next"])
 
 
 class ToolContractTest(unittest.TestCase):
