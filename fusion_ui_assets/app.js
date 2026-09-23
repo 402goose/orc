@@ -57,12 +57,25 @@ const state = {
   polling: false,
   signature: "",
 };
+// localStorage, not sessionStorage: the capability is stable per machine, so a
+// second tab and a later restart should both just work. The fragment is only
+// cleared once it has been stored, so a bookmarked URL keeps working if not.
 let token = new URLSearchParams(location.hash.slice(1)).get("token");
 if (token) {
-  sessionStorage.setItem("fusion-token", token);
-  history.replaceState(null, "", "#overview");
+  let stored = false;
+  try {
+    localStorage.setItem("fusion-token", token);
+    stored = true;
+  } catch (error) {
+    /* private window or blocked storage: keep the fragment as the only copy */
+  }
+  if (stored) history.replaceState(null, "", "#overview");
 }
-token ||= sessionStorage.getItem("fusion-token") || "";
+try {
+  token ||= localStorage.getItem("fusion-token") || "";
+} catch (error) {
+  token ||= "";
+}
 
 async function api(path, body, workspace = state.workspace) {
   const url = new URL("/api/" + path, location.origin);
