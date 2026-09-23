@@ -184,6 +184,21 @@ class RunHandleTest(unittest.TestCase):
         self.assertIsNone(result["workflow_id"])
         self.assertEqual(result["status"], "starting")
 
+    def test_reports_failed_when_the_launch_dies_before_registering(self):
+        # Found by dogfooding: a null handle with no explanation left the client
+        # with nothing. A dead launch and a slow one are different answers.
+        class DeadProc:
+            pid = 1
+            def poll(self):
+                return 1
+
+        result = fusion_mcp.start_run(
+            self.workspace, "add tests", "build",
+            spawn=lambda argv, **kw: DeadProc(), sleep=lambda _s: None,
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("error", result)
+
     def test_rejects_an_empty_request_and_an_unknown_kind(self):
         with self.assertRaises(ValueError):
             fusion_mcp.start_run(self.workspace, "   ", "build", spawn=self.fake_spawn(None))

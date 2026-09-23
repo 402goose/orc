@@ -346,7 +346,7 @@ def start_run(
     kind: str = "build",
     *,
     base: str | None = None,
-    wait_seconds: float = 25.0,
+    wait_seconds: float = 90.0,
     spawn=subprocess.Popen,
     now=time.monotonic,
     sleep=time.sleep,
@@ -394,8 +394,10 @@ def start_run(
     finally:
         handle.close()
 
-    # Builds register before loading Laya or fetching issues, so the directory
-    # appears quickly. Poll for it rather than guessing the id.
+    # The workflow id is minted by the coordinator, so poll for the directory
+    # rather than guessing it. Intake (config, model catalog, Laya) runs first,
+    # and measured against this repo that takes ~30s before registration.
+    pid = getattr(proc, "pid", None)
     deadline = now() + wait_seconds
     while now() < deadline:
         new = _workflow_ids(workspace) - before
@@ -405,22 +407,45 @@ def start_run(
                 "workflow_id": workflow_id,
                 "status": "running",
                 "kind": kind,
-                "pid": getattr(proc, "pid", None),
+                "pid": pid,
                 "poll_with": "fusion_run_status",
                 "evidence": [f"orc://workflow/{workflow_id}/report"],
             }
+        if _launch_died(proc):
+            return {
+                "workflow_id": None,
+                "status": "failed",
+                "kind": kind,
+                "pid": pid,
+                "error": "the run exited before registering a workflow",
+                "log": _tail(workspace / ".fusion" / "mcp-launch.log"),
+            }
         sleep(0.25)
 
+    # Still alive but slow. Say so honestly rather than inventing a handle, and
+    # leave the caller a way to recover one.
     return {
         "workflow_id": None,
         "status": "starting",
         "kind": kind,
-        "pid": getattr(proc, "pid", None),
+        "pid": pid,
         "note": (
-            "The run was launched but has not registered a workflow directory yet. "
-            "Call fusion_here to pick it up."
+            "Launched, but it has not registered a workflow directory yet. It is "
+            "still running: call fusion_here to pick up the handle."
         ),
     }
+
+
+def _launch_died(proc) -> bool:
+    poll = getattr(proc, "poll", None)
+    return bool(poll and poll() is not None)
+
+
+def _tail(path: Path, limit: int = 2000) -> str:
+    try:
+        return path.read_text(errors="replace")[-limit:]
+    except OSError:
+        return ""
 
 
 def run_status(workspace: Path, workflow_id: str) -> dict[str, Any]:
