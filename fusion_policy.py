@@ -13,8 +13,15 @@ def context(task):
     return {"task_id": task["run_id"], "group": task.get("parent_task_id") or task["run_id"]}
 
 
-def route_candidates(config, task, store):
+def route_candidates(config, task, store, rejected=None):
+    """Pass `rejected` to collect why each lane was dropped. The reasons live
+    beside the checks that produce them so an explanation can never drift from
+    the filter it is explaining."""
     import fusion_core as core
+
+    def drop(key, why):
+        if rejected is not None:
+            rejected.setdefault(key, why)
     yolo = core.execution_mode(config) == "yolo"
     history = defaultdict(list)
     outcomes = {event["task_id"]: event["accepted"] for event in read_jsonl(DecisionStore(task["workspace"]).path)
@@ -52,19 +59,27 @@ def route_candidates(config, task, store):
     if task.get("prefer_different_agent"):
         candidates.sort(key=lambda item: item[1] == task["prefer_different_agent"])
     for key, agent, route in candidates:
-        if key in unhealthy or agent not in {"claude", "codex", "agy", "grok"}:
+        if key in unhealthy:
+            drop(key, "a recent run on this lane hit a quota or permission limit")
+            continue
+        if agent not in {"claude", "codex", "agy", "grok"}:
             continue
         settings = core.agent_settings(config, {"agent": agent, "route": route})
         if (agent, settings.get("command", agent)) in unavailable_commands:
+            drop(key, f"{settings.get('command', agent)} is already known to be unavailable this run")
             continue
         if not core.executable(settings.get("command", agent)):
+            drop(key, f"{settings.get('command', agent)} is not on PATH")
             continue
         if not yolo and agent == "agy" and not core.agy_headless_status(settings)["automatic_ready"]:
+            drop(key, core.agy_headless_status(settings).get("reason", "agy is not ready for headless use"))
             continue
         # Named read-only routes cannot be repurposed into writer routes.
         if not yolo and task.get("write") and (settings.get("sandbox") == "read-only" or settings.get("permission_mode") == "plan" or settings.get("mode") == "plan"):
+            drop(key, "read-only or plan-mode lane cannot take a task that writes")
             continue
         if not yolo and not task.get("write") and settings.get("mode") in {"yolo", "auto", "accept-edits"}:
+            drop(key, f"{settings.get('mode')} mode is too permissive for a read-only task")
             continue
         command = str(settings.get("command", agent))
         if Path(command).name == "orc":
@@ -72,13 +87,16 @@ def route_candidates(config, task, store):
             model = settings.get("model")
             if model:
                 if model not in core._orc_model_ids(command, ["--fit"]):
+                    drop(key, f"{model} has no passing `orc probe --fit` evidence")
                     continue
             else:
                 try:
                     model = core.select_orc_model(command, str(settings.get("model_selector", "best")), False)
-                except (ValueError, RuntimeError, OSError):
+                except (ValueError, RuntimeError, OSError) as exc:
+                    drop(key, f"no ORC model passed tool-fit for this route ({exc})")
                     continue
             if not model:
+                drop(key, "no ORC model passed tool-fit for this route")
                 continue
         else:
             model = settings.get("model", "")
@@ -88,6 +106,7 @@ def route_candidates(config, task, store):
                  if "cost_usd" in span.get("usage", {}) or "cost" in span.get("usage", {})]
         mean_cost = sum(costs) / len(costs) if costs else None
         if task.get("budget_remaining_usd") is not None and mean_cost is not None and mean_cost > task["budget_remaining_usd"]:
+            drop(key, f"its average reported cost ${mean_cost:.4f} exceeds the ${task['budget_remaining_usd']:.4f} left in the budget")
             continue
         choices.append({"key": key, "agent": agent, "route": route, "model": model,
                         "runs": len(spans), "reported_success_rate": sum(s.get("status") == "success" for s in spans) / len(spans) if spans else None,
@@ -97,6 +116,21 @@ def route_candidates(config, task, store):
         if len(choices) == 8:
             break
     return choices
+
+
+def no_route_reason(config, task, store):
+    """Say which lane was dropped and why, instead of only that none survived.
+
+    Without this the first real failure on an installed machine is an
+    implementation node reporting that no route is available, with nothing
+    naming the binary that is missing or the read-only lane that cannot write.
+    """
+    rejected = {}
+    route_candidates(config, task, store, rejected)
+    detail = "; ".join(f"{key}: {why}" for key, why in sorted(rejected.items())) or "no lane is configured"
+    scope = "that can write" if task.get("write") else "for a read-only task"
+    return (f"no permitted worker is available {scope} -- {detail}. "
+            "Run `fusion doctor` to see every lane and its command.")
 
 
 def route_task(config, task, store):
@@ -118,7 +152,7 @@ def route_task(config, task, store):
             "model": task.get("settings_overrides", {}).get("model", ""),
         }]
     if not candidates:
-        raise ValueError("no healthy, permitted agent route is available")
+        raise ValueError(no_route_reason(config, task, store))
     selected, applied, record = candidates[0], False, None
     # A single candidate is not a choice: nothing to record, and Laya rejects one-option choices.
     if len(candidates) > 1:
