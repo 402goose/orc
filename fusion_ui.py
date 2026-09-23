@@ -28,6 +28,7 @@ import webbrowser
 import fusion_core as core
 import fusion_publish as publishing
 import fusion_garden as garden
+import fusion_truffle as truffle
 from fusion_learning import decision_rows, learning_summary
 from fusion_decisions import DecisionEngine, DecisionStore, config_for, read_jsonl
 from fusion_report import finding_request, format_report, reported_cost, select_report, terminal_text
@@ -341,7 +342,7 @@ class ControlRoom:
         spans = core.RunStore(workspace).traces(10000)
         worker_spans = [span for span in spans if span.get("agent") != "gate" and span.get("status") != "cache_hit"]
         return {"workflows": workflows[:200], "builds": sorted(builds, key=lambda b: b.get("started_at_ms", 0), reverse=True)[:30],
-                "jobs": self.jobs(workspace), "usage": core.usage_summary(spans),
+                "jobs": self.jobs(workspace), "hunts": truffle.history(workspace), "usage": core.usage_summary(spans),
                 "cost": {"calls": len(worker_spans), "reported_calls": sum(reported_cost(span.get("usage")) is not None for span in worker_spans)},
                 "now_ms": core.now_ms()}
 
@@ -450,6 +451,30 @@ class ControlRoom:
                 raise ValueError("Describe the task or paste a GitHub issue URL")
             argv += ["--", text]
             writes = kind in {"build", "debug"} and not prepare
+        elif action == "truffle-hunt":
+            settings = truffle.hunt_options(count=int(body.get("count", 5)), scan_limit=int(body.get("scan_limit", 40)),
+                                            search=body.get("search", ""), agent=body.get("agent", "auto"),
+                                            remote=body.get("remote", "origin"), include_assigned=body.get("include_assigned", False))
+            argv += ["truffle", "hunt", "--count", str(settings["count"]), "--scan-limit", str(settings["scan_limit"]),
+                     "--search", settings["search"], "--agent", settings["agent"], "--remote", settings["remote"]]
+            if settings["include_assigned"]:
+                argv += ["--include-assigned"]
+            text = f"Truffle pig · find up to {settings['count']} issues"
+        elif action == "truffle-run":
+            truffle.selection(workspace, body.get("scout_id"), body.get("issues"))
+            config, _ = core.load_config(workspace)
+            opts = publishing.options(config, body.get("publish"))
+            if opts["mode"] == "off":
+                raise ValueError("Choose manual or automatic PR mode for isolated issue fixes")
+            attempts = int(body.get("attempts", 2))
+            if not 1 <= attempts <= 5:
+                raise ValueError("Attempts must be 1–5")
+            argv += ["truffle", "run", body["scout_id"], "--issues", *map(str, body["issues"]),
+                     "--publish", opts["mode"], "--base", opts["base"], "--remote", opts["remote"], "--max-attempts", str(attempts)]
+            if not opts["draft"]:
+                argv += ["--ready"]
+            writes = True
+            text = f"Truffle pig · resolve {len(body['issues'])} issues"
         elif action == "publish":
             run_id = identifier(body.get("run_id"))
             publishing.eligible(workflow_status(workspace, run_id))
@@ -538,7 +563,7 @@ class ControlRoom:
                 raise ValueError("A publication job is already active in this workspace")
             if action == "suggest-labels" and any(j["status"] in ACTIVE and j.get("decision_id") == body["decision_id"] for j in self.jobs(workspace, limit=None)):
                 raise ValueError("Labels are already being drafted for this decision")
-            if action in {"build", "delegate", "resume", "workflow"} and any(j["status"] in ACTIVE and j["action"] in {"build", "delegate", "resume", "workflow"} for j in self.jobs(workspace)):
+            if action in {"build", "delegate", "resume", "workflow", "truffle-hunt", "truffle-run"} and any(j["status"] in ACTIVE and j["action"] in {"build", "delegate", "resume", "workflow", "truffle-hunt", "truffle-run"} for j in self.jobs(workspace)):
                 raise ValueError("A UI workflow is already active in this workspace. Follow or stop it before launching another.")
             directory.mkdir(parents=True, mode=0o700)
             if spec:
@@ -629,6 +654,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = {"default": app.default, "workspaces": [{"id": key, "name": p.name, "path": str(p)} for key, p in app.workspaces.items()]}
             elif path == "/api/overview":
                 result = app.overview(workspace)
+            elif path == "/api/truffle":
+                result = truffle.receipt(workspace, query.get("id"))
             elif path == "/api/workflow":
                 result = app.workflow(workspace, query.get("id"))
             elif path == "/api/job":

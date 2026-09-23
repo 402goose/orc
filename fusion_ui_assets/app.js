@@ -47,6 +47,8 @@ const state = {
   overview: null,
   config: null,
   report: null,
+  scout: null,
+  truffleSelection: {},
   decisions: [],
   decision: null,
   labelDrafts: {},
@@ -365,6 +367,7 @@ function overview() {
       )
       .join("")}</div>
     <aside><div class="section-bar"><h2>Start with a direction</h2></div><div class="panel">${[
+      ["truffle", "🐽", "Send in the Truffle pig", "Find tractable open issues. Queue the fixes worth doing."],
       [
         "audit",
         "◈",
@@ -409,6 +412,38 @@ function workflows() {
     ) +
       `<div class="filter-bar"><input id="run-search" placeholder="Search tasks, run IDs, or agents…" aria-label="Search workflows" value="${esc(state.search)}"><select id="run-filter" aria-label="Filter status">${["all", "running", "success", "failed", "blocked", "interrupted", "paused_quota", "paused_budget"].map((s) => `<option value="${s}" ${s === state.filter ? "selected" : ""}>${s === "all" ? "All statuses" : s.replaceAll("_", " ")}</option>`).join("")}</select><small>${runs.length} runs</small></div><div id="run-results">${runs.length ? `<div class="panel">${runRows(runs)}</div>` : empty("No matching workflows.", "Try another filter or start a new run.")}</div>`,
   );
+}
+function openHunt() {
+  modal("Send in the Truffle pig", "Scour this workspace’s GitHub issues for fixes grounded in actual code.",
+    `<form id="truffle-hunt-form"><div class="form-grid"><div class="field"><label for="hunt-count">Issues to find</label><input id="hunt-count" name="count" type="number" min="1" max="20" value="5" required><small>A target, not a promise. Weak candidates stay out.</small></div><div class="field"><label for="hunt-pool">Issues to inspect</label><input id="hunt-pool" name="scan_limit" type="number" min="1" max="200" value="40" required><small>Controls the scope of this hunt.</small></div><div class="field"><label for="hunt-worker">Scout worker</label><select id="hunt-worker" name="agent"><option value="auto">Auto · available worker</option>${["codex", "claude", "agy", "grok"].map(a => `<option>${a}</option>`).join("")}</select></div><div class="field"><label for="hunt-remote">Repository remote</label><input id="hunt-remote" name="remote" value="${esc(state.config?.publish?.remote || "origin")}" required></div></div><div class="field"><label for="hunt-search">GitHub search filter · optional</label><input id="hunt-search" name="search" maxlength="500" placeholder='label:bug sort:updated-desc'><small>Uses the repository attached to this remote. Requires an authenticated gh CLI.</small></div><label class="check-field"><input name="include_assigned" type="checkbox"> Include issues already assigned to someone</label><div class="launch-note">Investigation only. The scout checks source, tests and feasibility, and explains its skips. You choose which fixes enter Fusion. Uses your configured coding worker account.</div><div class="dialog-footer"><button class="button" type="button" data-action="truffle-open">Past hunts</button><button type="submit" class="button primary">Find the truffles →</button></div></form>`, "truffle-hunt");
+}
+function truffleSelected(hunt) {
+  const key = state.workspace + ":" + hunt.id;
+  return state.truffleSelection[key] ||= new Set(hunt.selected || hunt.candidates.filter(c => !c.workflow_id && c.status !== "skipped").map(c => c.number));
+}
+function truffleView() {
+  const h = state.id ? state.scout : null;
+  const hunts = state.overview.hunts || [];
+  if (!h) {
+    mount(intro("ISSUE SCOUT", "Truffle pig.", "A good nose for small fixes. Source evidence, a regression plan, and a clear path into Fusion.", button("New hunt", "truffle-hunt", "", "primary")) +
+      (hunts.length ? `<div class="panel">${hunts.map(r => `<button class="truffle-history" data-action="truffle-open" data-id="${esc(r.id)}"><span><strong>${esc(r.repo || "Reading repository…")}</strong><small>${esc(r.found)} / ${esc(r.target)} candidates · ${esc(r.scanned ?? "—")} issues inspected · ${date(r.started_at_ms)}</small><span>${esc(r.message)}</span></span>${badge(r.status)}<span>→</span></button>`).join("")}</div>` : empty("Let it sniff out the next fix.", "Choose how many issues you want. The scout will return fewer if the evidence does not support the target.", button("Start a hunt", "truffle-hunt", "", "primary"))));
+    return;
+  }
+  const selected = truffleSelected(h), busy = ["scouting", "running"].includes(h.status);
+  mount(`<button class="back" data-view="truffle">← All hunts</button>` + intro("TRUFFLE PIG · " + (h.repo || "GITHUB"), "The shortlist.", h.message || "Investigating open issues…", button("New hunt", "truffle-hunt")) +
+    `<div class="pill-row">${badge(h.status)}<span class="mono">${esc(h.id)}</span><small>${date(h.started_at_ms)}${h.head ? " · checkout " + esc(h.head.slice(0, 8)) + (h.dirty ? " with local changes" : "") : ""}</small></div><div class="truffle-stats"><div><strong>${h.candidates.length}<small> / ${h.target}</small></strong><span>Source-backed candidates</span></div><div><strong>${h.scanned ?? "—"}</strong><span>Open issues inspected</span></div><div><strong>${h.skipped.length}</strong><span>Skipped with a reason</span></div><div><strong>${h.candidates.filter(c => c.workflow_status === "success").length}</strong><span>Fixes accepted</span></div></div>
+    <div class="truffle-toolbar"><p class="help-copy">Source quotes are checked against files. Feasibility is the scout’s assessment; implementation and independent review still have to prove the fix.</p>${button("Queue selected fixes →", "truffle-queue", busy || !h.candidates.length ? "disabled" : "", "primary")}</div>
+    <div class="truffle-candidates">${h.candidates.map((c, i) => `<article class="panel truffle-candidate"><div class="panel-body"><div class="truffle-candidate-heading"><label class="check-field"><input type="checkbox" data-truffle-number="${c.number}" ${selected.has(c.number) ? "checked" : ""} ${busy || c.status === "skipped" ? "disabled" : ""} aria-label="Select issue ${c.number}"><span class="eyebrow">PICK ${i + 1} · #${c.number}</span></label>${badge(c.workflow_status || c.status)}</div><h2><a href="${esc(safeGithubURL(c.url))}" target="_blank" rel="noopener noreferrer">${esc(c.title)} ↗</a></h2><p>${esc(c.reason)}</p><div class="pill-row"><span class="chip">${esc(c.effort)} effort</span><span class="chip">${esc(c.risk)} regression risk</span><span class="chip">${c.evidence.length} source citations</span></div><p class="help-copy">${esc(c.reproduction)}</p>${c.queue_note ? `<p class="launch-note">${esc(c.queue_note)}</p>` : ""}${c.workflow_id ? button("Open workflow →", "run", `data-id="${esc(c.workflow_id)}"`, "primary small") : ""}<details data-disclosure-key="truffle-evidence-${c.number}"><summary>Evidence & implementation brief</summary>${c.evidence.map(e => `<div class="truffle-source"><button class="subtle" data-action="file" data-path="${esc(e.path)}">${esc(e.path)}:${e.line}–${e.end_line || e.line}</button><pre class="console">${esc(e.quote)}</pre></div>`).join("")}${[["Implementation", c.plan], ["Verification commands", c.verification], ["Acceptance criteria", c.acceptance]].map(([title, rows]) => `<h3>${title}</h3><ul>${rows.map(r => `<li>${esc(r)}</li>`).join("")}</ul>`).join("")}</details></div></article>`).join("")}</div>
+    ${!h.candidates.length && !busy ? empty("No convincing truffles in this pool.", "Review the skip reasons, broaden the search, or try another worker.") : ""}
+    ${h.skipped.length ? `<details class="panel truffle-skips" data-disclosure-key="truffle-skips"><summary>Why ${h.skipped.length} issues stayed out</summary>${h.skipped.map(s => `<p><strong>#${s.number}</strong> ${esc(s.reason)}</p>`).join("")}</details>` : ""}`);
+}
+function openTruffleQueue() {
+  const h = state.scout, numbers = [...truffleSelected(h)];
+  if (!numbers.length) return toast("Select at least one issue first.");
+  const defaults = {...state.config.publish, mode: state.config.publish?.mode === "auto" ? "auto" : "manual"};
+  modal("Queue the fixes", `${numbers.length} selected · one isolated worktree and reviewed workflow per issue`,
+    `<form id="truffle-queue-form"><p class="help-copy">${numbers.map(n => "#" + n).join(" · ")}</p>${publishFields("truffle", defaults)}<div class="field"><label for="truffle-attempts">Maximum attempts per stage</label><input id="truffle-attempts" name="attempts" type="number" min="1" max="5" value="2" required></div><div class="launch-note">Explore → plan → implement → independent review, one issue at a time. Closed issues and linked PRs are rechecked before launch. The queue pauses on a changed issue, failed review, quota or publication error; accepted work stays saved. Manual mode lets you inspect the diff before publishing. Automatic mode commits, pushes, and opens each accepted PR.</div><label class="check-field"><input name="allow_write" type="checkbox" required> Allow the selected fixes to edit their isolated worktrees</label><button type="submit" class="button primary">Start issue queue →</button></form>`, "truffle-queue");
+  $('#truffle-publish-mode option[value="off"]').remove();
 }
 function recommendationCards(output) {
   return (output?.findings || [])
@@ -968,7 +1003,7 @@ async function openJob(id) {
 function renderJob(job) {
   if (!$("#job-content")) return;
   const result = job.result || {};
-  const controls = `<div class="actions" style="margin:16px 0">${job.workflow_id ? button("Open workflow →", "job-workflow", `data-id="${esc(job.workflow_id)}"`, "primary") : ""}${active(job.status) ? button(job.status === "stopping" ? "Stopping…" : "Stop job", "cancel", `data-id="${esc(job.id)}" ${job.status === "stopping" ? "disabled" : ""}`, "danger") : ""}${result.workflow && !result.workflow_id ? button("Inspect prepared workflow", "prepared", `data-path="${esc(result.workflow)}"`) : ""}</div>`;
+  const controls = `<div class="actions" style="margin:16px 0">${job.action?.startsWith("truffle-") ? button("Open hunt →", "truffle-open", `data-id="${esc(result.id || "")}"`, "primary") : ""}${job.workflow_id ? button("Open workflow →", "job-workflow", `data-id="${esc(job.workflow_id)}"`, "primary") : ""}${active(job.status) ? button(job.status === "stopping" ? "Stopping…" : "Stop job", "cancel", `data-id="${esc(job.id)}" ${job.status === "stopping" ? "disabled" : ""}`, "danger") : ""}${result.workflow && !result.workflow_id ? button("Inspect prepared workflow", "prepared", `data-path="${esc(result.workflow)}"`) : ""}</div>`;
   replaceContent(
     $("#job-content"),
     `<div class="pill-row">${badge(job.status)}<small>${active(job.status) ? age(job.started_at_ms) + " elapsed" : date(job.finished_at_ms)}</small></div>${controls}${job.error ? `<div class="blocker">${esc(job.error)}</div>` : ""}<pre class="console job-console" data-scroll-key="job-console" data-follow-tail>${esc(job.console || (active(job.status) ? "Starting the local coordinator…" : "Job finished. See its result below."))}</pre>${job.output ? `<details ${!active(job.status) && !job.workflow_id ? "open" : ""}><summary>Result</summary><pre class="console">${esc(typeof result === "object" && Object.keys(result).length ? pretty(result) : job.output)}</pre></details>` : ""}<p class="help-copy" style="margin:16px 0 0">You can close this dialog. The job and its logs remain available under Launch activity.</p>`,
@@ -1063,6 +1098,7 @@ async function navigate(view, id = null) {
       overview: "Overview",
       workflows: "Workflows",
       workflow: "Workflow",
+      truffle: "Truffle pig",
       decisions: "Laya lab",
       models: "ORC models",
       settings: "Settings",
@@ -1094,6 +1130,11 @@ async function refresh(force = false) {
           : "Restricted runtime";
     }
     let signature = pretty({ ...data, now_ms: 0 });
+    if (state.view === "truffle" && state.id) {
+      state.scout = await api("truffle?id=" + encodeURIComponent(state.id), undefined, w);
+      if (epoch !== state.epoch) return;
+      signature = pretty(state.scout);
+    }
     if (state.view === "workflow") {
       const report = await api(
         "workflow?id=" + encodeURIComponent(state.id),
@@ -1126,6 +1167,7 @@ async function refresh(force = false) {
       state.signature = signature;
       if (state.view === "overview") overview();
       else if (state.view === "workflows") workflows();
+      else if (state.view === "truffle") truffleView();
       else if (state.view === "workflow") workflow();
       else if (state.view === "decisions") decisions();
       else if (state.view === "settings") settings();
@@ -1184,7 +1226,10 @@ document.addEventListener("click", async (event) => {
       ORCAppearance.set({ mode: target.dataset.mode });
     else if (a === "activity-latest") $(".worker-timeline")?.scrollTo({top: $(".worker-timeline").scrollHeight, behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth"});
     else if (a === "close") closeModal();
-    else if (a === "template") openLaunch(templates[target.dataset.template]);
+    else if (a === "template") target.dataset.template === "truffle" ? openHunt() : openLaunch(templates[target.dataset.template]);
+    else if (a === "truffle-hunt") openHunt();
+    else if (a === "truffle-open") { closeModal(); await navigate("truffle", target.dataset.id || null); }
+    else if (a === "truffle-queue") openTruffleQueue();
     else if (a === "run") await navigate("workflow", target.dataset.id);
     else if (a === "stage") {
       state.node = target.dataset.node;
@@ -1347,6 +1392,11 @@ document.addEventListener("submit", async (event) => {
       await reconnectWithURL(values.url.trim());
       closeModal();
       toast("Reconnected. Your other tabs can use this connection too.");
+    } else if (form.id === "truffle-hunt-form") {
+      await launch({...values, action: "truffle-hunt", include_assigned: !!values.include_assigned});
+    } else if (form.id === "truffle-queue-form") {
+      await launch({action: "truffle-run", scout_id: state.scout.id, issues: [...truffleSelected(state.scout)],
+        attempts: values.attempts, publish: publishValues("truffle"), allow_write: !!values.allow_write});
     } else if (form.id === "launch-form") {
       const kind = values.kind;
       await launch({
@@ -1434,6 +1484,10 @@ document.addEventListener("input", (event) => {
   }
 });
 document.addEventListener("change", (event) => {
+  if (event.target.matches("[data-truffle-number]") && state.scout) {
+    const selected = truffleSelected(state.scout), n = Number(event.target.dataset.truffleNumber);
+    if (event.target.checked) selected.add(n); else selected.delete(n);
+  }
   if (event.target.id.startsWith("settings-publish-")) {
     try {
       const value = JSON.parse($("#fusion-config").value);
@@ -1546,7 +1600,7 @@ async function connectWorkspace(data) {
   const route = location.hash.slice(1).split("/");
   await chooseWorkspace(workspace);
   if (
-    ["workflows", "workflow", "decisions", "models", "settings"].includes(
+    ["workflows", "workflow", "truffle", "decisions", "models", "settings"].includes(
       route[0],
     )
   )

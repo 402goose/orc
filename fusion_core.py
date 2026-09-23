@@ -1623,6 +1623,8 @@ def build_parser() -> argparse.ArgumentParser:
     display.add_argument("--progress", dest="progress", action="store_true", default=None, help="show live progress on stderr, including when redirected")
     display.add_argument("--quiet", dest="progress", action="store_false", help="hide progress; keep the final result")
     sub = parser.add_subparsers(dest="command", required=True)
+    from fusion_truffle import add_parser as truffle_parser
+    truffle_parser(sub)
 
     ui = sub.add_parser("ui", help="open the local ORC/Fusion control room in your browser")
     ui.add_argument("--port", type=int, default=8765, help="local port (0 selects an available port)")
@@ -1749,6 +1751,12 @@ def _main(args, parser) -> int:
         from fusion_ui import serve
         return serve(workspace, args.port, not args.no_open)
     config, config_path = load_config(workspace)
+    if args.command == "truffle":
+        from fusion_truffle import command as truffle_command
+        try:
+            return truffle_command(workspace, config, args)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            parser.error(str(exc))
     if args.command in {"build", "delegate", "ultra"} or args.command == "workflow" and args.workflow_command in {"run", "resume"}:
         from fusion_decisions import config_for
         progress.emit("fusion", f"{args.command} in {workspace}; Laya {config_for(config)['mode']}")

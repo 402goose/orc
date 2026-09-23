@@ -95,6 +95,9 @@ as the CLI. Existing terminal runs appear automatically. It includes:
   report downloads, and **Implement this** actions on numbered findings.
 - Discovery, build, debug, review, single-worker and custom JSON workflow launches;
   preparation without execution; resume and cancellation of UI-launched jobs.
+- **Truffle pig** scouts a chosen pool of open GitHub issues, checks source citations,
+  and ranks a target number of tractable fixes. Inspect the shortlist, select issues,
+  and queue separate implementation/review workflows with a chosen PR target branch.
 - A Laya lab for probes, probabilities, actual policy actions, reviewed labels,
   dataset exports, training, evaluation with a shuffled-state control, and calibration.
 - Project Fusion/ORC settings, worker availability, ORC model listings and profiles.
@@ -303,6 +306,7 @@ npm install --prefix /tmp/orc-ui-tools --no-audit --no-fund @playwright/test@1.6
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/ui_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/garden_browser.cjs
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/ui_connection_browser.cjs
+NODE_PATH=/tmp/orc-ui-tools/node_modules node test/truffle_browser.cjs
 ```
 
 Browser checks use disposable workspaces and fake coding workers. They exercise
@@ -347,6 +351,43 @@ sorts last-known-good models first; `orc models --fit` lists only those.
 `orc doctor` runs the fit probe when the cache is empty (`ORC_NO_FIT=1`
 skips it). Catalog `tools` is an advertisement; FIT is whether the model
 survived a Claude Code-shaped loop.
+
+### Truffle pig · from open issues to reviewed fixes
+
+Open **Overview → Send in the Truffle pig**, or **Truffle pig → New hunt**.
+Choose a target count (default 5), pool size (default 40), worker, and optional
+GitHub search filter such as `label:bug sort:updated-desc`. The repository comes
+from the selected Git remote, using your authenticated `gh` CLI. Scouting uses a
+coding worker for investigation; it does not edit code or post to GitHub.
+
+The shortlist shows why each issue is tractable, checked source quotations,
+effort/risk, reproduction evidence, implementation steps, test commands and
+acceptance criteria. It can return fewer issues than requested, including zero.
+Source citations are checked against the files; feasibility is a worker judgment,
+not a calibrated success probability. Skip reasons remain visible. Assigned issues
+(unless included), issues linked to open PRs, and issues already queued by another
+hunt are excluded. The PR check covers GitHub's closing-issue links, not every
+informal mention in a PR; the scout also checks related source and history.
+
+**Queue selected fixes** runs one issue at a time in its own worktree from the
+chosen target branch. Manual PR mode is the default; automatic mode commits,
+pushes and opens a PR only after implementation and independent review pass.
+Open/updated status and linked PRs are checked again before each launch. A changed
+issue needs a fresh hunt. Failure or quota pauses the queue: open the linked workflow,
+resume that workflow, then queue the remaining selection again. Successful workflows
+are reused, not repeated. Jobs survive closing the browser, and records live under
+`.fusion/truffle/` alongside the usual workflow artifacts.
+
+```sh
+orc 'fusion' --progress truffle hunt --count 5 --scan-limit 40 --search 'label:bug'
+orc 'fusion' truffle show truffle-0123456789ab
+# Use the saved hunt ID and only the issue numbers you chose from its shortlist:
+orc 'fusion' --progress truffle run truffle-0123456789ab --issues 123 456 --base staging --publish manual
+```
+
+Use `--publish auto` to publish accepted fixes automatically; PRs default to drafts.
+Each stage has an attempt limit (`--max-attempts`, default 2). Queue execution pauses
+at the first unresolved workflow instead of consuming more attempts across the pool.
 
 ## Profiles
 
