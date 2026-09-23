@@ -1614,6 +1614,13 @@ class HandoffParsingTest(unittest.TestCase):
             ["none of the tests pass"],
         )
 
+    def test_none_prefixed_filenames_and_hyphenated_blockers_survive(self):
+        for value in ("none.py", "nil-cache.json", "na.test.ts", "nothing.md", "none-of-the-tests-pass"):
+            with self.subTest(value=value):
+                parsed = fusion_core.parse_handoff(f"CHANGED: {value}\nBLOCKERS: {value}")
+                self.assertEqual(parsed['changed'], [value])
+                self.assertEqual(parsed['blockers'], [value])
+
     def test_tests_field_uses_the_same_rule(self):
         parsed = fusion_core.parse_handoff(
             "STATUS: success\nTESTS: none. This node is read-only; I only ran `git status`."
