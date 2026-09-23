@@ -762,6 +762,8 @@ function updateLaunch() {
   $("#launch-preview").textContent =
     k === "discovery"
       ? "Explore → plan. Reads the repository and produces recommendations."
+      : k === "sweep"
+        ? "Explore → one read-only worker per dimension, in parallel → one synthesis that reads them all. Never writes."
       : k === "review"
         ? "Explore → independent review. Unresolved findings block acceptance."
         : k === "delegate"
