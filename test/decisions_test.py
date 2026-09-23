@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fusion_core as core
 from fusion_build import prepare
 from fusion_decisions import (DecisionEngine, DecisionStore, ACCEPTANCE_QUESTIONS, INTAKE_QUESTIONS, RECOVERY_QUESTIONS,
-                              REVIEW_QUESTIONS, LayaRuntime, DEFAULTS, digest, fit_calibration, read_jsonl)
+                              REVIEW_QUESTIONS, LayaRuntime, DEFAULTS, digest, fit_calibration, read_jsonl,
+                              temperature_scale)
 from fusion_laya import dataset_rows
 from fusion_policy import accept_node, route_task, route_candidates, recovery, review_task
 from fusion_report import format_report, select_report
@@ -93,6 +94,35 @@ class DecisionsTest(unittest.TestCase):
         self.assertFalse(engine.allowed(record, "workflow"))
         record = engine.decide("intake", "x" * 7000, INTAKE_QUESTIONS)
         self.assertFalse(engine.allowed(record, "workflow"))
+
+    def test_recalibration_between_decide_and_allowed_is_not_ignored(self):
+        # The weekly loop rewrites calibration between runs, so the record a
+        # long-lived process holds was scaled by the previous temperature.
+        # Gating on that stored number applies actions at a confidence the
+        # current calibration would reject.
+        engine = self.engine({"workflow": "build"}, "active")
+
+        def calibrate(temperature):
+            report = {"schema": "fusion.calibration.v1", "model_identity": "fixture-model", "buckets": {
+                f"intake:{digest(INTAKE_QUESTIONS)}:{key}": {"qualified": True, "temperature": temperature, "threshold": .9}
+                for key in INTAKE_QUESTIONS}}
+            (self.workspace / "calibration.json").write_text(json.dumps(report))
+
+        calibrate(.25)
+        record = engine.decide("intake", "Build CSV export", INTAKE_QUESTIONS)
+        self.assertTrue(engine.allowed(record, "workflow"))
+        stored = record["recommendations"]["workflow"]["probability"]
+
+        calibrate(4)
+        current = max(temperature_scale(record["prediction"]["workflow"], 4).values())
+        self.assertLess(current, .9, "the fixture must actually fall below the threshold")
+        self.assertGreater(stored, current, "the stored probability must be the stale, sharper one")
+        self.assertFalse(engine.allowed(record, "workflow"), "gated on a probability the current calibration rejects")
+
+        # Recalibrating the other way admits it again, so this is a live read
+        # rather than a one-way refusal.
+        calibrate(.25)
+        self.assertTrue(engine.allowed(record, "workflow"))
 
     def test_malformed_calibration_abstains_without_breaking_the_run(self):
         engine = self.engine(mode="active")
