@@ -19,7 +19,7 @@ from fusion_decisions import (DecisionEngine, DecisionStore, ACCEPTANCE_QUESTION
 from fusion_laya import dataset_rows
 from fusion_policy import accept_node, route_task, route_candidates, recovery, review_task
 from fusion_report import format_report, select_report
-from fusion_workflow import WorkflowRunner, resume_workflow, workflow_report
+from fusion_workflow import WorkflowRunner, expand_spec, resume_workflow, validate_spec, workflow_report
 
 
 class Backend:
@@ -135,6 +135,46 @@ class DecisionsTest(unittest.TestCase):
         self.assertIsNone(runtime.process)
         with self.assertRaisesRegex(RuntimeError, "timed out"):
             runtime.predict("x", INTAKE_QUESTIONS)
+
+    def test_sweep_fans_out_one_worker_per_dimension(self):
+        self.config["decisions"]["mode"] = "off"
+        prepared = prepare(self.workspace, self.config, "Audit this service", across=["auth, payments", "data"])
+        self.assertEqual((prepared["kind"], prepared["read_only"]), ("sweep", True))
+        self.assertEqual(prepared["across"], ["auth", "payments", "data"])
+        spec = json.loads(Path(prepared["workflow"]).read_text())
+        sweep = next(node for node in spec["nodes"] if node["id"] == "sweep")
+        self.assertEqual(sweep["items"], ["auth", "payments", "data"])
+        self.assertIn("{item}", sweep["task_template"])
+        self.assertEqual(spec["max_parallel"], 3, "the fan-out must actually run concurrently")
+        self.assertEqual(spec["max_parallel_writers"], 0, "a sweep never writes")
+        # A mapped node expands to sweep-01..N, so requiring "sweep" by name
+        # would fail acceptance as an unknown node.
+        self.assertEqual(spec["acceptance"]["required_nodes"], ["explore", "synthesize"])
+        graph = expand_spec(spec)[0]["nodes"]
+        self.assertEqual([n["id"] for n in graph if n["base_id"] == "sweep"], ["sweep-01", "sweep-02", "sweep-03"])
+        synthesize = next(n for n in graph if n["id"] == "synthesize")
+        self.assertEqual(synthesize["needs"], ["sweep-01", "sweep-02", "sweep-03"])
+        validate_spec(spec)
+
+    def test_sweep_rejects_contradictory_or_empty_scope(self):
+        self.config["decisions"]["mode"] = "off"
+        with self.assertRaisesRegex(ValueError, "at least one --across"):
+            prepare(self.workspace, self.config, "Audit", kind="sweep")
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            prepare(self.workspace, self.config, "Audit", kind="build", across=["auth"])
+        with self.assertRaisesRegex(ValueError, "at most"):
+            prepare(self.workspace, self.config, "Audit", across=[str(n) for n in range(20)])
+
+    def test_sweep_scope_survives_an_active_classifier(self):
+        # Naming the dimensions is explicit scope; a confident "build" must not
+        # turn a read-only sweep into one that writes.
+        engine = self.engine({"workflow": "build"}, "active")
+        self.qualify(engine, "intake", INTAKE_QUESTIONS)
+        with patch("fusion_build.DecisionEngine", return_value=engine):
+            prepared = prepare(self.workspace, self.config, "Audit this service", across=["auth"])
+        self.assertEqual((prepared["kind"], prepared["read_only"]), ("sweep", True))
+        spec = json.loads(Path(prepared["workflow"]).read_text())
+        self.assertFalse(any(node.get("write") for node in spec["nodes"]))
 
     def test_intake_preserves_planning_scope_from_full_issue(self):
         issue = {"title": "New payments feature", "body": "Background. " * 1000 + "\nDiscovery/planning only. Do not implement.", "url": "https://github.com/org/repo/issues/1"}
