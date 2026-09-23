@@ -77,6 +77,10 @@ def main():
             output = workspace / "candidate-predictions.jsonl"
             evaluation = evaluate(argparse.Namespace(dataset=str(dataset), output=str(output), model_path=str(candidate), device="cpu"))
             assert evaluation["validation_questions"] == 1
+            assert evaluation["holdout"]["status"] == "checked", evaluation
+            assert report["data_quality"]["answers"] == 1
+            assert len(report["seen_train_inputs"]) == 1 and report["lineage_complete"]
+            assert evaluation["by_kind"]["intake"]["questions"] == 1
             calibration = fit_calibration(output, workspace / "candidate-calibration.json")
             assert calibration["model_identity"] != baseline["model_identity"]
             assert not any(bucket["qualified"] for bucket in calibration["buckets"].values())

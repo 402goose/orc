@@ -8,12 +8,22 @@ import time
 
 from ui_test import seed_workspace
 from fusion_decisions import DecisionStore, digest
-from fusion_ui import ControlRoom, Server
+from fusion_ui import ControlRoom, Server, atomic_json
 
 with tempfile.TemporaryDirectory(prefix="orc-ui-e2e-") as directory:
     root = Path(directory)
     workspace = root / "visa-demo"
-    seed_workspace(workspace)
+    config = seed_workspace(workspace)
+    if os.environ.get('FUSION_FIXTURE_COUNCIL') == '1':
+        worker = workspace / 'claude-fixture'
+        worker.write_text(f'#!{sys.executable}\n' + '''import json
+suggestion = {'answers': {'plausible': {'value': 'false', 'reason': 'The original input says no work was done.', 'evidence': ['E1']}}, 'abstentions': {}}
+message = 'STATUS: success\\nSUMMARY: Assessed evidence\\n```label-suggestion\\n' + json.dumps(suggestion) + '\\n```\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'
+print(json.dumps({'type': 'result', 'result': message, 'is_error': False}))
+''')
+        worker.chmod(0o755)
+        config['claude']['command'] = str(worker)
+        atomic_json(workspace / '.fusion.json', config)
     os.environ["ORC_HOME"] = str(root / "orc-home")
     os.environ["FUSION_TELEMETRY"] = "0"
     app = ControlRoom(workspace, root / "registry.json")

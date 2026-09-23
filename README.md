@@ -95,6 +95,9 @@ as the CLI. Existing terminal runs appear automatically. It includes:
   report downloads, and **Implement this** actions on numbered findings.
 - Discovery, build, debug, review, single-worker and custom JSON workflow launches;
   preparation without execution; resume and cancellation of UI-launched jobs.
+- **Truffle pig** scouts a chosen pool of open GitHub issues, checks source citations,
+  and ranks a target number of tractable fixes. Inspect the shortlist, select issues,
+  and queue separate implementation/review workflows with a chosen PR target branch.
 - A Laya lab for probes, probabilities, actual policy actions, reviewed labels,
   dataset exports, training, evaluation with a shuffled-state control, and calibration.
 - Project Fusion/ORC settings, worker availability, ORC model listings and profiles.
@@ -103,6 +106,10 @@ as the CLI. Existing terminal runs appear automatically. It includes:
   **Settings → Appearance**. Preferences persist in localStorage and sync across tabs.
 - Activity entries subtly animate only when new, respect reduced motion, and
   follow output smoothly while preserving your position when you scroll up.
+  Worker updates render as Markdown cards; consecutive commands collapse into
+  groups with expandable command/output receipts. **Latest** catches up to the
+  live tail. Technical logs and stage history live under **Run details**, closed
+  by default; expanded details stay open across refreshes.
 
 UI launches use the existing CLI and its permissions, writer lock, attempt limits
 and acceptance checks. Build/debug runs require the **Allow workspace edits**
@@ -110,6 +117,11 @@ checkbox; preparation starts no coding workers. Jobs continue when the browser
 or UI server closes. Restart the UI against the same workspace to reconnect.
 Runs started outside the UI are observable; stop those from their original terminal.
 Training and calibration never promote a model or enable active decisions automatically.
+
+If a restart expires a browser connection, click **Reconnect** and paste the full
+URL printed by `orc fusion ui`. Successful credentials are remembered for that
+local origin; opening the current URL in one tab reconnects other tabs in the same
+browser. Unsaved label edits remain intact, and failed actions are never replayed.
 
 In **Laya lab**, select a decision and click **Suggest labels**. Choose Auto or an
 installed Codex, Claude, AGY, or Grok worker. A background job reads a snapshot of
@@ -124,10 +136,55 @@ Drafts never enter training exports. Approval records the worker/model/run, draf
 identity, final labels and human evidence; regenerating does not replace existing
 approved labels. In-progress edits survive polling and navigation within the tab.
 Failed or cancelled jobs retain logs and can be retried with another worker.
+The Laya tab tracks retained approved answers, coverage by decision type, label
+balance, workflow-group splits, dataset exports, trained candidates and evaluations.
+The configured checkpoint is shown separately from candidate models. Approval
+does not retrain Laya: export reviewed labels, train a separate candidate, and
+evaluate it before choosing a checkpoint in project settings. Candidate cards
+show held-out accuracy and the shuffled-state control; improvement is reported
+only when the source model was evaluated on the same held-out benchmark. Historical
+prediction/label agreement is explicitly separate from held-out evaluation.
+
+**Training data health** shows distinct inputs, workflow groups, recorded review
+evidence, edits at approval, answer revisions, missing classes, and label sources.
+Duplicate inputs and conflicting labels link back to the examples for correction
+or exclusion. **Measured results** pairs exact source/candidate model identities
+on identical held-out inputs and labels, with sample counts, results by decision
+type, a training-majority baseline, and shuffled-state control. Export and training
+jobs save data-quality snapshots. New candidates record their local training
+ancestry; evaluation flags overlapping inputs or groups and withholds improvement
+claims for known leakage. Older candidates without this metadata show an unknown
+audit status. Repeated use of a small benchmark still does not prove generalization.
+
+**Data garden → Enable auto-drafts** queues incoming complete decisions for a
+labeling worker. There is **no daily cap**, including for gardens with an old saved
+limit. Optionally include existing decisions without a prior attempt.
+Garden runs one draft at a time while the control-room server is running, even
+with the browser closed. Settings, attempted decisions and daily usage survive
+restart. Pausing stops new calls; an existing draft can finish or be cancelled
+from its activity view. Provider usage may be charged to your worker account.
+
+Choose **Agent council** in Garden settings or an individual label editor to use
+two to four distinct local workers. Every member receives the same evidence in a
+fresh session, without prior votes, predictions, or labels. Members run sequentially;
+each uses one worker call. Only unanimous, evidence-citing answers become suggested
+labels. Disagreements, abstentions, and member failures remain visible with individual
+reasons and run/model provenance. They require a human assessment, and agreement
+alone is not proof of correctness. Council mode never approves labels automatically.
+
+The **Ready to review** queue contains suggested answers awaiting approval;
+all-abstention drafts appear under **Needs evidence**, and unsuccessful drafts
+under **Failed drafts**. Garden does not retry them automatically. **Exclude
+example** removes a decision from automatic drafting and future training exports;
+**Restore example** brings its existing reviewed answers back. Existing exported
+datasets and model weights are unchanged. Drafts are never approved, trained or
+promoted automatically.
+
 The CLI equivalent, which also only saves a draft, is:
 
 ```sh
 orc 'fusion' decisions suggest DECISION_ID --agent codex
+orc 'fusion' decisions suggest --council codex claude agy -- DECISION_ID
 ```
 
 Completed implementation workflows have an **Open PR** action. Choose a target
@@ -247,6 +304,9 @@ make test dogfood
 npm install --prefix /tmp/orc-ui-tools --no-audit --no-fund @playwright/test@1.63.0
 /tmp/orc-ui-tools/node_modules/.bin/playwright install chromium
 NODE_PATH=/tmp/orc-ui-tools/node_modules node test/ui_browser.cjs
+NODE_PATH=/tmp/orc-ui-tools/node_modules node test/garden_browser.cjs
+NODE_PATH=/tmp/orc-ui-tools/node_modules node test/ui_connection_browser.cjs
+NODE_PATH=/tmp/orc-ui-tools/node_modules node test/truffle_browser.cjs
 ```
 
 Browser checks use disposable workspaces and fake coding workers. They exercise
@@ -291,6 +351,43 @@ sorts last-known-good models first; `orc models --fit` lists only those.
 `orc doctor` runs the fit probe when the cache is empty (`ORC_NO_FIT=1`
 skips it). Catalog `tools` is an advertisement; FIT is whether the model
 survived a Claude Code-shaped loop.
+
+### Truffle pig · from open issues to reviewed fixes
+
+Open **Overview → Send in the Truffle pig**, or **Truffle pig → New hunt**.
+Choose a target count (default 5), pool size (default 40), worker, and optional
+GitHub search filter such as `label:bug sort:updated-desc`. The repository comes
+from the selected Git remote, using your authenticated `gh` CLI. Scouting uses a
+coding worker for investigation; it does not edit code or post to GitHub.
+
+The shortlist shows why each issue is tractable, checked source quotations,
+effort/risk, reproduction evidence, implementation steps, test commands and
+acceptance criteria. It can return fewer issues than requested, including zero.
+Source citations are checked against the files; feasibility is a worker judgment,
+not a calibrated success probability. Skip reasons remain visible. Assigned issues
+(unless included), issues linked to open PRs, and issues already queued by another
+hunt are excluded. The PR check covers GitHub's closing-issue links, not every
+informal mention in a PR; the scout also checks related source and history.
+
+**Queue selected fixes** runs one issue at a time in its own worktree from the
+chosen target branch. Manual PR mode is the default; automatic mode commits,
+pushes and opens a PR only after implementation and independent review pass.
+Open/updated status and linked PRs are checked again before each launch. A changed
+issue needs a fresh hunt. Failure or quota pauses the queue: open the linked workflow,
+resume that workflow, then queue the remaining selection again. Successful workflows
+are reused, not repeated. Jobs survive closing the browser, and records live under
+`.fusion/truffle/` alongside the usual workflow artifacts.
+
+```sh
+orc 'fusion' --progress truffle hunt --count 5 --scan-limit 40 --search 'label:bug'
+orc 'fusion' truffle show truffle-0123456789ab
+# Use the saved hunt ID and only the issue numbers you chose from its shortlist:
+orc 'fusion' --progress truffle run truffle-0123456789ab --issues 123 456 --base staging --publish manual
+```
+
+Use `--publish auto` to publish accepted fixes automatically; PRs default to drafts.
+Each stage has an attempt limit (`--max-attempts`, default 2). Queue execution pauses
+at the first unresolved workflow instead of consuming more attempts across the pool.
 
 ## Profiles
 
@@ -562,13 +659,11 @@ self-reported label, but Fusion doesn't trust it blindly: `turn.failed`/`error`
 events (Codex) and `is_error` (Claude) are structural, process-level signals
 that override a self-reported "success" claim. On top of that, Codex's
 `command_execution` items carry their own per-command exit code — if a
-command a worker actually ran fails but the worker's final text still claims
-success, that contradiction is surfaced as a blocker (`command exited N:
-<command>`) rather than silently trusted. This doesn't override the
-self-reported status on its own — a nonzero exit isn't always a real failure
-(`grep` returning 1 for "no matches" is routine) — it makes the evidence
-visible for a human or an acceptance gate to weigh, the same way permission
-denials already are.
+command returns nonzero, its receipt remains in `command_evidence` and the UI's
+**Evidence → Command observations**. Searches with no matches, corrected file
+lookups, and tests run before a fix do not become permanent blockers. Unresolved
+handoff blockers, provider errors, required evidence, and configured acceptance
+checks still determine whether a stage passes.
 
 ### Antigravity (agy) workers
 
@@ -653,6 +748,12 @@ linear Ultra preset, a workflow can map one node over many items, fan in on
 explicit dependencies, run independent read-only nodes concurrently, retry
 invalid handoffs, pause on provider quota, and resume from the persisted
 manifest without repeating accepted nodes.
+
+Git snapshot failures are coordinator errors: Fusion stops without spending
+more worker attempts or switching providers, and shows the underlying error
+instead of missing-handoff warnings. After repairing it, resume the affected
+stage. Snapshots preserve tracked files under ignored directories and leave the
+real Git index untouched; ignored generated files stay excluded.
 
 ```sh
 cp .fusion.workflow.example.json workflow.json

@@ -29,6 +29,7 @@ def add_parser(sub):
     suggest = commands.add_parser("suggest", help="draft evidence-backed labels using a worker; requires human approval")
     suggest.add_argument("id")
     suggest.add_argument("--agent", choices=["auto", "codex", "claude", "agy", "grok"], default="auto")
+    suggest.add_argument("--council", nargs="+", choices=["codex", "claude", "agy", "grok"], help="independent workers; unanimous answers become a draft")
     export = commands.add_parser("export", help="export reviewed labels, split by workflow group")
     export.add_argument("output")
     calibrate = commands.add_parser("calibrate", help="fit temperature on train and assess held-out groups")
@@ -97,7 +98,8 @@ def run(args, workspace, config):
         payload = DecisionEngine(workspace, config).decide(args.kind, state, questions)
     elif command == "suggest":
         from fusion_labeling import suggest
-        payload = suggest(workspace, config, args.id, args.agent)
+        members = getattr(args, "council", None)
+        payload = suggest(workspace, config, args.id, args.agent, "council" if members else "single", members)
     elif command == "label":
         if any("=" not in answer for answer in args.answers):
             raise ValueError("answers must be question=value pairs")

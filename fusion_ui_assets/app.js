@@ -54,50 +54,64 @@ const state = {
   overview: null,
   config: null,
   report: null,
+  scout: null,
+  truffleSelection: {},
   decisions: [],
   decision: null,
   labelDrafts: {},
+  learning: null,
+  garden: null,
+  gardenFilter: "all",
   search: "",
   filter: "all",
   epoch: 0,
   modal: null,
   polling: false,
   signature: "",
+  authRequired: false,
 };
-// localStorage, not sessionStorage: the capability is stable per machine, so a
-// second tab and a later restart should both just work. The fragment is only
-// cleared once it has been stored, so a bookmarked URL keeps working if not.
+const credentialKey = "fusion-token";
+function storedCredential(storage) {
+  try { return storage.getItem(credentialKey) || ""; } catch { return ""; }
+}
+function rememberCredential(value) {
+  // Share only credentials accepted by this server; the key is origin-scoped.
+  for (const storage of [sessionStorage, localStorage]) {
+    try { if (storedCredential(storage) !== value) storage.setItem(credentialKey, value); } catch {}
+  }
+}
 let token = new URLSearchParams(location.hash.slice(1)).get("token");
 if (token) {
-  let stored = false;
-  try {
-    localStorage.setItem("fusion-token", token);
-    stored = true;
-  } catch (error) {
-    /* private window or blocked storage: keep the fragment as the only copy */
-  }
-  if (stored) history.replaceState(null, "", "#overview");
+  history.replaceState(null, "", "#overview");
 }
-try {
-  token ||= localStorage.getItem("fusion-token") || "";
-} catch (error) {
-  token ||= "";
-}
+token ||= storedCredential(localStorage) || storedCredential(sessionStorage);
 
-async function api(path, body, workspace = state.workspace) {
+async function api(path, body, workspace = state.workspace, retryCredential = true) {
   const url = new URL("/api/" + path, location.origin);
   if (workspace) url.searchParams.set("w", workspace);
+  const requestToken = token;
   const response = await fetch(url, {
     method: body ? "POST" : "GET",
     headers: {
-      "X-Fusion-Token": token,
+      "X-Fusion-Token": requestToken,
       ...(body ? { "Content-Type": "application/json" } : {}),
     },
     body: body ? JSON.stringify({ ...body, workspace }) : undefined,
   });
   const data = await response.json();
+  if (response.status === 401) {
+    state.authRequired = true;
+    const shared = storedCredential(localStorage);
+    // Reads can recover after another tab connects. Never replay a mutation.
+    if (!body && retryCredential && shared && shared !== requestToken) {
+      token = shared;
+      return api(path, body, workspace, false);
+    }
+  }
   if (!response.ok)
     throw new Error(data.error || `Request failed (${response.status})`);
+  state.authRequired = false;
+  if (token === requestToken) rememberCredential(requestToken);
   return data;
 }
 function toast(message) {
@@ -110,6 +124,33 @@ function toast(message) {
 function error(message) {
   $("#error-banner").textContent = message || "";
   $("#error-banner").hidden = !message;
+  if (message && state.authRequired) {
+    const reconnect = document.createElement("button");
+    reconnect.className = "button small";
+    reconnect.dataset.action = "reconnect";
+    reconnect.textContent = "Reconnect";
+    $("#error-banner").append(" ", reconnect);
+  }
+}
+function openReconnect() {
+  modal("Reconnect to your control room", "A server restart can expire this tab’s connection. Your saved work stays on disk.",
+    `<form id="reconnect-form"><div class="field"><label for="reconnect-url">Current control-room URL</label><input id="reconnect-url" name="url" type="url" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:8765/#token=…" required><small>Paste the full URL printed by orc fusion ui. Opening that URL in another tab in this browser also reconnects this one.</small></div><button type="submit" class="button primary">Connect</button></form>`, "reconnect");
+}
+async function reconnectWithURL(value) {
+  let url;
+  try { url = new URL(value); } catch { throw new Error("Paste the full control-room URL printed in your terminal."); }
+  const candidate = new URLSearchParams(url.hash.slice(1)).get("token");
+  if (url.origin !== location.origin || !candidate)
+    throw new Error("Use the full URL for this local control room, including #token=…");
+  // Validate before replacing a working credential or notifying any other tab.
+  const response = await fetch("/api/bootstrap", {headers: {"X-Fusion-Token": candidate}});
+  if (!response.ok) throw new Error("That connection URL has expired. Use the latest URL printed by orc fusion ui.");
+  token = candidate;
+  state.authRequired = false;
+  rememberCredential(candidate);
+  if (new URLSearchParams(location.hash.slice(1)).has("token"))
+    history.replaceState(null, "", "#" + state.view + (state.id ? "/" + encodeURIComponent(state.id) : ""));
+  await connectWorkspace(await response.json());
 }
 function intro(eyebrow, title, description, action = "") {
   return `<div class="page-intro"><div><div class="eyebrow">${eyebrow}</div><h1>${title}</h1><p>${description}</p></div>${action || `<div class="date">${new Date().toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" })}</div>`}</div>`;
@@ -238,6 +279,8 @@ function animateNewActivity(el, previous) {
   );
 }
 function replaceContent(root, html, context) {
+  const disclosures = new Map(root.dataset.scrollContext === context
+    ? $$('details[data-disclosure-key]', root).map(el => [el.dataset.disclosureKey, el.open]) : []);
   const scrolls = new Map(
     root.dataset.scrollContext === context
       ? scrollPanes(root).map(({ el, key }) => [
@@ -253,6 +296,9 @@ function replaceContent(root, html, context) {
   );
   root.innerHTML = html;
   root.dataset.scrollContext = context;
+  $$('details[data-disclosure-key]', root).forEach(el => {
+    if (disclosures.has(el.dataset.disclosureKey)) el.open = disclosures.get(el.dataset.disclosureKey);
+  });
   enhanceMarkdown(root);
   const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
   scrollPanes(root).forEach(({ el, key }) => {
@@ -328,6 +374,7 @@ function overview() {
       )
       .join("")}</div>
     <aside><div class="section-bar"><h2>Start with a direction</h2></div><div class="panel">${[
+      ["truffle", "🐽", "Send in the Truffle pig", "Find tractable open issues. Queue the fixes worth doing."],
       [
         "audit",
         "◈",
@@ -373,6 +420,38 @@ function workflows() {
       `<div class="filter-bar"><input id="run-search" placeholder="Search tasks, run IDs, or agents…" aria-label="Search workflows" value="${esc(state.search)}"><select id="run-filter" aria-label="Filter status">${["all", "running", "success", "failed", "blocked", "interrupted", "paused_quota", "paused_budget"].map((s) => `<option value="${s}" ${s === state.filter ? "selected" : ""}>${s === "all" ? "All statuses" : s.replaceAll("_", " ")}</option>`).join("")}</select><small>${runs.length} runs</small></div><div id="run-results">${runs.length ? `<div class="panel">${runRows(runs)}</div>` : empty("No matching workflows.", "Try another filter or start a new run.")}</div>`,
   );
 }
+function openHunt() {
+  modal("Send in the Truffle pig", "Scour this workspace’s GitHub issues for fixes grounded in actual code.",
+    `<form id="truffle-hunt-form"><div class="form-grid"><div class="field"><label for="hunt-count">Issues to find</label><input id="hunt-count" name="count" type="number" min="1" max="20" value="5" required><small>A target, not a promise. Weak candidates stay out.</small></div><div class="field"><label for="hunt-pool">Issues to inspect</label><input id="hunt-pool" name="scan_limit" type="number" min="1" max="200" value="40" required><small>Controls the scope of this hunt.</small></div><div class="field"><label for="hunt-worker">Scout worker</label><select id="hunt-worker" name="agent"><option value="auto">Auto · available worker</option>${["codex", "claude", "agy", "grok"].map(a => `<option>${a}</option>`).join("")}</select></div><div class="field"><label for="hunt-remote">Repository remote</label><input id="hunt-remote" name="remote" value="${esc(state.config?.publish?.remote || "origin")}" required></div></div><div class="field"><label for="hunt-search">GitHub search filter · optional</label><input id="hunt-search" name="search" maxlength="500" placeholder='label:bug sort:updated-desc'><small>Uses the repository attached to this remote. Requires an authenticated gh CLI.</small></div><label class="check-field"><input name="include_assigned" type="checkbox"> Include issues already assigned to someone</label><div class="launch-note">Investigation only. The scout checks source, tests and feasibility, and explains its skips. You choose which fixes enter Fusion. Uses your configured coding worker account.</div><div class="dialog-footer"><button class="button" type="button" data-action="truffle-open">Past hunts</button><button type="submit" class="button primary">Find the truffles →</button></div></form>`, "truffle-hunt");
+}
+function truffleSelected(hunt) {
+  const key = state.workspace + ":" + hunt.id;
+  return state.truffleSelection[key] ||= new Set(hunt.selected || hunt.candidates.filter(c => !c.workflow_id && c.status !== "skipped").map(c => c.number));
+}
+function truffleView() {
+  const h = state.id ? state.scout : null;
+  const hunts = state.overview.hunts || [];
+  if (!h) {
+    mount(intro("ISSUE SCOUT", "Truffle pig.", "A good nose for small fixes. Source evidence, a regression plan, and a clear path into Fusion.", button("New hunt", "truffle-hunt", "", "primary")) +
+      (hunts.length ? `<div class="panel">${hunts.map(r => `<button class="truffle-history" data-action="truffle-open" data-id="${esc(r.id)}"><span><strong>${esc(r.repo || "Reading repository…")}</strong><small>${esc(r.found)} / ${esc(r.target)} candidates · ${esc(r.scanned ?? "—")} issues inspected · ${date(r.started_at_ms)}</small><span>${esc(r.message)}</span></span>${badge(r.status)}<span>→</span></button>`).join("")}</div>` : empty("Let it sniff out the next fix.", "Choose how many issues you want. The scout will return fewer if the evidence does not support the target.", button("Start a hunt", "truffle-hunt", "", "primary"))));
+    return;
+  }
+  const selected = truffleSelected(h), busy = ["scouting", "running"].includes(h.status);
+  mount(`<button class="back" data-view="truffle">← All hunts</button>` + intro("TRUFFLE PIG · " + (h.repo || "GITHUB"), "The shortlist.", h.message || "Investigating open issues…", button("New hunt", "truffle-hunt")) +
+    `<div class="pill-row">${badge(h.status)}<span class="mono">${esc(h.id)}</span><small>${date(h.started_at_ms)}${h.head ? " · checkout " + esc(h.head.slice(0, 8)) + (h.dirty ? " with local changes" : "") : ""}</small></div><div class="truffle-stats"><div><strong>${h.candidates.length}<small> / ${h.target}</small></strong><span>Source-backed candidates</span></div><div><strong>${h.scanned ?? "—"}</strong><span>Open issues inspected</span></div><div><strong>${h.skipped.length}</strong><span>Skipped with a reason</span></div><div><strong>${h.candidates.filter(c => c.workflow_status === "success").length}</strong><span>Fixes accepted</span></div></div>
+    <div class="truffle-toolbar"><p class="help-copy">Source quotes are checked against files. Feasibility is the scout’s assessment; implementation and independent review still have to prove the fix.</p>${button("Queue selected fixes →", "truffle-queue", busy || !h.candidates.length ? "disabled" : "", "primary")}</div>
+    <div class="truffle-candidates">${h.candidates.map((c, i) => `<article class="panel truffle-candidate"><div class="panel-body"><div class="truffle-candidate-heading"><label class="check-field"><input type="checkbox" data-truffle-number="${c.number}" ${selected.has(c.number) ? "checked" : ""} ${busy || c.status === "skipped" ? "disabled" : ""} aria-label="Select issue ${c.number}"><span class="eyebrow">PICK ${i + 1} · #${c.number}</span></label>${badge(c.workflow_status || c.status)}</div><h2><a href="${esc(safeGithubURL(c.url))}" target="_blank" rel="noopener noreferrer">${esc(c.title)} ↗</a></h2><p>${esc(c.reason)}</p><div class="pill-row"><span class="chip">${esc(c.effort)} effort</span><span class="chip">${esc(c.risk)} regression risk</span><span class="chip">${c.evidence.length} source citations</span></div><p class="help-copy">${esc(c.reproduction)}</p>${c.queue_note ? `<p class="launch-note">${esc(c.queue_note)}</p>` : ""}${c.workflow_id ? button("Open workflow →", "run", `data-id="${esc(c.workflow_id)}"`, "primary small") : ""}<details data-disclosure-key="truffle-evidence-${c.number}"><summary>Evidence & implementation brief</summary>${c.evidence.map(e => `<div class="truffle-source"><button class="subtle" data-action="file" data-path="${esc(e.path)}">${esc(e.path)}:${e.line}–${e.end_line || e.line}</button><pre class="console">${esc(e.quote)}</pre></div>`).join("")}${[["Implementation", c.plan], ["Verification commands", c.verification], ["Acceptance criteria", c.acceptance]].map(([title, rows]) => `<h3>${title}</h3><ul>${rows.map(r => `<li>${esc(r)}</li>`).join("")}</ul>`).join("")}</details></div></article>`).join("")}</div>
+    ${!h.candidates.length && !busy ? empty("No convincing truffles in this pool.", "Review the skip reasons, broaden the search, or try another worker.") : ""}
+    ${h.skipped.length ? `<details class="panel truffle-skips" data-disclosure-key="truffle-skips"><summary>Why ${h.skipped.length} issues stayed out</summary>${h.skipped.map(s => `<p><strong>#${s.number}</strong> ${esc(s.reason)}</p>`).join("")}</details>` : ""}`);
+}
+function openTruffleQueue() {
+  const h = state.scout, numbers = [...truffleSelected(h)];
+  if (!numbers.length) return toast("Select at least one issue first.");
+  const defaults = {...state.config.publish, mode: state.config.publish?.mode === "auto" ? "auto" : "manual"};
+  modal("Queue the fixes", `${numbers.length} selected · one isolated worktree and reviewed workflow per issue`,
+    `<form id="truffle-queue-form"><p class="help-copy">${numbers.map(n => "#" + n).join(" · ")}</p>${publishFields("truffle", defaults)}<div class="field"><label for="truffle-attempts">Maximum attempts per stage</label><input id="truffle-attempts" name="attempts" type="number" min="1" max="5" value="2" required></div><div class="launch-note">Explore → plan → implement → independent review, one issue at a time. Closed issues and linked PRs are rechecked before launch. The queue pauses on a changed issue, failed review, quota or publication error; accepted work stays saved. Manual mode lets you inspect the diff before publishing. Automatic mode commits, pushes, and opens each accepted PR.</div><label class="check-field"><input name="allow_write" type="checkbox" required> Allow the selected fixes to edit their isolated worktrees</label><button type="submit" class="button primary">Start issue queue →</button></form>`, "truffle-queue");
+  $('#truffle-publish-mode option[value="off"]').remove();
+}
 function recommendationCards(output) {
   return (output?.findings || [])
     .map(
@@ -406,6 +485,42 @@ function openPublish() {
 function showPublishPreview(p) {
   modal("Review pull request", `${p.repo} · ${p.branch} → ${p.base}`,
     `<form id="publish-form" data-run="${esc(p.workflow_id)}" data-snapshot="${esc(p.snapshot_id)}"><div class="field"><label for="pr-title">Title</label><input id="pr-title" name="title" value="${esc(p.title)}" maxlength="256" required></div><div class="field"><label for="pr-body">Description · Markdown</label><textarea id="pr-body" name="body" class="editor" required>${esc(p.body)}</textarea></div><label class="check-field"><input type="checkbox" name="draft" ${p.draft ? "checked" : ""}> Create as draft</label><details open><summary>Changes · ${p.files.length} files</summary><pre class="console publish-diff">${esc(p.diff)}</pre></details>${p.legacy ? '<label class="check-field"><input type="checkbox" name="accept_legacy_diff" required> This older run has no saved Git review snapshot. I checked this diff and confirm it is the change to publish.</label>' : '<p class="help-copy">This diff matches the saved tree from the accepted review.</p>'}<div class="dialog-footer"><small>Creates a commit, pushes the feature branch, and opens the PR against ${esc(p.base)}.</small><button class="button primary" type="submit">${p.commit ? "Retry publication →" : "Publish PR →"}</button></div></form>`, "publish");
+}
+function commandPreview(entry) {
+  return (entry.command || entry.name || "Command")
+    .replace(/^\S*\b(?:ba|z|fi)?sh\s+-\w*c\s+['"]?/, "").split("\n")[0].replace(/['"]$/, "");
+}
+function activityTimeline(node) {
+  const entries = node?.activity_entries?.length ? node.activity_entries
+    : (node?.messages || []).filter(m => !/^(worker session connected|worker turn completed)/.test(m))
+      .map((text, i) => ({id: `legacy-${i}`, kind: /^(running a command|command finished)/.test(text) ? "tool" : "message", text, name: text}));
+  const groups = [];
+  for (const entry of entries) {
+    if (["command", "tool"].includes(entry.kind)) {
+      if (groups.at(-1)?.kind === "commands") groups.at(-1).items.push(entry);
+      else groups.push({kind: "commands", id: entry.id, items: [entry]});
+    } else groups.push(entry);
+  }
+  return groups.map(entry => {
+    const key = `${state.node}-${node?.attempts || 0}-${entry.id}`;
+    if (entry.kind === "commands") {
+      const running = entry.items.some(c => c.status === "running") && node?.status === "running";
+      const nonzero = entry.items.filter(c => c.failed).length;
+      const count = entry.items.length;
+      const label = running ? "Running" : nonzero ? `${nonzero} nonzero ${nonzero === 1 ? "exit" : "exits"}` : "Finished";
+      return `<details class="activity-item command-group" data-activity-key="${esc(key)}" data-disclosure-key="${esc(key)}"><summary><span class="activity-symbol ${running ? "is-live" : nonzero ? "has-error" : ""}" aria-hidden="true">${running ? "●" : nonzero ? "!" : "✓"}</span><span class="command-group-copy"><span><strong>${count} ${entry.items.every(c => c.kind === "command") ? (count === 1 ? "command" : "commands") : (count === 1 ? "tool call" : "tool calls")}</strong><small>${label}</small></span><code>${esc(commandPreview(entry.items.at(-1)))}</code></span><span class="disclosure-chevron" aria-hidden="true">⌄</span></summary><div class="command-list">${entry.items.map(c => `<details class="command-detail" data-disclosure-key="${esc(key + '-' + c.id)}"><summary><span class="command-exit ${c.failed ? "has-error" : ""}">${c.exit_code != null ? `exit ${esc(c.exit_code)}` : c.status === "running" ? (node?.status === "running" ? "running" : "no exit") : "tool"}</span><code>${esc(commandPreview(c))}</code></summary>${c.command ? `<pre class="console">${esc(c.command)}</pre>` : ""}${c.output ? `<pre class="console command-output">${esc(c.output)}</pre>` : '<p class="help-copy">No command output captured.</p>'}</details>`).join("")}</div></details>`;
+    }
+    if (entry.kind === "message")
+      return `<article class="activity-item worker-update" data-activity-key="${esc(key)}"><div class="update-label"><span aria-hidden="true">✦</span> ${esc(node.agent || "Worker")} <span>update</span></div><div class="markdown">${markdown(entry.text)}</div></article>`;
+    return `<div class="activity-item activity-note ${entry.kind === "error" ? "blocker" : ""}" data-activity-key="${esc(key)}">${esc(entry.text)}</div>`;
+  }).join("") || `<div class="activity-empty"><span aria-hidden="true">◌</span><h3>${node?.status === "running" ? "Waiting for the first update" : "No activity captured"}</h3><p>${node?.status === "running" ? "Worker updates and commands will appear here as they arrive." : "Open Deliverable for the saved result, or Run details for logs."}</p></div>`;
+}
+function workerActivity(node, report) {
+  const running = node?.status === "running", worker = node?.agent || "Worker", a = node?.activity;
+  const duration = a?.started_at_ms ? Math.max(0, Math.floor(((running ? Date.now() : a.updated_at_ms) - a.started_at_ms) / 1000)) : null;
+  const elapsed = duration == null || !Number.isFinite(duration) ? "" : duration < 60 ? `${duration}s` : `${Math.floor(duration / 60)}m ${duration % 60}s`;
+  const eventNames = {"node.started":"Started", "node.retrying":"Retrying", "node.succeeded":"Completed", "node.failed":"Stopped", "node.reused":"Reused", "workflow.created":"Run created", "workflow.started":"Run started", "workflow.resumed":"Run resumed", "workflow.finished":"Run finished"};
+  return `<section class="worker-activity"><div class="activity-toolbar"><div><div class="eyebrow">${running ? '<span class="live-dot"></span> LIVE ACTIVITY' : "WORKER ACTIVITY"}</div><h2>${esc(state.node)} <span>with ${esc(worker)}</span></h2><p>${badge(node?.status || "pending")}${elapsed ? `<span>${elapsed} ${running ? "elapsed" : "total"}</span>` : ""}<span>Attempt ${node?.attempts || 0}</span></p></div>${button("Latest ↓", "activity-latest", 'aria-label="Jump to latest activity"', "small ghost")}</div><div class="activity-feed worker-timeline" data-scroll-key="worker-${esc(state.node)}-${node?.attempts || 0}" data-follow-tail tabindex="0" aria-label="Worker activity">${activityTimeline(node)}</div><p class="activity-follow-hint">Scroll back to pause following. Jump to latest to catch up.</p><details class="activity-diagnostics" data-disclosure-key="run-details-${esc(state.node)}-${node?.attempts || 0}"><summary>Run details <span>Logs &amp; stage history</span></summary><div class="diagnostic-content">${a ? `<div class="diagnostic-stats"><span>Process <b>${esc(a.pid)}</b></span><span>stdout <b>${number(a.stdout_bytes)}B</b></span><span>stderr <b>${number(a.stderr_bytes)}B</b></span><span>Refresh <b>2s</b></span></div>` : ""}${node?.stderr ? `<h3>Worker stderr</h3><pre class="console">${esc(node.stderr)}</pre>` : ""}<h3>Stage history</h3><div class="activity-feed stage-history" data-scroll-key="workflow-events" data-newest-first>${report.events.slice(-40).reverse().map(e => `<div class="activity-item" data-activity-key="${esc(pretty(e))}"><time>${date(e.ts)}</time><span>${esc(eventNames[e.type] || e.type.replaceAll(/[._]/g, " "))}${e.node_id ? ` · ${esc(e.node_id)}` : ""}${e.status ? ` · ${esc(e.status)}` : ""}</span></div>`).join("")}</div></div></details></section>`;
 }
 function workflow() {
   const report = state.report,
@@ -447,17 +562,9 @@ function workflow() {
           "The complete answer will appear here as soon as the worker finishes. Open Activity to follow its progress.",
           button("Watch activity", "tab", 'data-tab="activity"'),
         );
-  if (state.tab === "activity")
-    body = `<div class="article-head"><h2>${esc(state.node)} · live activity</h2><span class="pill">Updates every 2 seconds</span></div>${node?.activity ? `<div class="facts"><span>Worker</span><span>${esc(node.agent)} · PID ${node.activity.pid}</span><span>Elapsed</span><span>${age(node.activity.started_at_ms)}</span><span>Captured logs</span><span>${number(node.activity.stdout_bytes)}B stdout / ${number(node.activity.stderr_bytes)}B stderr</span></div><hr>` : ""}<div class="activity-feed" data-scroll-key="worker-${esc(state.node)}-${node?.attempts || 0}" data-follow-tail>${node?.messages?.length ? node.messages.map((m) => `<div class="activity-item"><strong>${esc(m)}</strong></div>`).join("") : `<p class="help-copy">${node?.status === "running" ? "Waiting for the next public worker update. Heartbeats show the coordinator is waiting; they do not guarantee progress." : "No public worker updates were captured. Check the result and stderr below."}</p>`}</div>${node?.stderr ? `<details><summary>Worker stderr</summary><pre class="console">${esc(node.stderr)}</pre></details>` : ""}<hr><h3>Workflow events</h3><div class="activity-feed" data-scroll-key="workflow-events" data-newest-first>${report.events
-      .slice(-40)
-      .reverse()
-      .map(
-        (e) =>
-          `<div class="activity-item" data-activity-key="${esc(pretty(e))}"><small>${date(e.ts)}</small><br><strong>${esc(e.type)}</strong> ${esc(e.node_id || "")} ${esc(e.status || "")}</div>`,
-      )
-      .join("")}</div>`;
+  if (state.tab === "activity") body = workerActivity(node, report);
   if (state.tab === "evidence")
-    body = `<h2>Verification &amp; handoff</h2>${(node?.result?.blockers || []).map((b) => `<div class="blocker">${esc(b)}</div>`).join("")}<h3>Reported checks</h3><pre class="console">${esc((node?.result?.tests || []).join("\n") || "No verification reported yet.")}</pre><h3>Changed files</h3><pre class="console">${esc((node?.result?.changed || []).join("\n") || "No changed files reported.")}</pre><p class="help-copy">These are worker receipts. Inspect the actual checks and diff before treating a claim as verified.</p>`;
+    body = `<h2>Verification &amp; handoff</h2>${(node?.result?.blockers || []).map((b) => `<div class="blocker">${esc(b)}</div>`).join("")}<h3>Reported checks</h3><pre class="console">${esc((node?.result?.tests || []).join("\n") || "No verification reported yet.")}</pre>${node?.result?.command_evidence?.length ? `<h3>Command observations</h3><p class="help-copy">These commands returned a nonzero exit during the turn. They may include searches with no matches, corrected lookups, or tests run before a fix. Unresolved issues belong in the final handoff above.</p><pre class="console">${esc(node.result.command_evidence.join("\n"))}</pre>` : ""}<h3>Changed files</h3><pre class="console">${esc((node?.result?.changed || []).join("\n") || "No changed files reported.")}</pre><p class="help-copy">These are worker receipts. Inspect the actual checks and diff before treating a claim as verified.</p>`;
   if (state.tab === "spec")
     body = `<div class="article-head"><h2>Workflow definition</h2>${button("Use as a new workflow", "custom-from-run", "", "small")}</div><pre class="console">${esc(pretty(report.spec))}</pre>`;
   if (node?.quota)
@@ -468,6 +575,10 @@ function workflow() {
     body =
       `<div class="quota-notice"><h3>${esc(node.permission_failure.agent)} could not run a required tool</h3><p>${state.config?.execution_mode === "yolo" && node?.result?.execution_mode !== "yolo" ? "This attempt used restricted permissions. YOLO is now configured; retry to launch with full runtime access." : esc(node.permission_failure.message)}</p><p>The worker stopped at a permission gate. Retry after configuring that worker, or choose Auto to use another permitted worker. Accepted stages stay saved.</p>${button("Retry this stage →", "resume", "", "small")}</div>` +
       body;
+  if (node?.coordinator_failure) {
+    const notice = `<div class="quota-notice"><h3>${esc(node.coordinator_failure.message)}</h3><p>${esc(node.coordinator_failure.detail)}</p><p>Fusion could not capture the Git state required for review. Retrying a different worker cannot repair this coordinator failure. After correcting it, resume this stage; accepted stages remain saved.</p>${button("Resume this stage →", "resume", "", "small")}</div>`;
+    body = notice + (state.tab === "report" && node.coordinator_failure.phase === "snapshot_before_review" ? '<p class="help-copy">No reviewer was launched, so there is no worker deliverable for this attempt.</p>' : body);
+  }
   mount(`<button class="back" data-view="workflows">← All workflows</button><div class="detail-heading"><div class="eyebrow">${report.read_only ? "DISCOVERY & INTELLIGENCE" : "IMPLEMENTATION WORKFLOW"}</div><h1>${esc(title)}</h1>${request}<div class="run-meta">${badge(report.status)}<span class="mono">${esc(report.workflow_id)}</span><span>${date(report.started_at_ms)}</span><span>${report.read_only ? "Investigation task" : "Implementation task"}</span></div><div class="actions">${button("Export report ↓", "export-report", "", "small")}${report.status === "success" && !report.read_only && !report.publication?.url ? button(report.publication?.status === "failed" ? "Retry publication" : "Open PR", "publish", "", "small primary") : ""}${["paused_quota", "paused_budget", "interrupted", "failed"].includes(report.status) ? button("Resume workflow", "resume", "", "small primary") : ""}${job ? button("Stop run", "cancel", `data-id="${esc(job.id)}"`, "small danger") : ""}</div></div>
     <div class="pipeline" aria-label="Workflow stages">${nodes.map((n, i) => `<button class="stage ${n.id === state.node ? "selected" : ""}" data-action="stage" data-node="${esc(n.id)}"><span class="stage-index">${String(i + 1).padStart(2, "0")}</span>${badge(n.status)}<h3>${esc(n.id)}</h3><small>${esc(n.agent)} · attempt ${n.attempts}</small>${n.needs?.length ? `<div><small>after ${esc(n.needs.join(", "))}</small></div>` : ""}</button>`).join("")}</div>
     <div class="detail-grid"><div class="panel"><div class="panel-body"><div class="tabs">${[
@@ -519,7 +630,9 @@ function labelDraft(record) {
     evidence: approved?.evidence || "",
     suggestion_id: approved?.suggestion_id || null,
     seen: approved?.suggestion_id || null,
-    worker: "auto",
+    worker: state.garden?.agent || "auto",
+    labeling_mode: state.garden?.labeling_mode || "single",
+    council_agents: state.garden?.council_agents || [],
     dirty: false,
   });
   const suggestion = record.suggestions?.at(-1);
@@ -535,6 +648,21 @@ function labelDraft(record) {
 function canApproveLabels(draft) {
   return Object.values(draft.answers).some(value => value !== "") && !!draft.evidence.trim();
 }
+function labelingControls(prefix, options) {
+  const council = options.labeling_mode === "council";
+  const workers = state.config?.workers || [];
+  const members = options.council_agents?.length ? options.council_agents : workers.filter(w => w.available).slice(0, 3).map(w => w.agent);
+  return `<div class="labeling-controls" data-labeling="${prefix}"><div class="form-grid"><div class="field"><label for="${prefix}-mode">Drafting method</label><select id="${prefix}-mode" name="labeling_mode"><option value="single" ${!council ? "selected" : ""}>Single worker</option><option value="council" ${council ? "selected" : ""}>Agent council</option></select></div><div class="field single-worker" ${council ? "hidden" : ""}><label for="${prefix}-worker">Labeling worker</label><select id="${prefix}-worker" name="agent"><option value="auto">Auto · available worker</option>${workers.map(w => `<option value="${esc(w.agent)}" ${options.worker === w.agent ? "selected" : ""} ${!w.available ? "disabled" : ""}>${esc(w.agent)}</option>`).join("")}</select></div></div><fieldset class="council-members" ${!council ? "hidden" : ""}><legend>Council members · choose at least two</legend><div>${workers.map(w => `<label class="check-field"><input type="checkbox" name="council_agents" value="${esc(w.agent)}" ${members.includes(w.agent) ? "checked" : ""} ${!w.available ? "disabled" : ""}> ${esc(w.agent)}${!w.available ? " · unavailable" : ""}</label>`).join("")}</div><p class="help-copy">Each member independently reads the same evidence. All selected members must agree to suggest an answer. You resolve disagreements and approve the final labels. One worker call per member, run in sequence.</p></fieldset></div>`;
+}
+function labelingValues(prefix) {
+  return {agent: $(`#${prefix}-worker`).value, labeling_mode: $(`#${prefix}-mode`).value,
+    council_agents: [...document.querySelectorAll(`[data-labeling="${prefix}"] [name=council_agents]:checked:not(:disabled)`)].map(el => el.value)};
+}
+function councilAssessment(suggestion) {
+  const c = suggestion.council;
+  if (!c) return "";
+  return `<section class="council-assessment"><h4>Council assessment · ${c.members.length} members</h4><p class="help-copy">Independent assessments, unanimous suggestions. Agreement is supporting evidence, not proof that a label is correct.</p><div class="council-outcomes">${Object.entries(c.questions).map(([key,q])=>`<span class="pill">${esc(key)} · ${esc(q.state)} · ${q.votes}/${q.members} answered</span>`).join("")}</div>${c.members.map(m=>`<details><summary>${esc(m.requested_agent)} · ${m.status === "success" ? `${Object.keys(m.answers).length} answers` : "assessment failed"}</summary><p class="help-copy">Worker: ${esc(m.agent || m.requested_agent)} · Model: ${esc(m.model || "not reported")} · Run: ${esc(m.run_id || "not started")}</p>${m.error ? `<p class="blocker">${esc(m.error)}</p>` : ""}${Object.entries(m.answers || {}).map(([k,v])=>`<p><strong>${esc(k)} → ${esc(v.value)}</strong><br>${esc(v.reason)} <small>[${esc(v.evidence.join(", "))}]</small></p>`).join("")}${Object.entries(m.abstentions || {}).map(([k,v])=>`<p class="help-copy"><strong>${esc(k)} · abstained</strong><br>${esc(v)}</p>`).join("")}</details>`).join("")}</section>`;
+}
 function labelEditor(record) {
   const draft = labelDraft(record);
   const suggestion = record.suggestions?.find(s => s.suggestion_id === draft.suggestion_id);
@@ -543,12 +671,12 @@ function labelEditor(record) {
   const busy = job && active(job.status);
   const options = q => q.type === "noul" ? ["false", "true"] : q.type === "score" ? Object.keys(q.criteria).map((_, i) => String(i)) : Object.keys(q.criteria || {});
   return `<section class="review-form"><div class="article-head"><div><h3>Teach from verified evidence</h3><p class="help-copy">Generate a draft, check its reasoning, then edit and approve. Only approved labels enter training exports.</p></div></div>
-    <div class="label-tools"><div class="field"><label for="label-worker">Labeling worker</label><select id="label-worker"><option value="auto">Auto · available worker</option>${(state.config?.workers || []).map(w => `<option value="${esc(w.agent)}" ${draft.worker === w.agent ? "selected" : ""} ${!w.available ? "disabled" : ""}>${esc(w.agent)}</option>`).join("")}</select></div>${button(busy ? "Drafting labels…" : latest ? "Regenerate labels" : "Suggest labels", "suggest-labels", busy ? "disabled" : "", "primary")}</div>
-    <p class="help-copy">Uses a coding worker with your configured account. Laya’s prediction is withheld from the worker; unsupported answers stay unlabeled.</p>
+    ${labelingControls("label", draft)}<div class="label-tools">${button(busy ? "Drafting labels…" : latest ? "Regenerate labels" : "Suggest labels", "suggest-labels", busy ? "disabled" : "", "primary")}</div>
+    <p class="help-copy">Uses your configured worker accounts. Laya’s prediction and prior labels are withheld; unsupported answers stay unlabeled.</p>
     ${job ? `<div class="label-job" role="status">${badge(job.status)}<span>${busy ? "Reading evidence and drafting labels · " + age(job.started_at_ms) : job.status === "success" ? (latest && !Object.keys(latest.answers).length ? "Assessment saved; no labels suggested." : "Draft saved. Review below before approving.") : "No new draft was saved. Open activity for the error, then retry with another worker."}</span>${button("View activity", "job", `data-id="${esc(job.id)}"`, "small")}${busy ? button("Stop", "cancel", `data-id="${esc(job.id)}"`, "small") : ""}</div>` : ""}
     ${latest && latest.suggestion_id !== draft.suggestion_id ? `<div class="launch-note">A new draft is ready. Your edits have been preserved. ${button("Use latest draft", "use-label-draft", "", "small")}</div>` : ""}
     ${suggestion && !Object.keys(suggestion.answers).length ? `<div class="launch-note">No labels were suggested. Check the reasons below. You can fill in any answer supported by the original input and add your evidence, or leave it unlabeled. Nothing enters training until you approve.</div>` : ""}
-    ${suggestion ? `<div class="label-reasoning"><div class="article-head"><h3>Suggested assessment</h3><span class="pill">Draft · ${esc(suggestion.agent)}</span></div>${Object.entries(suggestion.answers).map(([key, item]) => `<p><strong>${esc(key)} → ${esc(item.value)}</strong><br>${esc(item.reason)} <small>[${esc(item.evidence.join(", "))}]</small></p>`).join("")}${Object.entries(suggestion.abstentions).map(([key, reason]) => `<p class="help-copy"><strong>${esc(key)} · needs evidence</strong><br>${esc(reason)}</p>`).join("")}<details><summary>Evidence used · ${suggestion.sources.length} sources</summary>${suggestion.sources.map(s => `<h4>${esc(s.id)} · ${esc(s.title)}</h4>${s.timing ? `<p class="help-copy">${esc(s.timing)}</p>` : ""}<pre class="console label-source">${esc(typeof s.text === "string" ? s.text : pretty(s.text))}${s.truncated ? "\n[Excerpt truncated]" : ""}</pre>`).join("")}</details></div>` : ""}
+    ${suggestion ? `<div class="label-reasoning"><div class="article-head"><h3>Suggested assessment</h3><span class="pill">Draft · ${esc(suggestion.agent)}</span></div>${Object.entries(suggestion.answers).map(([key, item]) => `<p><strong>${esc(key)} → ${esc(item.value)}</strong><br>${esc(item.reason)} <small>[${esc(item.evidence.join(", "))}]</small></p>`).join("")}${Object.entries(suggestion.abstentions).map(([key, reason]) => `<p class="help-copy"><strong>${esc(key)} · needs evidence</strong><br>${esc(reason)}</p>`).join("")}${councilAssessment(suggestion)}<details><summary>Evidence used · ${suggestion.sources.length} sources</summary>${suggestion.sources.map(s => `<h4>${esc(s.id)} · ${esc(s.title)}</h4>${s.timing ? `<p class="help-copy">${esc(s.timing)}</p>` : ""}<pre class="console label-source">${esc(typeof s.text === "string" ? s.text : pretty(s.text))}${s.truncated ? "\n[Excerpt truncated]" : ""}</pre>`).join("")}</details></div>` : ""}
     <form id="label-form" data-decision="${esc(record.id)}"><div class="form-grid">${Object.entries(record.questions || {}).map(([key, q], i) => `<div class="field"><label for="label-answer-${i}">${esc(key)}</label><select id="label-answer-${i}" name="${esc(key)}"><option value="">Leave unlabeled</option>${options(q).map(v => `<option value="${esc(v)}" ${draft.answers[key] === v ? "selected" : ""}>${esc(v)}</option>`).join("")}</select><small>${esc(q.instructions || "")}</small></div>`).join("")}</div><div class="field"><label for="label-evidence">Verification evidence</label><textarea id="label-evidence" placeholder="What did you check? Which reproduction, diff, or test proves the answer?" required>${esc(draft.evidence)}</textarea></div><p class="help-copy">Select at least one answer and add verification evidence to approve. You can leave other questions unlabeled; only selected answers enter training.</p><button class="button primary" type="submit" ${canApproveLabels(draft) ? "" : "disabled"}>${draft.suggestion_id ? "Approve labels" : "Save reviewed labels"}</button>${record.labels?.length ? `<p class="help-copy" style="margin-top:15px">${record.labels.length} review(s) saved for this decision.</p>` : ""}</form></section>`;
 }
 function captureLabelEdits() {
@@ -561,18 +689,93 @@ function captureLabelEdits() {
   draft.dirty = true;
   form.querySelector('button[type="submit"]').disabled = !canApproveLabels(draft);
 }
+const percent = value => typeof value === "number" && Number.isFinite(value) ? `${(value * 100).toFixed(1)}%` : "Not measured";
+function qualityDashboard(l) {
+  const q = l.quality;
+  if (!q) return "";
+  const reviews = (q.draft_reviews.edited || 0) + (q.draft_reviews.unchanged || 0);
+  const councilQuestions = (q.council.agreed || 0) + (q.council.disputed || 0) + (q.council.insufficient || 0);
+  const issueLinks = ids => ids.map(id => button(esc(id), "quality-decision", `data-id="${esc(id)}"`, "small ghost mono")).join(" ");
+  return `<section class="panel quality-panel"><div class="panel-header"><div><div class="eyebrow">TRAINING DATA HEALTH</div><h3>What’s in your lessons?</h3></div><span class="pill">${q.examples} retained examples</span></div><div class="panel-body"><div class="quality-metrics">${[
+    [q.unique_inputs, "Distinct inputs", `${q.duplicate_examples} repeated examples`],
+    [q.groups.train + q.groups.validation, "Independent groups", `${q.groups.train} training · ${q.groups.validation} validation`],
+    [`${q.evidence_recorded}/${q.answers}`, "Evidence recorded", "Human review notes; not an automated correctness check"],
+    [reviews ? percent((q.draft_reviews.edited || 0) / reviews) : "Not measured", "Drafts edited at approval", `${reviews} retained draft reviews · ${q.revised_answers} answer revisions`],
+  ].map(([v,title,copy])=>`<div><strong>${esc(v)}</strong><h4>${title}</h4><p class="help-copy">${esc(copy)}</p></div>`).join("")}</div>
+  ${q.conflicts.length || q.cross_split_duplicates.length ? `<div class="quality-warning"><strong>${q.conflicts.length} conflicting input sets · ${q.cross_split_duplicates.length} sets shared across training and validation</strong><p>Review conflicting answers and exclude redundant examples. Shared inputs can inflate validation scores. Re-export after correcting the data.</p></div>` : `<p class="help-copy">${q.examples ? "No conflicting labels or identical inputs shared across the two splits detected." : "Approve examples to start measuring data quality."} These checks cannot establish label correctness or detect every form of leakage.</p>`}
+  <div class="learning-columns"><div><h4>Where the approved answers came from</h4>${Object.entries(q.sources).map(([name,count])=>`<div class="quality-source"><span>${name === "human" ? "Human-authored" : name === "council" ? "Council draft + human approval" : esc(name) + " draft + human approval"}</span><strong>${count}</strong></div>`).join("") || '<p class="help-copy">No retained approvals yet.</p>'}</div><div><h4>Council agreement</h4><p>${councilQuestions ? `${percent((q.council.agreed || 0) / councilQuestions)} unanimous · ${q.council.disputed || 0} disputed · ${q.council.insufficient || 0} without full support` : "No council assessments yet."}</p><p class="help-copy">${q.council.drafts || 0} latest drafts · ${q.council.failed_members || 0} failed members. Agreement measures consistency, not correctness.</p></div></div>
+  <details class="quality-details"><summary>Label balance · spot missing classes and skew</summary>${q.balance.map(b=>`<div class="quality-balance"><strong>${esc(b.question)}</strong><div class="balance-segments" aria-label="Label counts">${Object.entries(b.counts).filter(([,n])=>n).map(([name,n],i)=>`<span style="flex:${n};opacity:${1-i*.12}" title="${esc(name)}: ${n}"></span>`).join("")}</div><p class="help-copy">${Object.entries(b.counts).map(([name,n])=>`${esc(name)}: ${n}`).join(" · ")} · largest class ${percent(b.dominant_share)}</p>${b.missing_labels.length ? `<small>Not represented: ${b.missing_labels.map(esc).join(", ")}</small>` : ""}</div>`).join("")}<p class="help-copy">Imbalance may reflect real usage. Check underrepresented outcomes before treating overall accuracy as representative.</p></details>
+  ${q.duplicate_sets.length ? `<details class="quality-details"><summary>Inspect duplicate and conflicting examples · ${q.duplicate_sets.length} sets</summary>${q.duplicate_sets.slice(0,20).map(ids=>`<div class="quality-issue"><strong>${q.conflicts.some(c=>c.ids[0]===ids[0]) ? "Conflicting answers" : "Identical input"}${q.cross_split_duplicates.some(c=>c[0]===ids[0]) ? " · in both splits" : ""}</strong><div>${issueLinks(ids.slice(0,8))}</div></div>`).join("")}${q.duplicate_sets.length > 20 ? '<p class="help-copy">Showing the first 20 sets.</p>' : ""}</details>` : ""}</div></section>`;
+}
+function impactDashboard(l) {
+  const comparisons = l.comparisons || [];
+  return `<section class="panel impact-panel"><div class="panel-header"><div><div class="eyebrow">MEASURED RESULTS</div><h3>Are the lessons helping?</h3></div><span class="pill">${comparisons.filter(c=>c.delta !== null).length} matched comparisons</span></div><div class="panel-body"><p class="help-copy">Export approved labels, evaluate the source model, train a candidate, then evaluate that candidate on the same export. Each row below pairs exact model identities and the same held-out examples. New weights take effect only when you choose that checkpoint in Settings.</p>
+    ${comparisons.length ? comparisons.slice(0,8).map(c=>`<article class="impact-comparison"><div class="article-head"><div><strong>${esc(c.candidate_id)}</strong><small>${date(c.time_ms)} · benchmark ${esc(c.benchmark?.slice(0,12) || "unknown")}</small></div><div class="impact-delta ${c.delta !== null && c.delta < 0 ? "regressed" : ""}">${c.delta === null ? "Awaiting evidence" : `${c.delta >= 0 ? "+" : ""}${(c.delta*100).toFixed(1)} pp`}</div></div><div class="impact-bars">${[["Source", c.baseline_accuracy],["Candidate", c.accuracy]].map(([name,value])=>`<div><span>${name}</span><div class="coverage-track"><i style="width:${typeof value === "number" ? value*100 : 0}%"></i></div><strong>${percent(value)}</strong></div>`).join("")}</div><p class="help-copy">${c.train_answers ?? "Unrecorded"} training answers · ${c.validation_questions ?? "?"} held-out questions in ${c.validation_groups ?? "?"} groups.<br>Shuffled-state control: ${percent(c.control_accuracy)} · training-majority baseline: ${percent(c.majority_accuracy)}.</p>${c.notes.map(note=>`<p class="quality-warning">${esc(note)}</p>`).join("")}${c.holdout_status !== "checked" ? `<p class="help-copy">${c.holdout_status === "contaminated" ? "Known overlap: do not interpret the accuracy as evidence of generalization." : "This run has no complete training-overlap audit. Re-evaluate with a candidate trained by this version to track lineage."}</p>` : '<p class="help-copy">No exact input or group overlap detected against recorded local training lineage. Sample size and repeated benchmark use still matter.</p>'}${Object.keys(c.by_kind).length ? `<details><summary>Results by decision type</summary>${Object.entries(c.by_kind).map(([kind,v])=>`<div class="quality-source"><span>${esc(kind)} · ${v.questions} questions</span><strong>${percent(c.baseline_by_kind[kind]?.accuracy)} → ${percent(v.accuracy)}</strong></div>`).join("")}</details>` : ""}</article>`).join("") : `<div class="impact-empty"><strong>No measured improvement yet.</strong><p>${l.labeled_questions} approved answers are available. ${l.candidates.length ? "Evaluate your candidate and its source model to see the difference here." : "They become model changes after you train a candidate. Paired evaluations will show gains and regressions here over time."}</p></div>`}
+  </div></section>`;
+}
+function learningDashboard() {
+  const l = state.learning;
+  if (!l) return "";
+  const model = l.model;
+  let running = 0;
+  const growth = l.growth.map(day => ({...day, total: running += day.labels})).slice(-30);
+  const latestExport = l.exports[0];
+  return `<section class="learning-dashboard" aria-label="Laya learning progress">
+    <div class="learning-hero panel"><div><div class="eyebrow">YOUR LAYA</div><h2>${l.candidates.length ? "Lessons becoming a model." : "Every verified lesson counts."}</h2><p>${l.candidates.length ? "Follow your candidates from training through evaluation. Your configured model is shown separately." : "You’re building Laya’s training data. Approved labels become new weights when you train a candidate."}</p><div class="learning-actions">${button("Export approved labels", "learning-step", 'data-step="export"', "primary")}${button("Train candidate", "learning-step", `data-step="train" ${!l.can_train || !latestExport ? 'disabled title="Export labels from both train and validation groups first"' : ""}`)}${button("Evaluate configured model", "learning-step", `data-step="evaluate" ${!latestExport ? "disabled" : ""}`)}</div></div>
+    <div class="learning-growth"><div><strong>${number(l.labeled_questions)}</strong><span>approved answers retained</span></div><div class="growth-chart" role="img" aria-label="Cumulative retained labels by first review date">${growth.length ? growth.map(day => `<div style="height:${Math.max(5, day.total / Math.max(1, running) * 100)}%" title="${esc(date(day.day_ms))}: ${day.total} retained answers"><i></i></div>`).join("") : '<p>Your first approval starts the chart.</p>'}</div><small>Current retained labels · excludes removed examples</small></div></div>
+    <div class="learning-pipeline">${[
+      [l.reviewed_decisions, "Reviewed examples", `${l.labeled_questions} answers across ${Object.keys(l.kinds).length} decision types`],
+      [l.exports.length, "Dataset exports", `${l.groups.train} training / ${l.groups.validation} held-out groups`],
+      [l.candidates.length, "Trained candidates", "Separate checkpoints; never auto-activated"],
+      [l.evaluations.length, "Completed evaluations", "Held-out questions and shuffled-state control"],
+    ].map(([n,title,copy],i)=>`<div><span class="eyebrow">0${i+1}</span><strong>${number(n)}</strong><h3>${title}</h3><p>${copy}</p></div>`).join("")}</div>
+    ${gardenPanel()}
+    <div class="learning-columns"><section class="panel"><div class="panel-header"><h3>Model in use</h3><span class="pill">${esc(model.mode)}</span></div><div class="panel-body"><h2>${model.path ? "Custom checkpoint" : "Bundled Laya checkpoint"}</h2><p class="help-copy">${model.path ? esc(model.path) : "The router selects the bundled checkpoint. Label approvals alone do not modify it."}</p>${model.training.method ? `<p>${esc(model.training.method)} · ${esc(model.training.steps)} training steps</p>` : ""}<p class="help-copy">${model.qualified_buckets} saved qualified calibration buckets (model-specific)${model.mode === "shadow" ? " · recommendations remain advisory" : model.mode === "off" ? " · inference is disabled" : " · automatic actions still require qualification"}.</p><details><summary>Last observed model identity</summary><p class="mono">${esc(model.last_observed_identity || "No successful inference recorded")}</p><small>${model.last_observed_at_ms ? date(model.last_observed_at_ms) + " · historical observation; may predate configuration changes" : "Run a probe to observe the configured model."}</small></details></div></section>
+    <section class="panel"><div class="panel-header"><h3>Teaching coverage</h3><span class="pill">${l.labeled_questions} / ${l.eligible_questions} answers</span></div><div class="panel-body">${Object.entries(l.kinds).map(([kind,v])=>`<div class="coverage-row"><div><strong>${esc(kind)}</strong><small>${v.labeled} / ${v.questions}</small></div><div class="coverage-track"><i style="width:${v.questions ? v.labeled / v.questions * 100 : 0}%"></i></div></div>`).join("") || '<p class="help-copy">New decisions will appear here as you use Fusion.</p>'}<p class="help-copy">${l.can_train ? "Training and held-out groups are present. More independent workflows improve the evidence." : "Training needs approved examples in both training and held-out workflow groups. Keep reviewing independent runs; repeats of one workflow stay together."}</p><details><summary>Label balance &amp; historical agreement</summary>${Object.entries(l.distribution).map(([key,labels])=>`<p><strong>${esc(key)}</strong><br>${Object.entries(labels).map(([label,n])=>`${esc(label)}: ${n}`).join(" · ")}</p>`).join("")}<p>${percent(l.agreement.rate)} agreement on ${l.agreement.compared} reviewed answers. This compares recorded predictions with human labels; it is not a held-out score or proof of improvement.</p></details></div></section></div>
+    ${qualityDashboard(l)}${impactDashboard(l)}
+    ${l.candidates.length ? `<section class="panel candidate-panel"><div class="panel-header"><h3>Your trained candidates</h3><span class="pill">${l.candidates.length} saved</span></div><div class="candidate-grid">${l.candidates.slice(0,6).map(c=>{
+      const evaluation = l.evaluations.find(e=>e.result.model_identities?.length === 1 && e.result.model_identities[0] === c.training.model_identity);
+      const matched = l.comparisons?.find(item=>item.candidate_id === c.id && item.evaluation_id === evaluation?.id);
+      const score = evaluation?.result;
+      const delta = matched?.delta == null ? null : matched.delta * 100;
+      return `<article class="candidate-card"><div class="article-head"><strong>${esc(c.id)}</strong><span class="pill">${model.path === c.path ? "Configured" : "Candidate"}</span></div><p class="help-copy">${date(c.started_at_ms)} · ${esc(c.training.steps ?? "?")} steps · ${esc(c.training.train_groups ?? "?")} training groups</p><div class="candidate-score"><strong>${percent(score?.accuracy)}</strong><span>held-out accuracy${score ? ` · ${esc(score.validation_questions)} questions` : ""}</span></div><p class="help-copy">Shuffled-state control: ${percent(score?.control_accuracy)}${delta !== null ? `<br>${delta >= 0 ? "+" : ""}${delta.toFixed(1)} percentage points vs source model on the same held-out benchmark.` : "<br>Evaluate the source model on the same dataset to measure improvement."}</p><div class="actions">${button("Evaluate candidate", "learning-step", `data-step="evaluate" data-model="${esc(c.path)}" data-dataset="${esc(c.dataset)}"`, "small")}${button("Training activity", "job", `data-id="${esc(c.id)}"`, "small")}</div><details><summary>Training lineage</summary><pre class="console">${esc(pretty(c.training))}</pre><p class="mono">${esc(c.path)}</p></details></article>`;
+    }).join("")}</div></section>` : ""}
+    ${l.evaluations.length || l.jobs.length ? `<details class="learning-history"><summary>Learning history · ${l.jobs.length} recent jobs</summary>${l.evaluations.slice(0,6).map(e=>`<div class="evaluation-row"><div><strong>${e.result.model_path ? "Custom checkpoint" : "Configured / bundled model"}</strong><small>${esc(e.id)} · ${esc(e.result.validation_questions ?? 0)} held-out questions</small></div><div>${percent(e.result.accuracy)}<small>Control: ${percent(e.result.control_accuracy)}</small></div>${button("View activity", "job", `data-id="${esc(e.id)}"`, "small")}</div>`).join("")}${jobRows(l.jobs)}</details>` : ""}
+  </section>`;
+}
+function gardenPanel() {
+  const g = state.garden;
+  if (!g) return "";
+  const ready = state.decisions.filter(r => r.garden_state === "needs_review").length;
+  const title = ready ? `${ready} ${ready === 1 ? "draft is" : "drafts are"} ready to review.`
+    : g.state === "drafting" ? "Your next draft is in progress."
+    : !g.enabled ? "Automatic drafting is paused." : g.queued ? "Your next drafts are queued." : "Ready for new decisions.";
+  return `<section class="panel garden-panel"><div class="garden-main"><div class="eyebrow">DATA GARDEN · NO DAILY CAP</div><h2>${title}</h2><p>${ready ? "The proposed labels and evidence are waiting below. Review, edit if needed, then approve." : "Automatically draft labels as decisions arrive. You edit and approve the useful ones."}</p>
+    <div class="garden-usage"><span>${g.used_today} automatic drafts started today (UTC)</span><span>${g.queued} queued · one draft at a time</span><span>${g.labeling_mode === "council" ? `Council · ${esc(g.council_agents.join(" + "))}` : `Single worker · ${esc(g.agent)}`}</span></div>
+    ${g.error ? `<p class="blocker">${esc(g.error)}</p>` : ""}${g.latest_job?.status === "failed" ? '<p class="help-copy">The last draft failed. Review its activity and retry explicitly; garden does not repeatedly call a failing worker for the same decision.</p>' : ""}</div>
+    <div class="garden-controls"><span class="pill">${esc(g.state.replaceAll("_", " "))}</span>${ready ? button(`Review ${ready} ${ready === 1 ? "draft" : "drafts"} →`, "garden-review", "", "primary") : ""}${button(g.enabled ? "Garden settings" : "Enable auto-drafts", "garden-settings", "", ready ? "" : "primary")}${g.enabled ? button("Pause garden", "garden-pause", "", "small ghost") : ""}${g.active_job ? button("View current draft", "job", `data-id="${esc(g.active_job.id)}"`, "small") : g.latest_job ? button("Latest activity", "job", `data-id="${esc(g.latest_job.id)}"`, "small ghost") : ""}</div></section>`;
+}
+function gardenToolbar() {
+  const choices = [["all","All decisions"],["needs_review","Ready to review"],["needs_draft","Needs a draft"],["needs_evidence","Needs evidence"],["drafting","Drafting"],["approved","Approved"],["needs_attention","Failed drafts"],["excluded","Excluded"]];
+  return `<div class="garden-toolbar" role="group" aria-label="Filter learning queue">${choices.map(([id,label])=>button(`${label} <small>${id === "all" ? state.decisions.length : state.decisions.filter(r=>r.garden_state===id).length}</small>`, "garden-filter", `data-filter="${id}" aria-pressed="${state.gardenFilter === id}"`, "small")).join("")}</div>`;
+}
+function openGarden() {
+  const g = state.garden;
+  modal("Tend your data garden", "Continuous drafting. Your choice of reviewers.", `<form id="garden-form"><label class="check-field"><input type="checkbox" name="enabled" ${g.enabled ? "checked" : ""}> Automatically draft labels for new decisions</label>${labelingControls("garden", {...g, worker: g.agent})}<label class="check-field"><input type="checkbox" name="include_existing"> Also draft existing eligible decisions without a prior attempt</label><div class="launch-note">No daily cap. Uses your configured worker accounts and their provider quotas. One draft runs at a time, with one automatic attempt per decision. You can pause at any time. Only approved labels enter training. The queue runs while the control-room server is running, even with the browser closed.</div><button class="button primary" type="submit">Save garden settings</button></form>`, "garden");
+}
+
 function decisions() {
-  const records = state.decisions;
+  const records = state.decisions.filter(r => state.gardenFilter === "all" || r.garden_state === state.gardenFilter);
   const record = records.find((r) => r.id === state.decision) || records[0];
   state.decision = record?.id;
   mount(
     intro(
       "LOCAL INTELLIGENCE",
       "Meet the decision layer.",
-      "Inspect recommendations, compare probabilities, and teach Laya from outcomes you have verified.",
+      "Grow your dataset, measure what Laya learns, and keep every lesson grounded in evidence.",
       `<div class="actions">${button("Learning tools", "learning")}${button("New probe", "probe", "", "primary")}</div>`,
     ) +
-      `<div class="lab-layout"><div class="panel decision-list">${records.length ? records.map((r) => `<div class="decision-row ${r.id === state.decision ? "selected" : ""}" role="button" tabindex="0" data-action="decision" data-id="${esc(r.id)}"><div class="decision-kind">◇ ${esc(r.kind)} ${badge(r.status)}</div><div class="prediction">${esc(decisionPredictions(r) || r.error || "No prediction")}</div><div class="run-meta"><span>${esc(r.mode)}</span><span>${number(r.duration_ms)}ms</span>${r.labels?.length ? "<span>✓ reviewed</span>" : ""}</div></div>`).join("") : '<div class="panel-body"><p>No decisions recorded yet. Run a local probe or start a workflow.</p></div>'}</div>
+      learningDashboard() + gardenToolbar() + `<div class="lab-layout"><div class="panel decision-list">${records.length ? records.map((r) => `<div class="decision-row ${r.id === state.decision ? "selected" : ""}" role="button" tabindex="0" data-action="decision" data-id="${esc(r.id)}"><div class="decision-kind">◇ ${esc(r.kind)} ${badge(r.status)}</div><div class="prediction">${esc(decisionPredictions(r) || r.error || "No prediction")}</div><div class="run-meta"><span>${esc(r.mode)}</span><span>${number(r.duration_ms)}ms</span>${r.reviewed_answers && Object.keys(r.reviewed_answers).length ? "<span>✓ reviewed</span>" : ""}<span>${esc((r.garden_state || "").replaceAll("_", " "))}</span></div></div>`).join("") : '<div class="panel-body"><p>No decisions recorded yet. Run a local probe or start a workflow.</p></div>'}</div>
     <div class="panel"><div class="panel-body">${
       record
         ? `<div class="article-head"><div><h2>${esc(record.kind)} decision</h2><small>${esc(record.id)}</small></div><span class="pill">${esc(record.mode)}</span></div>${record.error ? `<div class="blocker">${esc(record.error)}</div>` : ""}${record.truncated ? '<div class="blocker">Input was truncated. This decision cannot qualify for automatic action or reviewed labels.</div>' : ""}${Object.entries(
@@ -586,12 +789,12 @@ function decisions() {
               "",
             )}<h3 style="margin-top:25px">What actually happened</h3>${record.applications?.length ? record.applications.map((a) => `<p class="help-copy"><strong>${esc(a.actual)}</strong> · ${a.applied ? "Model recommendation applied" : "Policy decision; recommendation advisory"}<br>${esc(a.reason || "")}</p>`).join("") : '<p class="help-copy">This probe has no workflow action attached.</p>'}<details><summary>Input &amp; model evidence</summary><pre class="console">${esc(pretty({ state: record.state, prediction: record.prediction, model: record.model_identity, context: record.context }))}</pre></details>${
             record.status === "ok" && !record.truncated
-              ? labelEditor(record)
+              ? `<div class="garden-record-tools">${record.excluded ? "Excluded from future exports and automatic drafts. Existing datasets and trained models are unchanged." : "Keep useful examples; exclude noisy or unsuitable inputs from future exports."}${button(record.excluded ? "Restore example" : "Exclude example", "exclude-label", `data-id="${esc(record.id)}" data-excluded="${!record.excluded}"`, "small")}</div>` + (record.excluded ? "" : labelEditor(record))
               : ""
           }`
         : empty(
-            "A small model. An inspectable decision.",
-            "Probe intake, review, recovery, or acceptance without launching a coding agent.",
+            state.gardenFilter === "all" ? "A small model. An inspectable decision." : "No decisions in this queue.",
+            state.gardenFilter === "all" ? "Probe intake, review, recovery, or acceptance without launching a coding agent." : "Choose another filter, or let the garden prepare new drafts.",
             button("Try a probe", "probe", "", "primary"),
           )
     }</div></div></div>`,
@@ -811,7 +1014,7 @@ async function openJob(id) {
 function renderJob(job) {
   if (!$("#job-content")) return;
   const result = job.result || {};
-  const controls = `<div class="actions" style="margin:16px 0">${job.workflow_id ? button("Open workflow →", "job-workflow", `data-id="${esc(job.workflow_id)}"`, "primary") : ""}${active(job.status) ? button(job.status === "stopping" ? "Stopping…" : "Stop job", "cancel", `data-id="${esc(job.id)}" ${job.status === "stopping" ? "disabled" : ""}`, "danger") : ""}${result.workflow && !result.workflow_id ? button("Inspect prepared workflow", "prepared", `data-path="${esc(result.workflow)}"`) : ""}</div>`;
+  const controls = `<div class="actions" style="margin:16px 0">${job.action?.startsWith("truffle-") ? button("Open hunt →", "truffle-open", `data-id="${esc(result.id || "")}"`, "primary") : ""}${job.workflow_id ? button("Open workflow →", "job-workflow", `data-id="${esc(job.workflow_id)}"`, "primary") : ""}${active(job.status) ? button(job.status === "stopping" ? "Stopping…" : "Stop job", "cancel", `data-id="${esc(job.id)}" ${job.status === "stopping" ? "disabled" : ""}`, "danger") : ""}${result.workflow && !result.workflow_id ? button("Inspect prepared workflow", "prepared", `data-path="${esc(result.workflow)}"`) : ""}</div>`;
   replaceContent(
     $("#job-content"),
     `<div class="pill-row">${badge(job.status)}<small>${active(job.status) ? age(job.started_at_ms) + " elapsed" : date(job.finished_at_ms)}</small></div>${controls}${job.error ? `<div class="blocker">${esc(job.error)}</div>` : ""}<pre class="console job-console" data-scroll-key="job-console" data-follow-tail>${esc(job.console || (active(job.status) ? "Starting the local coordinator…" : "Job finished. See its result below."))}</pre>${job.output ? `<details ${!active(job.status) && !job.workflow_id ? "open" : ""}><summary>Result</summary><pre class="console">${esc(typeof result === "object" && Object.keys(result).length ? pretty(result) : job.output)}</pre></details>` : ""}<p class="help-copy" style="margin:16px 0 0">You can close this dialog. The job and its logs remain available under Launch activity.</p>`,
@@ -826,13 +1029,16 @@ function openProbe() {
     "probe",
   );
 }
-function openLearning() {
+function openLearning(options = {}) {
   modal(
     "Learn from reviewed outcomes",
     "Export, train, evaluate, and calibrate without automatically promoting a model.",
     `<form id="learning-form"><div class="field"><label>Action</label><select name="action" id="learning-action"><option value="export">Export reviewed labels</option><option value="train">Train a separate candidate</option><option value="evaluate">Evaluate with shuffled-state control</option><option value="calibrate">Calibrate held-out predictions</option></select></div><div class="field"><label>Dataset path · inside this workspace’s .fusion directory</label><input name="dataset" placeholder="ui/jobs/…/dataset.jsonl"><small>Export does not need a dataset. Other actions require a prior export or evaluation output.</small></div><div class="field"><label>Candidate model path · optional, inside .fusion</label><input name="model_path" placeholder="ui/jobs/…/candidate"><small>Used by train/evaluate; leave empty to use the configured checkpoint.</small></div><div class="launch-note">Outputs are written to a new job directory. Training never changes your active model. Calibration needs independent held-out groups to qualify.</div><button class="button primary">Start learning job →</button></form>`,
     "learning",
   );
+  if (options.action) $("#learning-action").value = options.action;
+  $("#learning-form [name=dataset]").value = options.dataset || state.learning?.exports?.[0]?.path || "";
+  $("#learning-form [name=model_path]").value = options.model_path || "";
 }
 async function openFile(path) {
   try {
@@ -903,6 +1109,7 @@ async function navigate(view, id = null) {
       overview: "Overview",
       workflows: "Workflows",
       workflow: "Workflow",
+      truffle: "Truffle pig",
       decisions: "Laya lab",
       models: "ORC models",
       settings: "Settings",
@@ -934,6 +1141,11 @@ async function refresh(force = false) {
           : "Restricted runtime";
     }
     let signature = pretty({ ...data, now_ms: 0 });
+    if (state.view === "truffle" && state.id) {
+      state.scout = await api("truffle?id=" + encodeURIComponent(state.id), undefined, w);
+      if (epoch !== state.epoch) return;
+      signature = pretty(state.scout);
+    }
     if (state.view === "workflow") {
       const report = await api(
         "workflow?id=" + encodeURIComponent(state.id),
@@ -951,6 +1163,8 @@ async function refresh(force = false) {
       const d = await api("decisions", undefined, w);
       if (epoch !== state.epoch) return;
       state.decisions = d.records;
+      state.learning = d.learning;
+      state.garden = d.garden;
       signature = pretty(d);
     }
     const formsActive =
@@ -964,6 +1178,7 @@ async function refresh(force = false) {
       state.signature = signature;
       if (state.view === "overview") overview();
       else if (state.view === "workflows") workflows();
+      else if (state.view === "truffle") truffleView();
       else if (state.view === "workflow") workflow();
       else if (state.view === "decisions") decisions();
       else if (state.view === "settings") settings();
@@ -984,6 +1199,8 @@ async function chooseWorkspace(id) {
   state.workspace = id;
   localStorage.setItem("fusion-workspace", id);
   state.config = null;
+  state.learning = state.garden = null;
+  state.gardenFilter = "all";
   const ws = state.workspaces.find((w) => w.id === id);
   $("#workspace").value = id;
   $("#workspace-path").textContent = ws?.path || "";
@@ -1006,7 +1223,8 @@ document.addEventListener("click", async (event) => {
       return;
     }
     const a = target.dataset.action;
-    if (a === "appearance")
+    if (a === "reconnect") openReconnect();
+    else if (a === "appearance")
       modal(
         "Make yourself at home.",
         "Ten palettes. Light, dark, or in sync with your device.",
@@ -1017,8 +1235,12 @@ document.addEventListener("click", async (event) => {
       ORCAppearance.set({ theme: target.dataset.theme });
     else if (a === "appearance-mode")
       ORCAppearance.set({ mode: target.dataset.mode });
+    else if (a === "activity-latest") $(".worker-timeline")?.scrollTo({top: $(".worker-timeline").scrollHeight, behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth"});
     else if (a === "close") closeModal();
-    else if (a === "template") openLaunch(templates[target.dataset.template]);
+    else if (a === "template") target.dataset.template === "truffle" ? openHunt() : openLaunch(templates[target.dataset.template]);
+    else if (a === "truffle-hunt") openHunt();
+    else if (a === "truffle-open") { closeModal(); await navigate("truffle", target.dataset.id || null); }
+    else if (a === "truffle-queue") openTruffleQueue();
     else if (a === "run") await navigate("workflow", target.dataset.id);
     else if (a === "stage") {
       state.node = target.dataset.node;
@@ -1061,10 +1283,10 @@ document.addEventListener("click", async (event) => {
     } else if (a === "suggest-labels") {
       const record = state.decisions.find(r => r.id === state.decision);
       const workspace = state.workspace;
-      const agent = $("#label-worker").value;
+      const options = labelingValues("label");
       target.disabled = true;
       try {
-        await api("launch", { action: "suggest-labels", decision_id: record.id, agent }, workspace);
+        await api("launch", { action: "suggest-labels", decision_id: record.id, ...options }, workspace);
         // Keep edits while the job runs; a fresh draft only replaces untouched fields.
         toast("Drafting labels. Nothing is approved or added to training yet.");
         if (workspace === state.workspace) await refresh(true);
@@ -1075,6 +1297,34 @@ document.addEventListener("click", async (event) => {
       draft.dirty = false;
       draft.seen = null;
       decisions();
+    } else if (a === "garden-settings") openGarden();
+    else if (a === "garden-review") {
+      state.gardenFilter = "needs_review";
+      decisions();
+      const editor = $(".review-form");
+      if (editor) {
+        editor.setAttribute("tabindex", "-1");
+        editor.focus({preventScroll: true});
+        editor.scrollIntoView({block: "start", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth"});
+      }
+    }
+    else if (a === "garden-pause") {
+      await api("garden", {enabled: false, agent: state.garden.agent});
+      toast("Garden paused. Any current draft can finish; no new calls will start.");
+      await refresh(true);
+    } else if (a === "garden-filter") {
+      state.gardenFilter = target.dataset.filter;
+      decisions();
+    } else if (a === "exclude-label") {
+      await api("label-exclusion", {id: target.dataset.id, excluded: target.dataset.excluded === "true"});
+      await refresh(true);
+    } else if (a === "quality-decision") {
+      state.gardenFilter = "all";
+      state.decision = target.dataset.id;
+      decisions();
+      $(".lab-layout > .panel:last-child")?.scrollIntoView({block: "start"});
+    } else if (a === "learning-step") {
+      openLearning({action: target.dataset.step, dataset: target.dataset.dataset, model_path: target.dataset.model});
     } else if (a === "probe") openProbe();
     else if (a === "learning") openLearning();
     else if (a === "orc") await loadOrc(target.dataset.command);
@@ -1149,7 +1399,16 @@ document.addEventListener("submit", async (event) => {
   if (submit) submit.disabled = true;
   try {
     const values = Object.fromEntries(new FormData(form));
-    if (form.id === "launch-form") {
+    if (form.id === "reconnect-form") {
+      await reconnectWithURL(values.url.trim());
+      closeModal();
+      toast("Reconnected. Your other tabs can use this connection too.");
+    } else if (form.id === "truffle-hunt-form") {
+      await launch({...values, action: "truffle-hunt", include_assigned: !!values.include_assigned});
+    } else if (form.id === "truffle-queue-form") {
+      await launch({action: "truffle-run", scout_id: state.scout.id, issues: [...truffleSelected(state.scout)],
+        attempts: values.attempts, publish: publishValues("truffle"), allow_write: !!values.allow_write});
+    } else if (form.id === "launch-form") {
       const kind = values.kind;
       await launch({
         ...values,
@@ -1170,6 +1429,12 @@ document.addEventListener("submit", async (event) => {
     } else if (form.id === "probe-form")
       await launch({ ...values, action: "probe", mode: "shadow" });
     else if (form.id === "learning-form") await launch(values);
+    else if (form.id === "garden-form") {
+      await api("garden", {enabled: !!values.enabled, ...labelingValues("garden"), include_existing: !!values.include_existing});
+      closeModal();
+      toast(values.enabled ? "Garden enabled. New drafts will arrive for your review." : "Garden paused.");
+      await refresh(true);
+    }
     else if (form.id === "resume-form") {
       const route = values.worker.startsWith("route:")
         ? values.worker.slice(6)
@@ -1231,6 +1496,10 @@ document.addEventListener("input", (event) => {
   }
 });
 document.addEventListener("change", (event) => {
+  if (event.target.matches("[data-truffle-number]") && state.scout) {
+    const selected = truffleSelected(state.scout), n = Number(event.target.dataset.truffleNumber);
+    if (event.target.checked) selected.add(n); else selected.delete(n);
+  }
   if (event.target.id.startsWith("settings-publish-")) {
     try {
       const value = JSON.parse($("#fusion-config").value);
@@ -1239,9 +1508,16 @@ document.addEventListener("change", (event) => {
     } catch { error("Correct the JSON before changing publishing defaults."); }
   }
   if (event.target.closest("#label-form")) captureLabelEdits();
-  if (event.target.id === "label-worker") {
-    const record = state.decisions.find(r => r.id === state.decision);
-    labelDraft(record).worker = event.target.value;
+  const controls = event.target.closest(".labeling-controls");
+  if (controls) {
+    const prefix = controls.dataset.labeling;
+    const options = labelingValues(prefix);
+    controls.querySelector(".single-worker").hidden = options.labeling_mode === "council";
+    controls.querySelector(".council-members").hidden = options.labeling_mode !== "council";
+    if (prefix === "label") {
+      const draft = labelDraft(state.decisions.find(r => r.id === state.decision));
+      Object.assign(draft, options, {worker: options.agent});
+    }
   }
   if (event.target.id === "resume-node") {
     const node = state.report.live_nodes.find(
@@ -1321,32 +1597,65 @@ document.addEventListener("keydown", (event) => {
     navigate("workflows").then(() => $("#run-search")?.focus());
   }
 });
-async function init() {
-  try {
-    const data = await api("bootstrap");
-    state.workspaces = data.workspaces;
-    fillWorkspaces();
-    const remembered = localStorage.getItem("fusion-workspace");
-    const workspace = data.workspaces.some((w) => w.id === remembered)
-      ? remembered
-      : data.default;
-    const route = location.hash.slice(1).split("/");
-    await chooseWorkspace(workspace);
-    if (
-      ["workflows", "workflow", "decisions", "models", "settings"].includes(
-        route[0],
-      )
+async function connectWorkspace(data) {
+  state.workspaces = data.workspaces;
+  fillWorkspaces();
+  const remembered = state.workspace || localStorage.getItem("fusion-workspace");
+  const workspace = data.workspaces.some((w) => w.id === remembered)
+    ? remembered
+    : data.default;
+  if (state.workspace === workspace) {
+    // Poll normally to keep focused forms, label edits and open dialogs intact.
+    await refresh();
+    return;
+  }
+  const route = location.hash.slice(1).split("/");
+  await chooseWorkspace(workspace);
+  if (
+    ["workflows", "workflow", "truffle", "decisions", "models", "settings"].includes(
+      route[0],
     )
-      await navigate(route[0], route[1] ? decodeURIComponent(route[1]) : null);
+  )
+    await navigate(route[0], route[1] ? decodeURIComponent(route[1]) : null);
+}
+let connectionAttempt = null;
+async function connect() {
+  if (connectionAttempt) return connectionAttempt;
+  connectionAttempt = (async () => {
+    try {
+      await connectWorkspace(await api("bootstrap"));
+      if (state.modal === "reconnect") closeModal();
+    } catch (e) {
+      $("#connection").textContent = state.authRequired ? "reconnect" : "offline";
+      error(e.message);
+      if (!state.workspace)
+        mount(empty("Connect to your control room.", esc(e.message), button("Reconnect", "reconnect", "", "primary")));
+    }
+  })();
+  try { await connectionAttempt; } finally { connectionAttempt = null; }
+}
+window.addEventListener("storage", async event => {
+  if (event.storageArea === localStorage && event.key === credentialKey && event.newValue && event.newValue !== token) {
+    token = event.newValue;
+    await connect();
+  }
+});
+window.addEventListener("hashchange", async () => {
+  if (!new URLSearchParams(location.hash.slice(1)).has("token")) return;
+  try {
+    await reconnectWithURL(location.href);
   } catch (e) {
     error(e.message);
-    mount(empty("Connect to your control room.", esc(e.message)));
   }
+});
+async function init() {
+  await connect();
   setInterval(async () => {
-    if (state.polling || document.hidden || !state.workspace) return;
+    if (state.polling || document.hidden) return;
     state.polling = true;
     try {
-      await refresh();
+      if (state.workspace) await refresh();
+      else if (!state.authRequired) await connect();
     } finally {
       state.polling = false;
     }

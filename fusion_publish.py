@@ -78,13 +78,23 @@ def snapshot(workspace, paths=None):
     with tempfile.TemporaryDirectory(prefix="fusion-index-") as tmp:
         env = {"GIT_INDEX_FILE": str(Path(tmp) / "index"), "GIT_LITERAL_PATHSPECS": "1"}
         git(workspace, "read-tree", "HEAD", env=env)
-        if paths is None:
-            paths = (git(workspace, "ls-files", "-z", "--cached", "--others", "--exclude-standard") +
-                     git(workspace, "ls-tree", "-r", "--name-only", "-z", "HEAD")).decode().split("\0")
-        paths = sorted({p for p in paths if allowed_path(p)})
-        # Batching keeps argv bounded in monorepos. Deleted tracked paths remain included.
-        for offset in range(0, len(paths), 200):
-            git(workspace, "add", "-A", "--", *paths[offset:offset + 200], env=env)
+        head = set(git(workspace, "ls-tree", "-r", "--name-only", "-z", "HEAD").decode().split("\0"))
+        indexed = set(git(workspace, "ls-files", "--cached", "-z").decode().split("\0"))
+        untracked = set(git(workspace, "ls-files", "--others", "--exclude-standard", "-z").decode().split("\0"))
+        selected = {p for p in head | indexed | untracked if allowed_path(p)}
+        if paths is not None:
+            scopes = {p.rstrip('/') for p in paths if allowed_path(p)}
+            selected = {p for p in selected if any(p == s or p.startswith(s + '/') for s in scopes)}
+        # Update HEAD-tracked files without re-adding their ignored parent directories.
+        # Newly indexed files express explicit user intent, even if now ignored;
+        # only those exact paths may be forced. New untracked files honor ignore rules.
+        indexed_new = {p for p in selected & (indexed - head) if os.path.lexists(Path(workspace) / p)}
+        for args, group in ((["add", "-u"], selected & head),
+                            (["add", "-f"], indexed_new),
+                            (["add"], selected & (untracked - head - indexed))):
+            files = sorted(group)
+            for offset in range(0, len(files), 200):
+                git(workspace, *args, "--", *files[offset:offset + 200], env=env)
         return git(workspace, "write-tree", env=env).decode().strip()
 
 
