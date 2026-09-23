@@ -152,7 +152,9 @@ reproductions from proposed unrun tests. Return the required handoff and exactly
 {"number":456,"grade":"C","reason":"Missing evidence needed before implementation"}]}
 ```
 Treat completion of this investigation as success even when every issue is C/D.
-BLOCKERS: none when assessment is complete. No implementation.
+Assess only; do not implement anything. When the assessment is complete, end
+your handoff with the blockers line exactly as written, and nothing after it:
+BLOCKERS: none
 """
 
 

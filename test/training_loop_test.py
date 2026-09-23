@@ -153,4 +153,32 @@ class TrainingLoopTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'local learning job is already active'):
                 ControlRoom.launch(self.app,self.w,{'action':'export'})
 
+    def test_a_vanished_job_directory_does_not_take_down_the_whole_lab(self):
+        """/api/decisions serves decisions, review, garden and training from one
+        call, and configure() returns status too. A job directory that is gone -
+        pruned, or absent in a copied or restored workspace - used to raise
+        "Job does not exist" out of status(), 500ing all four and leaving no way
+        to even turn the loop off.
+        """
+        self.enable()
+        round = {'id': 'round-lost', 'number': 1, 'status': 'running', 'phase': 'baseline',
+                 'active_job': '20260101-000000-deadbeef', 'tokens': {}, 'started_at_ms': 1}
+        loop.save(loop.root(self.w) / 'rounds' / 'round-lost' / 'round.json', round)
+
+        with patch.object(self.app, 'job', side_effect=ValueError('Job does not exist')):
+            state = loop.status(self.app, self.w)          # must not raise
+            self.assertIsNone(state['active_job'])
+            self.assertEqual(state['state'], 'needs_attention')
+            self.assertIn('no longer on disk', state['reason'])
+            # and the user can still turn the loop off to recover
+            self.assertFalse(loop.configure(self.app, self.w, {'enabled': False})['enabled'])
+
+    def test_a_paused_loop_reports_paused_even_with_a_lost_job(self):
+        round = {'id': 'round-lost', 'number': 1, 'status': 'running', 'phase': 'baseline',
+                 'active_job': 'gone', 'tokens': {}, 'started_at_ms': 1}
+        loop.save(loop.root(self.w) / 'rounds' / 'round-lost' / 'round.json', round)
+        with patch.object(self.app, 'job', side_effect=ValueError('Job does not exist')):
+            self.assertEqual(loop.status(self.app, self.w)['state'], 'paused')
+
+
 if __name__=='__main__':unittest.main()
