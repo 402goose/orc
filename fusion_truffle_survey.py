@@ -196,8 +196,10 @@ def latest(workspace):
     return truffle.receipt(workspace, max(records, key=lambda r: r["started_at_ms"])["id"]) if records else None
 
 
-def survey(workspace, config, agent="auto", remote="origin", resume=None, sync_only=False, include_assigned=False):
-    if agent not in truffle.WORKERS or type(sync_only) is not bool or type(include_assigned) is not bool:
+def survey(workspace, config, agent="auto", remote="origin", resume=None, sync_only=False,
+           include_assigned=False, takeover=False):
+    if (agent not in truffle.WORKERS or type(sync_only) is not bool
+            or type(include_assigned) is not bool or type(takeover) is not bool):
         raise ValueError("Choose a scout worker and survey options")
     truffle.hunt_options(agent=agent, remote=remote)
     workspace = Path(workspace)
@@ -207,8 +209,18 @@ def survey(workspace, config, agent="auto", remote="origin", resume=None, sync_o
         if resume:
             truffle.receipt(workspace, resume)  # Validate the identifier and saved record.
             record = read(truffle.root_for(workspace, resume) / "hunt.json")
-            if record.get("status") in {"scouting", "running", "waiting"} and core.process_alive(record.get("pid")):
-                raise ValueError("This woodland already has an active coordinator")
+            # process_alive answers "does some process hold this pid", not "is it
+            # still ours". A pid recorded before a crash or reboot gets recycled,
+            # and gating on it alone strands every saved grade behind a stranger
+            # that will never exit. Confirm identity, and leave a way out.
+            if (record.get("status") in {"scouting", "running", "waiting"}
+                    and core.process_alive(record.get("pid"))
+                    and core.process_matches(record.get("pid"), resume)
+                    and not takeover):
+                raise ValueError(
+                    "This woodland already has an active coordinator. Pass --takeover "
+                    "if you are certain that run is gone."
+                )
             if record.get("kind") != "survey" or not record.get("inventory_complete"):
                 raise ValueError("Sync a complete issue inventory before grading")
             if record.get("checkout_key") != checkout_key(workspace):
