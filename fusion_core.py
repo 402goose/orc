@@ -230,6 +230,32 @@ MASK = "••••••••"
 SECRET = re.compile(r"token|secret|password|api.?key|authorization", re.I)
 
 
+def process_alive(pid: Any) -> bool | None:
+    """True, False, or None when the answer is unknowable.
+
+    None matters: a missing or unusable pid is not evidence of death, and
+    callers should leave the recorded status alone rather than declare a run
+    interrupted. 0 is never probed -- `os.kill(0, 0)` signals the caller's own
+    process group and always succeeds, so treating it as a pid reports every
+    record without one as permanently alive.
+    """
+    if pid is None:
+        return None
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True  # owned by another user, so it exists
+    except OSError:
+        return False
+    return True
+
+
 def redact(value: Any) -> Any:
     """Mask secret-looking values anywhere in a structure before printing it.
 
