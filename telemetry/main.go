@@ -67,6 +67,7 @@ type summaryRow struct {
 	Status            *string `json:"status"`
 	FailureClass      *string `json:"failure_class"`
 	Calls             int64   `json:"calls"`
+	CostReportedCalls int64   `json:"cost_reported_calls"`
 	TotalCostUSD      float64 `json:"total_cost_usd"`
 	TotalInputTokens  float64 `json:"total_input_tokens"`
 	TotalOutputTokens float64 `json:"total_output_tokens"`
@@ -298,6 +299,7 @@ func (s *server) querySummary(ctx context.Context, hours int, installID string) 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT agent, route, model, status, failure_class,
 		       count(*) AS calls,
+		       count(usage->>'cost_usd') AS cost_reported_calls,
 		       COALESCE(sum((usage->>'cost_usd')::numeric), 0) AS total_cost_usd,
 		       COALESCE(sum((usage->>'input_tokens')::numeric), 0) AS total_input_tokens,
 		       COALESCE(sum((usage->>'output_tokens')::numeric), 0) AS total_output_tokens,
@@ -318,7 +320,7 @@ func (s *server) querySummary(ctx context.Context, hours int, installID string) 
 		var row summaryRow
 		if err := rows.Scan(
 			&row.Agent, &row.Route, &row.Model, &row.Status, &row.FailureClass,
-			&row.Calls, &row.TotalCostUSD, &row.TotalInputTokens, &row.TotalOutputTokens, &row.AvgDurationMs,
+			&row.Calls, &row.CostReportedCalls, &row.TotalCostUSD, &row.TotalInputTokens, &row.TotalOutputTokens, &row.AvgDurationMs,
 		); err != nil {
 			return nil, err
 		}
