@@ -710,7 +710,11 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
         waves = {item["wave"]: {node["id"] for node in item["nodes"]} for item in report["waves"]}
         self.assertEqual(waves[0], {"research-01", "research-02", "research-03"})
         self.assertEqual(waves[1], {"synthesize"})
-        self.assertEqual(report["usage"]["spans"], 4)
+        # Four worker spans plus one gate span per accepted node.
+        self.assertEqual(report["usage"]["spans"], 8)
+        gate = next(group for group in report["usage"]["by_route"] if group["agent"] == "gate")
+        self.assertEqual((gate["success"], gate["failed"]), (4, 0))
+        self.assertEqual(sum(g["calls"] for g in report["usage"]["by_route"] if g["agent"] != "gate"), 4)
         self.assertEqual(report["blockers"], [])
         self.assertIsNone(report["resume_command"])
 
