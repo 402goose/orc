@@ -13,6 +13,8 @@ from urllib.request import Request, urlopen
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import signal
+import fusion_ui
 from fusion_ui import ControlRoom, Server, atomic_json, read_json, activity_entries, MASK
 
 
@@ -22,6 +24,12 @@ def seed_workspace(workspace):
     worker.write_text(f"#!{sys.executable}\n" + '''import json, sys, time
 prompt = sys.stdin.read()
 print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'Inspecting fixture source files'}}),flush=True)
+if 'wedged fixture' in prompt:
+    # A child that asks to be left alone. Cancellation must not depend on a
+    # worker's cooperation, so this is the case escalation exists for.
+    import signal as _signal
+    _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
+    time.sleep(120)
 if 'wait fixture' in prompt:
     time.sleep(30)
 if 'LABEL_SUGGESTION_V1' in prompt:
@@ -219,6 +227,20 @@ class ControlRoomTest(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(activity["pid"], 0)
 
+    def test_cancelling_a_worker_that_ignores_sigint_still_finishes(self):
+        """A job whose worker refuses SIGINT must still reach a terminal state."""
+        with patch.dict(os.environ, {"FUSION_CANCEL_GRACE_SECONDS": "1"}):
+            job = self.app.launch(
+                self.workspace,
+                {"action": "delegate", "agent": "codex", "text": "wedged fixture", "mode": "off"},
+            )
+            self.wait_job(job["id"], lambda j: "worker started" in j.get("console", ""))
+            status, _, _ = self.request("/api/cancel", {"id": job["id"]})
+            self.assertEqual(status, 200)
+            result = self.wait_job(job["id"])
+        self.assertEqual(result["status"], "cancelled")
+
+
     def test_workspace_registration_does_not_scan_or_launch_other_repositories(self):
         second = self.root / "another-repo"
         second.mkdir()
@@ -307,6 +329,68 @@ class ControlRoomTest(unittest.TestCase):
         self.assertEqual(self.request('/api/label-exclusion', {'id': 'label-test', 'excluded': False})[0], 200)
         self.assertEqual(store.export(self.root / 'restored.jsonl')['examples'], 1)
         self.assertEqual(self.request('/api/garden', {'enabled': False})[0], 200)
+
+
+class CancelEscalationTest(unittest.TestCase):
+    """"Stopping" must be a state a job passes through, not one it sits in.
+
+    The supervisor sent exactly one SIGINT, to the direct child, with no
+    escalation and no upper bound. A child that had not installed its handler
+    yet, or would not honour it, left the job in "stopping" forever and the
+    person who clicked Cancel waiting on it. This is the decision that was
+    missing, tested directly because the surrounding loop owns a live
+    subprocess and cannot be driven to that state reliably.
+    """
+
+    def test_does_nothing_until_cancellation_is_requested(self):
+        self.assertIsNone(fusion_ui.cancel_action(False, None, False, 100.0, 5))
+
+    def test_interrupts_once_when_first_requested(self):
+        self.assertEqual(fusion_ui.cancel_action(True, None, False, 100.0, 5), "interrupt")
+
+    def test_waits_out_the_grace_period_before_escalating(self):
+        self.assertIsNone(fusion_ui.cancel_action(True, 100.0, False, 104.9, 5))
+
+    def test_escalates_once_the_grace_period_expires(self):
+        self.assertEqual(fusion_ui.cancel_action(True, 100.0, False, 105.1, 5), "kill")
+
+    def test_never_escalates_twice(self):
+        self.assertIsNone(fusion_ui.cancel_action(True, 100.0, True, 1e6, 5))
+
+    def test_signal_job_prefers_the_group_so_workers_are_reached(self):
+        # Workers start in the child's session, so signalling only the child
+        # leaves them running. The group is what reaches them.
+        sent = []
+
+        class Proc:
+            pid = 4242
+            def send_signal(self, sig):
+                sent.append(("child", sig))
+
+        with patch("fusion_ui.os.getpgid", return_value=4242), \
+             patch("fusion_ui.os.killpg", side_effect=lambda pgid, sig: sent.append(("group", sig))):
+            fusion_ui.signal_job(Proc(), signal.SIGINT)
+        self.assertEqual(sent, [("group", signal.SIGINT)])
+
+    def test_signal_job_falls_back_to_the_child_and_never_raises(self):
+        sent = []
+
+        class Proc:
+            pid = 4242
+            def send_signal(self, sig):
+                sent.append(sig)
+
+        with patch("fusion_ui.os.getpgid", side_effect=PermissionError(1, "not permitted")):
+            fusion_ui.signal_job(Proc(), signal.SIGKILL)
+        self.assertEqual(sent, [signal.SIGKILL])
+
+        class GoneProc:
+            pid = 1
+            def send_signal(self, sig):
+                raise ProcessLookupError
+
+        with patch("fusion_ui.os.getpgid", side_effect=ProcessLookupError):
+            fusion_ui.signal_job(GoneProc(), signal.SIGKILL)  # must not raise
 
 
 if __name__ == "__main__":

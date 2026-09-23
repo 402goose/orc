@@ -40,6 +40,49 @@ ASSETS = Path(__file__).with_name("fusion_ui_assets")
 from fusion_core import MASK, SECRET, redact  # one definition, shared with `fusion doctor`
 IDENTIFIER = re.compile(r"^[A-Za-z0-9_.-]+$")
 ACTIVE = {"queued", "running", "stopping"}
+# How long a cancelled job may stay in "stopping" before we stop asking nicely.
+CANCEL_GRACE_SECONDS = float(os.environ.get("FUSION_CANCEL_GRACE_SECONDS", "5"))
+
+
+def cancel_action(requested, cancelled_at, escalated, now, grace):
+    """Decide what a cancelled job's supervisor should do on this tick.
+
+    "interrupt" once when cancellation is first requested, then "kill" if the
+    job is still alive after the grace period, then nothing.
+
+    One SIGINT is a request, not a guarantee: it can land before the child has
+    installed its handler, or the child can be wedged. Without the escalation
+    a job sits in "stopping" forever, and the person who clicked Cancel waits
+    on a state it will never leave.
+    """
+    if not requested:
+        return None
+    if cancelled_at is None:
+        return "interrupt"
+    if not escalated and now - cancelled_at > grace:
+        return "kill"
+    return None
+
+
+def signal_job(proc, sig) -> None:
+    """Signal a job's whole process group, falling back to the child alone.
+
+    Jobs start with start_new_session=True, so the child leads its own group
+    and its workers are in it. Signalling the group is what reaches those
+    workers; signalling only the child leaves them running. Teardown is best
+    effort and must never raise: the group can become unsignalable between the
+    check and the call (leader reaped, pid recycled), which the OS reports as
+    EPERM rather than ESRCH.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+        return
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.send_signal(sig)
+    except (ProcessLookupError, OSError):
+        pass
 
 
 def read_json(path, default=None):
@@ -200,15 +243,20 @@ def run_job(directory):
         with (directory / "stdout.log").open("wb") as out, (directory / "stderr.log").open("wb") as err:
             proc = subprocess.Popen(request["argv"], cwd=request["workspace"], env=environment,
                                     stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
-            cancelled = False
+            cancelled_at = None
+            escalated = False
             while proc.poll() is None:
-                if (directory / "cancel").exists() and not cancelled:
-                    cancelled = True
+                action = cancel_action(
+                    (directory / "cancel").exists(), cancelled_at, escalated,
+                    time.monotonic(), CANCEL_GRACE_SECONDS,
+                )
+                if action == "interrupt":
+                    cancelled_at = time.monotonic()
                     state["status"] = "stopping"
-                    try:
-                        proc.send_signal(signal.SIGINT)
-                    except ProcessLookupError:
-                        pass
+                    signal_job(proc, signal.SIGINT)
+                elif action == "kill":
+                    escalated = True
+                    signal_job(proc, signal.SIGKILL)
                 state["updated_at_ms"] = core.now_ms()
                 if not state.get("workflow_id"):
                     match = re.search(r"(\d{8}-\d{6}-wf-[a-f0-9]+)", tail(directory / "stderr.log", 12000))
@@ -216,6 +264,7 @@ def run_job(directory):
                         state["workflow_id"] = match[1]
                 atomic_json(directory / "job.json", state)
                 time.sleep(.25)
+            cancelled = cancelled_at is not None
             state.update(exit_code=proc.returncode, status="cancelled" if cancelled else "success" if proc.returncode == 0 else "failed")
         result = read_json(directory / "stdout.log")
         state["result"] = result
