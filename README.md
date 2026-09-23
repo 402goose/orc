@@ -588,7 +588,17 @@ changed file paths, test commands, raw blocker text, or any local filesystem
 or workspace path. Run `fusion telemetry status` any time to see exactly
 what is currently configured to send. A send is always best-effort with a
 short timeout — a down or misconfigured collector never blocks or fails the
-actual dispatch. The collector itself (a small Fly + Postgres app) lives in
+actual dispatch.
+
+`fusion telemetry report [--hours N]` (default 168, i.e. 7 days) fetches
+the group's aggregate patterns back from the collector — calls, cost, and
+average duration grouped by agent/route/model/status/failure_class, plus
+how many distinct installs contributed. This is how remote telemetry
+actually pays off: everyone using the shared collector can see what the
+group is learning, not just whoever holds database credentials. Add
+`--json` for the machine-readable form.
+
+The collector itself (a small Fly + Postgres app) lives in
 [`telemetry/`](telemetry/).
 
 The architecture and source map are in [FUSION_RESEARCH.md](FUSION_RESEARCH.md).
