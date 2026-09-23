@@ -13,6 +13,7 @@ import uuid
 
 import fusion_core as core
 import fusion_progress as progress
+from fusion_workflow import effective_status
 from fusion_publish import options, read, repo_for, save, text
 
 WORKERS = {"auto", "codex", "claude", "agy", "grok"}
@@ -81,16 +82,15 @@ def receipt(workspace, scout_id):
     record = read(root_for(workspace, scout_id) / "hunt.json")
     if not record:
         raise ValueError("Hunt does not exist")
-    if record.get("status") in {"scouting", "running"}:
-        try:
-            os.kill(record.get("pid", 0), 0)
-        except ProcessLookupError:
-            record["status"] = "interrupted"
+    if record.get("status") in {"scouting", "running"} and core.process_alive(record.get("pid")) is False:
+        record["status"] = "interrupted"
     for row in record.get("candidates", []):
         run_id = row.get("workflow_id")
         if run_id:
             manifest = read(Path(workspace) / ".fusion/workflows" / run_id / "manifest.json")
-            row["workflow_status"] = manifest.get("status", "interrupted")
+            # A killed workflow coordinator leaves "running" in the manifest, so
+            # read it the same way `watch` and `report` do.
+            row["workflow_status"] = effective_status(manifest) if manifest else "interrupted"
             row["publication"] = read(Path(workspace) / ".fusion/workflows" / run_id / "publish.json")
     return record
 

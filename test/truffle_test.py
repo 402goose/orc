@@ -170,6 +170,40 @@ class TruffleTest(unittest.TestCase):
         pub.save(truffle.root_for(self.workspace, other["id"]) / "hunt.json", other)
         self.assertEqual(truffle.reserved_issues(self.workspace, "fixture/project", record["id"]), {1:"existing-run"})
 
+    def test_receipt_reads_liveness_without_probing_a_process_group(self):
+        record = self.saved_hunt(1)
+        root = truffle.root_for(self.workspace, record["id"])
+
+        # A record with no pid is not evidence of death: os.kill(0, 0) signals
+        # the caller's own group and always succeeds, so probing it would mark
+        # every such hunt permanently alive.
+        pub.save(root / "hunt.json", {**record, "status": "scouting"})
+        self.assertEqual(truffle.receipt(self.workspace, record["id"])["status"], "scouting")
+
+        pub.save(root / "hunt.json", {**record, "status": "scouting", "pid": os.getpid()})
+        self.assertEqual(truffle.receipt(self.workspace, record["id"])["status"], "scouting")
+
+        pub.save(root / "hunt.json", {**record, "status": "scouting", "pid": 2 ** 22 - 1})
+        self.assertEqual(truffle.receipt(self.workspace, record["id"])["status"], "interrupted")
+
+        # A pid owned by another user raises PermissionError; it exists, and it
+        # must not propagate out of receipt() and break the whole hunt list.
+        pub.save(root / "hunt.json", {**record, "status": "running", "pid": 1})
+        self.assertEqual(truffle.receipt(self.workspace, record["id"])["status"], "running")
+        self.assertTrue(truffle.history(self.workspace))
+
+    def test_receipt_reports_a_dead_workflow_coordinator(self):
+        record = self.saved_hunt(1)
+        root = truffle.root_for(self.workspace, record["id"])
+        run_id = "20260923-000000-wf-deadbeef"
+        manifest = self.workspace / ".fusion/workflows" / run_id / "manifest.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(json.dumps({"status": "running", "coordinator_pid": 2 ** 22 - 1}))
+        record["candidates"][0]["workflow_id"] = run_id
+        pub.save(root / "hunt.json", record)
+        row = truffle.receipt(self.workspace, record["id"])["candidates"][0]
+        self.assertEqual(row["workflow_status"], "interrupted", "a killed coordinator must not read as running")
+
     def test_lock_validation_and_write_boundary(self):
         record = self.saved_hunt()
         with truffle.locked(self.workspace), self.assertRaisesRegex(ValueError, "already running"):

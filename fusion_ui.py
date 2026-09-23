@@ -143,11 +143,8 @@ def tail(path, limit=100_000):
 
 
 def alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, TypeError, ValueError):
-        return False
+    # One definition, in fusion_core; this keeps the boolean contract callers expect.
+    return core.process_alive(pid) is True
 
 
 def run_job(directory):
