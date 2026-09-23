@@ -355,6 +355,8 @@ def failure_class(result: dict[str, Any]) -> str | None:
     to make local `fusion usage` slicing easier and as the only failure
     signal sent in a remote telemetry payload -- raw blocker text can
     contain project-specific detail and is never sent remotely."""
+    if result.get("failure_phase") in {"snapshot_before_review", "snapshot_after_review"}:
+        return "coordinator_error"
     text = " ".join(str(item) for item in result.get("blockers", [])).lower()
     if "permission denied" in text or "agy denied" in text or "agy auto-denied" in text:
         return "permission_denied"
@@ -821,14 +823,9 @@ def parse_codex_events(stdout: str) -> tuple[str | None, str, str | None, dict[s
             if item.get("type") == "agent_message" and item.get("text"):
                 messages.append(str(item["text"]))
             elif item.get("type") == "command_execution":
-                # A structural signal Fusion previously never looked at: the
-                # turn can complete and the worker's own STATUS line can
-                # still claim success while a command it actually ran
-                # failed. Surfaced as evidence (a blocker), not an automatic
-                # status override -- a nonzero exit isn't always a real
-                # failure (grep returning 1 for "no matches" is routine),
-                # so this is data for a human or an acceptance gate to
-                # weigh, the same way permission denials already are.
+                # Keep command exits for inspection separately from unresolved
+                # handoff blockers. Searches can return 1, red tests can precede
+                # a fix, and failed lookups can be corrected within this turn.
                 exit_code = item.get("exit_code")
                 if isinstance(exit_code, int) and exit_code != 0:
                     command = compact(str(item.get("command") or "command"), 200)
@@ -1230,7 +1227,8 @@ def dispatch(
         "summary": compact(str(handoff.get("summary") or summary).strip(), int(config.get("max_result_chars", 12000))),
         "changed": handoff.get("changed", []),
         "tests": handoff.get("tests", []),
-        "blockers": handoff.get("blockers", []) + evidence_notes + ([failure] if failure else []),
+        "blockers": handoff.get("blockers", []) + (evidence_notes if task["agent"] != "codex" else []) + ([failure] if failure else []),
+        "command_evidence": evidence_notes if task["agent"] == "codex" else [],
         "exit_code": exit_code,
         "duration_ms": duration_ms,
         "usage": usage,
@@ -1692,6 +1690,8 @@ def build_parser() -> argparse.ArgumentParser:
     display.add_argument("--progress", dest="progress", action="store_true", default=None, help="show live progress on stderr, including when redirected")
     display.add_argument("--quiet", dest="progress", action="store_false", help="hide progress; keep the final result")
     sub = parser.add_subparsers(dest="command", required=True)
+    from fusion_truffle import add_parser as truffle_parser
+    truffle_parser(sub)
 
     ui = sub.add_parser("ui", help="open the local ORC/Fusion control room in your browser")
     ui.add_argument("--port", type=int, default=8765, help="local port (0 selects an available port)")
@@ -1829,6 +1829,12 @@ def _main(args, parser) -> int:
         from fusion_ui import serve
         return serve(workspace, args.port, not args.no_open)
     config, config_path = load_config(workspace)
+    if args.command == "truffle":
+        from fusion_truffle import command as truffle_command
+        try:
+            return truffle_command(workspace, config, args)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            parser.error(str(exc))
     if args.command in {"build", "delegate", "ultra"} or args.command == "workflow" and args.workflow_command in {"run", "resume"}:
         from fusion_decisions import config_for
         progress.emit("fusion", f"{args.command} in {workspace}; Laya {config_for(config)['mode']}")

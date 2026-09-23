@@ -188,6 +188,20 @@ def read_jsonl(path):
     return records
 
 
+def reviewed_labels(events):
+    """Effective human answers and explicit exclusions, shared by UI and export."""
+    labels, exclusions = {}, {}
+    for event in events:
+        key = event.get("id")
+        if event.get("event") == "label" and event.get("verified"):
+            if event.get("replace"):
+                labels[key] = {}
+            labels.setdefault(key, {}).update(event["answers"])
+        elif event.get("event") == "label_exclusion":
+            exclusions[key] = event.get("excluded") is True
+    return labels, exclusions
+
+
 class DecisionStore:
     def __init__(self, workspace):
         self.root = Path(workspace) / ".fusion" / "decisions"
@@ -238,15 +252,12 @@ class DecisionStore:
         self.append("label", id=decision_id, answers=answers, evidence=evidence, verified=True, replace=replace, **provenance)
 
     def export(self, destination):
-        labels = {}
-        for event in read_jsonl(self.path):
-            if event.get("event") == "label" and event.get("verified"):
-                if event.get("replace"):
-                    labels[event["id"]] = {}
-                labels.setdefault(event["id"], {}).update(event["answers"])
+        events = read_jsonl(self.path)
+        labels, exclusions = reviewed_labels(events)
         rows = []
-        for record in self.records():
-            if record["id"] not in labels or record.get("status") != "ok":
+        records = {e["id"]: e for e in events if e.get("event") == "decision"}
+        for record in records.values():
+            if not labels.get(record["id"]) or exclusions.get(record["id"]) or record.get("status") != "ok" or record.get("truncated"):
                 continue
             group = record.get("context", {}).get("group") or record.get("context", {}).get("task_id") or digest(record["state"])
             split = "validation" if int(digest(group)[:8], 16) % 5 == 0 else "train"
@@ -260,7 +271,9 @@ class DecisionStore:
             for row in rows:
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
         destination.chmod(0o600)
-        return {"examples": len(rows), "splits": dict(Counter(row["split"] for row in rows)), "path": str(destination)}
+        from fusion_quality import dataset_quality
+        return {"examples": len(rows), "splits": dict(Counter(row["split"] for row in rows)), "path": str(destination),
+                "data_quality": dataset_quality(rows), "dataset_hash": hashlib.sha256(destination.read_bytes()).hexdigest()}
 
 
 def labels_for(question):

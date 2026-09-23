@@ -1,0 +1,122 @@
+// Disposable workspaces and fake label workers; no real model calls.
+const {chromium, expect} = require('@playwright/test');
+const {spawn} = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+(async () => {
+  const fixture = spawn('python3', ['-u', path.join(__dirname, 'ui_browser_fixture.py')], {env: {...process.env, PYTHONDONTWRITEBYTECODE: '1', FUSION_FIXTURE_COUNCIL: '1'}});
+  let stderr = '', browser, page;
+  fixture.stderr.on('data', b=>stderr+=b);
+  try {
+    const info = await new Promise((resolve,reject)=> {
+      let output = '';
+      const timer = setTimeout(()=>reject(Error('Fixture timed out '+stderr)),20000);
+      fixture.stdout.on('data',b=>{output+=b; const line=output.split('\n').find(l=>l.startsWith('{"url"')); if(line){clearTimeout(timer);resolve(JSON.parse(line));}});
+      fixture.on('exit',c=>{clearTimeout(timer);reject(Error('Fixture exit '+c+' '+stderr));});
+    });
+    browser = await chromium.launch({headless:true});
+    page = await browser.newPage({viewport:{width:1440,height:1050}});
+    const errors=[];
+    page.on('pageerror', e=>errors.push(e.message));
+    await page.route('**/*', route=>route.request().url().startsWith(new URL(info.url).origin) ? route.continue() : route.abort());
+    await page.goto(info.url);
+    await page.locator('[data-view=decisions]').click();
+    await expect(page.locator('.learning-hero')).toContainText('0');
+    await expect(page.locator('.learning-columns').first()).toContainText('Bundled Laya checkpoint');
+    await page.getByRole('button',{name:'Enable auto-drafts',exact:true}).click();
+    await expect(page.locator('#garden-form [name=enabled]')).not.toBeChecked();
+    await page.locator('#garden-form [name=enabled]').check();
+    await page.selectOption('#garden-worker','codex');
+    await page.selectOption('#garden-mode','council');
+    await expect(page.locator('#garden-form .council-members')).toBeVisible();
+    await page.locator('#garden-form [name=include_existing]').check();
+    await page.getByRole('button',{name:'Save garden settings'}).click();
+    await expect(page.locator('.garden-panel')).toContainText('1 automatic drafts started today',{timeout:15000});
+    await expect(page.getByRole('heading',{name:'Suggested assessment'})).toBeVisible({timeout:15000});
+    await expect(page.locator('.garden-panel')).toContainText('NO DAILY CAP');
+    await expect(page.locator('.garden-panel h2')).toHaveText('1 draft is ready to review.');
+    await expect(page.locator('.council-assessment')).toContainText('2 members');
+    await expect(page.locator('.council-outcomes')).toContainText('agreed');
+    await expect(page.locator('.quality-panel')).toContainText('100.0% unanimous');
+    const gardenSettings = path.join(info.workspace,'.fusion/decisions/garden.json');
+    const originalSettings = fs.readFileSync(gardenSettings,'utf8');
+    expect(JSON.parse(originalSettings).council_agents).toEqual(['codex','claude']);
+    expect(JSON.parse(originalSettings).daily_limit).toBeUndefined();
+    await page.getByRole('button',{name:'Garden settings',exact:true}).click();
+    await expect(page.locator('#garden-mode')).toHaveValue('council');
+    await expect(page.locator('#garden-limit')).toHaveCount(0);
+    await page.getByRole('button',{name:'Close dialog'}).click();
+    expect(fs.readFileSync(gardenSettings,'utf8')).toBe(originalSettings);
+    await page.locator('.garden-panel').screenshot({path:'/tmp/orc-garden-unlimited-light.png'});
+    await page.evaluate(()=>ORCAppearance.set({mode:'dark'}));
+    await page.locator('.garden-panel').screenshot({path:'/tmp/orc-garden-unlimited-dark.png'});
+    await page.setViewportSize({width:390,height:844});
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    await page.locator('.garden-panel').screenshot({path:'/tmp/orc-garden-unlimited-mobile.png'});
+    await page.setViewportSize({width:1440,height:1050});
+    await page.evaluate(()=>ORCAppearance.set({mode:'light'}));
+    await expect(page.locator('.learning-hero')).toContainText('0');
+    const eventPath = path.join(info.workspace,'.fusion/decisions/events.jsonl');
+    const events = ()=>fs.readFileSync(eventPath,'utf8').trim().split('\n').map(JSON.parse);
+    expect(events().filter(e=>e.event==='label')).toHaveLength(0);
+    await page.getByRole('button',{name:'Review 1 draft →',exact:true}).click();
+    await expect(page.locator('[data-filter=needs_review]')).toHaveAttribute('aria-pressed','true');
+    await expect(page.locator('.review-form')).toBeFocused();
+    await expect(page.locator('.decision-row')).toHaveCount(1);
+    await expect(page.locator('#label-form select')).toHaveValue('false');
+    await page.getByRole('button',{name:'Approve labels',exact:true}).click();
+    await expect(page.locator('.learning-growth strong')).toHaveText('1');
+    await expect(page.locator('.garden-panel h2')).toHaveText('Ready for new decisions.');
+    await expect(page.locator('[data-action=garden-review]')).toHaveCount(0);
+    await page.locator('[data-filter=approved]').click();
+    await expect(page.locator('.decision-row')).toHaveCount(1);
+    await page.getByRole('button',{name:'Exclude example',exact:true}).click();
+    await expect(page.locator('.learning-growth strong')).toHaveText('0');
+    await page.locator('[data-filter=excluded]').click();
+    await expect(page.locator('#label-form')).toHaveCount(0);
+    await page.getByRole('button',{name:'Restore example',exact:true}).click();
+    await expect(page.locator('.learning-growth strong')).toHaveText('1');
+    await page.locator('[data-filter=all]').click();
+    await page.getByRole('button',{name:'Pause garden',exact:true}).click();
+    await expect(page.locator('.garden-panel .pill')).toHaveText('paused');
+    await page.reload();
+    await expect(page.locator('.garden-panel .pill')).toHaveText('paused');
+    expect(events().filter(e=>e.event==='label_suggestion'&&e.id==='fixture-decision')).toHaveLength(1);
+
+    // Persisted candidate/evaluation evidence is displayed separately from active weights.
+    const jobs = path.join(info.workspace,'.fusion/ui/jobs');
+    const write = (file,value)=>{fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,JSON.stringify(value));};
+    const candidate = path.join(jobs,'trained-fixture/candidate');
+    write(path.join(candidate,'training.json'),{steps:24,train_groups:20,model_identity:'candidate-v1',source_identity:'bundled-v1',mean_loss:.42});
+    write(path.join(jobs,'trained-fixture/job.json'),{id:'trained-fixture',action:'train',status:'success',started_at_ms:Date.now()});
+    write(path.join(jobs,'trained-fixture/request.json'),{learning:{dataset:'decisions/fixture-dataset.jsonl'}});
+    for(const [id,identity,score] of [['baseline-fixture','bundled-v1',.6],['eval-fixture','candidate-v1',.8]]) {
+      write(path.join(jobs,id,'job.json'),{id,action:'evaluate',status:'success',started_at_ms:Date.now(),result:{dataset_hash:'exact-same-dataset',model_identities:[identity],accuracy:score,control_accuracy:.45,validation_questions:40}});
+    }
+    await expect(page.locator('.candidate-card')).toContainText('80.0%',{timeout:10000});
+    await expect(page.locator('.candidate-card')).toContainText('+20.0 percentage points');
+    await expect(page.locator('.impact-panel')).toContainText('+20.0 pp');
+    await expect(page.locator('.impact-panel')).toContainText('no complete training-overlap audit');
+    await expect(page.locator('.quality-panel')).toContainText('Council draft + human approval');
+    await expect(page.locator('.learning-columns').first()).toContainText('Bundled Laya checkpoint');
+    await page.getByRole('button',{name:'Evaluate candidate',exact:true}).click();
+    await expect(page.locator('#learning-action')).toHaveValue('evaluate');
+    await expect(page.locator('#learning-form [name=model_path]')).toHaveValue(fs.realpathSync(candidate));
+    await expect(page.locator('#learning-form [name=dataset]')).toHaveValue('decisions/fixture-dataset.jsonl');
+    await page.getByRole('button',{name:'Close dialog'}).click();
+    await page.screenshot({path:'/tmp/orc-laya-garden.png',fullPage:true});
+    await page.setViewportSize({width:390,height:844});
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    await page.screenshot({path:'/tmp/orc-laya-garden-mobile.png',fullPage:true});
+    expect(errors).toEqual([]);
+    console.log('Garden browser checks passed: no daily cap, council consensus, persisted settings, review shortcut, data health, measured impact, opt-in drafts, approval, exclusion, pause/reload, candidate lineage, light/dark/mobile.');
+  } catch(error) {
+    if(page) await page.screenshot({path:'/tmp/orc-garden-failure.png',fullPage:true}).catch(()=>{});
+    throw error;
+  } finally {
+    if(browser) await browser.close();
+    fixture.kill('SIGINT');
+    await new Promise(resolve=>{if(fixture.exitCode!==null)return resolve(); fixture.once('exit',resolve);setTimeout(resolve,10000).unref();});
+    if(stderr)process.stderr.write(stderr);
+  }
+})().catch(e=>{console.error(e);process.exitCode=1;});

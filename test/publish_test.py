@@ -11,7 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fusion_core as core
 import fusion_publish as pub
-from fusion_workflow import WorkflowRunner
+from fusion_workflow import WorkflowRunner, resume_workflow
 
 
 def seed_git(root):
@@ -144,6 +144,105 @@ class PublicationTest(unittest.TestCase):
         files = pub.text(self.workspace, "ls-tree", "-r", "--name-only", tree)
         self.assertNotIn("app.txt", files)
         self.assertIn("binary.bin", files)
+
+    def ignored_corpus(self):
+        corpus = self.workspace / 'fuzz/corpus'
+        corpus.mkdir(parents=True)
+        (self.workspace / '.gitignore').write_text('.fusion/\nfuzz/corpus/\n')
+        for name in ['seed', 'delete-me']:
+            (corpus / name).write_text('original\n')
+        pub.git(self.workspace, 'add', '.gitignore')
+        pub.git(self.workspace, 'add', '-f', 'fuzz/corpus/seed', 'fuzz/corpus/delete-me')
+        pub.git(self.workspace, 'commit', '-m', 'tracked fixtures in ignored directory')
+        return corpus
+
+    def test_snapshot_updates_tracked_ignored_files_without_adding_ignored_output(self):
+        corpus = self.ignored_corpus()
+        (corpus / 'seed').write_text('updated\n')
+        (corpus / 'delete-me').unlink()
+        (corpus / 'generated').write_text('must stay ignored\n')
+        index = (self.workspace / '.git/index').read_bytes()
+        tree = pub.snapshot(self.workspace)
+        self.assertEqual(pub.git(self.workspace, 'show', tree + ':fuzz/corpus/seed'), b'updated\n')
+        files = pub.text(self.workspace, 'ls-tree', '-r', '--name-only', tree).splitlines()
+        self.assertNotIn('fuzz/corpus/generated', files)
+        self.assertNotIn('fuzz/corpus/delete-me', files)
+        self.assertEqual((self.workspace / '.git/index').read_bytes(), index)
+
+    def test_snapshot_includes_explicitly_staged_ignored_addition_only(self):
+        corpus = self.ignored_corpus()
+        (corpus / 'intentional').write_text('explicit user intent\n')
+        (corpus / 'generated').write_text('not staged\n')
+        pub.git(self.workspace, 'add', '-f', 'fuzz/corpus/intentional')
+        index = (self.workspace / '.git/index').read_bytes()
+        tree = pub.snapshot(self.workspace)
+        files = pub.text(self.workspace, 'ls-tree', '-r', '--name-only', tree).splitlines()
+        self.assertIn('fuzz/corpus/intentional', files)
+        self.assertNotIn('fuzz/corpus/generated', files)
+        self.assertEqual((self.workspace / '.git/index').read_bytes(), index)
+
+    def test_scoped_snapshot_expands_directories_and_preserves_literal_names(self):
+        corpus = self.ignored_corpus()
+        (corpus / 'seed').write_text('scoped edit\n')
+        (self.workspace / 'other.txt').write_text('unrelated\n')
+        source = self.workspace / 'src'
+        source.mkdir()
+        (source / ':(magic)[1].txt').write_text('literal\n')
+        (source / '.fusion').mkdir()
+        (source / '.fusion/private.txt').write_text('not publishable\n')
+        tree = pub.snapshot(self.workspace, ['fuzz/corpus', 'src'])
+        self.assertEqual(pub.git(self.workspace, 'show', tree + ':other.txt'), b'unrelated baseline\n')
+        self.assertEqual(pub.git(self.workspace, 'show', tree + ':src/:(magic)[1].txt'), b'literal\n')
+        self.assertNotIn('private.txt', pub.text(self.workspace, 'ls-tree', '-r', '--name-only', tree))
+
+    def test_snapshot_failure_stops_once_and_resume_reuses_accepted_implementation(self):
+        config = core.deep_merge(self.config, {'codex': {'command': sys.executable}})
+        spec = {'task': 'Fix routing', 'publish': self.config['publish'], 'max_attempts': 3, 'nodes': [
+            {'id': 'implement', 'agent': 'codex', 'role': 'implementation', 'write': True, 'task': 'Implement'},
+            {'id': 'review', 'agent': 'codex', 'role': 'review', 'needs': ['implement'], 'task': 'Review',
+             'acceptance': {'required_handoff': ['tests']}}]}
+        called = []
+        def worker(config, task, store):
+            called.append(task['role'])
+            if task['write']:
+                (Path(task['workspace']) / 'app.txt').write_text('fixed\n')
+            return {'run_id': task['run_id'], 'status': 'success', 'agent': 'codex', 'exit_code': 0,
+                    'summary': 'Verified', 'tests': ['fixture check'], 'changed': ['app.txt'] if task['write'] else [], 'blockers': []}
+        with patch.object(core, 'dispatch', side_effect=worker):
+            runner = WorkflowRunner(self.workspace, config, spec)
+            with patch.object(pub, 'snapshot', side_effect=ValueError('snapshot fixture failure')):
+                failed = runner.run()
+            self.assertEqual(failed['status'], 'failed')
+            self.assertEqual(called, ['implementation'])
+            self.assertEqual(runner.nodes['review']['attempts'], 1)
+            result = runner.nodes['review']['result']
+            self.assertEqual(result['blockers'], ['snapshot fixture failure'])
+            self.assertEqual(result['failure_phase'], 'snapshot_before_review')
+            resumed = resume_workflow(self.workspace, config, runner.run_id, node_id='review', max_attempts=3)
+        self.assertEqual(resumed['status'], 'success', resumed)
+        self.assertEqual(called, ['implementation', 'review'])
+
+    def test_post_review_snapshot_failure_preserves_worker_evidence(self):
+        config = core.deep_merge(self.config, {'codex': {'command': sys.executable}})
+        spec = {'task': 'Review snapshot', 'publish': self.config['publish'], 'nodes': [
+            {'id': 'implement', 'agent': 'codex', 'role': 'implementation', 'write': True, 'task': 'Implement'},
+            {'id': 'review', 'agent': 'codex', 'role': 'review', 'task': 'Review', 'needs': ['implement']}]}
+        runner = WorkflowRunner(self.workspace, config, spec)
+        result = {'status': 'success', 'agent': 'codex', 'tests': ['verified fixture'], 'blockers': [],
+                  'artifacts': {'answer': 'saved answer.md'}, 'usage': {'output_tokens': 42}}
+        with patch.object(pub, 'snapshot', side_effect=['tree', ValueError('after-review snapshot failed')]), patch.object(core, 'dispatch', return_value=result):
+            payload = runner._run_node('review', 1)
+        self.assertEqual(payload['result']['failure_phase'], 'snapshot_after_review')
+        self.assertEqual(payload['result']['tests'], ['verified fixture'])
+        self.assertEqual(payload['result']['artifacts'], {'answer': 'saved answer.md'})
+        self.assertEqual(payload['result']['usage']['output_tokens'], 42)
+
+    def test_snapshot_failure_never_spends_a_classifier_call_or_switches_workers(self):
+        from fusion_policy import recovery
+        node = {'id': 'review', 'agent': 'auto', 'attempts': 1}
+        result = {'status': 'error', 'failure_phase': 'snapshot_before_review', 'blockers': ['git failed']}
+        with patch('fusion_policy.DecisionEngine', side_effect=AssertionError('Classifier cannot repair a coordinator failure')):
+            self.assertEqual(recovery(self.config, self.workspace, 'wf', node, result, False, 5), ('stop', None))
 
     def test_failed_unreviewed_and_discovery_workflows_cannot_publish(self):
         for alteration in ("failed", "no-review", "review-before-write", "discovery"):

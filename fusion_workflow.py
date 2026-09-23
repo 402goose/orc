@@ -566,6 +566,10 @@ BLOCKERS: unresolved issues, or none
 """
 
     def _accept_node(self, node: dict[str, Any], result: dict[str, Any]) -> tuple[bool, list[str]]:
+        if core.failure_class(result) == "coordinator_error":
+            # The coordinator failed to establish the review evidence. Worker
+            # handoff checks cannot repair this and only obscure the real error.
+            return False, []
         problems: list[str] = []
         if result.get("status") not in TERMINAL_SUCCESS:
             problems.append(f"worker status is {result.get('status', 'unknown')}")
@@ -644,34 +648,44 @@ BLOCKERS: unresolved issues, or none
             task["prefer_different_agent"] = prior.get("agent")
         if self.spec["budget_usd"]:
             task["budget_remaining_usd"] = max(0, self.spec["budget_usd"] - self._spent())
+        phase, result = "worker_dispatch", None
         try:
             review_tree = None
             if self.git_context and not write and "review" in node["role"].lower():
                 from fusion_publish import snapshot
+                phase = "snapshot_before_review"
                 review_tree = snapshot(self.workspace)
+            phase = "worker_dispatch"
             result = core.dispatch(self.config, task, store)
             if review_tree:
+                phase = "snapshot_after_review"
                 if snapshot(self.workspace) != review_tree:
                     result.update(status="error", blockers=[*result.get("blockers", []), "Files changed during review; review a stable tree before publishing"])
                 else:
                     result["reviewed_tree"] = review_tree
         except (OSError, ValueError, RuntimeError) as exc:
-            result = {
-                "schema": core.SCHEMA,
-                "run_id": task["run_id"],
-                "status": "error",
-                "agent": agent,
-                "role": node["role"],
-                "route": route,
-                "summary": "workflow node could not be dispatched",
-                "changed": [],
-                "tests": [],
-                "blockers": [str(exc)],
-                "exit_code": 126,
-                "duration_ms": 0,
-                "usage": {},
-                "artifacts": {},
-            }
+            if phase == "snapshot_after_review" and result:
+                result.update(status="error", failure_phase=phase,
+                              summary="Review finished, but Fusion could not verify its Git snapshot",
+                              blockers=[*result.get("blockers", []), str(exc)])
+            else:
+                result = {
+                    "schema": core.SCHEMA,
+                    "run_id": task["run_id"],
+                    "status": "error",
+                    "agent": agent,
+                    "role": node["role"],
+                    "route": route,
+                    "summary": "Review did not start: Fusion could not snapshot the repository" if phase == "snapshot_before_review" else "workflow node could not be dispatched",
+                    "failure_phase": phase,
+                    "changed": [],
+                    "tests": [],
+                    "blockers": [str(exc)],
+                    "exit_code": 126,
+                    "duration_ms": 0,
+                    "usage": {},
+                    "artifacts": {},
+                }
         result["workflow_id"] = self.run_id
         result["node_id"] = node_id
         result["attempt"] = attempt

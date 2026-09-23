@@ -16,6 +16,7 @@ async function checkActivityScrolling(page) {
         { length: 60 + revision },
         (_, i) => `Worker update ${i + 1} · revision ${revision}`,
       );
+      node.activity_entries = node.messages.map((text, i) => ({id: `update-${i}`, kind: 'message', text}));
     }
     report.events = Array.from({ length: 40 }, (_, i) => ({
       ts: Date.now() - i * 1000,
@@ -26,9 +27,11 @@ async function checkActivityScrolling(page) {
   });
   const feed = page.locator(".activity-feed").first();
   const events = page.locator(".activity-feed").nth(1);
+  // Scroll metrics round to CSS pixels; smooth scrolling may settle within 1px.
   const atBottom = () =>
-    feed.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop < 1);
+    feed.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop <= 2);
   await expect(feed).toContainText("Worker update 60");
+  await page.locator('.activity-diagnostics > summary').click();
   await expect.poll(atBottom).toBe(true);
   await feed.evaluate((el) => (el.scrollTop = 130));
   await events.evaluate((el) => (el.scrollTop = 240));
@@ -36,9 +39,11 @@ async function checkActivityScrolling(page) {
   await expect(feed).toContainText("Worker update 61");
   expect(await feed.evaluate((el) => el.scrollTop)).toBe(130);
   expect(await events.evaluate((el) => el.scrollTop)).toBe(240);
+  await expect(page.locator('.activity-diagnostics')).toHaveAttribute('open', '');
 
   // Follow only after returning to the bottom; new content scrolls smoothly.
-  await feed.evaluate((el) => (el.scrollTop = el.scrollHeight));
+  await page.getByRole("button", {name: "Jump to latest activity"}).click();
+  await expect.poll(atBottom).toBe(true);
   await page.evaluate(() => {
     window.scrollBehaviors = [];
     const original = Element.prototype.scrollTo;
@@ -57,7 +62,8 @@ async function checkActivityScrolling(page) {
   await feed.evaluate((el) => (el.scrollTop = 180));
   revision++;
   await expect(feed).toContainText("Worker update 63");
-  expect(await feed.evaluate((el) => el.scrollTop)).toBe(180);
+  // In-flight smooth scrolling and CSS-pixel rounding may settle one pixel away.
+  expect(Math.abs(await feed.evaluate((el) => el.scrollTop) - 180)).toBeLessThanOrEqual(2);
 
   // A different stage starts at its own latest output, not the old position.
   await page.locator('.stage[data-node="explore"]').click();
@@ -72,6 +78,46 @@ async function checkActivityScrolling(page) {
   );
   await page.emulateMedia({ reducedMotion: "no-preference" });
   await page.unroute("**/api/workflow?*");
+}
+
+async function checkActivityLayout(page) {
+  await page.route('**/api/workflow?*', async route => {
+    const response = await route.fetch(), report = await response.json();
+    for (const node of report.live_nodes) {
+      node.status = 'running';
+      node.activity_entries = [
+        {id:'note-1', kind:'message', text:'I found the retry boundary in `src/payments.ts`.\n\nThe request can be replayed after a timeout. I’m checking the existing tests before changing it.'},
+        ...Array.from({length:6}, (_, i) => ({id:`cmd-${i}`, kind:'command', status:'finished', command:i === 5 ? 'pnpm test -- payment-retries' : `rg -n "retry" src/payments.ts`, exit_code:0, output:'PASS payment-retries.test.ts\n12 tests passed\n<script>window.PWNED=true</script>'})),
+        {id:'note-2', kind:'message', text:'**The reproduction is confirmed.** All 12 existing tests pass, but none covers the timeout between authorization and settlement.\n\nNext: add a regression test for that gap.'},
+        {id:'active-1', kind:'command', status:'running', command:'pnpm test -- payment-timeout', exit_code:null},
+      ];
+    }
+    await route.fulfill({response, json:report});
+  });
+  await page.evaluate(() => refresh(true));
+  await expect(page.locator('.worker-update')).toHaveCount(2);
+  await expect(page.locator('.command-group')).toHaveCount(2);
+  await expect(page.locator('.command-group').first()).toContainText('6 commands');
+  await expect(page.locator('.command-group').last()).toContainText('Running');
+  await expect(page.locator('.activity-diagnostics')).not.toHaveAttribute('open', '');
+  await expect(page.getByRole('heading', {name:'Workflow events', exact:true})).toHaveCount(0);
+  await page.evaluate(() => Promise.all(document.getAnimations().filter(a => a.effect.getTiming().iterations !== Infinity).map(a => a.finished.catch(() => {}))));
+  await page.screenshot({path:'/tmp/orc-activity-light.png',fullPage:true});
+  await page.locator('.command-group > summary').first().click();
+  await page.locator('.command-detail > summary').first().click();
+  await expect(page.locator('.command-output').first()).toBeVisible();
+  await page.evaluate(() => refresh(true));
+  await expect(page.locator('.command-output').first()).toBeVisible();
+  expect(await page.evaluate(() => window.PWNED)).toBeUndefined();
+  await page.locator('.command-group > summary').first().click();
+  await page.evaluate(() => ORCAppearance.set({mode:'dark'}));
+  await page.screenshot({path:'/tmp/orc-activity-dark.png',fullPage:true});
+  await page.setViewportSize({width:390,height:844});
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({path:'/tmp/orc-activity-mobile.png',fullPage:true});
+  await page.setViewportSize({width:1440,height:1050});
+  await page.evaluate(() => ORCAppearance.set({mode:'light'}));
+  await page.unroute('**/api/workflow?*');
 }
 
 (async () => {
@@ -157,7 +203,26 @@ async function checkActivityScrolling(page) {
     await expect(page.locator(".activity-feed").first()).toContainText(
       "Inspecting fixture source files",
     );
+    await checkActivityLayout(page);
     await checkActivityScrolling(page);
+
+    await page.route('**/api/workflow?*', async route => {
+      const response = await route.fetch();
+      const report = await response.json();
+      report.live_nodes.find(n => n.id === 'explore').coordinator_failure = {
+        phase: 'snapshot_before_review', message: 'Review did not start: Fusion could not snapshot the repository', detail: 'Git snapshot fixture failure',
+      };
+      report.live_nodes.find(n => n.id === 'explore').result.command_evidence = ['command exited 1: cat corrected-path'];
+      await route.fulfill({response, json: report});
+    });
+    await page.getByRole('button', {name: 'Deliverable', exact: true}).click();
+    await page.evaluate(() => refresh(true));
+    await expect(page.getByRole('heading', {name: 'Review did not start: Fusion could not snapshot the repository'})).toBeVisible();
+    await expect(page.locator('.detail-grid')).toContainText('No reviewer was launched');
+    await page.getByRole('button', {name: 'Evidence', exact: true}).click();
+    await expect(page.getByRole('heading', {name: 'Command observations'})).toBeVisible();
+    await expect(page.locator('.console').filter({hasText: 'command exited 1: cat corrected-path'})).toBeVisible();
+    await page.unroute('**/api/workflow?*');
 
     await page.locator("[data-view=decisions]").click();
     await expect(
