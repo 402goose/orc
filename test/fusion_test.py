@@ -1650,6 +1650,33 @@ class HandoffParsingTest(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(self.blockers(value), [])
 
+    def test_prose_is_one_statement_not_comma_fragments(self):
+        """These fields become a Laya decision's input state, not just display.
+
+        A worker wrote one coherent sentence about what it ran. Comma-splitting
+        turned it into three fragments, and those fragments were fed to the
+        acceptance classifier as the state it judged. Debris in, nonsense out.
+        """
+        written = ('`./test/run.sh` \u2192 exit 0, "all 70 tests passed". '
+                   'I did not run `make test`, `make dogfood` or the browser tests.')
+        parsed = fusion_core.parse_handoff("STATUS: success\nTESTS: " + written)["tests"]
+        self.assertEqual(parsed, [written])
+
+    def test_genuine_lists_still_split(self):
+        for value, expected in [
+            ("missing fixture, broken import", ["missing fixture", "broken import"]),
+            ("src/a.py, src/b.py", ["src/a.py", "src/b.py"]),
+            ("pytest -q, ruff check", ["pytest -q", "ruff check"]),
+        ]:
+            with self.subTest(value=value):
+                parsed = fusion_core.parse_handoff("STATUS: success\nCHANGED: " + value)["changed"]
+                self.assertEqual(parsed, expected)
+
+    def test_a_filename_period_does_not_make_it_prose(self):
+        # The period in src/a.py closes a name, not a sentence.
+        self.assertFalse(fusion_core._reads_as_prose("src/a.py, src/b.py"))
+        self.assertTrue(fusion_core._reads_as_prose("Ran the suite. It passed."))
+
     def test_real_blockers_survive(self):
         self.assertEqual(
             self.blockers("the suite fails and I could not fix it"),

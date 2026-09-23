@@ -193,6 +193,20 @@ def compact(text: str, limit: int) -> str:
     return text[: max(0, limit - 80)] + "\n...[truncated by fusion]..."
 
 
+_SENTENCE_BREAK = re.compile(r"[.!?](?:\s|$)")
+
+
+def _reads_as_prose(value: str) -> bool:
+    """Does this run to full sentences rather than name a list of things?
+
+    A list item is a path, a command, a short phrase; it does not end a
+    sentence. So a value carrying sentence-ending punctuation followed by
+    whitespace or the end of the string is prose. `src/a.py, src/b.py` is not
+    - the period there is inside a filename, not closing a sentence.
+    """
+    return bool(_SENTENCE_BREAK.search(value))
+
+
 NONE_ANSWERS = {"none", "n/a", "na", "nil", "nothing", "-", "—"}
 
 
@@ -221,6 +235,13 @@ def parse_handoff(text: str) -> dict[str, Any]:
         lead = re.split(r"[.;:,—-](?:\s+|$)", value, maxsplit=1)[0].strip().lower()
         if lead in NONE_ANSWERS:
             return []
+        if _reads_as_prose(value):
+            # One statement, not a comma-delimited list. Splitting prose on
+            # commas produces fragments that read as gibberish, and these
+            # fields are not only displayed - they become the state a Laya
+            # decision is classified from, so the debris degrades the model's
+            # input. One honest sentence beats three nonsense entries.
+            return [value]
         return [item.strip() for item in value.split(",") if item.strip()]
 
     reported_status = fields.get("STATUS", "").lower()
