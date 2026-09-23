@@ -127,10 +127,22 @@ def status(app, workspace, rows=None):
     groups = readiness(rows)
     running = next((r for r in history if r.get('status') in {'running','needs_attention'}), None)
     pending = changes((running or previous).get('tokens',{}),current)
-    active_job = app.job(workspace,running['active_job']) if running and running.get('active_job') else None
+    active_job = None
+    if running and running.get('active_job'):
+        try:
+            active_job = app.job(workspace,running['active_job'])
+        except (ValueError, OSError):
+            # The job directory can be pruned, or simply absent in a copied or
+            # restored workspace. A vanished job must not take out the lab:
+            # /api/decisions serves decisions, review, garden AND training from
+            # this one call, and configure() returns it too - so raising here
+            # would 500 everything and leave no way to even turn the loop off.
+            active_job = None
+    lost_job = bool(running and running.get('active_job') and active_job is None)
     ready = groups['train'] >= 2 and groups['validation'] >= 2
     if not value['enabled']: state,reason = 'paused','Automatic training is off. Saved rounds and active jobs are preserved.'
     elif running and running['status']=='needs_attention': state,reason='needs_attention',running.get('error','This round needs attention.')
+    elif lost_job: state,reason='needs_attention','The saved job for this step is no longer on disk. Retry this step.'
     elif running: state,reason='running',f"Round {running['number']} · {running['phase']}"
     elif not ready: state,reason='gathering','Gather approved examples from at least two training and two held-out workflow groups.'
     elif previous and pending < value['min_new_answers']: state,reason='gathering',f"{pending} / {value['min_new_answers']} new or changed approved answers for the next round."
