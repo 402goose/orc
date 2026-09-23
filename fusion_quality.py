@@ -57,7 +57,8 @@ def review_quality(rows):
             council["drafts"] += 1
             for q in suggestion["council"].get("questions", {}).values():
                 council[q["state"]] += 1
-            council["failed_members"] += sum(m.get("status") != "success" for m in suggestion["council"].get("members", []))
+            council["failed_members"] += sum(m.get("status") not in {"success", "unavailable"} for m in suggestion["council"].get("members", []))
+            council["unavailable_members"] += sum(m.get("status") == "unavailable" for m in suggestion["council"].get("members", []))
         effective, previous = {}, {}
         for event in row.get("labels", []):
             if not event.get("verified"):

@@ -31,6 +31,7 @@ def add_parser(sub):
     suggest.add_argument("--agent", choices=["auto", "codex", "claude", "agy", "grok"], default="auto")
     suggest.add_argument("--council", nargs="+", choices=["codex", "claude", "agy", "grok"], help="independent workers; unanimous answers become a draft")
     suggest.add_argument("--approval", choices=["human", "council"], default="human", help="opt in to automatic approval of unanimous council answers")
+    suggest.add_argument("--council-rule", choices=["unanimous", "available"], default="unanimous", help="available skips operationally unavailable members; at least two must agree")
     suggest.add_argument("--garden-policy", help="saved garden policy; changes or pausing revoke pending automatic approvals")
     export = commands.add_parser("export", help="export reviewed labels, split by workflow group")
     export.add_argument("output")
@@ -102,7 +103,7 @@ def run(args, workspace, config):
         from fusion_labeling import suggest
         members = getattr(args, "council", None)
         payload = suggest(workspace, config, args.id, args.agent, "council" if members else "single", members,
-                          getattr(args, "approval", "human"), getattr(args, "garden_policy", None))
+                          getattr(args, "approval", "human"), getattr(args, "garden_policy", None), getattr(args, "council_rule", "unanimous"))
     elif command == "label":
         if any("=" not in answer for answer in args.answers):
             raise ValueError("answers must be question=value pairs")

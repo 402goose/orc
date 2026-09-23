@@ -25,6 +25,21 @@ print(json.dumps({'type': 'result', 'result': message, 'is_error': False}))
         config['claude']['command'] = str(worker)
         atomic_json(workspace / '.fusion.json', config)
     os.environ["ORC_HOME"] = str(root / "orc-home")
+    if os.environ.get('FUSION_FIXTURE_AVAILABLE_COUNCIL') == '1':
+        claude = workspace / 'claude-fixture'
+        claude.write_text(f'#!{sys.executable}\n' + '''import json
+print(json.dumps({'type':'result','result':'API Error: 400 You have reached your specified API usage limits.', 'is_error':True}))
+''')
+        grok = workspace / 'grok-fixture'
+        grok.write_text(f'#!{sys.executable}\n' + '''import json
+suggestion = {'answers': {'plausible': {'value':'false','reason':'The original input says no work was done.','evidence':['E1']}}, 'abstentions':{}}
+message = 'STATUS: success\\nSUMMARY: Assessed evidence\\n```label-suggestion\\n'+json.dumps(suggestion)+'\\n```\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'
+print(json.dumps({'type':'text','data':message}))
+print(json.dumps({'type':'end','stopReason':'end_turn'}))
+''')
+        grok.chmod(0o755)
+        config['grok']['command'] = str(grok)
+        atomic_json(workspace / '.fusion.json', config)
     os.environ["FUSION_TELEMETRY"] = "0"
     app = ControlRoom(workspace, root / "registry.json")
     job = app.launch(workspace, {"action":"build", "kind":"discovery", "text":"Find the highest-impact improvements in CLI reliability and payment routing", "mode":"off", "attempts":1})
@@ -54,6 +69,8 @@ print(json.dumps({'type': 'result', 'result': message, 'is_error': False}))
                  recommendations={"plausible":{"value":"false","probability":.88}},
                  prediction={"plausible":{"false":.88,"true":.12}}, model_identity="fixture-model", schema_hash="fixture", context={})
     store.append("application", id="fixture-decision", actual="accept", applied=False)
+    if os.environ.get('FUSION_FIXTURE_AVAILABLE_COUNCIL') == '1':
+        store.append('label_exclusion', id='abstained-review', excluded=True)
     if os.environ.get('FUSION_FIXTURE_LIVE_COUNCIL') == '1':
         store.append('label_exclusion', id='abstained-review', excluded=True)
         codex = workspace / 'codex-fixture'

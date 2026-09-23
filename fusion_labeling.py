@@ -96,6 +96,40 @@ def teacher_questions(questions):
 WORKERS = {"codex", "claude", "agy", "grok"}
 
 
+def council_rule(value="unanimous"):
+    if value not in {"unanimous", "available"}:
+        raise ValueError("Choose all selected members or available members for council agreement")
+    return value
+
+
+def unavailable(member):
+    # A bad assessment or abstention is not an unavailable account.
+    return member.get("status") in {"error", "unavailable"} and member.get("failure_class") in {
+        "quota", "timeout", "missing_executable", "permission_denied"}
+
+
+def recent_quota(workspace, config, agent):
+    """Reuse the native account cooldown; a successful newer call clears it."""
+    import fusion_core as core
+    command = core.agent_settings(config, {"agent": agent}).get("command", agent)
+    if Path(str(command)).name == "orc":
+        return None  # Named profiles may use different accounts.
+    for span in core.RunStore(workspace).traces(limit=200):
+        if span.get("agent") != agent:
+            continue
+        if span.get("route") and span["route"] not in config.get("routes", {}):
+            continue
+        settings = core.agent_settings(config, {"agent": agent, "route": span.get("route")})
+        if settings.get("command", agent) != command:
+            continue
+        if span.get("failure_class") == "quota" and 0 <= core.now_ms() - span.get("end_time_ms", 0) < core.LANE_COOLDOWN_SECONDS * 1000:
+            return {"requested_agent": agent, "agent": agent, "status": "unavailable", "failure_class": "quota",
+                    "error": "Recent call reached this account's quota; skipping during its 15-minute cooldown.",
+                    "prior_run_id": span.get("task_id")}
+        break
+    return None
+
+
 def labeling_options(mode="single", members=None):
     if mode not in {"single", "council"}:
         raise ValueError("Choose single-worker or council labeling")
@@ -160,7 +194,8 @@ BLOCKERS: none when your assessment is complete, including when evidence is insu
     metadata = {k: result.get(k) for k in ("agent", "model", "run_id", "usage")}
     metadata["requested_agent"] = agent
     if result.get("status") != "success" or result.get("exit_code") != 0:
-        return {**metadata, "status": "error", "error": "Label worker failed: " + str(result.get("blockers") or result.get("summary"))}
+        return {**metadata, "status": "error", "failure_class": core.failure_class(result),
+                "error": "Label worker failed: " + str(result.get("blockers") or result.get("summary"))}
     try:
         answer = (Path(workspace) / ".fusion/runs" / result["run_id"] / "answer.md").read_text()
         return {**metadata, "status": "success", **parse_suggestion(answer, record, sources)}
@@ -168,34 +203,39 @@ BLOCKERS: none when your assessment is complete, including when evidence is insu
         return {**metadata, "status": "error", "error": str(exc)}
 
 
-def council_consensus(record, members):
+def council_consensus(record, members, rule="unanimous"):
     """Only unanimous, evidence-citing answers survive; every vote stays inspectable."""
+    council_rule(rule)
+    selected = members
+    members = [m for m in selected if not unavailable(m)] if rule == "available" else selected
     answers, abstentions, questions = {}, {}, {}
     for key in record["questions"]:
         votes = [m.get("answers", {}).get(key) if m.get("status") == "success" else None for m in members]
         values = [v["value"] for v in votes if v]
-        unanimous = len(values) == len(members) and len(set(values)) == 1
+        unanimous = len(members) >= 2 and len(values) == len(members) and len(set(values)) == 1
         questions[key] = {"state": "agreed" if unanimous else "disputed" if len(set(values)) > 1 else "insufficient",
-                          "votes": len(values), "members": len(members)}
+                          "votes": len(values), "members": len(members), "selected": len(selected),
+                          "unavailable": len(selected) - len(members)}
         if unanimous:
             answers[key] = {"value": values[0],
                             "reason": "\n\n".join(f"{m['requested_agent']}: {v['reason']}" for m, v in zip(members, votes)),
                             "evidence": sorted({ref for v in votes for ref in v["evidence"]})}
         else:
-            abstentions[key] = "Council did not reach unanimous support. " + "; ".join(
+            abstentions[key] = "Council needs at least two supported answers and agreement from every participating member. " + "; ".join(
                 f"{m['requested_agent']}: " + (v["value"] if v else m.get("abstentions", {}).get(key) or m.get("error", "No answer"))
                 for m, v in zip(members, votes))
     return {"answers": answers, "abstentions": abstentions, "questions": questions}
 
 
 def suggest(workspace, config, decision_id, agent="auto", labeling_mode="single", council_agents=None,
-            approval_mode="human", garden_policy=None):
+            approval_mode="human", garden_policy=None, rule="unanimous"):
     import sys
     from fusion_publish import save
     if agent not in WORKERS | {"auto"}:
         raise ValueError("Choose an installed labeling worker")
     options = labeling_options(labeling_mode, council_agents)
     approval_options(approval_mode, labeling_mode)
+    council_rule(rule)
     store = DecisionStore(workspace)
     record = labelable(store, decision_id)
     sources = evidence_bundle(workspace, record)
@@ -204,7 +244,8 @@ def suggest(workspace, config, decision_id, agent="auto", labeling_mode="single"
     assessment_id = uuid.uuid4().hex
     live = {"id": assessment_id, "decision_id": decision_id, "status": "running", "phase": "assessing",
             "pid": os.getpid(), "started_at_ms": int(time.time() * 1000), "labeling_mode": labeling_mode,
-            "approval_mode": approval_mode, "members": [{"requested_agent": worker, "status": "pending"} for worker in selected]}
+            "approval_mode": approval_mode, "council_rule": rule,
+            "members": [{"requested_agent": worker, "status": "pending"} for worker in selected]}
     live_path = store.root / "assessments" / (assessment_id + ".json")
     save(live_path, live)
     try:
@@ -216,7 +257,10 @@ def suggest(workspace, config, decision_id, agent="auto", labeling_mode="single"
                 live["members"][index]["run_id"] = run_id
                 save(live_path, live)
             try:
-                member = assessment(workspace, config, record, sources, worker, on_started=started)
+                member = recent_quota(workspace, config, worker) if labeling_mode == "council" and rule == "available" else None
+                member = member or assessment(workspace, config, record, sources, worker, on_started=started)
+                if rule == "available" and unavailable(member):
+                    member["status"] = "unavailable"
             except (OSError, ValueError, RuntimeError) as exc:
                 member = {"requested_agent": worker, "agent": worker, "status": "error", "error": str(exc)}
             members.append(member)
@@ -234,10 +278,10 @@ def suggest(workspace, config, decision_id, agent="auto", labeling_mode="single"
         save(live_path, live)
         raise ValueError("; ".join(m["error"] for m in members))
     if labeling_mode == "council":
-        consensus = council_consensus(record, members)
+        consensus = council_consensus(record, members, rule)
         parsed = {k: consensus[k] for k in ("answers", "abstentions")}
         metadata = {"agent": "council", "model": None, "run_id": None,
-                    "council": {"rule": "unanimous", "members": members, "questions": consensus["questions"]}}
+                    "council": {"rule": rule, "members": members, "questions": consensus["questions"]}}
     else:
         parsed = {k: members[0][k] for k in ("answers", "abstentions")}
         metadata = {k: members[0].get(k) for k in ("agent", "model", "run_id", "usage")}
@@ -293,18 +337,28 @@ def approve_council(workspace, decision_id, suggestion_id, garden_policy=None):
         for member in members:
             if member.get('status') == 'success':
                 parse_suggestion('```label-suggestion\n' + json.dumps({k: member[k] for k in ('answers', 'abstentions')}) + '\n```', record, suggestion['sources'])
-        consensus = council_consensus(record, members)
+        rule = council_rule(suggestion.get('council', {}).get('rule', 'unanimous'))
+        consensus = council_consensus(record, members, rule)
         answers = {key: item['value'] for key, item in consensus['answers'].items()}
         if not answers:
-            return {"status": "needs_review", "answers": {}, "reason": "No unanimous, evidence-backed answers; review the disagreements or missing evidence"}
+            missing = [m['requested_agent'] for m in members if unavailable(m)]
+            reason = ("All-selected rule requires " + ', '.join(missing) + "; choose available-member agreement to continue without unavailable accounts."
+                      if missing and rule == 'unanimous' else
+                      "At least two successful members must agree on a supported answer. Inspect disagreements, missing evidence, or failed assessments.")
+            return {"status": "needs_review", "answers": {}, "reason": reason}
         evidence = '\n\n'.join(f"{key} = {item['value']}: {item['reason']} [{', '.join(item['evidence'])}]" for key, item in consensus['answers'].items())
-        reviewers = [{k: m.get(k) for k in ('requested_agent', 'agent', 'model', 'run_id')} for m in members]
+        participating = [m for m in members if not (rule == 'available' and unavailable(m))]
+        reviewers = [{k: m.get(k) for k in ('requested_agent', 'agent', 'model', 'run_id')} for m in participating]
         store.append('label', id=decision_id, answers=answers, evidence=evidence, verified=True, replace=False,
-                     source='council_approved_suggestion', suggestion_id=suggestion_id, approval_rule='unanimous',
+                     source='council_approved_suggestion', suggestion_id=suggestion_id, approval_rule=rule,
+                     unavailable_members=[{k: m.get(k) for k in ('requested_agent', 'failure_class', 'error', 'run_id', 'prior_run_id')}
+                                          for m in members if m not in participating],
                      reviewers=reviewers, suggested_by={'agent': 'council', 'labeling_mode': 'council', 'assessment_id': suggestion.get('assessment_id')})
         pending = sorted(set(record['questions']) - set(answers))
         return {"status": "partial" if pending else "approved", "answers": answers, "pending": pending,
-                "reason": f"{len(answers)} answers approved by {len(members)} unanimous council members" + (f"; {len(pending)} still need review" if pending else "")}
+                "reason": f"{len(answers)} {'answer' if len(answers) == 1 else 'answers'} approved by {len(participating)} agreeing council members"
+                          + (f"; {len(members) - len(participating)} unavailable" if len(members) != len(participating) else "")
+                          + (f"; {len(pending)} still need review" if pending else "")}
 
 
 def approval_provenance(store, record, suggestion_id, answers):

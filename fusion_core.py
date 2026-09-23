@@ -113,6 +113,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "grok": {
         "command": "grok",
+        "output_format": "streaming-json",
         "permission_mode": "plan",
         "model": "",
     },
@@ -893,6 +894,41 @@ def parse_claude_output(stdout: str) -> tuple[str | None, str, str | None, dict[
     return session_id, text, failure, usage, model, denial_notes
 
 
+def parse_grok_output(stdout: str, output_format: str = "streaming-json"):
+    """Grok's documented headless ACP projection; never include thought events."""
+    if output_format == "plain":
+        return None, stdout.strip(), None, {}, None, []
+    text, failure, final = [], None, {}
+    ended = False
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        if kind == "text" and isinstance(event.get("data"), str):
+            text.append(event["data"])
+        elif kind == "tool_call":
+            text = []  # Commentary before tools is not the final handoff.
+        elif kind == "error":
+            failure = str(event.get("message") or "Grok reported an error")
+            final = event
+        elif kind == "end":
+            ended, final = True, event
+            if event.get("stopReason") not in (None, "end_turn"):
+                failure = failure or "Grok stopped: " + str(event["stopReason"])
+    if not ended:
+        failure = failure or "Grok stream ended without its final completion event"
+    usage = dict(final.get("usage") or {})
+    if final.get("total_cost_usd") is not None and not final.get("cost_is_partial"):
+        usage["cost_usd"] = final["total_cost_usd"]
+    models = final.get("modelUsage") or {}
+    model = next(iter(models)) if len(models) == 1 else None
+    return final.get("sessionId"), "".join(text).strip(), failure, usage, model, []
+
+
 def parse_agy_output(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None, list[str]]:
     try:
         value = json.loads(stdout)
@@ -1067,15 +1103,16 @@ def agent_command(
         mode = "bypassPermissions" if yolo else settings.get("permission_mode", "plan") if task["write"] else "plan"
         if mode not in {"plan", "acceptEdits", "dontAsk", "bypassPermissions"}:
             raise ValueError("Grok workers require plan, acceptEdits, or dontAsk permissions")
+        output_format = settings.get("output_format", "streaming-json")
+        if output_format not in {"plain", "streaming-json"}:
+            raise ValueError("Grok output_format must be plain or streaming-json")
         argv = [command, "--cwd", task["workspace"], "--no-subagents", "--permission-mode", mode,
-                "--output-format", "plain", "-p", brief_for(task)]
+                "--output-format", output_format, "-p", brief_for(task)]
         if yolo:
             argv += ["--sandbox", "none", "--no-plan"]
         if settings.get("model"):
             argv += ["--model", settings["model"]]
-        # Plain mode guarantees a public handoff without assuming a JSON schema.
-        # Each node gets a fresh session; token/cost coverage remains unknown.
-        return argv, os.environ.copy(), {"command": command, "model": settings.get("model") or ""}
+        return argv, os.environ.copy(), {"command": command, "model": settings.get("model") or "", "output_format": output_format}
     if agent == "claude":
         command = settings.get("command", "claude")
         command_name = Path(command).name
@@ -1199,6 +1236,7 @@ def dispatch(
                 input=prompt if task["agent"] == "codex" else None,
                 timeout=int(config.get("timeout_seconds", 3600)),
                 stdout_path=stdout_path, stderr_path=stderr_path, label=label,
+                plain_output=task["agent"] == "grok" and metadata.get("output_format") == "plain",
             )
         exit_code = completed.returncode
         if task["agent"] == "codex":
@@ -1206,8 +1244,9 @@ def dispatch(
         elif task["agent"] == "agy":
             new_session, summary, failure, usage, event_model, evidence_notes = parse_agy_output(completed.stdout)
         elif task["agent"] == "grok":
-            new_session, summary, usage, event_model, evidence_notes = None, completed.stdout.strip(), {}, None, []
-            failure = compact(progress.clean(completed.stderr), 1500) if exit_code != 0 and completed.stderr.strip() else None
+            new_session, summary, failure, usage, event_model, evidence_notes = parse_grok_output(completed.stdout, metadata.get("output_format", "plain"))
+            if exit_code != 0 and completed.stderr.strip():
+                failure = failure or compact(progress.clean(completed.stderr), 1500)
         else:
             new_session, summary, failure, usage, event_model, evidence_notes = parse_claude_output(completed.stdout)
         # Preserve the public deliverable outside the compact receipt and trace.

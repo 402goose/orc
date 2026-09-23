@@ -90,6 +90,52 @@ class CouncilApprovalTest(unittest.TestCase):
             suggest(self.workspace, self.config, 'decision', approval_mode='council')
         dispatch.assert_not_called()
 
+    def test_available_rule_approves_three_votes_despite_quota_with_auditable_export(self):
+        members = [self.member('codex'), dict(status='error', requested_agent='claude', failure_class='quota', error='API usage limit'),
+                   self.member('agy'), self.member('grok')]
+        with patch('fusion_labeling.assessment', side_effect=members):
+            result = suggest(self.workspace, self.config, 'decision', labeling_mode='council',
+                             council_agents=['codex','claude','agy','grok'], approval_mode='council', rule='available')
+        self.assertEqual(result['approval']['status'], 'approved')
+        self.assertIn('3 agreeing', result['approval']['reason'])
+        self.assertEqual(result['council']['questions']['specialty']['members'], 3)
+        event = self.labels()[0]
+        self.assertEqual(event['approval_rule'], 'available')
+        self.assertEqual(event['unavailable_members'][0]['requested_agent'], 'claude')
+        self.assertEqual([m['agent'] for m in event['reviewers']], ['codex','agy','grok'])
+        self.assertEqual(self.app.label_runs(self.workspace)[0]['members'][1]['status'], 'unavailable')
+        path = self.workspace / 'available.jsonl'
+        self.store.export(path)
+        provenance = json.loads(path.read_text())['label_provenance']['specialty']
+        self.assertEqual(provenance['approval_rule'], 'available')
+        self.assertEqual(provenance['unavailable_members'][0]['failure_class'], 'quota')
+
+    def test_available_rule_does_not_drop_dissent_abstention_or_invalid_assessment(self):
+        quota = dict(status='error', requested_agent='claude', failure_class='quota', error='Quota exhausted')
+        cases = [[self.member('codex'), quota],
+                 [self.member('codex'), quota, self.member('grok', specialty='general', review='false')],
+                 [self.member('codex'), quota, self.member('grok', specialty=None, review=None)],
+                 [self.member('codex'), self.member('agy'), dict(status='error', requested_agent='grok', error='Invalid JSON')]]
+        for members in cases:
+            with self.subTest(members=members), patch('fusion_labeling.assessment', side_effect=members):
+                result = suggest(self.workspace, self.config, 'decision', labeling_mode='council',
+                                 council_agents=[m['requested_agent'] for m in members], approval_mode='council', rule='available')
+            self.assertEqual(result['approval']['status'], 'needs_review')
+            self.assertEqual(self.labels(), [])
+
+    def test_available_rule_reuses_quota_cooldown_and_success_clears_it(self):
+        from fusion_labeling import recent_quota
+        span = dict(agent='claude', failure_class='quota', end_time_ms=core.now_ms(), task_id='prior')
+        with patch.object(core.RunStore, 'traces', return_value=[span]):
+            self.assertEqual(recent_quota(self.workspace, self.config, 'claude')['prior_run_id'], 'prior')
+            with patch('fusion_labeling.assessment', side_effect=[self.member('codex'), self.member('agy')]) as assess:
+                result = suggest(self.workspace, self.config, 'decision', labeling_mode='council',
+                                 council_agents=['codex','claude','agy'], approval_mode='council', rule='available')
+            self.assertEqual(assess.call_count, 2)
+            self.assertEqual(result['approval']['status'], 'approved')
+        with patch.object(core.RunStore, 'traces', return_value=[{**span,'failure_class':None},span]):
+            self.assertIsNone(recent_quota(self.workspace, self.config, 'claude'))
+
     def test_stale_excluded_and_human_reviewed_inputs_are_preserved(self):
         for mutation in ('stale', 'excluded', 'human'):
             with self.subTest(mutation=mutation):
@@ -106,12 +152,13 @@ class CouncilApprovalTest(unittest.TestCase):
                 self.assertFalse(any(e['source']=='council_approved_suggestion' for e in self.labels()))
 
     def test_garden_pause_and_changed_policy_revoke_inflight_approval(self):
-        for mutation in ('pause', 'members'):
+        for mutation in ('pause', 'members', 'rule'):
             configured = garden.save(self.app,self.workspace,dict(enabled=True,include_existing=True,labeling_mode='council',
                                       council_agents=['codex','claude'],approval_mode='council'))
             def assess(workspace, config, record, sources, agent, on_started=None):
                 if agent=='claude':
-                    garden.save(self.app,self.workspace,{'enabled':False} if mutation=='pause' else {'enabled':True,'council_agents':['codex','grok']})
+                    garden.save(self.app,self.workspace,{'enabled':False} if mutation=='pause' else
+                                {'enabled':True,'council_rule':'available'} if mutation=='rule' else {'enabled':True,'council_agents':['codex','grok']})
                 return self.member(agent)
             result = self.run_council(assess,policy=configured['policy_id'])
             self.assertEqual(result['approval']['status'], 'needs_review')

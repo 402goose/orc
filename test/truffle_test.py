@@ -204,6 +204,35 @@ class TruffleTest(unittest.TestCase):
         row = truffle.receipt(self.workspace, record["id"])["candidates"][0]
         self.assertEqual(row["workflow_status"], "interrupted", "a killed coordinator must not read as running")
 
+    def test_paused_queue_tracks_manually_recovered_workflow_and_publication(self):
+        record = self.saved_hunt()
+        record.update(status='paused', selected=[1], publish={'mode':'auto'}, message='Old failure')
+        record['candidates'][0].update(workflow_id='recovered', status='failed')
+        root = truffle.root_for(self.workspace, record['id'])
+        pub.save(root/'hunt.json', record)
+        workflow = self.workspace/'.fusion/workflows/recovered'
+        pub.save(workflow/'manifest.json', {'status':'failed'})
+        self.assertEqual(truffle.receipt(self.workspace, record['id'])['status'], 'paused')
+        pub.save(workflow/'manifest.json', {'status':'running', 'coordinator_pid':os.getpid()})
+        self.assertEqual(truffle.receipt(self.workspace, record['id'])['status'], 'waiting')
+        pub.save(workflow/'manifest.json', {'status':'success'})
+        self.assertEqual(truffle.receipt(self.workspace, record['id'])['status'], 'paused', 'Auto publication still pending')
+        pub.save(workflow/'publish.json', {'status':'published', 'url':'https://github.com/fixture/project/pull/9'})
+        self.assertEqual(truffle.receipt(self.workspace, record['id'])['status'], 'complete')
+        self.assertEqual(truffle.history(self.workspace)[0]['status'], 'complete')
+        self.assertEqual(pub.read(root/'hunt.json')['status'], 'paused', 'Read must preserve the original coordinator receipt')
+        record['selected'] = [1,2]
+        pub.save(root/'hunt.json', record)
+        restored = truffle.receipt(self.workspace, record['id'])
+        self.assertEqual(restored['status'], 'ready')
+        self.assertIn('Continue queue', restored['message'])
+        self.assertFalse(restored['candidates'][1].get('workflow_id'), 'Read must not dispatch another issue')
+        record['publish']['mode'] = 'manual'
+        record['selected'] = [1]
+        pub.save(root/'hunt.json', record)
+        (workflow/'publish.json').unlink()
+        self.assertEqual(truffle.receipt(self.workspace, record['id'])['status'], 'complete')
+
     def test_lock_validation_and_write_boundary(self):
         record = self.saved_hunt()
         with truffle.locked(self.workspace), self.assertRaisesRegex(ValueError, "already running"):

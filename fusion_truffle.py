@@ -92,6 +92,29 @@ def receipt(workspace, scout_id):
             # read it the same way `watch` and `report` do.
             row["workflow_status"] = effective_status(manifest) if manifest else "interrupted"
             row["publication"] = read(Path(workspace) / ".fusion/workflows" / run_id / "publish.json")
+            context = read(Path(workspace) / ".fusion/workflows" / run_id / "git.json")
+            mode = context.get("mode", record.get("publish", {}).get("mode", "manual"))
+            row["queue_complete"] = row["workflow_status"] == "success" and (
+                row["publication"].get("status") == "published" if mode == "auto" else row["publication"].get("status") != "failed")
+            if row["queue_complete"]:
+                row["status"] = "success"
+    # A manual workflow recovery can finish after the queue coordinator exits.
+    # Derive current state without dispatching work or rewriting its receipt.
+    selected = [r for r in record.get("candidates", []) if r["number"] in record.get("selected", [])]
+    if selected and record.get("status") in {"paused", "interrupted", "complete"}:
+        pending = [r for r in selected if not r.get("queue_complete") and r.get("status") != "skipped"]
+        record["saved_status"] = record["status"]
+        if not pending:
+            record.update(status="complete", message="Selected issues finished. Open each workflow for the reviewed diff and PR.")
+        elif any(r.get("workflow_status") == "running" for r in pending):
+            record.update(status="waiting", message="A selected workflow is running. Its progress appears below; any remaining issues need Continue queue after it finishes.")
+        elif all(not r.get("workflow_id") and r.get("status") == "ready" for r in pending) and any(r.get("queue_complete") for r in selected):
+            record.update(status="ready", message=f"Recovered fixes are accepted. Continue queue to start the remaining {len(pending)} issues.")
+        else:
+            blocked = next((r for r in pending if r.get("workflow_id")), None)
+            if blocked:
+                problem = "PR publication pending or failed" if blocked.get("workflow_status") == "success" else blocked.get("workflow_status", "interrupted")
+                record.update(status="paused", message=f"Queue waiting at #{blocked['number']}: {problem}. Open its workflow. Resume it or retry PR publication, then continue the queue.")
     return record
 
 

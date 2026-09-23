@@ -214,6 +214,7 @@ def label_provenance(events):
             effective.setdefault(event["id"], {})[key] = {
                 "source": event.get("source", "human"), "suggestion_id": event.get("suggestion_id"),
                 "reviewers": event.get("reviewers", []), "time_ms": event.get("time_ms"),
+                "approval_rule": event.get("approval_rule"), "unavailable_members": event.get("unavailable_members", []),
             }
     return effective
 
