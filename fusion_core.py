@@ -10,12 +10,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from typing import Any, Iterator
@@ -224,6 +226,23 @@ def json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
 
 
+MASK = "••••••••"
+SECRET = re.compile(r"token|secret|password|api.?key|authorization", re.I)
+
+
+def redact(value: Any) -> Any:
+    """Mask secret-looking values anywhere in a structure before printing it.
+
+    Anything that dumps configuration to a terminal or a browser goes through
+    this: `fusion doctor` is the first thing install.sh tells a new user to
+    run, and it prints the merged config."""
+    if isinstance(value, dict):
+        return {key: MASK if SECRET.search(key) and item else redact(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact(item) for item in value]
+    return value
+
+
 def number(value: Any) -> float:
     if isinstance(value, bool):
         return 0.0
@@ -386,13 +405,25 @@ def worker_availability(config: dict[str, Any], agent: str) -> dict[str, Any]:
     return state
 
 
+# Stands in for the cached id when ORC_HOME cannot be written, so one such
+# machine reports as one install for the life of the process rather than as a
+# new install per span.
+_EPHEMERAL_INSTALL_ID = uuid.uuid4().hex
+
+
 def telemetry_install_id() -> str:
     """A random id stable across a machine's projects, not tied to a
     person's identity. Generated once and cached under ORC_HOME (matching
     the orc CLI's own convention), not per-workspace."""
     home = Path(os.environ.get("ORC_HOME") or (Path.home() / ".config" / "orc")).expanduser()
-    home.mkdir(parents=True, exist_ok=True)
     id_path = home / "telemetry_id"
+    try:
+        # An unwritable home must never reach the caller: this runs on the
+        # dispatch path now that reporting is on by default, and telemetry
+        # failing is never a reason for a worker run to fail.
+        home.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return _EPHEMERAL_INSTALL_ID
     try:
         existing = id_path.read_text(encoding="utf-8").strip()
     except OSError:
@@ -403,7 +434,9 @@ def telemetry_install_id() -> str:
     try:
         id_path.write_text(new_id + "\n", encoding="utf-8")
     except OSError:
-        pass
+        # Can't persist it, so don't mint a fresh one per span and report as
+        # a thousand separate installs; reuse this process's id instead.
+        return _EPHEMERAL_INSTALL_ID
     return new_id
 
 
@@ -427,7 +460,7 @@ def announce_remote_telemetry(endpoint: str) -> None:
         f"fusion: sending anonymous usage telemetry to {endpoint}\n"
         f"        agent, model, outcome, timing and token counts -- never prompts,\n"
         f"        output, file paths or repository names. Stop it with\n"
-        f"        FUSION_TELEMETRY=0 -- your local traces keep working.\n"
+        f"        `fusion telemetry off` (or FUSION_TELEMETRY=0) -- local traces keep working.\n"
         f"        Said once; see `fusion telemetry status` any time.",
         file=sys.stderr,
     )
@@ -483,17 +516,51 @@ def _summary_endpoint(ingest_endpoint: str) -> str:
     return f"{base}/summary" if base else ingest_endpoint
 
 
-def fetch_remote_summary(remote: dict[str, Any], hours: int) -> dict[str, Any]:
+def set_remote_telemetry(workspace: Path, enabled: bool) -> Path:
+    """Persist the reporting choice so the opt-out in the first-run notice is
+    a command, not an instruction to hand-author JSON."""
+    path = find_upward(".fusion.json", workspace) or (workspace / ".fusion.json")
+    try:
+        current = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(current, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    telemetry = current.setdefault("telemetry", {})
+    if not isinstance(telemetry, dict):
+        raise ValueError(f"{path} has a non-object telemetry block")
+    remote = telemetry.setdefault("remote", {})
+    if not isinstance(remote, dict):
+        raise ValueError(f"{path} has a non-object telemetry.remote block")
+    remote["enabled"] = enabled
+    temp = path.with_suffix(".json.tmp")
+    temp.write_text(json.dumps(current, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp.replace(path)
+    return path
+
+
+def fetch_remote_summary(remote: dict[str, Any], hours: int, every_install: bool = False) -> dict[str, Any]:
     """Unlike send_remote_telemetry, this is an explicit interactive request
     (`fusion telemetry report`) so it surfaces errors instead of swallowing
-    them -- a user asking to see the group's aggregate data wants to know if
-    the collector is unreachable, not silently get nothing."""
+    them -- a user asking to see their data wants to know if the collector is
+    unreachable, not silently get nothing.
+
+    Reading your own rows needs no credential: this machine already holds an
+    unguessable install id and already sends it with every span, so it can ask
+    for its own rows back. Only the cross-install view needs the shared token,
+    because that one reveals how many people are running this and what they
+    spend."""
     endpoint = str(remote.get("endpoint") or "")
     if not endpoint:
         raise ValueError("telemetry.remote.endpoint is not configured")
     url = f"{_summary_endpoint(endpoint)}?hours={int(hours)}"
-    request = urllib.request.Request(url, method="GET")
     token = str(remote.get("token") or "")
+    if every_install:
+        if not token:
+            raise ValueError("reading every install needs telemetry.remote.token; without it you still see your own rows")
+    else:
+        url += "&install_id=" + urllib.parse.quote(telemetry_install_id(), safe="")
+    request = urllib.request.Request(url, method="GET")
     if token:
         request.add_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(request, timeout=10) as response:
@@ -1610,7 +1677,7 @@ def doctor(workspace: Path, config: dict[str, Any]) -> int:
                 **({"error": "command is not executable"} if not path else {}),
             }
         )
-    payload = {"workspace": str(workspace), "config": config, "checks": checks, "route_checks": route_checks}
+    payload = {"workspace": str(workspace), "config": redact(config), "checks": checks, "route_checks": route_checks}
     print(json_text(payload))
     return 0 if all(item["ok"] for item in checks if item["required"]) and all(item["ok"] for item in route_checks) else 1
 
@@ -1636,7 +1703,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     build = sub.add_parser("build", help="turn a feature idea into an interactive build, with planning and review instructions included")
     build.add_argument("--agent", choices=["claude", "codex"], default="codex", help="lead agent (default: codex)")
-    build.add_argument("--kind", choices=["discovery", "build", "debug", "review"], help="explicit workflow; planning-only requests remain read-only")
+    build.add_argument("--kind", choices=["discovery", "build", "debug", "review", "sweep"], help="explicit workflow; planning-only requests remain read-only")
+    build.add_argument(
+        "--across", action="append", metavar="DIMENSION", default=[],
+        help="fan one read-only worker out per dimension, then synthesize their findings; repeat the flag "
+             "or comma-separate. Implies --kind sweep.",
+    )
     build_mode = build.add_mutually_exclusive_group()
     build_mode.add_argument("--plan-only", action="store_true", help="save the brief and workflow without starting coding agents")
     build_mode.add_argument("--execute", action="store_true", help="execute the generated bounded workflow instead of an interactive lead")
@@ -1717,10 +1789,16 @@ def build_parser() -> argparse.ArgumentParser:
     telemetry = sub.add_parser("telemetry", help="local and remote telemetry configuration")
     telemetry_sub = telemetry.add_subparsers(dest="telemetry_command", required=True)
     telemetry_sub.add_parser("status", help="show what remote telemetry is configured to send, if any")
+    telemetry_sub.add_parser("on", help="turn remote reporting on for this workspace")
+    telemetry_sub.add_parser("off", help="turn remote reporting off for this workspace; local traces keep working")
     telemetry_report = telemetry_sub.add_parser(
-        "report", help="fetch aggregate usage/failure patterns from the shared remote collector"
+        "report", help="show the usage and failure patterns this machine reported; --all needs a shared token"
     )
     telemetry_report.add_argument("--hours", type=int, default=168, help="lookback window in hours (default: 168, 7 days)")
+    telemetry_report.add_argument(
+        "--all", action="store_true",
+        help="every install, not just this one; needs telemetry.remote.token, which only the collector's operator has",
+    )
 
     from fusion_decision_cli import add_parser
     add_parser(sub)
@@ -1790,8 +1868,21 @@ def _main(args, parser) -> int:
                 print("fusion telemetry report: telemetry.remote.enabled is not set; nothing to fetch", file=sys.stderr)
                 return 1
             try:
-                summary = fetch_remote_summary(remote, args.hours)
-            except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+                summary = fetch_remote_summary(remote, args.hours, every_install=args.all)
+            except urllib.error.HTTPError as exc:
+                detail = (
+                    "the collector refused the shared token in telemetry.remote.token"
+                    if args.all else
+                    "the collector refused this request; reading your own rows should need no credential"
+                ) if exc.code == 401 else f"the collector returned {exc.code}"
+                print(f"fusion telemetry report: {detail}", file=sys.stderr)
+                return 1
+            except ValueError as exc:
+                # Raised locally, before any request -- saying the collector is
+                # unreachable would send someone debugging the network.
+                print(f"fusion telemetry report: {exc}", file=sys.stderr)
+                return 1
+            except (urllib.error.URLError, OSError, TimeoutError) as exc:
                 print(f"fusion telemetry report: could not reach the collector: {exc}", file=sys.stderr)
                 return 1
             if args.json:
@@ -1807,10 +1898,18 @@ def _main(args, parser) -> int:
                         + f"avg {row.get('avg_duration_ms', 0):.0f}ms"
                     )
             return 0
+        if args.telemetry_command in {"on", "off"}:
+            wanted = args.telemetry_command == "on"
+            path = set_remote_telemetry(workspace, wanted)
+            state = "on" if wanted else "off"
+            print(f"remote telemetry {state} for this workspace ({path})"
+                  + ("" if wanted else "; local traces keep working"))
+            return 0
         payload = {
             "local_enabled": (config.get("telemetry") or {}).get("enabled", True),
             "local_path": str(workspace / ".fusion" / "traces.jsonl"),
             "remote_enabled": enabled,
+            "remote_token_configured": bool(remote.get("token")),
             "remote_endpoint": remote.get("endpoint") or None,
             "install_id": telemetry_install_id() if enabled else None,
             "fields_sent": (
@@ -1900,7 +1999,8 @@ def _main(args, parser) -> int:
             parser.error("feature idea must not be empty")
         from fusion_build import prepare, run_prepared
         try:
-            prepared = prepare(workspace, config, args.idea, args.kind, args.budget_usd, args.max_attempts, execute=args.execute)
+            prepared = prepare(workspace, config, args.idea, args.kind, args.budget_usd, args.max_attempts,
+                               execute=args.execute, across=args.across)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             parser.error(str(exc))
         if args.plan_only:

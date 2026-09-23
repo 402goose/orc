@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, urlsplit
 import uuid
 import webbrowser
 
+import fusion_build as build_module
 import fusion_core as core
 import fusion_publish as publishing
 import fusion_garden as garden
@@ -35,8 +36,7 @@ from fusion_report import finding_request, format_report, reported_cost, select_
 from fusion_workflow import validate_spec, workflow_report, workflow_status
 
 ASSETS = Path(__file__).with_name("fusion_ui_assets")
-MASK = "••••••••"
-SECRET = re.compile(r"token|secret|password|api.?key|authorization", re.I)
+from fusion_core import MASK, SECRET, redact  # one definition, shared with `fusion doctor`
 IDENTIFIER = re.compile(r"^[A-Za-z0-9_.-]+$")
 ACTIVE = {"queued", "running", "stopping"}
 
@@ -114,14 +114,6 @@ def inside(root, path):
     if not path.is_relative_to(root):
         raise ValueError("Path must stay inside this workspace")
     return path
-
-
-def redact(value):
-    if isinstance(value, dict):
-        return {key: MASK if SECRET.search(key) and item else redact(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [redact(item) for item in value]
-    return value
 
 
 def restore_secrets(value, previous):
@@ -428,13 +420,19 @@ class ControlRoom:
         spec = None
         if action == "build":
             kind = body.get("kind", "discovery")
-            if kind not in {"discovery", "review", "build", "debug"}:
-                raise ValueError("Choose discovery, review, build or debug")
+            if kind not in {"discovery", "review", "build", "debug", "sweep"}:
+                raise ValueError("Choose discovery, review, build, debug or sweep")
             budget, attempts = float(body.get("budget", 0)), int(body.get("attempts", 2))
             if not math.isfinite(budget) or budget < 0 or not 1 <= attempts <= 5:
                 raise ValueError("Budget must be nonnegative; attempts must be between 1 and 5")
             prepare = body.get("prepare") is True
             argv += ["build", "--kind", kind, "--plan-only" if prepare else "--execute", "--budget-usd", str(budget), "--max-attempts", str(attempts)]
+            if kind == "sweep":
+                across = build_module.dimensions(body.get("across") or [])
+                if not across:
+                    raise ValueError("A sweep needs at least one dimension to fan out across")
+                for dimension in across:
+                    argv += ["--across", dimension]
             if kind in {"build", "debug"} and body.get("publish") is not None:
                 config, _ = core.load_config(workspace)
                 publish_options = publishing.options(config, body["publish"])
@@ -583,6 +581,35 @@ class ControlRoom:
         return self.job(workspace, job_id)
 
 
+def persistent_token():
+    """One capability per machine, not per server start.
+
+    Minting a fresh one each start meant a restart, a second tab, or any
+    bookmark hit a 401 the browser could not act on. The token still exists:
+    the loopback Host/Origin check only constrains browsers, so any local
+    process could otherwise reach /api/launch and spend provider quota.
+    """
+    home = Path(os.environ.get("ORC_HOME") or Path.home() / ".config/orc")
+    path = home / "ui-token"
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+        if existing:
+            return existing
+    except OSError:
+        pass
+    token = secrets.token_urlsafe(32)
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        with open(path, "x", opener=lambda name, flags: os.open(name, flags, 0o600)) as stream:
+            stream.write(token + "\n")
+    except FileExistsError:  # another server won the race; use what it wrote
+        try:
+            return path.read_text(encoding="utf-8").strip() or token
+        except OSError:
+            return token
+    except OSError:
+        pass  # unwritable home: a per-start token still works for this session
+    return token
 def garden_lock(workspace, action):
     return garden.locked(workspace, 'label-jobs') if action == 'suggest-labels' else contextlib.nullcontext()
 
@@ -592,7 +619,7 @@ class Server(ThreadingHTTPServer):
 
     def __init__(self, port, app):
         self.app = app
-        self.token = secrets.token_urlsafe(32)
+        self.token = persistent_token()
         super().__init__(("127.0.0.1", port), Handler)
         self.origin = f"http://127.0.0.1:{self.server_port}"
         self.url = self.origin + "/#token=" + self.token
