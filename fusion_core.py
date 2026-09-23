@@ -193,6 +193,9 @@ def compact(text: str, limit: int) -> str:
     return text[: max(0, limit - 80)] + "\n...[truncated by fusion]..."
 
 
+NONE_ANSWERS = {"none", "n/a", "na", "nil", "nothing", "-", "—"}
+
+
 def parse_handoff(text: str) -> dict[str, Any]:
     """Extract the small handoff contract from a worker's final message."""
     fields: dict[str, str] = {}
@@ -206,8 +209,15 @@ def parse_handoff(text: str) -> dict[str, Any]:
                 break
 
     def list_field(name: str) -> list[str]:
-        value = fields.get(name, "")
-        if not value or value.lower() in {"none", "n/a", "-"}:
+        value = fields.get(name, "").strip()
+        if not value or value.lower() in NONE_ANSWERS:
+            return []
+        # Workers answer "none" in prose: "none.", "N/A", "None - read-only node".
+        # Only the leading clause decides, so an explanation after it is not
+        # comma-split into phantom entries. A trailing comma-split on a real
+        # answer is fine; a phantom blocker fails a node that actually passed.
+        lead = re.split(r"[.;:,—-]", value, maxsplit=1)[0].strip().lower()
+        if lead in NONE_ANSWERS:
             return []
         return [item.strip() for item in value.split(",") if item.strip()]
 
