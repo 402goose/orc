@@ -905,6 +905,20 @@ print(json.dumps({{'type':'result','subtype':'success','is_error':False,'session
             self.assertEqual(node["attempts"], 1)
             self.assertEqual(node["result"]["digest"], first_digests[node["id"]])
 
+        # A digest-matched node skips dispatch entirely, so it would
+        # otherwise never produce a trace span -- verify it does anyway,
+        # tagged distinctly as "cache_hit" rather than success or failure.
+        traces = [json.loads(line) for line in (self.workspace / ".fusion" / "traces.jsonl").read_text().splitlines()]
+        cache_hit_spans = [span for span in traces if span.get("status") == "cache_hit"]
+        self.assertEqual(len(cache_hit_spans), 2)
+        self.assertEqual({span["trace_id"] for span in cache_hit_spans}, {first["workflow_id"]})
+        self.assertIsNone(fusion_core.failure_class({"status": "cache_hit", "blockers": []}))
+
+        # usage_summary must not lump a cache hit in with real failures.
+        summary = fusion_core.usage_summary(traces)
+        self.assertEqual(sum(group["cache_hit"] for group in summary["by_route"]), 2)
+        self.assertEqual(sum(group["failed"] for group in summary["by_route"]), 0)
+
     def test_resume_with_edited_spec_reruns_only_changed_node_and_downstream(self):
         calls = self.bin_dir / "calls.txt"
         claude = self.write_agent(
