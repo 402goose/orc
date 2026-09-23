@@ -1522,6 +1522,29 @@ def tool_definitions() -> list[dict[str, Any]]:
 import fusion_mcp  # noqa: E402  (module-level cycle-free helper)
 
 
+def _reported_cost(row: dict[str, Any]) -> str:
+    """Render a group's cost without passing an absence off as a zero.
+
+    Providers differ: Claude reports cost_usd, Codex does not. Summing a column
+    of nulls gives 0.0, and printing that as $0.0000 says "these calls were
+    free" about calls that burned hundreds of thousands of tokens - in the one
+    tool built to answer what this costs.
+    """
+    calls = int(row.get("calls") or 0)
+    reported = row.get("cost_reported_calls")
+    total = float(row.get("total_cost_usd") or 0)
+    if reported is None:
+        # An older collector that does not report coverage. Say so rather than
+        # implying the zero is measured.
+        return f"${total:.4f}" if total else "cost not reported"
+    reported = int(reported)
+    if reported == 0:
+        return "cost not reported"
+    if reported < calls:
+        return f"${total:.4f} ({reported}/{calls} reported)"
+    return f"${total:.4f}"
+
+
 def mcp_result(payload: Any) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}], "structuredContent": payload}
 
@@ -1996,7 +2019,7 @@ def _main(args, parser) -> int:
                     print(
                         f"  {label}: {row.get('status')}"
                         + (f" ({row.get('failure_class')})" if row.get("failure_class") else "")
-                        + f" -- {row.get('calls')} calls, ${row.get('total_cost_usd', 0):.4f}, "
+                        + f" -- {row.get('calls')} calls, {_reported_cost(row)}, "
                         + f"avg {row.get('avg_duration_ms', 0):.0f}ms"
                     )
             return 0
