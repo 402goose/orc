@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -266,8 +267,10 @@ class RunHandleTest(unittest.TestCase):
         self.assertEqual(sent, [])
 
     def test_process_matches_rejects_a_stranger_and_a_dead_pid(self):
-        self.assertFalse(fusion_mcp.process_matches(1, "wf-1"))        # launchd/init
-        self.assertFalse(fusion_mcp.process_matches(999999, "wf-1"))   # not a process
+        import fusion_core
+
+        self.assertFalse(fusion_core.process_matches(1, "wf-1"))        # launchd/init
+        self.assertFalse(fusion_core.process_matches(999999, "wf-1"))   # not a process
 
     def test_cancel_reports_honestly_when_the_coordinator_is_gone(self):
         write_manifest(self.workspace, "wf-1", status="running", coordinator_pid=None)
@@ -312,6 +315,43 @@ class ActiveWorkflowVisibilityTest(unittest.TestCase):
         self.assertEqual(len(state["recent_workflows"]), 10)
         self.assertIn("wf-000-long", [w["workflow_id"] for w in state["active_workflows"]])
         self.assertIn("running", state["next"])
+
+
+class ProcessIdentityTest(unittest.TestCase):
+    """A recorded pid answers "is something alive", not "is it still ours".
+
+    Three callers now need this: workflow coordinators, MCP cancel, and survey
+    resume. It lives in fusion_core beside process_alive so they share one
+    definition rather than three.
+    """
+
+    def test_a_live_unrelated_process_is_not_a_match(self):
+        import fusion_core
+
+        self.assertFalse(fusion_core.process_matches(1, "wf-1"))  # launchd/init
+
+    def test_a_dead_pid_is_not_a_match(self):
+        import fusion_core
+
+        self.assertFalse(fusion_core.process_matches(999999, "wf-1"))
+
+    def test_an_unreadable_ps_degrades_to_a_match(self):
+        # Refusing every cancel on a platform whose ps we cannot read would be
+        # worse than occasionally signalling a stranger.
+        import fusion_core
+
+        with patch("fusion_core.subprocess.run", side_effect=OSError("no ps")):
+            self.assertTrue(fusion_core.process_matches(4242, "wf-1"))
+
+    def test_the_run_id_alone_can_establish_a_match(self):
+        import fusion_core
+
+        class Out:
+            stdout = "python fusion --workspace /x workflow run wf-special"
+
+        with patch("fusion_core.subprocess.run", return_value=Out()):
+            self.assertTrue(fusion_core.process_matches(4242, "wf-special"))
+            self.assertTrue(fusion_core.process_matches(4242, "unrelated"))  # 'fusion' in command
 
 
 class ToolContractTest(unittest.TestCase):

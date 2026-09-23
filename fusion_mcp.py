@@ -490,36 +490,12 @@ def run_status(workspace: Path, workflow_id: str) -> dict[str, Any]:
     }
 
 
-def process_matches(pid: int, workflow_id: str) -> bool:
-    """Is this pid still the coordinator we recorded, or a stranger wearing it?
-
-    A pid recorded minutes ago can be recycled by the OS onto something else
-    entirely, and signalling it would interrupt an unrelated program. Confirm
-    the command line still looks like the fusion run we mean before acting.
-    Unknowable is treated as a match, so a platform whose `ps` we cannot read
-    keeps working rather than silently refusing every cancel.
-    """
-    try:
-        out = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return True
-    command = (out.stdout or "").strip()
-    if not command:
-        return False  # ps ran and found nothing: the process is gone.
-    if workflow_id and workflow_id in command:
-        return True
-    return "fusion" in command
-
-
 def cancel_run(workspace: Path, workflow_id: str, *, kill=None, matches=None) -> dict[str, Any]:
     """Ask a run's coordinator to stop. Cooperative: the run may already be over."""
     import os
     import signal
 
-    from fusion_core import process_alive
+    from fusion_core import process_alive, process_matches as core_process_matches
 
     manifest_path = workspace / ".fusion" / "workflows" / workflow_id / "manifest.json"
     if not manifest_path.is_file():
@@ -533,7 +509,7 @@ def cancel_run(workspace: Path, workflow_id: str, *, kill=None, matches=None) ->
     # the cleanup path that stops each worker. Workers start their own session,
     # so killing the coordinator does not cascade to them: a SIGTERM here would
     # take down the coordinator and leave its workers running, still billing.
-    identify = matches or process_matches
+    identify = matches or core_process_matches
     if not identify(int(pid), workflow_id):
         return {
             "workflow_id": workflow_id,

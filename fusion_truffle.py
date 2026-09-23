@@ -412,6 +412,8 @@ def add_parser(sub):
     survey.add_argument("--resume", help="continue a saved survey's unassessed issues")
     survey.add_argument("--sync-only", action="store_true", help="map all issues without starting grading workers")
     survey.add_argument("--include-assigned", action="store_true")
+    survey.add_argument("--takeover", action="store_true",
+                        help="resume even though a process still holds the recorded pid")
     show = commands.add_parser("show")
     show.add_argument("scout_id")
     queue = commands.add_parser("run", help="implement selected issues sequentially; accepted review required before PR publication")
@@ -427,7 +429,7 @@ def add_parser(sub):
 def command(workspace, config, args):
     if args.truffle_command == "survey":
         from fusion_truffle_survey import survey
-        result = survey(workspace, config, **{k: getattr(args, k) for k in ("agent", "remote", "resume", "sync_only", "include_assigned")})
+        result = survey(workspace, config, **{k: getattr(args, k) for k in ("agent", "remote", "resume", "sync_only", "include_assigned", "takeover")})
     elif args.truffle_command == "hunt":
         result = hunt(workspace, config, **{k: getattr(args, k) for k in ("count", "scan_limit", "search", "agent", "remote", "include_assigned")})
     elif args.truffle_command == "show":

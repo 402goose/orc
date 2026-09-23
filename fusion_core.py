@@ -290,6 +290,30 @@ def process_alive(pid: Any) -> bool | None:
     return True
 
 
+def process_matches(pid: int, workflow_id: str) -> bool:
+    """Is this pid still the coordinator we recorded, or a stranger wearing it?
+
+    A pid recorded minutes ago can be recycled by the OS onto something else
+    entirely, and signalling it would interrupt an unrelated program. Confirm
+    the command line still looks like the fusion run we mean before acting.
+    Unknowable is treated as a match, so a platform whose `ps` we cannot read
+    keeps working rather than silently refusing every cancel.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    command = (out.stdout or "").strip()
+    if not command:
+        return False  # ps ran and found nothing: the process is gone.
+    if workflow_id and workflow_id in command:
+        return True
+    return "fusion" in command
+
+
 def redact(value: Any) -> Any:
     """Mask secret-looking values anywhere in a structure before printing it.
 
