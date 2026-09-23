@@ -2,24 +2,20 @@
 "use strict";
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
-const esc = (value) =>
-  String(value ?? "").replace(
-    /[&<>"']/g,
-    (c) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
-        c
-      ],
-  );
+// Pure decision logic lives in logic.js so it can be tested without a browser.
+const {
+  esc,
+  safeGithubURL,
+  withoutDerived,
+  active,
+  canApproveLabels,
+  commandPreview,
+  matchesWorkflowFilter,
+  tokenFromURL,
+  storedCredential,
+} = ORCLogic;
 const pretty = (value) => JSON.stringify(value, null, 2);
-// `graph` is derived from `nodes` and regenerated on every validate, so showing
-// it in an editor invites edits that are silently discarded.
-const withoutDerived = (spec) => {
-  if (!spec || typeof spec !== "object") return spec;
-  const { graph, ...rest } = spec;
-  return rest;
-};
 const sigil = (name, extra = "") => ORCBrand.icon(name, extra);
-const active = (status) => ["running", "queued", "stopping"].includes(status);
 const badge = (value) =>
   `<span class="status ${esc(value)}">${esc((value || "unknown").replaceAll("_", " "))}</span>`;
 const date = (ms) =>
@@ -31,15 +27,7 @@ const date = (ms) =>
         minute: "2-digit",
       })
     : "Unknown start";
-const age = (ms) => {
-  if (!ms) return "—";
-  const n = Math.max(0, Math.floor((Date.now() - ms) / 1000));
-  return n < 60
-    ? `${n}s`
-    : n < 3600
-      ? `${Math.floor(n / 60)}m ${n % 60}s`
-      : `${Math.floor(n / 3600)}h ${Math.floor((n % 3600) / 60)}m`;
-};
+const age = (ms) => ORCLogic.age(ms);
 const number = (n) =>
   new Intl.NumberFormat(undefined, {
     notation: "compact",
@@ -74,9 +62,6 @@ const state = {
   authRequired: false,
 };
 const credentialKey = "fusion-token";
-function storedCredential(storage) {
-  try { return storage.getItem(credentialKey) || ""; } catch { return ""; }
-}
 function rememberCredential(value) {
   // Share only credentials accepted by this server; the key is origin-scoped.
   for (const storage of [sessionStorage, localStorage]) {
@@ -140,10 +125,8 @@ function openReconnect() {
     `<form id="reconnect-form"><div class="field"><label for="reconnect-url">Current control-room URL</label><input id="reconnect-url" name="url" type="url" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:8765/#token=…" required><small>Paste the full URL printed by orc fusion ui. Opening that URL in another tab in this browser also reconnects this one.</small></div><button type="submit" class="button primary">Connect</button></form>`, "reconnect");
 }
 async function reconnectWithURL(value) {
-  let url;
-  try { url = new URL(value); } catch { throw new Error("Paste the full control-room URL printed in your terminal."); }
-  const candidate = new URLSearchParams(url.hash.slice(1)).get("token");
-  if (url.origin !== location.origin || !candidate)
+  const candidate = tokenFromURL(value, location.origin);
+  if (!candidate)
     throw new Error("Use the full URL for this local control room, including #token=…");
   // Validate before replacing a working credential or notifying any other tab.
   const response = await fetch("/api/bootstrap", {headers: {"X-Fusion-Token": candidate}});
@@ -411,12 +394,8 @@ function overview() {
   );
 }
 function workflows() {
-  const runs = state.overview.workflows.filter(
-    (run) =>
-      (state.filter === "all" || run.status === state.filter) &&
-      `${run.task} ${run.id} ${run.agents}`
-        .toLowerCase()
-        .includes(state.search.toLowerCase()),
+  const runs = state.overview.workflows.filter((run) =>
+    matchesWorkflowFilter(run, state.filter, state.search),
   );
   mount(
     intro(
@@ -480,9 +459,6 @@ function publicationCard(report) {
   const checks = p.pr?.statusCheckRollup || [];
   return `<section class="panel publication-panel"><div class="panel-header"><h3>Pull request</h3>${badge(p.status || "pending")}</div><div class="panel-body"><div class="facts"><span>Target</span><span>${esc(p.base || g.base)}</span><span>Branch</span><span class="mono">${esc(p.branch || g.branch)}</span>${p.commit ? `<span>Commit</span><span class="mono">${esc(p.commit.slice(0, 12))}</span>` : ""}</div>${p.error ? `<p class="blocker">${esc(p.error)}</p>` : ""}${p.url ? `<p><a href="${esc(safeGithubURL(p.url))}" target="_blank" rel="noopener noreferrer">Open PR #${esc(p.number)} ↗</a> · ${esc(p.pr?.state || "Published")}</p>${button("Refresh PR checks", "pr-refresh", "", "small")}<p class="help-copy">${p.checked_at_ms ? "Last checked " + date(p.checked_at_ms) : "CI status has not been fetched yet."}</p>${checks.map(c => `<p class="help-copy">${esc(c.name || c.context)} · ${esc(c.conclusion || c.state || c.status)}</p>`).join("")}` : `<p class="help-copy">${g.mode === "auto" ? "Publishes automatically after the implementation and review are accepted." : "Completed stages stay saved while you publish or retry."}</p>`}${g.workspace ? `<details><summary>Run worktree</summary><p class="mono">${esc(g.workspace)}</p></details>` : ""}</div></section>`;
 }
-function safeGithubURL(url) {
-  try { const u = new URL(url); return u.protocol === "https:" && u.hostname === "github.com" ? u.href : "#"; } catch { return "#"; }
-}
 function openPublish() {
   const report = state.report;
   const value = { ...state.config.publish, ...report.git, ...report.publication };
@@ -492,10 +468,6 @@ function openPublish() {
 function showPublishPreview(p) {
   modal("Review pull request", `${p.repo} · ${p.branch} → ${p.base}`,
     `<form id="publish-form" data-run="${esc(p.workflow_id)}" data-snapshot="${esc(p.snapshot_id)}"><div class="field"><label for="pr-title">Title</label><input id="pr-title" name="title" value="${esc(p.title)}" maxlength="256" required></div><div class="field"><label for="pr-body">Description · Markdown</label><textarea id="pr-body" name="body" class="editor" required>${esc(p.body)}</textarea></div><label class="check-field"><input type="checkbox" name="draft" ${p.draft ? "checked" : ""}> Create as draft</label><details open><summary>Changes · ${p.files.length} files</summary><pre class="console publish-diff">${esc(p.diff)}</pre></details>${p.legacy ? '<label class="check-field"><input type="checkbox" name="accept_legacy_diff" required> This older run has no saved Git review snapshot. I checked this diff and confirm it is the change to publish.</label>' : '<p class="help-copy">This diff matches the saved tree from the accepted review.</p>'}<div class="dialog-footer"><small>Creates a commit, pushes the feature branch, and opens the PR against ${esc(p.base)}.</small><button class="button primary" type="submit">${p.commit ? "Retry publication →" : "Publish PR →"}</button></div></form>`, "publish");
-}
-function commandPreview(entry) {
-  return (entry.command || entry.name || "Command")
-    .replace(/^\S*\b(?:ba|z|fi)?sh\s+-\w*c\s+['"]?/, "").split("\n")[0].replace(/['"]$/, "");
 }
 function activityTimeline(node) {
   const entries = node?.activity_entries?.length ? node.activity_entries
@@ -663,9 +635,6 @@ function labelDraft(record) {
       `${k} = ${v.value}: ${v.reason} [${v.evidence.join(", ")}]`).join("\n\n");
   }
   return draft;
-}
-function canApproveLabels(draft) {
-  return Object.values(draft.answers).some(value => value !== "") && !!draft.evidence.trim();
 }
 function labelingControls(prefix, options) {
   const council = options.labeling_mode === "council";
