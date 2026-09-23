@@ -821,6 +821,15 @@ BLOCKERS: unresolved issues, or none
                                                 "usage": result.get("usage", {})})
                     with progress.activity(node_id, "checking handoff and acceptance criteria"):
                         accepted, problems = self._accept_node(node, result)
+                    if accepted:
+                        # A semantic Done-check leg, spent only on a node that already passed
+                        # every structural check. It can add a problem; it cannot clear one.
+                        from fusion_policy import accept_node
+                        plausible, acceptance_decision_id = accept_node(self.config, self.workspace, self.run_id, node, result)
+                        result.setdefault("decisions", {})["acceptance"] = acceptance_decision_id
+                        if not plausible:
+                            accepted = False
+                            problems = problems + ["Laya acceptance check: reported success does not plausibly match the task"]
                     if problems:
                         result.setdefault("blockers", []).extend(problems)
                     previous = node.get("result") or {}
