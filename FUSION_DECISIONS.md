@@ -79,7 +79,10 @@ it. Interactive lead sessions use their own provider controls.
    permission denial, increase attempts, or discard prior spend. A qualified
    switch applies only to an automatic lane and excludes the failed route.
    Repairs receive the previous result and log paths. Quota failures pause
-   by default. User-requested resume is an explicit new attempt.
+   by default. An attempt that repeats the previous attempt's blockers
+   exactly stops instead of retrying; that is a rule applied to the
+   receipts, not a classifier question. User-requested resume is an
+   explicit new attempt.
 4. **Review:** adds general, security, payments or data-integrity checks to
    read-only review workers. Generated implementation workflows always
    retain their independent review. The classifier cannot remove it or

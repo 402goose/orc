@@ -453,7 +453,15 @@ intentionally ran `false`: status stayed the worker's own "success" claim,
 and the contradicting evidence appeared in blockers instead of vanishing.
 
 Quota detection staying keyword-matched is still the more open gap here --
-same conclusion the external research reached independently. Codex's `error`
+same conclusion the external research reached independently. It is at
+least one keyword list now: `_quota_failure` (lane cooldown and pause) and
+`failure_class` (recovery classification, telemetry) had drifted --
+`credits` and `too many requests` were only in the former, and only the
+former read the summary -- so a 402/429 paused the node correctly while
+its recovery decision was logged as `worker_error`. `core.quota_failure`
+and `QUOTA_MARKERS` are the single source for both, and
+`LANE_COOLDOWN_SECONDS` lives beside them instead of being repeated as a
+literal in routing. Codex's `error`
 events do carry a structured `error.type` in at least one observed shape
 (`invalid_request_error`, from an unsupported-model rejection caught live
 during this session); whether provider quota/rate-limit responses carry an

@@ -29,9 +29,7 @@ NODE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 TERMINAL_SUCCESS = {"success"}
 TERMINAL_FAILURE = {"failed", "blocked", "invalid"}
 TERMINAL_PAUSED = {"paused_quota", "paused_budget"}
-# How long a recent quota/session-limit trace keeps an agent lane in cooldown
-# before a fresh run is willing to try it again.
-LANE_COOLDOWN_SECONDS = 900
+LANE_COOLDOWN_SECONDS = core.LANE_COOLDOWN_SECONDS
 
 
 def _run_id(prefix: str = "wf") -> str:
@@ -223,22 +221,6 @@ def load_spec(path: Path) -> dict[str, Any]:
 def _result_cost(result: dict[str, Any]) -> float:
     usage = result.get("usage") or {}
     return core.number(usage.get("cost_usd", usage.get("cost", 0)))
-
-
-def _quota_failure(result: dict[str, Any]) -> bool:
-    text = " ".join(str(item) for item in result.get("blockers", []))
-    text = f"{text} {result.get('summary', '')}".lower()
-    markers = (
-        "usage limit",
-        "session limit",
-        "rate limit",
-        "quota",
-        "credits",
-        "resets at",
-        "resets ",
-        "too many requests",
-    )
-    return any(marker in text for marker in markers)
 
 
 class WorkflowRunner:
@@ -526,7 +508,7 @@ class WorkflowRunner:
             if not isinstance(end_time, (int, float)):
                 continue
             age_ms = now - end_time
-            if 0 <= age_ms <= LANE_COOLDOWN_SECONDS * 1000 and _quota_failure(span):
+            if 0 <= age_ms <= LANE_COOLDOWN_SECONDS * 1000 and core.quota_failure(span):
                 self._set_lane(agent, "cooldown", f"a {agent} run reported a quota/session limit {int(age_ms / 1000)}s ago")
 
     def _prompt(self, node: dict[str, Any]) -> str:
@@ -841,6 +823,14 @@ BLOCKERS: unresolved issues, or none
                         accepted, problems = self._accept_node(node, result)
                     if problems:
                         result.setdefault("blockers", []).extend(problems)
+                    previous = node.get("result") or {}
+                    if (not accepted and node["attempts"] > 1 and previous.get("blockers")
+                            and previous.get("blockers") == result.get("blockers")):
+                        # Same failure twice is a stuck loop, decided here from the
+                        # receipts rather than asked of a classifier.
+                        node["repeated_failure"] = True
+                        problems = problems + ["attempt repeated the previous attempt's blockers exactly; stopping instead of retrying"]
+                        result["blockers"].append(problems[-1])
                     if accepted:
                         dependency_digests = {dep: (self.nodes[dep].get("result") or {}).get("digest") for dep in node["needs"]}
                         result["digest"] = self._input_digest(self._definition_digest(node), dependency_digests)
@@ -858,7 +848,7 @@ BLOCKERS: unresolved issues, or none
                     elif action == "switch":
                         node["status"] = "pending"
                         self._event("node.switching", {"node_id": node_id, "excluded_routes": node["excluded_routes"]})
-                    elif _quota_failure(result):
+                    elif core.quota_failure(result):
                         node["status"] = "paused_quota"
                         self._event("node.paused_quota", {"node_id": node_id, "attempt": node["attempts"]})
                         if node["agent"] != "auto":
