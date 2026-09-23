@@ -378,7 +378,22 @@ class DecisionEngine:
             return False
         bucket = report.get("buckets", {}).get(f"{record['kind']}:{record['schema_hash']}:{question}", {})
         threshold = max(float(self.options["threshold"]), float(bucket.get("threshold", 1)))
-        return bool(bucket.get("qualified") and record["recommendations"].get(question, {}).get("probability", 0) >= threshold)
+        # Re-derive the probability from the raw distribution under the
+        # calibration being read *now*, rather than trusting the one decide()
+        # stored. Those can be different files: the weekly loop rewrites
+        # calibration between runs, and a long-lived process holds records
+        # scaled by the old temperature. Comparing a stale probability to a
+        # fresh threshold is how an action gets applied at a confidence the
+        # current calibration would reject. Temperature scaling is monotonic,
+        # so the selected label is unchanged -- only its magnitude moves.
+        probabilities = record.get("prediction", {}).get(question) or {}
+        if not probabilities:
+            return False
+        try:
+            scaled = temperature_scale(probabilities, float(bucket.get("temperature", 1)))
+        except (ArithmeticError, TypeError, ValueError):
+            return False
+        return bool(bucket.get("qualified") and max(scaled.values()) >= threshold)
 
     def applied(self, record, actual, applied=False, reason="shadow mode or unqualified recommendation"):
         if record.get("status") != "off":

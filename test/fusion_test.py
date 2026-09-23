@@ -1473,6 +1473,22 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
                 {"enabled": True, "endpoint": "https://127.0.0.1:1/v1/ingest"},
                 {"agent": "claude", "status": "success", "usage": {}},
             )
+    def test_ui_token_survives_a_restart_and_stays_private(self):
+        import fusion_ui
+        home = Path(self.temp.name) / "orc-home"
+        with patch.dict(os.environ, {"ORC_HOME": str(home)}):
+            first = fusion_ui.persistent_token()
+            self.assertTrue(first)
+            # A restart must not 401 an open tab or a bookmark.
+            self.assertEqual(first, fusion_ui.persistent_token())
+            self.assertEqual((home / "ui-token").stat().st_mode & 0o777, 0o600)
+        other = Path(self.temp.name) / "other-home"
+        with patch.dict(os.environ, {"ORC_HOME": str(other)}):
+            self.assertNotEqual(first, fusion_ui.persistent_token(), "separate homes are separate capabilities")
+        blocked = Path(self.temp.name) / "blocked"
+        blocked.write_text("not a directory", encoding="utf-8")
+        with patch.dict(os.environ, {"ORC_HOME": str(blocked / "orc")}):
+            self.assertTrue(fusion_ui.persistent_token(), "an unwritable home still serves this session")
 
     def test_telemetry_report_fails_clearly_when_remote_disabled(self):
         (self.workspace / ".fusion.json").write_text(json.dumps({"telemetry": {"remote": {"enabled": False}}}))

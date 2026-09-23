@@ -475,12 +475,43 @@ class ControlRoom:
         return self.job(workspace, job_id)
 
 
+def persistent_token():
+    """One capability per machine, not per server start.
+
+    Minting a fresh one each start meant a restart, a second tab, or any
+    bookmark hit a 401 the browser could not act on. The token still exists:
+    the loopback Host/Origin check only constrains browsers, so any local
+    process could otherwise reach /api/launch and spend provider quota.
+    """
+    home = Path(os.environ.get("ORC_HOME") or Path.home() / ".config/orc")
+    path = home / "ui-token"
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+        if existing:
+            return existing
+    except OSError:
+        pass
+    token = secrets.token_urlsafe(32)
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        with open(path, "x", opener=lambda name, flags: os.open(name, flags, 0o600)) as stream:
+            stream.write(token + "\n")
+    except FileExistsError:  # another server won the race; use what it wrote
+        try:
+            return path.read_text(encoding="utf-8").strip() or token
+        except OSError:
+            return token
+    except OSError:
+        pass  # unwritable home: a per-start token still works for this session
+    return token
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, port, app):
         self.app = app
-        self.token = secrets.token_urlsafe(32)
+        self.token = persistent_token()
         super().__init__(("127.0.0.1", port), Handler)
         self.origin = f"http://127.0.0.1:{self.server_port}"
         self.url = self.origin + "/#token=" + self.token
