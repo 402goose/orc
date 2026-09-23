@@ -74,6 +74,7 @@ type summaryRow struct {
 }
 
 type summaryResponse struct {
+	Scope          string       `json:"scope"`
 	WindowHours    int          `json:"window_hours"`
 	TotalSpans     int64        `json:"total_spans"`
 	UniqueInstalls int64        `json:"unique_installs"`
@@ -195,8 +196,18 @@ func validateIngestPayload(payload ingestPayload) error {
 }
 
 func (s *server) handleSummary(w http.ResponseWriter, r *http.Request) {
-	if !validBearerToken(r.Header.Get("Authorization"), s.token) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	// Two ways in, and neither asks a human to carry a secret. A client that
+	// reports already holds an unguessable install_id; presenting it returns
+	// that install's own rows and nothing else. The shared token is only for
+	// the cross-install view, which would otherwise expose how many people are
+	// running this and what they spend.
+	installID := strings.TrimSpace(r.URL.Query().Get("install_id"))
+	if installID == "" && !validBearerToken(r.Header.Get("Authorization"), s.token) {
+		http.Error(w, "unauthorized: pass install_id for your own rows, or a bearer token for every install", http.StatusUnauthorized)
+		return
+	}
+	if len(installID) > 128 {
+		http.Error(w, "install_id is too long", http.StatusBadRequest)
 		return
 	}
 	hours, err := parseWindowHours(r.URL.Query().Get("hours"))
@@ -207,7 +218,7 @@ func (s *server) handleSummary(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	resp, err := s.querySummary(ctx, hours)
+	resp, err := s.querySummary(ctx, hours, installID)
 	if err != nil {
 		log.Printf("query summary: %v", err)
 		http.Error(w, "storage error", http.StatusInternalServerError)
@@ -266,14 +277,20 @@ func (s *server) insertSpans(ctx context.Context, installID string, spans []span
 	return tx.Commit()
 }
 
-func (s *server) querySummary(ctx context.Context, hours int) (*summaryResponse, error) {
-	resp := &summaryResponse{WindowHours: hours}
+// querySummary scopes to one install when installID is non-empty. The empty
+// string means every install, which handleSummary only allows behind the token.
+func (s *server) querySummary(ctx context.Context, hours int, installID string) (*summaryResponse, error) {
+	resp := &summaryResponse{WindowHours: hours, Scope: "all installs"}
+	if installID != "" {
+		resp.Scope = "this install"
+	}
 
 	totals := s.db.QueryRowContext(ctx, `
 		SELECT count(*), count(DISTINCT install_id)
 		FROM spans
 		WHERE received_at > now() - make_interval(hours => $1)
-	`, hours)
+		  AND ($2 = '' OR install_id = $2)
+	`, hours, installID)
 	if err := totals.Scan(&resp.TotalSpans, &resp.UniqueInstalls); err != nil {
 		return nil, err
 	}
@@ -287,10 +304,11 @@ func (s *server) querySummary(ctx context.Context, hours int) (*summaryResponse,
 		       COALESCE(avg(duration_ms), 0) AS avg_duration_ms
 		FROM spans
 		WHERE received_at > now() - make_interval(hours => $1)
+		  AND ($2 = '' OR install_id = $2)
 		GROUP BY agent, route, model, status, failure_class
 		ORDER BY calls DESC
 		LIMIT 200
-	`, hours)
+	`, hours, installID)
 	if err != nil {
 		return nil, err
 	}

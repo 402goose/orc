@@ -1034,6 +1034,26 @@ def workflow_status(workspace: Path, run_id: str) -> dict[str, Any]:
         raise ValueError(f"cannot read workflow run {run_id}: {exc}") from exc
 
 
+def effective_status(manifest: dict[str, Any]) -> str | None:
+    """A manifest reads "running" until the coordinator writes again, so one
+    that was killed says "running" forever -- `workflow watch` never exits and
+    `report` offers no way forward. The coordinator's pid is recorded on every
+    flush, so a dead pid means interrupted, not running."""
+    status = manifest.get("status")
+    if status != "running":
+        return status
+    pid = manifest.get("coordinator_pid")
+    if pid is None:
+        return status
+    try:
+        os.kill(int(pid), 0)
+    except PermissionError:
+        return status  # owned by another user, so still alive
+    except (OSError, TypeError, ValueError):
+        return "interrupted"
+    return status
+
+
 def workflow_report(workspace: Path, run_id: str) -> dict[str, Any]:
     """One combined view of a workflow run: waves, lanes, usage, and blockers.
 
@@ -1095,7 +1115,7 @@ def workflow_report(workspace: Path, run_id: str) -> dict[str, Any]:
     if not primary_nodes and outputs:
         latest_wave = max(wave_of(item["node_id"]) for item in outputs)
         primary_nodes = [item["node_id"] for item in outputs if wave_of(item["node_id"]) == latest_wave]
-    status = manifest.get("status")
+    status = effective_status(manifest)
     error = manifest.get("error")
     return {
         "schema": "fusion.workflow.report.v1",
