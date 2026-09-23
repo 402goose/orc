@@ -234,6 +234,13 @@ def normalized_usage(usage: Any) -> dict[str, float]:
             number(cache_creation.get(key))
             for key in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
         )
+    # Real `codex exec --json` usage reports cache_write_input_tokens under
+    # that name rather than cache_creation_input_tokens (verified against a
+    # live turn.completed event after Codex quota reset -- see
+    # FUSION_RESEARCH.md). Map it so codex cache-write spend isn't silently
+    # dropped from usage/cost aggregation.
+    if "cache_creation_input_tokens" not in output and "cache_write_input_tokens" in usage:
+        output["cache_creation_input_tokens"] = number(usage["cache_write_input_tokens"])
     return output
 
 

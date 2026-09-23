@@ -340,11 +340,30 @@ That live Claude trace is what surfaced a real bug, found by diffing what
 This is a useful general lesson for this harness: a fixture that encodes an
 *assumed* schema will happily stay green forever even if the real CLI's
 schema drifts or was never quite what the parser assumed, since nothing ever
-diffs the fixture against a live response. `parse_codex_events` makes the
-same top-level `model`/`model_id` assumption and has not been checked
-against a real successful Codex response, because Codex has been quota-gated
-for this whole session -- that assumption should get the same treatment once
-Codex quota resets, rather than being patched blind.
+diffs the fixture against a live response.
+
+**Update, Codex quota reset:** checked the same `model`/`model_id`
+assumption in `parse_codex_events` against real `codex exec --json` output
+(inspected the full event vocabulary across a multi-step run --
+`thread.started`, `turn.started`, `item.completed` for both
+`agent_message` and `command_execution` items, `turn.completed`). Unlike
+Claude, **no event carries a model field at all** in this Codex CLI
+version -- there's no salvageable key to fall back to the way `modelUsage`
+saved the Claude case. Concluded this needs no code change:
+`dispatch()` already falls back to the *configured* model
+(`metadata["model"]`) when parsing reports none, which is the most honest
+answer available when the provider genuinely doesn't report one. A real
+gap the same live check *did* find: real `turn.completed` usage reports
+`cache_write_input_tokens`, which didn't match any field
+`normalized_usage()` recognized (silently dropped, no crash, but codex
+cache-write spend was invisible in aggregation). Fixed by mapping it to
+`cache_creation_input_tokens`, the same normalized name Claude's
+`cache_creation` sub-object maps to. Verified against a real `fusion
+delegate --agent codex` dispatch end to end, including through `fusion
+usage`'s aggregation. Real Codex/ChatGPT-plan usage also never reports
+`cost_usd`/`cost` at all -- confirmed this is a genuine provider-side gap,
+not a parsing miss, so codex spend stays at `$0` in aggregation by design,
+not by bug.
 
 Also visible in the real Claude response: `permission_denials` (an array,
 empty in every run so far) and `subagent_stats` (not surfaced anywhere;
