@@ -27,6 +27,8 @@ import fusion_progress as progress
 SCHEMA = "fusion.v1"
 TELEMETRY_SCHEMA = "fusion.telemetry.v1"
 DEFAULTS: dict[str, Any] = {
+    "publish": {"mode": "off", "base": "staging", "remote": "origin", "draft": True},
+    "execution_mode": "restricted",
     "decisions": DECISION_DEFAULTS,
     "lead": "claude",
     "sidekick": "codex",
@@ -90,6 +92,7 @@ DEFAULTS: dict[str, Any] = {
     "codex": {
         "command": "codex",
         "sandbox": "workspace-write",
+        "git_write": True,
         "approval": "never",
         "model": "",
     },
@@ -103,6 +106,12 @@ DEFAULTS: dict[str, Any] = {
     "agy": {
         "command": "agy",
         "mode": "",
+        "model": "",
+        "sandbox": True,
+    },
+    "grok": {
+        "command": "grok",
+        "permission_mode": "plan",
         "model": "",
     },
 }
@@ -145,20 +154,30 @@ def workspace_path(value: str | None) -> Path:
 def load_config(workspace: Path) -> tuple[dict[str, Any], Path | None]:
     path_value = os.environ.get("FUSION_CONFIG")
     path = Path(path_value).expanduser().resolve() if path_value else find_upward(".fusion.json", workspace)
-    if path is None:
-        return deep_merge({}, DEFAULTS), None
-    try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SystemExit(f"fusion: cannot read {path}: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise SystemExit(f"fusion: {path} must contain a JSON object")
-    merged = deep_merge(DEFAULTS, parsed)
-    # Stage maps are a workflow definition, not additive defaults. A project
-    # that supplies its own stages should replace the built-in pipeline.
-    if isinstance(parsed.get("ultra"), dict) and "stages" in parsed["ultra"]:
-        merged.setdefault("ultra", {})["stages"] = parsed["ultra"]["stages"]
-    return merged, path
+    global_path = Path(os.environ.get("ORC_HOME") or Path.home() / ".config/orc") / "fusion.json"
+    merged, source = deep_merge({}, DEFAULTS), None
+    for config_path in dict.fromkeys([global_path, path]):
+        if config_path is None or (config_path == global_path and not config_path.is_file()):
+            continue
+        try:
+            parsed = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"fusion: cannot read {config_path}: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise SystemExit(f"fusion: {config_path} must contain a JSON object")
+        merged, source = deep_merge(merged, parsed), config_path
+        # Stage maps are complete workflow definitions, not additive defaults.
+        if isinstance(parsed.get("ultra"), dict) and "stages" in parsed["ultra"]:
+            merged.setdefault("ultra", {})["stages"] = parsed["ultra"]["stages"]
+    execution_mode(merged)
+    return merged, source
+
+
+def execution_mode(config: dict[str, Any]) -> str:
+    mode = config.get("execution_mode", "restricted")
+    if not isinstance(mode, str) or mode not in {"restricted", "yolo"}:
+        raise ValueError("execution_mode must be restricted or yolo")
+    return mode
 
 
 def now_ms() -> int:
@@ -318,7 +337,7 @@ def failure_class(result: dict[str, Any]) -> str | None:
     signal sent in a remote telemetry payload -- raw blocker text can
     contain project-specific detail and is never sent remotely."""
     text = " ".join(str(item) for item in result.get("blockers", [])).lower()
-    if "permission denied" in text or "agy denied" in text:
+    if "permission denied" in text or "agy denied" in text or "agy auto-denied" in text:
         return "permission_denied"
     if result.get("status") in {"success", "cache_hit"}:
         return None
@@ -329,6 +348,40 @@ def failure_class(result: dict[str, Any]) -> str | None:
     if "not available on path" in text:
         return "missing_executable"
     return "worker_error"
+
+
+def agy_headless_status(settings: dict[str, Any]) -> dict[str, Any]:
+    """Check local permission setup without starting a model or changing policy.
+
+    A scoped allowlist may work for an explicit task, but does not establish
+    readiness for arbitrary automatic reviews. Explicit AGY selections remain
+    possible, and actual permission denials still stop the workflow.
+    """
+    path = Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if not isinstance(value, dict):
+            raise ValueError("settings must be a JSON object")
+    except (OSError, ValueError) as exc:
+        return {"automatic_ready": False, "reason": f"Cannot read AGY permission settings: {exc}"}
+    enabled = settings.get("sandbox", True) is True or value.get("enableTerminalSandbox") is True
+    policy = value.get("toolPermission", "request-review")
+    ready = enabled and policy == "proceed-in-sandbox"
+    return {"automatic_ready": ready,
+            "reason": "Sandboxed commands configured; explicit permission rules still apply" if ready else
+                      f'Headless command setup needed: set toolPermission to "proceed-in-sandbox" and enableTerminalSandbox to true in {path}'}
+
+
+def worker_availability(config: dict[str, Any], agent: str) -> dict[str, Any]:
+    settings = config.get(agent, {})
+    available = bool(executable(settings.get("command", agent)))
+    state = {"agent": agent, "available": available, "automatic_ready": available,
+             "reason": "Installed; account availability is checked during execution" if available else "Not on PATH"}
+    if available and execution_mode(config) == "yolo":
+        state.update(automatic_ready=True, reason="YOLO: runtime permission prompts and sandbox disabled")
+    elif available and agent == "agy":
+        state.update(agy_headless_status(settings))
+    return state
 
 
 def telemetry_install_id() -> str:
@@ -495,6 +548,7 @@ class RunStore:
             "duration_ms": max(0, ended_at_ms - started_at_ms),
             "status": result.get("status"),
             "failure_class": failure_class(result),
+            "execution_mode": execution_mode(config),
             "agent": task["agent"],
             "role": task["role"],
             "route": task.get("route"),
@@ -769,7 +823,10 @@ def parse_agy_output(stdout: str) -> tuple[str | None, str, str | None, dict[str
             for item in denied
             if isinstance(item, dict)
         ) or "tool"
-        failure = f"agy auto-denied tools in headless mode: {names}; grant them in settings.json or use a sandboxed route"
+        failure = (f"agy auto-denied tools in headless mode: {names}; configure sandboxed commands "
+                   '(enableTerminalSandbox: true, toolPermission: "proceed-in-sandbox") in '
+                   "~/.gemini/antigravity-cli/settings.json, or retry this stage with another worker. "
+                   "Explicit deny/ask rules still require attention.")
     elif not text:
         failure = "agy returned an empty response"
     raw_usage = value.get("usage") if isinstance(value.get("usage"), dict) else {}
@@ -852,6 +909,30 @@ def select_orc_model(command: str, selector: str, allow_untested: bool = False) 
     return None
 
 
+def codex_permission_args(workspace: Path, settings: dict[str, Any], write: bool) -> list[str]:
+    """Allow repository Git operations for writers without unrestricted access."""
+    sandbox = settings.get("sandbox", "workspace-write") if write else "read-only"
+    if sandbox != "workspace-write" or not settings.get("git_write", True):
+        return ["-s", sandbox]
+    # Inherit Codex's workspace/temp/network boundary and protected .codex paths.
+    # Only Git metadata is added, including the shared directory of a worktree.
+    roots = set()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(workspace), "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+        if result.returncode == 0:
+            roots = {str(Path(line).resolve()) for line in result.stdout.splitlines() if line.strip()}
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # A new, non-Git workspace may still initialize its own .git.
+    paths = [json.dumps(path) + '="write"' for path in sorted(roots)]
+    filesystem = ','.join(['":workspace_roots"={".git"="write"}', *paths])
+    profile = '{extends=":workspace",filesystem={' + filesystem + '}}'
+    return ["--strict-config", "-c", 'default_permissions="fusion_git_write"',
+            "-c", "permissions.fusion_git_write=" + profile]
+
+
 def agent_command(
     config: dict[str, Any],
     task: dict[str, Any],
@@ -859,25 +940,29 @@ def agent_command(
 ) -> tuple[list[str], dict[str, str], dict[str, Any]]:
     agent = task["agent"]
     settings = agent_settings(config, task)
+    yolo = execution_mode(config) == "yolo"
+    env = os.environ.copy()
     if agent == "codex":
         command = settings.get("command", "codex")
-        argv = [command, "-C", task["workspace"]]
-        sandbox = "workspace-write" if task["write"] else "read-only"
-        argv += ["-s", sandbox, "-a", settings.get("approval", "never"), "exec", "--json", "--skip-git-repo-check"]
+        permissions = ["--dangerously-bypass-approvals-and-sandbox"] if yolo else [
+            *codex_permission_args(Path(task["workspace"]), settings, task["write"]),
+            "-a", settings.get("approval", "never") if task["write"] else "never"]
+        argv = [command, "-C", task["workspace"], *permissions]
+        argv += ["exec", "resume", session_id, "--json"] if session_id else ["exec", "--json", "--skip-git-repo-check"]
         model = settings.get("model")
         if model:
             argv += ["-m", model]
-        if session_id:
-            argv = [command, "-C", task["workspace"], "-s", sandbox, "-a", settings.get("approval", "never"), "exec", "resume", session_id, "--json"]
-            if model:
-                argv += ["-m", model]
         argv.append("-")
         return argv, os.environ.copy(), {"command": command, "model": settings.get("model") or ""}
     if agent == "agy":
         command = settings.get("command", "agy")
         mode_key = str(settings.get("mode") or settings.get("permission_mode") or "")
-        mode = (AGY_MODE_ALIASES.get(mode_key) or "accept-edits") if task["write"] else "plan"
+        mode = "accept-edits" if yolo else (AGY_MODE_ALIASES.get(mode_key) or "accept-edits") if task["write"] else "plan"
         argv = [command, "-p", brief_for(task), "--output-format", "json", "--mode", mode]
+        if yolo:
+            argv.append("--dangerously-skip-permissions")
+        elif settings.get("sandbox", True) is True:
+            argv.append("--sandbox")
         selected_model = str(settings.get("model", ""))
         if selected_model:
             argv += ["--model", selected_model]
@@ -887,6 +972,20 @@ def agent_command(
         if session_id:
             argv += ["--conversation", session_id]
         return argv, os.environ.copy(), {"command": command, "model": selected_model}
+    if agent == "grok":
+        command = settings.get("command", "grok")
+        mode = "bypassPermissions" if yolo else settings.get("permission_mode", "plan") if task["write"] else "plan"
+        if mode not in {"plan", "acceptEdits", "dontAsk", "bypassPermissions"}:
+            raise ValueError("Grok workers require plan, acceptEdits, or dontAsk permissions")
+        argv = [command, "--cwd", task["workspace"], "--no-subagents", "--permission-mode", mode,
+                "--output-format", "plain", "-p", brief_for(task)]
+        if yolo:
+            argv += ["--sandbox", "none", "--no-plan"]
+        if settings.get("model"):
+            argv += ["--model", settings["model"]]
+        # Plain mode guarantees a public handoff without assuming a JSON schema.
+        # Each node gets a fresh session; token/cost coverage remains unknown.
+        return argv, os.environ.copy(), {"command": command, "model": settings.get("model") or ""}
     if agent == "claude":
         command = settings.get("command", "claude")
         command_name = Path(command).name
@@ -904,10 +1003,16 @@ def agent_command(
             ) or ""
         if command_name == "orc" and selected_model:
             argv += ["-m", selected_model]
-        mode = settings.get("permission_mode", "acceptEdits") if task["write"] else "plan"
-        argv += ["-p", "--output-format", "json", "--permission-mode", mode]
+        argv += ["-p", "--output-format", "json"]
+        if yolo:
+            argv += ["--dangerously-skip-permissions", "--settings", '{"sandbox":{"enabled":false}}']
+            if command_name == "orc":
+                env["ORC_MODE"] = "yolo"
+        else:
+            mode = settings.get("permission_mode", "acceptEdits") if task["write"] else "plan"
+            argv += ["--permission-mode", mode]
         permission_prompts = settings.get("permission_prompts")
-        if permission_prompts:
+        if permission_prompts and not yolo:
             argv += ["--permission-prompts", permission_prompts]
         if command_name != "orc" and selected_model:
             argv += ["--model", selected_model]
@@ -921,12 +1026,12 @@ def agent_command(
             # spend is zero; it would only sabotage cheap lanes.
             argv += ["--max-budget-usd", str(max_budget)]
         allowed = settings.get("allowed_tools") or []
-        if allowed:
+        if allowed and not yolo:
             argv += ["--allowedTools", *allowed]
         if session_id:
             argv += ["--resume", session_id]
         argv.append(brief_for(task))
-        return argv, os.environ.copy(), {"command": command, "model": selected_model}
+        return argv, env, {"command": command, "model": selected_model}
     raise ValueError(f"unsupported agent: {agent}")
 
 
@@ -949,6 +1054,7 @@ def dispatch(
     if task["resume"]:
         session_id = store.sessions().get(task["session_key"])
     argv, env, metadata = agent_command(config, task, session_id)
+    metadata["execution_mode"] = execution_mode(config)
     task["resolved"] = metadata
     store.write_json(run_dir / "task.json", task)
     binary = executable(argv[0])
@@ -988,7 +1094,9 @@ def dispatch(
     evidence_notes: list[str] = []
     exit_code = 1
     label = task.get("progress_label", task["role"])
-    progress.emit(label, f"selected {task['agent']} ({task.get('route') or 'native'}); {'write permitted' if task['write'] else 'read-only'}")
+    scope = "implementation" if task["write"] else "review/investigation only"
+    access = "YOLO: no runtime permission prompts or sandbox" if execution_mode(config) == "yolo" else "restricted runtime"
+    progress.emit(label, f"selected {task['agent']} ({task.get('route') or 'native'}); {scope}; {access}")
     try:
         with contextlib.ExitStack() as stack:
             with progress.activity(label, "acquiring workspace writer lock" if task["write"] else "preparing read-only worker"):
@@ -1007,6 +1115,9 @@ def dispatch(
             new_session, summary, failure, usage, event_model, evidence_notes = parse_codex_events(completed.stdout)
         elif task["agent"] == "agy":
             new_session, summary, failure, usage, event_model, evidence_notes = parse_agy_output(completed.stdout)
+        elif task["agent"] == "grok":
+            new_session, summary, usage, event_model, evidence_notes = None, completed.stdout.strip(), {}, None, []
+            failure = compact(progress.clean(completed.stderr), 1500) if exit_code != 0 and completed.stderr.strip() else None
         else:
             new_session, summary, failure, usage, event_model, evidence_notes = parse_claude_output(completed.stdout)
         # Preserve the public deliverable outside the compact receipt and trace.
@@ -1044,6 +1155,7 @@ def dispatch(
         "schema": SCHEMA,
         "run_id": task["run_id"],
         "status": status,
+        "execution_mode": execution_mode(config),
         "agent": task["agent"],
         "role": task["role"],
         "route": task.get("route"),
@@ -1238,7 +1350,7 @@ def tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "agent": {"type": "string", "enum": ["auto", "codex", "claude", "agy"]},
+                    "agent": {"type": "string", "enum": ["auto", "codex", "claude", "agy", "grok"]},
                     "task": {"type": "string"},
                     "role": {"type": "string", "default": "implementation"},
                     "success_criteria": {"type": "array", "items": {"type": "string"}},
@@ -1305,8 +1417,8 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
                     payload = {"decisions": DecisionStore(workspace).records()[-max(1, min(50, int(args.get("limit", 10)))):]}
                 elif name == "fusion_delegate":
                     agent = args.get("agent")
-                    if agent not in {"auto", "codex", "claude", "agy"}:
-                        raise ValueError("agent must be auto, codex, claude, or agy")
+                    if agent not in {"auto", "codex", "claude", "agy", "grok"}:
+                        raise ValueError("agent must be auto, codex, claude, agy, or grok")
                     target = workspace_path(args["workspace"]) if args.get("workspace") else workspace
                     if target != workspace:
                         target_config, _ = load_config(target)
@@ -1376,6 +1488,7 @@ def mcp_config_file(workspace: Path, read_only: bool = False) -> tuple[tempfile.
 
 
 def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str | None, interactive: bool = True, read_only: bool = False) -> int:
+    yolo = execution_mode(config) == "yolo"
     if agent == "claude":
         settings = config["claude"]
         command = executable(settings.get("command", "claude"))
@@ -1385,12 +1498,16 @@ def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str |
         handle, config_path = mcp_config_file(workspace, read_only)
         handle.close()
         argv = [command, "--mcp-config", str(config_path), "--append-system-prompt", LEAD_PROMPT]
-        if read_only and interactive:
+        if yolo:
+            argv += ["--dangerously-skip-permissions", "--settings", '{"sandbox":{"enabled":false}}']
+        elif read_only and interactive:
             argv += ["--permission-mode", "plan"]
         if not interactive:
-            argv += ["-p", "--output-format", "json", "--permission-mode", "plan" if read_only else settings.get("permission_mode", "acceptEdits")]
+            argv += ["-p", "--output-format", "json"]
+            if not yolo:
+                argv += ["--permission-mode", "plan" if read_only else settings.get("permission_mode", "acceptEdits")]
             permission_prompts = settings.get("permission_prompts")
-            if permission_prompts:
+            if permission_prompts and not yolo:
                 argv += ["--permission-prompts", permission_prompts]
         if task:
             argv += [task]
@@ -1410,7 +1527,9 @@ def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str |
             return 127
         script = Path(__file__).resolve().parent / "fusion"
         args_toml = json.dumps([str(script), "mcp-serve"])
-        argv = [command, "-C", str(workspace), "-s", "read-only" if read_only else settings.get("sandbox", "workspace-write"), "-a", "never" if read_only else "on-request", "-c", f"mcp_servers.fusion.command={json.dumps(sys.executable)}", "-c", f"mcp_servers.fusion.args={args_toml}"]
+        permissions = ["--dangerously-bypass-approvals-and-sandbox"] if yolo else [
+            *codex_permission_args(workspace, settings, not read_only), "-a", "never" if read_only else "on-request"]
+        argv = [command, "-C", str(workspace), *permissions, "-c", f"mcp_servers.fusion.command={json.dumps(sys.executable)}", "-c", f"mcp_servers.fusion.args={args_toml}"]
         argv += ["-c", f"mcp_servers.fusion.env.FUSION_WORKSPACE={json.dumps(str(workspace))}"]
         if read_only:
             argv += ["-c", 'mcp_servers.fusion.env.FUSION_READ_ONLY="1"']
@@ -1461,7 +1580,7 @@ def print_ultra_result(result: dict[str, Any], as_json: bool) -> None:
 
 def doctor(workspace: Path, config: dict[str, Any]) -> int:
     checks = []
-    for agent in ("claude", "codex", "agy"):
+    for agent in ("claude", "codex", "agy", "grok"):
         command = config.get(agent, {}).get("command", agent)
         path = executable(command)
         checks.append(
@@ -1471,6 +1590,8 @@ def doctor(workspace: Path, config: dict[str, Any]) -> int:
                 "path": path,
                 "ok": bool(path),
                 "required": agent in {"claude", "codex"},
+                "execution_mode": execution_mode(config),
+                **({"headless": worker_availability(config, agent)} if agent == "agy" and path else {}),
             }
         )
     route_checks = []
@@ -1505,6 +1626,10 @@ def build_parser() -> argparse.ArgumentParser:
     display.add_argument("--quiet", dest="progress", action="store_false", help="hide progress; keep the final result")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    ui = sub.add_parser("ui", help="open the local ORC/Fusion control room in your browser")
+    ui.add_argument("--port", type=int, default=8765, help="local port (0 selects an available port)")
+    ui.add_argument("--no-open", action="store_true", help="print the URL without opening a browser")
+
     lead = sub.add_parser("lead", help="launch an interactive lead agent with the Fusion MCP server")
     lead.add_argument("--agent", choices=["claude", "codex"], help="lead agent; defaults to .fusion.json or claude")
     lead.add_argument("task", nargs="?", help="optional initial task")
@@ -1517,6 +1642,12 @@ def build_parser() -> argparse.ArgumentParser:
     build_mode.add_argument("--execute", action="store_true", help="execute the generated bounded workflow instead of an interactive lead")
     build.add_argument("--budget-usd", type=float, default=0, help="stop workflow dispatches after recorded spend reaches this amount (0 disables)")
     build.add_argument("--max-attempts", type=int, default=2)
+    build.add_argument("--publish", choices=["off", "manual", "auto"], help="PR publication mode; manual/auto use an isolated worktree")
+    build.add_argument("--base", help="PR target branch")
+    build.add_argument("--remote", help="Git publication remote")
+    build_pr = build.add_mutually_exclusive_group()
+    build_pr.add_argument("--draft", dest="draft", action="store_true", default=None)
+    build_pr.add_argument("--ready", dest="draft", action="store_false")
     build.add_argument("--from-workflow", metavar="RUN_ID", help="use a completed workflow's numbered recommendation as the new implementation request")
     build.add_argument("--from-node", help="stage containing the recommendation; defaults to the final output")
     build.add_argument("--finding", type=int, help="recommendation number from --from-workflow")
@@ -1527,7 +1658,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("task", help="initial task for the lead")
 
     delegate = sub.add_parser("delegate", help="run one bounded sidekick task")
-    delegate.add_argument("--agent", choices=["auto", "claude", "codex", "agy"], required=True)
+    delegate.add_argument("--agent", choices=["auto", "claude", "codex", "agy", "grok"], required=True)
     delegate.add_argument("--role", default="implementation")
     delegate.add_argument("--read-only", action="store_true", help="give the worker a read-only workspace")
     delegate.add_argument("--fresh", action="store_true", help="start a fresh agent session")
@@ -1540,16 +1671,22 @@ def build_parser() -> argparse.ArgumentParser:
     ultra = sub.add_parser("ultra", help="run a bounded UltraCode-style explore/plan/implement/review pipeline")
     ultra.add_argument("--stages", type=int, help="maximum number of configured stages")
     ultra.add_argument("--cheap-only", action="store_true", help="force Claude stages onto the orc-free route")
-    ultra.add_argument("--harness", choices=["claude", "codex", "agy"], help="run every Ultra stage through one harness")
+    ultra.add_argument("--harness", choices=["claude", "codex", "agy", "grok"], help="run every Ultra stage through one harness")
     ultra.add_argument("task", help="task for the pipeline")
 
     workflow = sub.add_parser("workflow", help="run a persisted bounded Fusion DAG")
     workflow_sub = workflow.add_subparsers(dest="workflow_command", required=True)
+    from fusion_publish import add_parser as publish_parser
+    publish_parser(workflow_sub)
     workflow_run = workflow_sub.add_parser("run", help="validate and run a workflow JSON spec")
     workflow_run.add_argument("spec", help="path to a fusion.workflow.v1 JSON spec")
     workflow_run.add_argument("--task", help="override the task in the spec")
     workflow_resume = workflow_sub.add_parser("resume", help="resume a paused or failed workflow")
     workflow_resume.add_argument("run_id")
+    workflow_resume.add_argument("--node", help="unfinished stage to retry with a different worker")
+    workflow_resume.add_argument("--agent", choices=["auto", "claude", "codex", "agy", "grok"])
+    workflow_resume.add_argument("--route", help="configured route to use for the selected stage")
+    workflow_resume.add_argument("--max-attempts", type=int, help="new explicit attempt limit per stage")
     workflow_resume.add_argument(
         "--spec", help="re-validate against this workflow JSON instead of replaying the persisted spec unchanged"
     )
@@ -1610,6 +1747,9 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main(args, parser) -> int:
     workspace = workspace_path(args.workspace)
+    if args.command == "ui":
+        from fusion_ui import serve
+        return serve(workspace, args.port, not args.no_open)
     config, config_path = load_config(workspace)
     if args.command in {"build", "delegate", "ultra"} or args.command == "workflow" and args.workflow_command in {"run", "resume"}:
         from fusion_decisions import config_for
@@ -1689,9 +1829,12 @@ def _main(args, parser) -> int:
                 return progress.watch_workflow(workspace, args.run_id, as_json=args.json, once=args.once)
             if args.workflow_command == "run":
                 result = run_workflow(workspace, config, Path(args.spec).expanduser().resolve(), args.task)
+            elif args.workflow_command == "publish":
+                from fusion_publish import command
+                result = command(workspace, config, args)
             elif args.workflow_command == "resume":
                 spec_path = Path(args.spec).expanduser().resolve() if getattr(args, "spec", None) else None
-                result = resume_workflow(workspace, config, args.run_id, spec_path)
+                result = resume_workflow(workspace, config, args.run_id, spec_path, args.node, args.agent, args.route, args.max_attempts)
             elif args.workflow_command == "report":
                 from fusion_report import format_report, select_report
                 result = workflow_report(workspace, args.run_id)
@@ -1706,7 +1849,7 @@ def _main(args, parser) -> int:
                         print(f"Saved report: {output}", file=sys.stderr)
             else:
                 result = workflow_status(workspace, args.run_id)
-        except (OSError, ValueError, RuntimeError) as exc:
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             if args.json:
                 print(json_text({"schema": "fusion.workflow.v1", "status": "error", "error": str(exc)}))
             else:
@@ -1714,6 +1857,8 @@ def _main(args, parser) -> int:
             return 2
         if args.json:
             print(json_text(result))
+        elif args.workflow_command == "publish":
+            print(result.get("url") or json_text(result))
         elif args.workflow_command == "report":
             print(rendered_report, end="")
         elif args.workflow_command in {"run", "resume"}:
@@ -1726,8 +1871,13 @@ def _main(args, parser) -> int:
             for problem in result.get("acceptance", {}).get("problems", []):
                 print(f"  acceptance: {problem}")
         status = result.get("status")
-        return 0 if status == "success" else 2 if status in {"paused_quota", "paused_budget", "running"} else 1
+        if result.get("publication", {}).get("status") == "failed":
+            return 1
+        return 0 if status in {"success", "published", "preview"} else 2 if status in {"paused_quota", "paused_budget", "running"} else 1
     if args.command == "build":
+        from fusion_publish import options as publish_options
+        overrides = {key: getattr(args, arg) for key, arg in (("mode", "publish"), ("base", "base"), ("remote", "remote"), ("draft", "draft")) if getattr(args, arg) is not None}
+        config = {**config, "publish": publish_options(config, overrides)}
         if args.from_workflow:
             if args.finding is None:
                 parser.error("--from-workflow requires --finding NUMBER")
@@ -1756,7 +1906,7 @@ def _main(args, parser) -> int:
                 print(json_text(result))
             else:
                 progress.print_workflow(result)
-            return 0 if result["status"] == "success" else 1
+            return 0 if result["status"] == "success" and result.get("publication", {}).get("status") != "failed" else 1
         scope = "This request is read-only. Investigate or review, and do not implement.\n" if prepared["read_only"] else ""
         prompt = scope + BUILD_PROMPT + args.idea + f"\nRead the complete request and brief: {prepared['brief']}\nPrepared workflow: {prepared['workflow']}"
         return launch_lead(workspace, config, args.agent, prompt, interactive=True, read_only=prepared["read_only"])

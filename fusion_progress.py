@@ -258,6 +258,12 @@ def print_workflow(result):
     print(f"Reported spend: ${result.get('spent_usd', 0):.4f}")
     print(f"Report: {result['artifacts']['root']}")
     print(f"Details: fusion workflow report {result['workflow_id']}")
+    publication = result.get("publication") or {}
+    if publication.get("url"):
+        print(f"PR: {publication['url']}")
+    elif publication.get("status") == "failed":
+        print(f"Publication needs attention: {clean(publication.get('error', ''), 600)}")
+        print(f"Retry: fusion workflow publish {result['workflow_id']}")
 
 
 def _watch_path(workspace, run_id):

@@ -75,7 +75,183 @@ orc doctor              check everything end to end (resolved model + fit)
 orc probe [model]       smoke-test the launch path (1-token request)
 orc probe --fit [model] tool-loop smoke test; result cached 24h as FIT/FAIL
 orc config              open config in $EDITOR
+orc fusion ui           open the local browser control room
 ```
+
+### Browser control room
+
+```sh
+cd /path/to/your/repository
+orc 'fusion' ui
+# Or select the repository explicitly:
+orc 'fusion' --workspace /path/to/repository ui --port 8765
+```
+
+The control room opens in your browser and reads the same `.fusion` artifacts
+as the CLI. Existing terminal runs appear automatically. It includes:
+
+- Workspace switching, searchable workflow history, live stage activity and worker updates.
+- Rendered Markdown plans and reports, tables, copyable code blocks, evidence,
+  report downloads, and **Implement this** actions on numbered findings.
+- Discovery, build, debug, review, single-worker and custom JSON workflow launches;
+  preparation without execution; resume and cancellation of UI-launched jobs.
+- A Laya lab for probes, probabilities, actual policy actions, reviewed labels,
+  dataset exports, training, evaluation with a shuffled-state control, and calibration.
+- Project Fusion/ORC settings, worker availability, ORC model listings and profiles.
+- Ten palettes (Grove, Ocean, Iris, Rose, Amber, Glacier, Mint, Sand, Slate, Ember)
+  with Light, Dark, and System modes. Open **Appearance** in the sidebar or
+  **Settings → Appearance**. Preferences persist in localStorage and sync across tabs.
+- Activity entries subtly animate only when new, respect reduced motion, and
+  follow output smoothly while preserving your position when you scroll up.
+
+UI launches use the existing CLI and its permissions, writer lock, attempt limits
+and acceptance checks. Build/debug runs require the **Allow workspace edits**
+checkbox; preparation starts no coding workers. Jobs continue when the browser
+or UI server closes. Restart the UI against the same workspace to reconnect.
+Runs started outside the UI are observable; stop those from their original terminal.
+Training and calibration never promote a model or enable active decisions automatically.
+
+In **Laya lab**, select a decision and click **Suggest labels**. Choose Auto or an
+installed Codex, Claude, AGY, or Grok worker. A background job reads a snapshot of
+the original input and that attempt's saved result/answer, then drafts labels with
+reasons and evidence references. The teacher does not receive Laya's predictions,
+policy choices, or previous labels. It can abstain when evidence is missing.
+No repository changes or new verification runs are requested. This uses your
+configured worker account and can incur provider usage.
+
+Review the evidence, edit any answers or explanation, and click **Approve labels**.
+Drafts never enter training exports. Approval records the worker/model/run, draft
+identity, final labels and human evidence; regenerating does not replace existing
+approved labels. In-progress edits survive polling and navigation within the tab.
+Failed or cancelled jobs retain logs and can be retried with another worker.
+The CLI equivalent, which also only saves a draft, is:
+
+```sh
+orc 'fusion' decisions suggest DECISION_ID --agent codex
+```
+
+Completed implementation workflows have an **Open PR** action. Choose a target
+branch and remote, preview the exact diff, edit the title and Markdown body, and
+publish a draft or ready PR. Older runs require confirmation of the preview
+because they predate saved Git review snapshots. Only their recorded implementation
+paths are carried into the publication worktree; unrelated local changes and
+`.fusion` artifacts stay out of the commit. PR publication uses Git and the local
+GitHub CLI account, with no additional coding-worker calls.
+
+Configure **Settings → GitHub publishing**, or set project `.fusion.json`:
+
+```json
+{
+  "publish": {
+    "mode": "auto",
+    "base": "staging",
+    "remote": "origin",
+    "draft": true
+  }
+}
+```
+
+`off` keeps ordinary workflow execution in the current workspace. `manual` and
+`auto` start bounded implementation workflows in a clean Git worktree from the
+fetched target branch. Existing uncommitted changes in the original checkout are
+not copied into new runs. Dependencies may need installation in the new worktree.
+Manual runs wait for **Open PR**; automatic runs commit, push a feature branch and
+create the PR after successful implementation and downstream review. Reviews
+record their Git tree; changed files invalidate publication until reviewed again.
+These modes apply to persisted workflows (`build --execute` / `workflow run`).
+
+```sh
+# Override publishing defaults for one bounded implementation run:
+orc 'fusion' --progress build --kind build --execute \
+  --publish auto --base staging --draft 'Implement the requested feature with tests'
+
+# Preview a completed workflow without committing, pushing, or opening a PR:
+orc 'fusion' --json workflow publish WORKFLOW_ID --base staging --preview
+
+# Publish a run with a saved review snapshot, or retry its failed publication:
+orc 'fusion' --progress workflow publish WORKFLOW_ID
+# Older runs additionally require --accept-legacy-diff after inspecting the preview.
+```
+
+Publication state is stored separately in the workflow directory. A failed push
+or GitHub call leaves accepted stages intact; retries retain the branch and target
+and recover an existing PR instead of creating duplicates. Commit hooks run normally.
+The UI displays the PR URL, commit, target and worktree; **Refresh PR checks** fetches
+current GitHub checks. Changing the target of an isolated run requires a new run
+against that target. Automatic publication failures return a nonzero CLI exit code
+while the implementation workflow remains successful.
+
+Runtime access is configured with `execution_mode`: `restricted` (default) or
+`yolo`. Settings load from `~/.config/orc/fusion.json` (or `$ORC_HOME/fusion.json`)
+and then the project's `.fusion.json`. To use YOLO across workspaces, set the
+machine configuration to:
+
+```json
+{"execution_mode": "yolo"}
+```
+
+YOLO applies to leads, new and resumed workers, all workflow roles, and named
+routes. Codex gets `--dangerously-bypass-approvals-and-sandbox`; Claude, ORC
+routes, and AGY get `--dangerously-skip-permissions`; Grok gets
+`--permission-mode bypassPermissions --sandbox none --no-plan`. Claude's
+sandbox is disabled through invocation settings. AGY additionally requires
+`enableTerminalSandbox: false` in its native settings if it was enabled there.
+In YOLO, review/discovery scopes are worker instructions, not runtime read-only
+guarantees. Attempt limits, budgets, provider quotas, and acceptance checks
+remain in effect. The UI shows the selected access mode and lets you override
+it per workspace under Settings → Runtime access.
+
+In restricted mode, Codex writer runs use the `fusion_git_write` permission profile: the workspace
+sandbox plus writable Git metadata, including linked worktrees. Branch creation,
+staging, and commits work; discovery and review remain read-only. This requires
+a Codex CLI with named permission profiles and `--strict-config` support.
+Set `codex.git_write` to `false` to retain Codex's standard protected `.git` behavior.
+Explicit legacy `sandbox_mode` settings in Codex config take precedence over named
+profiles; remove those settings to use this scoped profile. Already-running workers
+keep the permissions they started with; new launches and resumed workers use the update.
+
+When an **Auto** stage hits a provider quota, Fusion excludes that route and
+tries another installed, permitted worker within the existing attempt and budget
+limits. This works with Laya off or in shadow mode. Explicitly selected workers
+stay pinned. A quota notice identifies the exhausted worker and route separately
+from Fusion's spend budget. **Resume workflow** lets you select the unfinished
+stage, worker or named route, and an explicit attempt limit; accepted stages are
+reused when their inputs still match. For example:
+
+```sh
+orc 'fusion' workflow resume RUN_ID --node review --agent codex --max-attempts 3
+```
+
+Native workers are Codex, Claude, Antigravity (`agy`), and Grok Build (`grok`).
+Local CLIs still use their own remote-provider accounts and quotas. Grok uses
+headless plain output, a fresh session, and no subagents; its default `plan`
+permission mode makes it an automatic read-only review/discovery option in restricted mode. Its
+token usage and cost are unknown unless reported by a future adapter. Set
+`grok.permission_mode` to `acceptEdits` for explicitly authorized writer work.
+Named ORC routes can use other configured models; automatic ORC selection still
+requires passing tool-fit evidence.
+
+The server binds only to `127.0.0.1`. Use the complete URL printed in your terminal
+to connect a browser; its fragment contains a per-server access capability.
+`--no-open` prints that URL without opening a browser. `--port 0` chooses a free
+port. The runtime needs only Python's standard library; Markdown rendering and
+sanitization assets ship locally. There is no npm install, CDN, or hosted UI service.
+
+Keyboard shortcuts: **N** new run, **1–5** sections, **/** workflow search,
+**Esc** close dialog, **?** shortcut reference.
+
+Development verification:
+
+```sh
+make test dogfood
+npm install --prefix /tmp/orc-ui-tools --no-audit --no-fund @playwright/test@1.63.0
+/tmp/orc-ui-tools/node_modules/.bin/playwright install chromium
+NODE_PATH=/tmp/orc-ui-tools/node_modules node test/ui_browser.cjs
+```
+
+Browser checks use disposable workspaces and fake coding workers. They exercise
+rendering, launches, settings, cancellation, reviewed labels and mobile layouts
+without paid agent calls. Browser tools are needed only to run these checks.
 
 The model picker shows live OpenRouter input/output prices per million tokens.
 Free models are marked `FREE`; type `FREE` in the regular picker or use
@@ -408,10 +584,31 @@ fusion delegate --agent agy --read-only --role countercheck \
 fusion --json ultra --harness agy 'Explore and review this change.'
 ```
 
-Headless `agy` cannot answer tool-permission prompts, so it auto-denies tools
-outside its allow-rules; plan mode is safe for read-only work, and write routes
-should use `accept-edits` with the workspace sandbox rather than
-`--dangerously-skip-permissions`. `agy` has no per-call budget flag, so cap its
+In restricted mode, Fusion launches `agy` with `--sandbox` and uses `plan` for readers or
+`accept-edits` for writers. Execution mode alone does not grant command
+permissions. In `~/.gemini/antigravity-cli/settings.json`, merge these settings
+with your existing configuration:
+
+```json
+{"enableTerminalSandbox": true, "toolPermission": "proceed-in-sandbox"}
+```
+
+This permits sandboxed commands while preserving explicit permission rules;
+commands outside the sandbox can still require approval. See the
+[Antigravity sandbox documentation](https://www.antigravity.google/docs/sandbox?tab=cli).
+If your shell or tools come from Nix and fail with a sandbox-blocked library
+under `/nix/store`, add `read_file(/nix/store)` to the existing
+`permissions.allow` list. This mounts the runtime files read-only; it does not
+authorize unsandboxed commands. Preserve other permission rules.
+
+Fusion checks this local setup before selecting AGY automatically. This is a
+configuration check, not a guarantee of authentication, quota, or every tool's
+permission. Explicit AGY selections can still use a narrower custom allowlist.
+`fusion doctor` and the UI show headless setup status. Permission denials stop
+the attempt; resuming with Auto excludes that failed worker, while explicitly
+selecting AGY lets you retry after correcting its configuration. Fusion never
+adds a permission bypass in restricted mode. Explicit `execution_mode: "yolo"`
+uses the bypass flags described above. `agy` has no per-call budget flag, so cap its
 cost with `timeout_seconds` and the workflow's `budget_usd`. OpenRouter models
 are not in the `agy` host list — route those through the `orc` path instead.
 `agy` is not (yet) a lead candidate; `fusion lead` remains Claude or Codex.

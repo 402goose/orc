@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>ORC · Control room</title>
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <script src="/appearance.js"></script>
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/vendor/marked.js" defer></script>
+    <script src="/vendor/purify.js" defer></script>
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <aside class="sidebar">
+      <a class="brand" href="#overview" aria-label="ORC home"
+        ><span class="brand-mark">o<span>r</span>c</span
+        ><span class="brand-label">CONTROL ROOM</span></a
+      >
+      <div class="workspace-label">
+        WORKSPACE
+        <button
+          id="add-workspace"
+          class="icon-button"
+          aria-label="Add workspace"
+        >
+          +
+        </button>
+      </div>
+      <select id="workspace" aria-label="Workspace"></select>
+      <div id="workspace-path" class="workspace-path"></div>
+      <nav aria-label="Main navigation">
+        <button data-view="overview" class="nav-item active">
+          <span>◫</span> Overview <kbd>1</kbd>
+        </button>
+        <button data-view="workflows" class="nav-item">
+          <span>⌘</span> Workflows <kbd>2</kbd>
+        </button>
+        <button data-view="decisions" class="nav-item">
+          <span>◇</span> Laya lab <kbd>3</kbd>
+        </button>
+        <button data-view="models" class="nav-item">
+          <span>▤</span> ORC models <kbd>4</kbd>
+        </button>
+        <button data-view="settings" class="nav-item">
+          <span>⚙</span> Settings <kbd>5</kbd>
+        </button>
+      </nav>
+      <div class="sidebar-bottom">
+        <button
+          id="appearance"
+          class="appearance-shortcut"
+          data-action="appearance"
+        >
+          <span>◐ Appearance</span><small id="appearance-name"></small>
+        </button>
+        <div class="local-status">
+          <i></i> Local connection <span id="connection">live</span>
+        </div>
+        <p>Your agents. Your machine.<br />Your work, in one place.</p>
+        <button id="shortcuts" class="subtle">
+          Keyboard shortcuts <kbd>?</kbd>
+        </button>
+      </div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div class="breadcrumb">
+          ORC <span>/</span> <span id="view-name">Overview</span>
+        </div>
+        <div class="top-actions">
+          <div class="runtime-status">
+            <span
+              id="execution-chip"
+              class="pill"
+              title="Runtime access for new launches and retries"
+              >Runtime</span
+            ><span id="mode-chip" class="pill">Laya · shadow</span>
+          </div>
+          <button id="launch-top" class="button primary">
+            <span>+</span> New run <kbd>N</kbd>
+          </button>
+        </div>
+      </header>
+      <div id="error-banner" class="error-banner" hidden></div>
+      <div id="content" tabindex="-1">
+        <div class="empty">
+          <div class="loader"></div>
+          <h2>Connecting to your workspace</h2>
+          <p>Reading saved runs and worker activity.</p>
+        </div>
+      </div>
+    </main>
+    <dialog id="dialog" aria-labelledby="dialog-title">
+      <div id="dialog-content"></div>
+    </dialog>
+    <div id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

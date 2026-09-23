@@ -44,9 +44,11 @@ echo "installed: $DEST/orc"
 cp "$FUSION_SRC" "$DEST/fusion"
 cp "$FUSION_CORE_SRC" "$DEST/fusion_core.py"
 cp "$FUSION_WORKFLOW_SRC" "$DEST/fusion_workflow.py"
-for module in fusion_decisions fusion_laya fusion_policy fusion_build fusion_decision_cli fusion_progress fusion_report; do
+for module in fusion_decisions fusion_laya fusion_policy fusion_build fusion_decision_cli fusion_progress fusion_report fusion_ui fusion_labeling fusion_publish; do
   cp "$(dirname "$FUSION_CORE_SRC")/$module.py" "$DEST/$module.py"
 done
+mkdir -p "$DEST/fusion_ui_assets"
+cp -R "$(dirname "$FUSION_CORE_SRC")/fusion_ui_assets/." "$DEST/fusion_ui_assets/"
 chmod +x "$DEST/fusion"
 echo "installed: $DEST/fusion"
 

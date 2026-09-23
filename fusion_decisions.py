@@ -221,22 +221,28 @@ class DecisionStore:
                 entry.update(actual=event.get("actual"), applied=bool(event.get("applied")))
         return found
 
-    def label(self, decision_id, answers, evidence):
+    def label(self, decision_id, answers, evidence, suggestion_id=None, replace=False):
         record = self.get(decision_id)
         if record.get("status") != "ok" or record.get("truncated"):
             raise ValueError("label only successful, complete model inputs; shorten truncated inputs and run again")
-        if not evidence.strip() or not answers:
+        if not isinstance(evidence, str) or not evidence.strip() or not isinstance(answers, dict) or not answers:
             raise ValueError("reviewed labels require answers and verification evidence")
         for key, label in answers.items():
             question = record["questions"].get(key)
             if not question or label not in labels_for(question):
                 raise ValueError(f"invalid label {key}={label}")
-        self.append("label", id=decision_id, answers=answers, evidence=evidence, verified=True)
+        provenance = {"source": "human"}
+        if suggestion_id:
+            from fusion_labeling import approval_provenance
+            provenance = approval_provenance(self, record, suggestion_id, answers)
+        self.append("label", id=decision_id, answers=answers, evidence=evidence, verified=True, replace=replace, **provenance)
 
     def export(self, destination):
         labels = {}
         for event in read_jsonl(self.path):
             if event.get("event") == "label" and event.get("verified"):
+                if event.get("replace"):
+                    labels[event["id"]] = {}
                 labels.setdefault(event["id"], {}).update(event["answers"])
         rows = []
         for record in self.records():

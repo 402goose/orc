@@ -137,7 +137,7 @@ def expand_spec(spec: dict[str, Any]) -> tuple[dict[str, Any], dict[str, list[st
                 raise ValueError(f"workflow node {node['id']} depends on unknown node {dependency_id}")
         node["needs"] = list(dict.fromkeys(needs))
         node["agent"] = str(node.get("agent", "claude"))
-        if node["agent"] not in {"auto", "claude", "codex", "agy"}:
+        if node["agent"] not in {"auto", "claude", "codex", "agy", "grok"}:
             raise ValueError(f"workflow node {node['id']} has unsupported agent {node['agent']}")
         node["role"] = str(node.get("role", node["id"]))
         node["write"] = bool(node.get("write", False))
@@ -207,6 +207,11 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
     normalized["budget_usd"] = budget
     normalized["acceptance"] = acceptance
     normalized["graph"] = graph
+    if "publish" in spec:
+        from fusion_publish import options
+        normalized["publish"] = options({}, spec["publish"])
+        if normalized["publish"]["mode"] != "off" and not any(n["write"] for n in nodes):
+            raise ValueError("Publishing requires an implementation workflow")
     return normalized
 
 
@@ -233,6 +238,7 @@ class WorkflowRunner:
         resume: bool = False,
     ):
         self.workspace = workspace
+        self.control_workspace = workspace
         self.config = config
         self.spec = validate_spec(spec)
         self.run_id = run_id or _run_id()
@@ -242,8 +248,17 @@ class WorkflowRunner:
         self.nodes_root = self.root / "nodes"
         self.manifest_path = self.root / "manifest.json"
         self.events_path = self.root / "events.jsonl"
+        self.git_context = {}
+        if resume:
+            from fusion_publish import read
+            self.git_context = read(self.root / "git.json")
+        elif self.spec.get("publish", {}).get("mode", "off") != "off":
+            from fusion_publish import setup_worktree
+            self.git_context = setup_worktree(workspace, self.run_id, self.spec.get("task", ""), self.spec["publish"])
+        if self.git_context:
+            self.workspace = Path(self.git_context["workspace"])
         self.workflow_baseline = {
-            relative: _fingerprint(workspace / relative)
+            relative: _fingerprint(self.workspace / relative)
             for relative in self.spec.get("acceptance", {}).get("required_files", [])
         }
         self.nodes: dict[str, dict[str, Any]] = {}
@@ -260,7 +275,7 @@ class WorkflowRunner:
         if resume:
             self._load_existing()
         else:
-            self.root.mkdir(parents=True, exist_ok=False)
+            self.root.mkdir(parents=True, exist_ok=bool(self.git_context))
             self.nodes_root.mkdir(parents=True, exist_ok=True)
             self._write_manifest("running")
             self._event("workflow.created", {"task": self.spec.get("task", "")})
@@ -298,6 +313,15 @@ class WorkflowRunner:
             self.nodes[node_id]["result"] = result
             self.nodes[node_id]["excluded_routes"] = old.get("excluded_routes", [])
             status = str(old.get("status", "pending"))
+            denied = core.failure_class(result or {}) == "permission_denied"
+            access_changed = (result or {}).get("execution_mode", "restricted") != core.execution_mode(self.config)
+            if denied and access_changed:
+                failed_lane = (result or {}).get("route") or (result or {}).get("agent")
+                self.nodes[node_id]["excluded_routes"] = [lane for lane in self.nodes[node_id]["excluded_routes"] if lane != failed_lane]
+            if (status == "paused_quota" or (denied and not access_changed)) and self.nodes[node_id]["agent"] == "auto" and not self.nodes[node_id].get("route"):
+                lane = (result or {}).get("route") or (result or {}).get("agent")
+                if lane and lane not in self.nodes[node_id]["excluded_routes"]:
+                    self.nodes[node_id]["excluded_routes"].append(lane)
             self.nodes[node_id]["status"] = "success" if status == "success" else "pending"
         self._invalidate_stale_receipts()
         self._write_manifest("running")
@@ -418,6 +442,8 @@ class WorkflowRunner:
             progress.emit(node_id, f"starting node {list(self.nodes).index(node_id) + 1}/{len(self.nodes)}; attempt {payload['attempt']}/{self.spec['max_attempts']}")
         elif event_type == "node.succeeded":
             progress.emit(node_id, f"accepted; {sum(node['status'] == 'success' for node in self.nodes.values())}/{len(self.nodes)} nodes complete")
+        elif event_type == "node.switching":
+            progress.emit(node_id, f"{payload.get('from_route', 'worker')} reached its provider quota; selecting another healthy worker within the attempt limit" if payload.get("reason") == "quota" else "switching to another permitted worker")
         elif event_type.startswith("node.") and event_type not in {"node.started", "node.succeeded"}:
             detail = "; ".join(str(item) for item in (payload.get("problems") or (payload.get("result") or {}).get("blockers", [])))
             progress.emit(node_id, event_type.removeprefix("node.") + (f": {detail}" if detail else ""))
@@ -434,6 +460,7 @@ class WorkflowRunner:
             "task": self.spec.get("task", ""),
             "spec": self.spec,
             "workflow_baseline": self.workflow_baseline,
+            "git": self.git_context,
             "nodes": self.nodes,
             "lanes": self.lane_health,
             "attempt_ledger": self.attempt_ledger,
@@ -590,12 +617,14 @@ BLOCKERS: unresolved issues, or none
         task = core.make_task(
             self.workspace,
             agent,
-            self._prompt(node),
+            self._prompt(node) + (f"\nWork in this dedicated worktree. The starting Git commit is {self.git_context['base_sha']}. "
+                                  "Inspect the full diff against that commit, including newly created files. "
+                                  "Do not commit or push; Fusion publishes the reviewed changes after completion." if self.git_context else ""),
             node["role"],
             ["complete the assigned node", "return evidence in the required handoff format"],
             ["do not broaden the workflow task", "do not run parallel writers in this workspace"],
-            f"workflow:{self.run_id}:{node_id}",
-            bool(node.get("resume", False)) or attempt > 1,
+            f"workflow:{self.run_id}:{node_id}" + (f":{agent}:{route or 'native'}:{settings.get('model', '')}" if agent != "auto" else ""),
+            (bool(node.get("resume", False)) or attempt > 1) and core.failure_class(node.get("result") or {}) != "permission_denied",
             write,
             parent_task_id=self.run_id,
             route=route,
@@ -616,7 +645,16 @@ BLOCKERS: unresolved issues, or none
         if self.spec["budget_usd"]:
             task["budget_remaining_usd"] = max(0, self.spec["budget_usd"] - self._spent())
         try:
+            review_tree = None
+            if self.git_context and not write and "review" in node["role"].lower():
+                from fusion_publish import snapshot
+                review_tree = snapshot(self.workspace)
             result = core.dispatch(self.config, task, store)
+            if review_tree:
+                if snapshot(self.workspace) != review_tree:
+                    result.update(status="error", blockers=[*result.get("blockers", []), "Files changed during review; review a stable tree before publishing"])
+                else:
+                    result["reviewed_tree"] = review_tree
         except (OSError, ValueError, RuntimeError) as exc:
             result = {
                 "schema": core.SCHEMA,
@@ -856,7 +894,8 @@ BLOCKERS: unresolved issues, or none
                         self._event("node.succeeded", {"node_id": node_id, "attempt": node["attempts"]})
                     elif action == "switch":
                         node["status"] = "pending"
-                        self._event("node.switching", {"node_id": node_id, "excluded_routes": node["excluded_routes"]})
+                        self._event("node.switching", {"node_id": node_id, "excluded_routes": node["excluded_routes"],
+                                                       "from_route": result.get("route") or result.get("agent"), "reason": core.failure_class(result)})
                     elif core.quota_failure(result):
                         node["status"] = "paused_quota"
                         self._event("node.paused_quota", {"node_id": node_id, "attempt": node["attempts"]})
@@ -882,12 +921,17 @@ BLOCKERS: unresolved issues, or none
             self._event("workflow.acceptance_failed", {"problems": acceptance_problems})
         self._write_manifest(status, "; ".join(acceptance_problems) if acceptance_problems else None)
         self._event("workflow.finished", {"status": status, "spent_usd": self._spent()})
+        if status == "success" and self.spec.get("publish", {}).get("mode") == "auto":
+            from fusion_publish import auto_publish
+            auto_publish(self.control_workspace, self.run_id, self.config)
         return self.result(status, acceptance_problems)
 
     def result(self, status: str | None = None, acceptance_problems: list[str] | None = None) -> dict[str, Any]:
+        from fusion_publish import public_status
         return {
             "schema": WORKFLOW_SCHEMA,
             "workflow_id": self.run_id,
+            "publication": public_status(self.control_workspace, self.run_id),
             "status": status or self._final_status(),
             "task": self.spec.get("task", ""),
             "spent_usd": self._spent(),
@@ -913,7 +957,46 @@ def run_workflow(workspace: Path, config: dict[str, Any], spec_path: Path, task:
     return WorkflowRunner(workspace, config, spec).run()
 
 
-def resume_workflow(workspace: Path, config: dict[str, Any], run_id: str, spec_path: Path | None = None) -> dict[str, Any]:
+def reroute_resume_spec(manifest: dict[str, Any], config: dict[str, Any], node_id: str | None = None,
+                       agent: str | None = None, route: str | None = None, max_attempts: int | None = None) -> dict[str, Any]:
+    spec = copy.deepcopy(manifest.get("spec") or {})
+    if agent is not None or route is not None:
+        if not node_id:
+            raise ValueError("Choose a stage to change its worker")
+    if node_id:
+        saved = manifest.get("nodes", {}).get(node_id)
+        if not saved or saved.get("status") == "success":
+            raise ValueError("Choose an unfinished stage; accepted stages are preserved")
+        spec["nodes"] = copy.deepcopy(spec["graph"]["nodes"])
+        for node in spec["nodes"]:
+            for key in ("task_template", "items", "map"):
+                node.pop(key, None)
+            if node["id"] != node_id:
+                continue
+            if agent is not None or route is not None:
+                for key in ("route", "command", "model", "model_selector", "profile", "launcher_args",
+                            "max_budget_usd", "permission_mode", "permission_prompts", "allowed_tools", "allow_untested"):
+                    node.pop(key, None)
+                node["agent"] = agent or "auto"
+                if route:
+                    lane = config.get("routes", {}).get(route)
+                    if not lane or (agent not in {None, "auto", lane.get("agent")}):
+                        raise ValueError("Choose a configured route matching the selected worker")
+                    node["route"] = route
+                    node["agent"] = lane["agent"]
+        limit = max_attempts if max_attempts is not None else spec.get("max_attempts", 1)
+        if limit <= saved.get("attempts", 0):
+            raise ValueError("Raise the attempt limit to permit another attempt for this stage")
+    if max_attempts is not None:
+        if not 1 <= max_attempts <= 100:
+            raise ValueError("Attempt limit must be between 1 and 100")
+        spec["max_attempts"] = max_attempts
+    return validate_spec(spec)
+
+
+def resume_workflow(workspace: Path, config: dict[str, Any], run_id: str, spec_path: Path | None = None,
+                    node_id: str | None = None, agent: str | None = None, route: str | None = None,
+                    max_attempts: int | None = None) -> dict[str, Any]:
     manifest_path = workspace / ".fusion" / "workflows" / run_id / "manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -923,7 +1006,9 @@ def resume_workflow(workspace: Path, config: dict[str, Any], run_id: str, spec_p
     # lets a caller resume with an edited workflow.json; the digest check in
     # _invalidate_stale_receipts() then reruns only the nodes whose definition
     # or dependency evidence actually changed, not the whole graph.
-    spec = load_spec(spec_path) if spec_path else (manifest.get("spec") or {})
+    if spec_path and any(value is not None for value in (node_id, agent, route, max_attempts)):
+        raise ValueError("Use either --spec or stage retry options")
+    spec = load_spec(spec_path) if spec_path else reroute_resume_spec(manifest, config, node_id, agent, route, max_attempts)
     return WorkflowRunner(workspace, config, spec, run_id=run_id, resume=True).run()
 
 
@@ -943,6 +1028,7 @@ def workflow_report(workspace: Path, run_id: str) -> dict[str, Any]:
     from the persisted manifest and the trace ledger in one read-only call.
     """
     from fusion_report import command, findings, read_answer, reported_cost
+    from fusion_publish import public_status
     manifest = workflow_status(workspace, run_id)
     nodes = manifest.get("nodes") or {}
     spec_nodes = {node["id"]: node for node in (manifest.get("spec", {}).get("graph", {}).get("nodes") or [])}
@@ -1001,6 +1087,8 @@ def workflow_report(workspace: Path, run_id: str) -> dict[str, Any]:
         "schema": "fusion.workflow.report.v1",
         "workflow_id": run_id,
         "workspace": str(workspace),
+        "git": manifest.get("git") or {},
+        "publication": public_status(workspace, run_id),
         "status": status,
         "task": manifest.get("task"),
         "spent_usd": manifest.get("spent_usd", sum(_result_cost(node.get("result") or {}) for node in nodes.values())),
