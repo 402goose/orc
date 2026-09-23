@@ -264,6 +264,7 @@ def usage_summary(spans: list[dict[str, Any]]) -> dict[str, Any]:
                 "calls": 0,
                 "success": 0,
                 "failed": 0,
+                "cache_hit": 0,
                 "duration_ms": 0,
                 **{field: 0.0 for field in fields},
             },
@@ -271,6 +272,8 @@ def usage_summary(spans: list[dict[str, Any]]) -> dict[str, Any]:
         group["calls"] += 1
         if span.get("status") == "success":
             group["success"] += 1
+        elif span.get("status") == "cache_hit":
+            group["cache_hit"] += 1
         else:
             group["failed"] += 1
         group["duration_ms"] += int(number(span.get("duration_ms")))
@@ -293,7 +296,7 @@ def failure_class(result: dict[str, Any]) -> str | None:
     text = " ".join(str(item) for item in result.get("blockers", [])).lower()
     if "permission denied" in text or "agy denied" in text:
         return "permission_denied"
-    if result.get("status") == "success":
+    if result.get("status") in {"success", "cache_hit"}:
         return None
     if any(marker in text for marker in ("usage limit", "session limit", "rate limit", "quota", "resets at", "resets ")):
         return "quota"
