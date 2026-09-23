@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlsplit
 import uuid
 import webbrowser
 
+import fusion_build as build_module
 import fusion_core as core
 import fusion_publish as publishing
 from fusion_decisions import DecisionEngine, DecisionStore, config_for, read_jsonl
@@ -343,13 +344,19 @@ class ControlRoom:
         spec = None
         if action == "build":
             kind = body.get("kind", "discovery")
-            if kind not in {"discovery", "review", "build", "debug"}:
-                raise ValueError("Choose discovery, review, build or debug")
+            if kind not in {"discovery", "review", "build", "debug", "sweep"}:
+                raise ValueError("Choose discovery, review, build, debug or sweep")
             budget, attempts = float(body.get("budget", 0)), int(body.get("attempts", 2))
             if not math.isfinite(budget) or budget < 0 or not 1 <= attempts <= 5:
                 raise ValueError("Budget must be nonnegative; attempts must be between 1 and 5")
             prepare = body.get("prepare") is True
             argv += ["build", "--kind", kind, "--plan-only" if prepare else "--execute", "--budget-usd", str(budget), "--max-attempts", str(attempts)]
+            if kind == "sweep":
+                across = build_module.dimensions(body.get("across") or [])
+                if not across:
+                    raise ValueError("A sweep needs at least one dimension to fan out across")
+                for dimension in across:
+                    argv += ["--across", dimension]
             if kind in {"build", "debug"} and body.get("publish") is not None:
                 config, _ = core.load_config(workspace)
                 publish_options = publishing.options(config, body["publish"])
