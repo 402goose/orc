@@ -1485,7 +1485,7 @@ The lead controls the final decision. Do not broaden the task. Return the exact 
 
 
 def tool_definitions() -> list[dict[str, Any]]:
-    return [
+    return fusion_mcp.ASYNC_TOOLS + [
         {
             "name": "fusion_delegate",
             "description": "Delegate a bounded task to the other coding agent and receive a structured handoff. The lead keeps final judgment.",
@@ -1519,6 +1519,9 @@ def tool_definitions() -> list[dict[str, Any]]:
     ]
 
 
+import fusion_mcp  # noqa: E402  (module-level cycle-free helper)
+
+
 def mcp_result(payload: Any) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}], "structuredContent": payload}
 
@@ -1541,12 +1544,29 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
         response: dict[str, Any] | None = None
         if method == "initialize":
             response = {
-                "protocolVersion": request.get("params", {}).get("protocolVersion", "2024-11-05"),
-                "capabilities": {"tools": {"listChanged": False}},
+                "protocolVersion": request.get("params", {}).get("protocolVersion", fusion_mcp.MCP_PROTOCOL_VERSION),
+                "capabilities": fusion_mcp.SERVER_CAPABILITIES,
                 "serverInfo": {"name": "fusion", "version": "0.1.0"},
             }
         elif method == "tools/list":
             response = {"tools": tool_definitions()}
+        elif method == "prompts/list":
+            response = {"prompts": fusion_mcp.PROMPTS}
+        elif method == "prompts/get":
+            params = request.get("params") or {}
+            try:
+                response = fusion_mcp.prompt_messages(params.get("name"), params.get("arguments") or {}, workspace)
+            except Exception as exc:
+                response = mcp_error(str(exc))
+        elif method == "resources/list":
+            response = {"resources": fusion_mcp.list_resources(workspace)}
+        elif method == "resources/templates/list":
+            response = {"resourceTemplates": fusion_mcp.RESOURCE_TEMPLATES}
+        elif method == "resources/read":
+            try:
+                response = fusion_mcp.read_resource((request.get("params") or {}).get("uri", ""), workspace)
+            except Exception as exc:
+                response = mcp_error(str(exc))
         elif method == "tools/call":
             params = request.get("params") or {}
             name = params.get("name")
@@ -1583,8 +1603,13 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
                         raise ValueError("task is required")
                     payload = dispatch(target_config, task, target_store)
                 else:
-                    raise ValueError(f"unknown tool: {name}")
+                    payload = fusion_mcp.dispatch_async_tool(name, args, workspace)
                 response = mcp_result(payload)
+                if isinstance(payload, dict) and payload.get("workflow_id"):
+                    # Hand back evidence URIs rather than inlining artifacts.
+                    response["content"] = response["content"] + fusion_mcp.evidence_links(
+                        workspace, str(payload["workflow_id"])
+                    )
             except Exception as exc:  # MCP must return a tool error instead of corrupting stdout.
                 response = mcp_error(str(exc))
         elif method == "ping":
