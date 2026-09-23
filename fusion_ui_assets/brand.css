@@ -42,7 +42,7 @@
 .guild-motto { font-size:clamp(25px,3vw,37px); letter-spacing:-.045em; line-height:1.15; font-weight:650; color:var(--text); margin-bottom:12px; }
 .guild-cast { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:26px 0; }
 .guild-member { position:relative; padding:23px; background:var(--panel2); border:1px solid var(--line); border-radius:16px 4px 16px 4px; }
-.guild-member-mark { width:52px; height:52px; display:grid; place-items:center; border:1px solid var(--accent-line); border-radius:14px; background:var(--accent-soft); margin-bottom:20px; }
+.guild-member-mark { --sigil-fill:var(--bg); width:52px; height:52px; display:grid; place-items:center; border:1px solid var(--accent-line); border-radius:14px; background:var(--accent-soft); margin-bottom:20px; }
 .guild-member-mark .sigil { width:34px; height:34px; }
 .guild-member h3 { margin:8px 0 10px; font-size:24px; }
 .guild-member p { line-height:1.7; margin-bottom:16px; }

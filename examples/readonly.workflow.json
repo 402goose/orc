@@ -1,0 +1,37 @@
+{
+  "task": "Review this repository and return an evidence-backed inventory. Do not edit tracked files.",
+  "max_parallel": 3,
+  "max_parallel_writers": 0,
+  "max_attempts": 1,
+  "budget_usd": 2,
+  "nodes": [
+    {
+      "id": "inventory",
+      "items": [
+        "repository structure and entry points",
+        "tests, fixtures and what they actually cover",
+        "documentation against the behaviour the code implements"
+      ],
+      "task_template": "Inspect {item}. Report concrete paths and distinguish observed facts from inferences. Do not edit files.",
+      "agent": "claude",
+      "role": "read-only investigator"
+    },
+    {
+      "id": "countercheck",
+      "items": ["source and evidence consistency", "gaps the inventory is likely to miss"],
+      "task_template": "Adversarially check {item} in this repository. Report corrections and supporting paths. Do not edit files.",
+      "agent": "codex",
+      "role": "read-only verifier"
+    },
+    {
+      "id": "synthesize",
+      "needs": ["inventory", "countercheck"],
+      "task": "Read the prior node receipts and produce a concise inventory in your structured handoff. Do not edit files.",
+      "agent": "claude",
+      "role": "read-only lead reviewer"
+    }
+  ],
+  "acceptance": {
+    "required_nodes": ["synthesize"]
+  }
+}

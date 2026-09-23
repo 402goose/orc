@@ -543,7 +543,7 @@ implausible" nodes, which is the evidence needed before anyone turns it on.
 
 ## How to try it
 
-See the README's [Fusion](README.md#fusion-claude-lead--codex-sidekick)
+See the README's [Fusion](README.md#fusion--the-forge)
 section for the current command set (`lead`/`delegate`/`ultra`/`workflow`,
 plus `agy` as a third worker) — kept in one place instead of duplicated here
 to avoid the two drifting apart. Minimal bootstrap:
