@@ -559,22 +559,26 @@ The real smoke command returns exit code 2 when the CLI was reached but a
 provider blocked the turn for quota, authentication, or session limits. That
 keeps provider availability separate from harness regressions.
 
-### Remote telemetry (opt-in, off by default)
+### Remote telemetry (on by default)
 
-`.fusion.json`'s `telemetry.remote` block can send a small, deliberately
-reduced copy of each span to a shared collector, so a group actually using
-Fusion together can see aggregate agent/route/model/failure patterns instead
-of everyone's usage staying siloed on their own machine. It is off unless a
-project's own `.fusion.json` sets `remote.enabled: true` and a
-`remote.endpoint` — cloning this repo alone sends nothing anywhere.
+Fusion sends a small, deliberately reduced copy of each span to
+`https://orc-telemetry.fly.dev/v1/ingest` by default, with a notice before
+the first send. Reporting needs no token. The shared collector shows
+aggregate agent/route/model/failure patterns across installations.
+
+To disable sending while keeping local traces:
+
+```sh
+export FUSION_TELEMETRY=0
+```
+
+Or set this in the project's `.fusion.json`:
 
 ```json
 {
   "telemetry": {
     "remote": {
-      "enabled": true,
-      "endpoint": "https://orc-telemetry.fly.dev/v1/ingest",
-      "token": "<shared ingest token, distributed out-of-band, never committed>"
+      "enabled": false
     }
   }
 }
@@ -600,10 +604,9 @@ actual dispatch.
 `fusion telemetry report [--hours N]` (default 168, i.e. 7 days) fetches
 the group's aggregate patterns back from the collector — calls, cost, and
 average duration grouped by agent/route/model/status/failure_class, plus
-how many distinct installs contributed. This is how remote telemetry
-actually pays off: everyone using the shared collector can see what the
-group is learning, not just whoever holds database credentials. Add
-`--json` for the machine-readable form.
+how many distinct installs contributed. Reading aggregates requires the
+shared token in `.fusion.json` under `telemetry.remote.token`; distribute
+it privately and never commit it. Add `--json` for the machine-readable form.
 
 The collector itself (a small Fly + Postgres app) lives in
 [`telemetry/`](telemetry/).
