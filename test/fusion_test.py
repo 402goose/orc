@@ -324,13 +324,8 @@ print(json.dumps({{'conversation_id':'denied-session', 'status':'SUCCESS', 'resp
         self.assertNotIn("--conversation", calls[-1]["argv"])
 
     def test_codex_command_execution_failure_is_surfaced_as_evidence(self):
-        # Matches the real command_execution item shape from a live
-        # `codex exec --json` run. A command failing mid-turn is structural
-        # evidence Fusion previously never looked at -- it's surfaced as a
-        # blocker so the contradiction is visible, but deliberately does not
-        # override status on its own: a nonzero exit isn't always a real
-        # failure (grep returning 1 for "no matches" is routine), so this is
-        # evidence for a human or acceptance gate to weigh, not a verdict.
+        # Nonzero command exits stay visible without becoming unresolved
+        # blockers. Real provider failures and handoff blockers remain fatal.
         codex = self.write_agent(
             "codex-command-failure",
             """
@@ -352,12 +347,45 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'output_tok
                 0,
             )
         result = json.loads(output.getvalue())
-        # Self-reported STATUS still wins for the overall verdict...
         self.assertEqual(result["status"], "success")
-        # ...but the contradicting evidence is visible, not silently lost.
-        self.assertEqual(len(result["blockers"]), 1)
-        self.assertIn("command exited 1", result["blockers"][0])
-        self.assertIn("pytest", result["blockers"][0])
+        self.assertEqual(result["blockers"], [])
+        self.assertEqual(len(result["command_evidence"]), 1)
+        self.assertIn("command exited 1", result["command_evidence"][0])
+        self.assertIn("pytest", result["command_evidence"][0])
+
+    def test_workflow_command_observations_do_not_override_acceptance(self):
+        for case in ("recovered", "unresolved", "failed_check", "missing_tests", "provider_error"):
+            with self.subTest(case=case):
+                handoff = ("STATUS: success\nSUMMARY: reviewed\nCHANGED: none\n"
+                           f"TESTS: {'none' if case == 'missing_tests' else 'tests passed'}\n"
+                           f"BLOCKERS: {'tests still fail' if case == 'unresolved' else 'none'}")
+                events = [
+                    {"type": "item.completed", "item": {"type": "command_execution",
+                     "command": "cat incorrect-path", "exit_code": 1}},
+                    {"type": "item.completed", "item": {"type": "command_execution",
+                     "command": "cat correct-path", "exit_code": 0}},
+                    {"type": "item.completed", "item": {"type": "agent_message", "text": handoff}},
+                    {"type": "turn.failed", "error": {"message": "provider unavailable"}}
+                    if case == "provider_error" else {"type": "turn.completed"},
+                ]
+                codex = self.write_agent("codex-observations", f"print({chr(10).join(json.dumps(e) for e in events)!r})\n")
+                self.config(codex=codex)
+                spec = {"task": "Review with recovered lookup", "max_attempts": 1,
+                        "nodes": [{"id": "review", "role": "review", "agent": "codex", "task": "Review",
+                                   "acceptance": {"required_handoff": ["summary", "tests"],
+                                                  "checks": [[sys.executable, "-c", f"raise SystemExit({1 if case == 'failed_check' else 0})"]]}}]}
+                path = self.workspace / "observations.json"
+                path.write_text(json.dumps(spec))
+                outcome = run_workflow(self.workspace, json.loads((self.workspace / ".fusion.json").read_text()), path)
+                self.assertEqual(outcome["status"], "success" if case == "recovered" else "failed")
+                result = outcome["nodes"][0]["result"]
+                self.assertEqual(result["command_evidence"], ["command exited 1: cat incorrect-path"])
+                expected = {"unresolved": "tests still fail", "failed_check": "acceptance check failed",
+                            "missing_tests": "required handoff field is empty: tests", "provider_error": "provider unavailable"}
+                if case in expected:
+                    self.assertIn(expected[case], "\n".join(result["blockers"]))
+                else:
+                    self.assertEqual(result["blockers"], [])
 
     def test_claude_json_result_is_structured(self):
         claude = self.write_agent(

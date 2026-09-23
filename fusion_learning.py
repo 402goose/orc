@@ -1,0 +1,131 @@
+"""Read-only learning evidence: reviewed coverage, candidate lineage, evaluations."""
+from collections import Counter, defaultdict
+import json
+from pathlib import Path
+
+from fusion_decisions import DecisionEngine, DecisionStore, digest, read_jsonl, reviewed_labels
+
+
+def read_object(path):
+    try:
+        value = json.loads(Path(path).read_text())
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def decision_rows(workspace):
+    events = read_jsonl(DecisionStore(workspace).path)
+    answers, excluded = reviewed_labels(events)
+    rows = {e['id']: {**e, 'applications': [], 'labels': [], 'suggestions': []}
+            for e in events if e.get('event') == 'decision'}
+    fields = {'application': 'applications', 'label': 'labels', 'label_suggestion': 'suggestions'}
+    for event in events:
+        row = rows.get(event.get('id'))
+        if row is not None and event.get('event') in fields:
+            row[fields[event['event']]].append(event)
+    for key, row in rows.items():
+        row['reviewed_answers'] = answers.get(key, {})
+        row['excluded'] = excluded.get(key, False)
+        suggestion = row['suggestions'][-1] if row['suggestions'] else None
+        approved_at = max((e.get('time_ms', 0) for e in row['labels'] if e.get('verified')), default=-1)
+        if row['excluded']:
+            state = 'excluded'
+        elif row.get('status') != 'ok' or row.get('truncated'):
+            state = 'ineligible'
+        elif suggestion and suggestion.get('time_ms', 0) > approved_at:
+            state = 'needs_review' if suggestion.get('answers') else 'needs_evidence'
+        elif row['reviewed_answers']:
+            state = 'approved'
+        else:
+            state = 'needs_draft'
+        row['garden_state'] = state
+    return sorted(reversed(list(rows.values())), key=lambda r: r.get('time_ms', 0), reverse=True)
+
+
+def learning_artifacts(workspace):
+    """Index successful UI learning jobs without loading model weights."""
+    root = Path(workspace) / '.fusion'
+    artifacts = []
+    for path in (root / 'ui/jobs').glob('*/job.json'):
+        job = read_object(path)
+        if job.get('action') not in {'export', 'train', 'evaluate', 'calibrate'}:
+            continue
+        request = read_object(path.with_name('request.json'))
+        result = job.get('result') if isinstance(job.get('result'), dict) else {}
+        metadata = request.get('learning') or {}
+        argv = request.get('argv', [])
+        model_path = metadata.get('model_path', '')
+        if not model_path and '--model-path' in argv:
+            model_path = argv[argv.index('--model-path') + 1]
+        if model_path:
+            path_value = Path(model_path).expanduser()
+            model_path = str((path_value if path_value.is_absolute() else root / path_value).resolve())
+        entry = {k: job.get(k) for k in ('id', 'action', 'status', 'started_at_ms')}
+        entry.update(result=result, model_path=model_path, dataset=metadata.get('dataset', ''))
+        if job.get('action') == 'train' and job.get('status') == 'success':
+            candidate = path.parent / 'candidate'
+            entry['training'] = read_object(candidate / 'training.json')
+            entry['path'] = str(candidate)
+        elif job.get('status') == 'success':
+            entry['path'] = result.get('path') or str(path.parent / ('calibration.json' if job['action'] == 'calibrate' else 'dataset.jsonl'))
+        artifacts.append(entry)
+    return sorted(artifacts, key=lambda a: a.get('started_at_ms') or 0, reverse=True)
+
+
+def learning_summary(workspace, config, rows=None):
+    rows = decision_rows(workspace) if rows is None else rows
+    counts = Counter(row['garden_state'] for row in rows)
+    kinds, distribution, growth = {}, defaultdict(Counter), Counter()
+    groups = {'train': set(), 'validation': set()}
+    labeled, questions, agreed, compared = 0, 0, 0, 0
+    for row in rows:
+        kind = kinds.setdefault(row['kind'], {'eligible': 0, 'reviewed': 0, 'questions': 0, 'labeled': 0})
+        if row.get('status') != 'ok' or row.get('truncated') or row['excluded']:
+            continue
+        kind['eligible'] += 1
+        kind['questions'] += len(row['questions'])
+        questions += len(row['questions'])
+        answers = row['reviewed_answers']
+        if not answers:
+            continue
+        kind['reviewed'] += 1
+        kind['labeled'] += len(answers)
+        labeled += len(answers)
+        group = row.get('context', {}).get('group') or row.get('context', {}).get('task_id') or digest(row['state'])
+        split = 'validation' if int(digest(group)[:8], 16) % 5 == 0 else 'train'
+        groups[split].add(group)
+        for key, value in answers.items():
+            distribution[f"{row['kind']} · {key}"][value] += 1
+            prediction = row.get('prediction', {}).get(key, {})
+            if prediction:
+                compared += 1
+                agreed += max(prediction, key=prediction.get) == value
+        # First human review date, current retained question count (not duplicate approvals).
+        first_review = next((e for e in row['labels'] if e.get('verified')), {})
+        growth[first_review.get('time_ms', row.get('time_ms', 0)) // 86400000] += len(answers)
+    artifacts = learning_artifacts(workspace)
+    candidates = [a for a in artifacts if a['action'] == 'train' and a['status'] == 'success']
+    evaluations = [a for a in artifacts if a['action'] == 'evaluate' and a['status'] == 'success']
+    exports = [a for a in artifacts if a['action'] == 'export' and a['status'] == 'success']
+    engine = DecisionEngine(workspace, config)
+    options = engine.options
+    calibration = engine.calibration()
+    configured = options.get('model_path', '')
+    observed = next((r for r in rows if r.get('status') == 'ok' and r.get('model_identity')), {})
+    training = read_object(Path(configured) / 'training.json') if configured else {}
+    from fusion_quality import review_quality, matched_comparisons
+    return {'counts': dict(counts), 'total': len(rows), 'labeled_questions': labeled, 'eligible_questions': questions,
+            'reviewed_decisions': sum(k['reviewed'] for k in kinds.values()), 'kinds': kinds,
+            'groups': {k: len(v) for k, v in groups.items()}, 'can_train': all(groups.values()),
+            'growth': [{'day_ms': day * 86400000, 'labels': n} for day, n in sorted(growth.items())],
+            'distribution': {k: dict(v) for k, v in distribution.items()},
+            'agreement': {'matched': agreed, 'compared': compared, 'rate': agreed / compared if compared else None},
+            'model': {'path': configured, 'mode': options['mode'], 'training': training,
+                      'last_observed_identity': observed.get('model_identity'),
+                      'last_observed_at_ms': observed.get('time_ms'),
+                      'qualified_buckets': sum(b.get('qualified') is True for b in calibration.get('buckets', {}).values()),
+                      'calibration_identity': calibration.get('model_identity')},
+            'quality': review_quality(rows), 'comparisons': matched_comparisons(candidates, evaluations),
+            'candidates': candidates, 'evaluations': evaluations, 'exports': exports,
+            'jobs': artifacts[:10]}

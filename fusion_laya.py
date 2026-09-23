@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import OrderedDict
+from collections import OrderedDict, Counter, defaultdict
 import contextlib
 import hashlib
 import importlib.metadata
@@ -111,13 +111,21 @@ def dataset_rows(path):
 
 
 def evaluate(args):
-    from fusion_decisions import distribution
+    from fusion_decisions import distribution, digest
+    from fusion_quality import dataset_quality, input_key
     rows = dataset_rows(args.dataset)
     backend, output = Backend(), Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     # Predict both partitions: temperature fitting uses train; qualification uses validation.
     correct = total = 0
     results = []
+    by_kind = defaultdict(lambda: {"correct": 0, "questions": 0})
+    train_labels = defaultdict(Counter)
+    for row in rows:
+        if row["split"] == "train":
+            for key, label in row["labels"].items():
+                train_labels[digest(row["questions"][key])][label] += 1
+    majority_correct = majority_total = 0
     for row in rows:
         result = backend.predict({"state": row["state"], "questions": row["questions"],
                                   "model_path": args.model_path, "device": args.device})
@@ -128,6 +136,13 @@ def evaluate(args):
             for key, label in row["labels"].items():
                 total += 1
                 correct += max(prediction[key], key=prediction[key].get) == label
+                metric = by_kind[row["kind"]]
+                metric["questions"] += 1
+                metric["correct"] += max(prediction[key], key=prediction[key].get) == label
+                counts = train_labels[digest(row["questions"][key])]
+                if counts:
+                    majority_total += 1
+                    majority_correct += sorted(counts, key=lambda v: (-counts[v], v))[0] == label
         results.append({**row, "prediction": prediction, "model_identity": result["model_identity"]})
     # Control: score each held-out example against another example's state. A model
     # that scores the same here is answering from the question, not the state.
@@ -138,6 +153,8 @@ def evaluate(args):
             foreign = validation[(index + 1) % len(validation)]["state"]
             result = backend.predict({"state": foreign, "questions": row["questions"],
                                       "model_path": args.model_path, "device": args.device})
+            if result["truncated"]:
+                raise ValueError("shuffled-state control truncates a reviewed example")
             prediction = {key: distribution(result["answers"][key], q) for key, q in row["questions"].items()}
             for key, label in row["labels"].items():
                 control_total += 1
@@ -146,8 +163,32 @@ def evaluate(args):
         for row in results:
             handle.write(json.dumps(row) + "\n")
     output.chmod(0o600)
-    return {"path": str(output), "validation_questions": total, "accuracy": correct / total if total else None,
-            "control_accuracy": control_correct / control_total if control_total else None}
+    quality = dataset_quality(rows)
+    ancestry = {}
+    if args.model_path:
+        metadata = Path(args.model_path) / 'training.json'
+        if metadata.is_file():
+            ancestry = json.loads(metadata.read_text())
+    overlap_groups = set(ancestry.get('seen_train_groups', [])) & {digest(r['group']) for r in validation}
+    overlap_inputs = set(ancestry.get('seen_train_inputs', [])) & {input_key(r) for r in validation}
+    contaminated = bool(overlap_groups or overlap_inputs or quality['cross_split_duplicates'] or quality['group_overlap'])
+    lineage_known = not args.model_path or ancestry.get('lineage_complete') is True
+    holdout = {"status": "contaminated" if contaminated else "checked" if lineage_known else "unknown",
+               "overlap_groups": len(overlap_groups), "overlap_inputs": len(overlap_inputs),
+               "cross_split_duplicates": len(quality['cross_split_duplicates'])}
+    benchmark = [{k: r[k] for k in ('id', 'group', 'state', 'questions', 'labels')} for r in sorted(validation, key=lambda r: r['id'])]
+    report = {"path": str(output), "validation_questions": total, "accuracy": correct / total if total else None,
+              "correct": correct, "by_kind": {k: {**v, "accuracy": v['correct'] / v['questions']} for k, v in by_kind.items()},
+              "majority_accuracy": majority_correct / majority_total if majority_total else None,
+              "majority_questions": majority_total,
+              "control_accuracy": control_correct / control_total if control_total else None,
+              "control_questions": control_total,
+              "validation_groups": len({row['group'] for row in validation}),
+              "dataset_hash": hashlib.sha256(Path(args.dataset).read_bytes()).hexdigest(),
+              "benchmark_hash": digest(benchmark), "data_quality": quality, "holdout": holdout,
+              "model_path": args.model_path, "model_identities": sorted({r['model_identity'] for r in results})}
+    output.with_suffix('.report.json').write_text(json.dumps(report, indent=2))
+    return report
 
 
 def train(args):
@@ -155,7 +196,8 @@ def train(args):
     import torch
     from laya.common import QTYPES, build_sequence, collate_items
     from safetensors.torch import save_file
-    from fusion_decisions import labels_for
+    from fusion_decisions import labels_for, digest
+    from fusion_quality import dataset_quality, input_key
     rows = dataset_rows(args.dataset)
     train_rows = [row for row in rows if row["split"] == "train"]
     if not train_rows or not any(row["split"] == "validation" for row in rows):
@@ -201,9 +243,17 @@ def train(args):
     cfg = {**agent.cfg, "temperature": [1, 1, 1], "temperature_by_options": {}}
     (output / "rl_agent_config.json").write_text(json.dumps(cfg, indent=2))
     save_file({key: tensor.detach().cpu().contiguous() for key, tensor in agent.model.state_dict().items()}, str(output / "model.safetensors"))
+    parent = {}
+    if args.model_path and (Path(args.model_path) / 'training.json').is_file():
+        parent = json.loads((Path(args.model_path) / 'training.json').read_text())
     report = {"method": "supervised decision-head fine-tuning", "source_identity": source_id,
+              "model_identity": identity(output),
               "dataset_hash": hashlib.sha256(Path(args.dataset).read_bytes()).hexdigest(),
               "seed": args.seed, "epochs": args.epochs, "steps": steps, "mean_loss": sum(losses) / steps,
+              "data_quality": dataset_quality(train_rows),
+              "seen_train_groups": sorted(set(parent.get('seen_train_groups', [])) | {digest(r['group']) for r in train_rows}),
+              "seen_train_inputs": sorted(set(parent.get('seen_train_inputs', [])) | {input_key(r) for r in train_rows}),
+              "lineage_complete": not args.model_path or parent.get('lineage_complete') is True,
               "train_groups": len({row["group"] for row in train_rows}), "promoted": False}
     (output / "training.json").write_text(json.dumps(report, indent=2))
     return {**report, "path": str(output)}
