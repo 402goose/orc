@@ -337,10 +337,47 @@ class DecisionsTest(unittest.TestCase):
             resumed = resume_workflow(self.workspace, self.config, first["workflow_id"])
         self.assertEqual(len(resumed["attempt_ledger"]), 1)
 
+    def test_quota_vocabulary_is_shared_by_classification_cooldown_and_pause(self):
+        for result in [{"status": "error", "blockers": ["Insufficient credits"]},
+                       {"status": "error", "summary": "HTTP 429 Too Many Requests", "blockers": []}]:
+            self.assertEqual(core.failure_class(result), "quota")
+            self.assertTrue(core.quota_failure(result))
+        self.assertIsNone(core.failure_class({"status": "success", "summary": "quota notes updated", "blockers": []}))
+        store = core.RunStore(self.workspace)
+        stale = core.now_ms() - (core.LANE_COOLDOWN_SECONDS + 1) * 1000
+        with patch.object(store, "traces", return_value=[{"agent": "codex", "failure_class": "quota", "end_time_ms": stale}]):
+            self.assertIn("codex", [c["key"] for c in route_candidates(self.config, self.task(), store)])
+        with patch.object(store, "traces", return_value=[{"agent": "codex", "failure_class": "quota", "end_time_ms": core.now_ms()}]):
+            self.assertNotIn("codex", [c["key"] for c in route_candidates(self.config, self.task(), store)])
+
+    def test_repeated_identical_failure_stops_before_the_attempt_limit(self):
+        config = {**self.config, "decisions": {"mode": "off"}}
+        spec = {"max_attempts": 3, "nodes": [{"id": "build", "agent": "codex", "task": "Fix defect"}]}
+        with patch.object(core, "dispatch", side_effect=lambda *a, **k: {"status": "error", "blockers": ["ModuleNotFoundError: laya"], "usage": {}}):
+            result = WorkflowRunner(self.workspace, config, spec).run()
+        node = result["nodes"][0]
+        self.assertEqual((node["attempts"], node["status"]), (2, "failed"))
+        self.assertTrue(any("repeated the previous attempt" in blocker for blocker in node["result"]["blockers"]))
+        distinct = iter(["first", "second", "third"])
+        with patch.object(core, "dispatch", side_effect=lambda *a, **k: {"status": "error", "blockers": [next(distinct)], "usage": {}}):
+            result = WorkflowRunner(self.workspace, config, spec).run()
+        self.assertEqual((result["nodes"][0]["attempts"], result["nodes"][0]["status"]), (3, "failed"))
+
+    def test_recovery_cannot_repair_a_repeated_failure(self):
+        engine = self.engine({"action": "repair"}, "active")
+        self.qualify(engine, "recovery", RECOVERY_QUESTIONS)
+        node = {"agent": "auto", "attempts": 2, "repeated_failure": True}
+        with patch("fusion_policy.DecisionEngine", return_value=engine):
+            action, _ = recovery(self.config, self.workspace, "w", node, {"status": "error", "blockers": ["same"]}, False, 3)
+        self.assertEqual(action, "stop")
+        self.assertIn('"repeated_failure": true', engine.store.records()[-1]["state"])
+
     def test_retry_costs_survive_budget_pause_and_resume(self):
         config = {**self.config, "decisions": {"mode": "off"}}
         spec = {"max_attempts": 3, "budget_usd": 1, "nodes": [{"id": "build", "agent": "codex", "task": "Fix defect"}]}
-        with patch.object(core, "dispatch", return_value={"status": "error", "blockers": ["failed test"], "usage": {"cost_usd": .6}}) as dispatch:
+        # Distinct failures per attempt: identical ones now stop as a stuck loop before the budget matters.
+        failures = iter(["failed test", "failed a different test", "still failing"])
+        with patch.object(core, "dispatch", side_effect=lambda *a, **k: {"status": "error", "blockers": [next(failures)], "usage": {"cost_usd": .6}}) as dispatch:
             runner = WorkflowRunner(self.workspace, config, spec)
             result = runner.run()
             self.assertEqual(dispatch.call_count, 2)
