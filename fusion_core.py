@@ -1703,7 +1703,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     build = sub.add_parser("build", help="turn a feature idea into an interactive build, with planning and review instructions included")
     build.add_argument("--agent", choices=["claude", "codex"], default="codex", help="lead agent (default: codex)")
-    build.add_argument("--kind", choices=["discovery", "build", "debug", "review"], help="explicit workflow; planning-only requests remain read-only")
+    build.add_argument("--kind", choices=["discovery", "build", "debug", "review", "sweep"], help="explicit workflow; planning-only requests remain read-only")
+    build.add_argument(
+        "--across", action="append", metavar="DIMENSION", default=[],
+        help="fan one read-only worker out per dimension, then synthesize their findings; repeat the flag "
+             "or comma-separate. Implies --kind sweep.",
+    )
     build_mode = build.add_mutually_exclusive_group()
     build_mode.add_argument("--plan-only", action="store_true", help="save the brief and workflow without starting coding agents")
     build_mode.add_argument("--execute", action="store_true", help="execute the generated bounded workflow instead of an interactive lead")
@@ -1988,7 +1993,8 @@ def _main(args, parser) -> int:
             parser.error("feature idea must not be empty")
         from fusion_build import prepare, run_prepared
         try:
-            prepared = prepare(workspace, config, args.idea, args.kind, args.budget_usd, args.max_attempts, execute=args.execute)
+            prepared = prepare(workspace, config, args.idea, args.kind, args.budget_usd, args.max_attempts,
+                               execute=args.execute, across=args.across)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             parser.error(str(exc))
         if args.plan_only:

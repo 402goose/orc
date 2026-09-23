@@ -11,6 +11,13 @@ const esc = (value) =>
       ],
   );
 const pretty = (value) => JSON.stringify(value, null, 2);
+// `graph` is derived from `nodes` and regenerated on every validate, so showing
+// it in an editor invites edits that are silently discarded.
+const withoutDerived = (spec) => {
+  if (!spec || typeof spec !== "object") return spec;
+  const { graph, ...rest } = spec;
+  return rest;
+};
 const active = (status) => ["running", "queued", "stopping"].includes(status);
 const badge = (value) =>
   `<span class="status ${esc(value)}">${esc((value || "unknown").replaceAll("_", " "))}</span>`;
@@ -713,6 +720,7 @@ function openLaunch(options = {}) {
       ["build", "Build a feature"],
       ["debug", "Reproduce & fix"],
       ["review", "Independent review"],
+      ["sweep", "Sweep in parallel"],
       ["delegate", "Single worker"],
       ["workflow", "Custom workflow JSON"],
     ]
@@ -722,7 +730,7 @@ function openLaunch(options = {}) {
       )
       .join(
         "",
-      )}</select></div><div class="field"><label for="launch-mode">Laya mode for this run</label><select id="launch-mode" name="mode">${["shadow", "off", "active"].map((m) => `<option ${m === (state.config?.mode || "shadow") ? "selected" : ""}>${m}</option>`).join("")}</select></div></div><div class="field" id="prompt-field"><label for="launch-text">${options.from_workflow ? "Additional constraints" : "What should happen?"}</label><textarea id="launch-text" name="text" rows="6" placeholder="Describe a feature, a bug, an investigation, or paste a GitHub issue URL…">${esc(options.text || "")}</textarea></div><div id="custom-field" class="field" hidden><label for="launch-spec">fusion.workflow.v1 JSON</label><textarea id="launch-spec" class="editor" name="spec" spellcheck="false">${esc(pretty(options.spec || { schema: "fusion.workflow.v1", task: "Inspect this repository", nodes: [{ id: "explore", agent: "auto", write: false, task: "Inspect the repository and report useful findings. Do not delegate further." }] }))}</textarea></div><div class="form-grid" id="worker-fields" hidden><div class="field"><label>Worker</label><select name="agent">${["auto", "codex", "claude", "agy", "grok"].map((a) => `<option>${a}</option>`).join("")}</select></div><div class="field"><label>Role</label><select name="role">${["review", "discovery", "planning", "implementation"].map((a) => `<option>${a}</option>`).join("")}</select></div><div class="field full"><label>Route</label><select name="route"><option value="">Automatic / native</option>${Object.keys(
+      )}</select></div><div class="field"><label for="launch-mode">Laya mode for this run</label><select id="launch-mode" name="mode">${["shadow", "off", "active"].map((m) => `<option ${m === (state.config?.mode || "shadow") ? "selected" : ""}>${m}</option>`).join("")}</select></div></div><div class="field" id="prompt-field"><label for="launch-text">${options.from_workflow ? "Additional constraints" : "What should happen?"}</label><textarea id="launch-text" name="text" rows="6" placeholder="Describe a feature, a bug, an investigation, or paste a GitHub issue URL…">${esc(options.text || "")}</textarea></div><div id="across-field" class="field" hidden><label for="launch-across">Dimensions to sweep, comma separated</label><input id="launch-across" name="across" placeholder="auth, payments, data integrity, performance"><p class="hint">One read-only worker per dimension, in parallel, then one that reads all of them and writes a ranked account.</p></div><div id="custom-field" class="field" hidden><label for="launch-spec">fusion.workflow.v1 JSON</label><textarea id="launch-spec" class="editor" name="spec" spellcheck="false">${esc(pretty(options.spec || { schema: "fusion.workflow.v1", task: "Inspect this repository", nodes: [{ id: "explore", agent: "auto", write: false, task: "Inspect the repository and report useful findings. Do not delegate further." }] }))}</textarea></div><div class="form-grid" id="worker-fields" hidden><div class="field"><label>Worker</label><select name="agent">${["auto", "codex", "claude", "agy", "grok"].map((a) => `<option>${a}</option>`).join("")}</select></div><div class="field"><label>Role</label><select name="role">${["review", "discovery", "planning", "implementation"].map((a) => `<option>${a}</option>`).join("")}</select></div><div class="field full"><label>Route</label><select name="route"><option value="">Automatic / native</option>${Object.keys(
       state.config?.effective?.routes || {},
     )
       .map((r) => `<option>${esc(r)}</option>`)
@@ -738,6 +746,7 @@ function updateLaunch() {
   const k = $("#launch-kind").value,
     prep = $("#prepare-only").checked && !["delegate", "workflow"].includes(k);
   $("#custom-field").hidden = k !== "workflow";
+  $("#across-field").hidden = k !== "sweep";
   $("#prompt-field").hidden = k === "workflow";
   $("#worker-fields").hidden = k !== "delegate";
   $("#build-fields").hidden = ["delegate", "workflow"].includes(k);
@@ -1030,7 +1039,7 @@ document.addEventListener("click", async (event) => {
         text: "Keep this change scoped. Preserve existing work, add meaningful regression coverage, and run relevant checks. Do not commit, push, or deploy.",
       });
     } else if (a === "custom-from-run")
-      openLaunch({ kind: "workflow", spec: state.report.spec });
+      openLaunch({ kind: "workflow", spec: withoutDerived(state.report.spec) });
     else if (a === "decision") {
       state.decision = target.dataset.id;
       decisions();
@@ -1133,6 +1142,7 @@ document.addEventListener("submit", async (event) => {
         allow_write: !!values.allow_write,
         prepare: !!values.prepare,
         spec: kind === "workflow" ? JSON.parse(values.spec) : undefined,
+        across: kind === "sweep" ? String(values.across || "").split(",").map((d) => d.trim()).filter(Boolean) : undefined,
         publish: ["build", "debug"].includes(kind) ? publishValues("launch") : undefined,
       });
     } else if (form.id === "publish-preview-form") {
