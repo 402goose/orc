@@ -10,14 +10,17 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	_ "embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,8 +31,10 @@ import (
 var schemaSQL string
 
 const (
-	maxBodyBytes   = 1 << 20 // 1MB: generous for a batch of a few dozen spans, small enough to bound abuse.
-	maxSpansPerReq = 500
+	maxBodyBytes       = 1 << 20 // 1MB: generous for a batch of a few dozen spans, small enough to bound abuse.
+	maxSpansPerReq     = 500
+	defaultWindowHours = 168 // 7 days
+	maxWindowHours     = 24 * 90
 )
 
 type span struct {
@@ -53,6 +58,26 @@ type ingestPayload struct {
 	Schema    string `json:"schema"`
 	InstallID string `json:"install_id"`
 	Spans     []span `json:"spans"`
+}
+
+type summaryRow struct {
+	Agent             *string `json:"agent"`
+	Route             *string `json:"route"`
+	Model             *string `json:"model"`
+	Status            *string `json:"status"`
+	FailureClass      *string `json:"failure_class"`
+	Calls             int64   `json:"calls"`
+	TotalCostUSD      float64 `json:"total_cost_usd"`
+	TotalInputTokens  float64 `json:"total_input_tokens"`
+	TotalOutputTokens float64 `json:"total_output_tokens"`
+	AvgDurationMs     float64 `json:"avg_duration_ms"`
+}
+
+type summaryResponse struct {
+	WindowHours    int          `json:"window_hours"`
+	TotalSpans     int64        `json:"total_spans"`
+	UniqueInstalls int64        `json:"unique_installs"`
+	ByGroup        []summaryRow `json:"by_group"`
 }
 
 type server struct {
@@ -91,6 +116,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 	mux.HandleFunc("POST /v1/ingest", srv.handleIngest)
+	mux.HandleFunc("GET /v1/summary", srv.handleSummary)
 
 	log.Printf("orc-telemetry listening on :%s", port)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
@@ -136,16 +162,12 @@ func (s *server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
-	if payload.InstallID == "" {
-		http.Error(w, "install_id is required", http.StatusBadRequest)
+	if err := validateIngestPayload(payload); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if len(payload.Spans) == 0 {
 		w.WriteHeader(http.StatusAccepted)
-		return
-	}
-	if len(payload.Spans) > maxSpansPerReq {
-		http.Error(w, "too many spans in one batch", http.StatusBadRequest)
 		return
 	}
 
@@ -157,6 +179,55 @@ func (s *server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// validateIngestPayload is pure (no I/O) so it can be unit tested without a
+// database.
+func validateIngestPayload(payload ingestPayload) error {
+	if payload.InstallID == "" {
+		return errors.New("install_id is required")
+	}
+	if len(payload.Spans) > maxSpansPerReq {
+		return errors.New("too many spans in one batch")
+	}
+	return nil
+}
+
+func (s *server) handleSummary(w http.ResponseWriter, r *http.Request) {
+	if !validBearerToken(r.Header.Get("Authorization"), s.token) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	hours, err := parseWindowHours(r.URL.Query().Get("hours"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	resp, err := s.querySummary(ctx, hours)
+	if err != nil {
+		log.Printf("query summary: %v", err)
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("encode summary: %v", err)
+	}
+}
+
+// parseWindowHours is pure so it can be unit tested without a server.
+func parseWindowHours(raw string) (int, error) {
+	if raw == "" {
+		return defaultWindowHours, nil
+	}
+	hours, err := strconv.Atoi(raw)
+	if err != nil || hours <= 0 || hours > maxWindowHours {
+		return 0, fmt.Errorf("hours must be a positive integer up to %d", maxWindowHours)
+	}
+	return hours, nil
 }
 
 func (s *server) insertSpans(ctx context.Context, installID string, spans []span) error {
@@ -194,10 +265,59 @@ func (s *server) insertSpans(ctx context.Context, installID string, spans []span
 	return tx.Commit()
 }
 
+func (s *server) querySummary(ctx context.Context, hours int) (*summaryResponse, error) {
+	resp := &summaryResponse{WindowHours: hours}
+
+	totals := s.db.QueryRowContext(ctx, `
+		SELECT count(*), count(DISTINCT install_id)
+		FROM spans
+		WHERE received_at > now() - make_interval(hours => $1)
+	`, hours)
+	if err := totals.Scan(&resp.TotalSpans, &resp.UniqueInstalls); err != nil {
+		return nil, err
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT agent, route, model, status, failure_class,
+		       count(*) AS calls,
+		       COALESCE(sum((usage->>'cost_usd')::numeric), 0) AS total_cost_usd,
+		       COALESCE(sum((usage->>'input_tokens')::numeric), 0) AS total_input_tokens,
+		       COALESCE(sum((usage->>'output_tokens')::numeric), 0) AS total_output_tokens,
+		       COALESCE(avg(duration_ms), 0) AS avg_duration_ms
+		FROM spans
+		WHERE received_at > now() - make_interval(hours => $1)
+		GROUP BY agent, route, model, status, failure_class
+		ORDER BY calls DESC
+		LIMIT 200
+	`, hours)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var row summaryRow
+		if err := rows.Scan(
+			&row.Agent, &row.Route, &row.Model, &row.Status, &row.FailureClass,
+			&row.Calls, &row.TotalCostUSD, &row.TotalInputTokens, &row.TotalOutputTokens, &row.AvgDurationMs,
+		); err != nil {
+			return nil, err
+		}
+		resp.ByGroup = append(resp.ByGroup, row)
+	}
+	return resp, rows.Err()
+}
+
 func validBearerToken(header, expected string) bool {
+	if expected == "" {
+		// main() already refuses to start with an empty INGEST_TOKEN, but
+		// never treat "no token configured" as "anything authenticates".
+		return false
+	}
 	const prefix = "Bearer "
 	if !strings.HasPrefix(header, prefix) {
 		return false
 	}
-	return header[len(prefix):] == expected
+	provided := header[len(prefix):]
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
 }
