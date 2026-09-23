@@ -185,6 +185,47 @@ def identifier(value):
     return value
 
 
+def model_path_for(workspace, requested):
+    """Resolve a checkpoint path for a train/evaluate job.
+
+    A checkpoint is a read-only input, not a workspace artifact, and it
+    legitimately lives outside the workspace: `decisions setup` downloads one
+    through snapshot_download into the Hugging Face cache, and a machine that
+    shares one checkpoint across repositories keeps it somewhere central.
+    Requiring it under .fusion rejected every one of those, and the automatic
+    training loop turned that into a permanent stall — it re-dispatched the
+    identical request on retry, so the round never recovered.
+
+    Containment still matters, because `requested` arrives in an HTTP body.
+    So trust the project's own configuration rather than the request: a path is
+    allowed when it is inside .fusion, or when the config already names that
+    checkpoint. Anything else is refused as before.
+    """
+    fusion_root = (Path(workspace) / ".fusion").resolve()
+    candidate = Path(requested).expanduser()
+    candidate = (candidate if candidate.is_absolute() else fusion_root / candidate).resolve()
+    if candidate.is_relative_to(fusion_root):
+        return candidate
+    configured = ""
+    try:
+        config, _ = core.load_config(workspace)
+        configured = (config.get("decisions") or {}).get("model_path") or ""
+    except (OSError, ValueError, SystemExit):
+        # load_config exits the process on malformed JSON, which suits a CLI
+        # and not a server. Either way, a config we cannot read grants nothing:
+        # fail closed rather than fall back to trusting the request.
+        configured = ""
+    if configured:
+        declared = Path(configured).expanduser()
+        declared = (declared if declared.is_absolute() else Path(workspace) / declared).resolve()
+        if candidate == declared or candidate.is_relative_to(declared):
+            return candidate
+    raise ValueError(
+        "A checkpoint must be inside this workspace's .fusion directory, or the "
+        "one named by decisions.model_path in .fusion.json"
+    )
+
+
 def inside(root, path):
     root = Path(root).resolve()
     path = Path(path).expanduser()
@@ -695,7 +736,7 @@ class ControlRoom:
             if action == "evaluate":
                 argv += ["--control"]
             if action in {"train", "evaluate"} and body.get("model_path"):
-                argv += ["--model-path", str(inside(workspace / ".fusion", body["model_path"]))]
+                argv += ["--model-path", str(model_path_for(workspace, body["model_path"]))]
         else:
             raise ValueError("Unsupported action")
         if writes and body.get("allow_write") is not True:
