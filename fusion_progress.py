@@ -324,8 +324,9 @@ def watch_workflow(workspace, run_id=None, *, as_json=False, once=False, interva
                     print_line(f"Following workflow {run_id}.")
                 manifest = json.loads(path.read_text())
         nodes = manifest.get("nodes", {})
+        from fusion_workflow import effective_status
         snapshot = (_build_snapshot(manifest) if path.name == "status.json" else
-                    {"schema": "fusion.watch.v1", "workflow_id": run_id, "status": manifest["status"], "nodes": []})
+                    {"schema": "fusion.watch.v1", "workflow_id": run_id, "status": effective_status(manifest), "nodes": []})
         for key, node in nodes.items():
             active_path = root / run_id / "nodes" / key / "active.json"
             active = json.loads(active_path.read_text()) if active_path.exists() else {}

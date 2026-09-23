@@ -1406,6 +1406,48 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
             server.shutdown()
             server.server_close()
 
+    def test_a_killed_coordinator_reads_as_interrupted_not_running(self):
+        from fusion_workflow import effective_status
+        # A manifest keeps whatever the coordinator last flushed, so one that
+        # was killed says "running" forever: watch never exits and report
+        # offers no way forward.
+        self.assertEqual(effective_status({"status": "running", "coordinator_pid": 2 ** 22 - 1}), "interrupted")
+        self.assertEqual(effective_status({"status": "running", "coordinator_pid": os.getpid()}), "running")
+        self.assertEqual(effective_status({"status": "running"}), "running", "no pid recorded is not evidence of death")
+        for terminal in ("success", "failed", "paused_quota"):
+            self.assertEqual(effective_status({"status": terminal, "coordinator_pid": 2 ** 22 - 1}), terminal)
+
+    def test_report_offers_a_way_forward_after_the_coordinator_dies(self):
+        from fusion_workflow import workflow_report
+        manifest = {
+            "schema": "fusion.workflow.v1", "workflow_id": "wf-dead", "status": "running",
+            "coordinator_pid": 2 ** 22 - 1, "task": "t", "spec": {"graph": {"nodes": []}},
+            "nodes": {}, "lanes": {}, "attempt_ledger": [], "artifacts": {},
+        }
+        path = self.workspace / ".fusion" / "workflows" / "wf-dead"
+        path.mkdir(parents=True)
+        (path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        report = workflow_report(self.workspace, "wf-dead")
+        self.assertEqual(report["status"], "interrupted")
+        self.assertIn("resume", report["resume_command"] or "", "an interrupted run must offer resume")
+
+    def test_no_available_worker_names_which_lane_and_why(self):
+        from fusion_policy import no_route_reason
+        config = {"codex": {"command": "missing-codex-binary"}, "claude": {"command": "missing-claude-binary"},
+                  "agy": {"command": "missing-agy"}, "grok": {"command": "missing-grok"},
+                  "routes": {"codex-read": {"agent": "codex", "sandbox": "read-only"}}}
+        task = fusion_core.make_task(self.workspace, "auto", "do it", "implementation", [], [], None, False, True)
+        reason = no_route_reason(config, task, fusion_core.RunStore(self.workspace))
+        self.assertIn("that can write", reason)
+        self.assertIn("missing-codex-binary is not on PATH", reason, "name the binary, not just the failure")
+        self.assertIn("fusion doctor", reason)
+
+        # A writer is also refused by a lane that exists but cannot write, and
+        # that reason has to be distinguishable from a missing binary.
+        installed = {**config, "codex": {"command": sys.executable}}
+        writer_reason = no_route_reason(installed, task, fusion_core.RunStore(self.workspace))
+        self.assertIn("cannot take a task that writes", writer_reason)
+
     def test_telemetry_report_fails_clearly_when_remote_disabled(self):
         (self.workspace / ".fusion.json").write_text(json.dumps({"telemetry": {"remote": {"enabled": False}}}))
         errors = io.StringIO()
