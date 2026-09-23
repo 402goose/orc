@@ -1114,6 +1114,11 @@ aggregation, model tool-support and fit flags, profile / `.orc.json`
 resolution, and `orc status` / `orc env` / `orc save` consuming the same
 resolved object. CI runs shellcheck on every script plus the test suite.
 
+`make test` runs the Python suite and rejects unexpected skips and expected failures.
+The real Codex sandbox probe is explicitly reported as unavailable on Linux, on
+machines without Codex, or when the installed CLI lacks named permission profiles.
+The other permission tests still run; a failing sandbox probe is never ignored.
+
 ## Caveats
 
 - Tool-calling quality varies by model — Claude Code leans hard on tools, so

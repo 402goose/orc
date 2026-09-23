@@ -26,18 +26,11 @@ refresh-quality:
 build:
 	./build.sh
 
-# A suite that ends in "OK (skipped=N)" still exits 0, so coverage can fall away
-# without anyone noticing. Require a bare OK; a deliberate skip gets stated here.
+# Unexpected skips and expected failures fail the suite. The only allowed skip
+# is the real macOS Codex sandbox probe when that runtime/profile is unavailable;
+# run_python.py checks its exact test ID and reason, and reports it explicitly.
 test:
-	@output=$$(PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test -p '*_test.py' 2>&1); \
-	status=$$?; \
-	printf '%s\n' "$$output"; \
-	[ $$status -eq 0 ] || exit $$status; \
-	printf '%s\n' "$$output" | grep -qx 'OK' || { \
-	  echo "" >&2; \
-	  echo "make test: the suite passed but did not end in a bare OK, so a test skipped or" >&2; \
-	  echo "expectedly failed and is hiding coverage. Fix it, or record the skip in the Makefile." >&2; \
-	  exit 1; }
+	PYTHONDONTWRITEBYTECODE=1 python3 test/run_python.py
 
 dogfood:
 	./test/fusion_dogfood.sh
