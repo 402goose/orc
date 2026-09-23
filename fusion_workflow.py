@@ -657,6 +657,21 @@ BLOCKERS: unresolved issues, or none
         result["attempt"] = attempt
         return {"task": task, "result": result}
 
+    def _record_gate(self, task: dict[str, Any], result: dict[str, Any], accepted: bool, problems: list[str]) -> None:
+        """The worker span is written inside dispatch(), before the gate runs, so it
+        only carries the worker's own claim. One gate span per acceptance decision
+        lets `usage` and remote telemetry count accepted vs rejected nodes. It
+        shares the receipt's run_id so resume never recovers it as a second call."""
+        run_id = result.get("run_id") or task.get("run_id")
+        if not run_id:
+            return
+        now = core.now_ms()
+        core.RunStore(self.workspace).trace_span(
+            self.config, {**task, "run_id": run_id, "agent": "gate", "route": None},
+            {"status": "success" if accepted else "failed", "blockers": list(problems), "usage": {}},
+            now, now, {},
+        )
+
     def _save_node(self, node_id: str, payload: dict[str, Any]) -> None:
         path = self._node_dir(node_id) / "node.json"
         temp = path.with_suffix(".tmp")
@@ -834,6 +849,7 @@ BLOCKERS: unresolved issues, or none
                     from fusion_policy import recovery
                     action, decision_id = recovery(self.config, self.workspace, self.run_id, node, result, accepted, self.spec["max_attempts"])
                     result.setdefault("decisions", {})["recovery"] = decision_id
+                    self._record_gate(payload.get("task") or {}, result, accepted, problems)
                     payload["acceptance"] = {"ok": accepted, "problems": problems}
                     self._save_node(node_id, payload)
                     if accepted:
@@ -943,6 +959,8 @@ def workflow_report(workspace: Path, run_id: str) -> dict[str, Any]:
         wave_cache[node_id] = depth
         return depth
 
+    from fusion_decisions import DecisionStore
+    decision_store = DecisionStore(workspace)
     waves: dict[int, list[dict[str, Any]]] = {}
     blockers: list[dict[str, Any]] = []
     outputs = []
@@ -960,6 +978,7 @@ def workflow_report(workspace: Path, run_id: str) -> dict[str, Any]:
             "changed": result.get("changed", []),
             "tests": result.get("tests", []),
             "digest": digest[:12] if digest else None,
+            "decisions": decision_store.summaries(result.get("decisions")) if result.get("decisions") else {},
         })
         if result and (node.get("attempts", 0) or result.get("run_id")):
             answer = read_answer(workspace, result)

@@ -175,6 +175,11 @@ def format_report(report, *, brief=False):
         lines.append(f"  {node['id']} [{node['agent']}]: {node['status']} (attempts={node['attempts']}{duration})")
         if brief and node.get("summary"):
             lines.append(f"    {progress.clean(node['summary'], 400)}")
+        for kind, decision in (node.get("decisions") or {}).items():
+            if decision.get("status") != "ok":
+                continue
+            picks = ", ".join(f"{question}={item['value']} ({item['probability']:.2f})" for question, item in decision.get("recommendations", {}).items())
+            lines.append(f"    laya {kind}: {picks} -> {decision.get('actual')} [{'applied' if decision.get('applied') else 'advisory'}]")
     changed = list(dict.fromkeys(path for node in stages for path in node.get("changed", [])))
     lines.append("Changes reported: " + (", ".join(terminal_text(path) for path in changed) if changed else "none"))
     for problem in report["acceptance_problems"]:
@@ -202,6 +207,10 @@ def format_report(report, *, brief=False):
         if not report["selected_outputs"]:
             lines.extend(["", "No completed worker output is available for this selection."])
     groups = report.get("usage", {}).get("by_route", [])
+    gates = [group for group in groups if group.get("agent") == "gate"]
+    groups = [group for group in groups if group.get("agent") != "gate"]
+    if gates:
+        lines.append(f"Gate: {sum(g['success'] for g in gates)} accepted, {sum(g['failed'] for g in gates)} rejected")
     if groups:
         lines.extend(["", "Usage:"])
         for group in groups:

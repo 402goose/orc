@@ -18,6 +18,7 @@ from fusion_decisions import (DecisionEngine, DecisionStore, INTAKE_QUESTIONS, R
                               REVIEW_QUESTIONS, LayaRuntime, DEFAULTS, digest, fit_calibration, read_jsonl)
 from fusion_laya import dataset_rows
 from fusion_policy import route_task, route_candidates, recovery, review_task
+from fusion_report import format_report, select_report
 from fusion_workflow import WorkflowRunner, resume_workflow, workflow_report
 
 
@@ -265,6 +266,76 @@ class DecisionsTest(unittest.TestCase):
             node = {"agent": "auto", "attempts": 1}
             self.assertEqual(recovery(self.config, self.workspace, "w", node, result, False, 2)[0], "switch")
             self.assertEqual(node["excluded_routes"], ["codex"])
+
+    def test_runtime_request_error_does_not_latch_the_serving_process(self):
+        serve = self.workspace / "serve.py"
+        serve.write_text("import json, sys\n"
+                         "for line in sys.stdin:\n"
+                         "    qs = json.loads(line)['questions']\n"
+                         "    if any(q['type'] == 'choice' and len(q['criteria']) < 2 for q in qs.values()):\n"
+                         "        print(json.dumps({'error': 'RuntimeError: selected index k out of range'}), flush=True)\n"
+                         "    else:\n"
+                         "        print(json.dumps({'answers': {k: {'noul': .9} for k in qs}, 'model_identity': 'fake'}), flush=True)\n")
+        helper = self.workspace / "runtime"
+        helper.write_text(f"#!/bin/sh\nexec {sys.executable} {serve}\n")
+        helper.chmod(0o755)
+        runtime = LayaRuntime({**DEFAULTS, "python": str(helper), "timeout_seconds": 10})
+        self.addCleanup(runtime.close)
+        one = {"route": {"type": "choice", "instructions": "pick", "criteria": {"only": "codex"}}}
+        with self.assertRaisesRegex(RuntimeError, "out of range"):
+            runtime.predict("x", one)
+        self.assertIsNone(runtime.error)
+        self.assertIsNotNone(runtime.process)
+        self.assertEqual(runtime.predict("x", INTAKE_QUESTIONS)["answers"]["needs_clarification"], {"noul": .9})
+
+    def test_one_option_choice_abstains_before_reaching_the_backend(self):
+        engine = self.engine({"route": "only"})
+        one = {"route": {"type": "choice", "instructions": "pick", "criteria": {"only": "codex"}}}
+        record = engine.decide("routing", "x", one)
+        self.assertEqual(record["status"], "unavailable")
+        self.assertIn("two options", record["error"])
+        self.assertEqual(engine.backend.calls, 0)
+
+    def test_single_candidate_lane_records_no_routing_decision(self):
+        engine = self.engine({"route": "claude"})
+        explicit = self.task("codex")
+        with patch("fusion_policy.DecisionEngine", return_value=engine):
+            route_task(self.config, explicit, core.RunStore(self.workspace))
+        self.assertEqual(engine.backend.calls, 0)
+        self.assertNotIn("routing", explicit.get("decisions", {}))
+        self.assertEqual(explicit["agent"], "codex")
+        self.assertFalse(engine.store.path.exists())
+
+    def test_gate_span_and_report_expose_acceptance_and_shadow_verdicts(self):
+        engine = self.engine({"action": "continue"})
+        spec = {"max_attempts": 1, "nodes": [{"id": "build", "agent": "codex", "task": "Fix defect"}]}
+        accepted = {"run_id": "r-ok", "status": "success", "summary": "fixed", "changed": ["a.py"], "tests": ["ok"], "usage": {"cost_usd": .1}}
+        with patch.object(core, "dispatch", return_value=dict(accepted)), patch("fusion_policy.DecisionEngine", return_value=engine):
+            first = WorkflowRunner(self.workspace, self.config, spec).run()
+        rejected = {**accepted, "run_id": "r-bad", "blockers": ["test failed"]}
+        with patch.object(core, "dispatch", return_value=dict(rejected)), patch("fusion_policy.DecisionEngine", return_value=engine):
+            second = WorkflowRunner(self.workspace, self.config, spec).run()
+        gates = {span["run_id"]: span for span in core.RunStore(self.workspace).traces(limit=100) if span["agent"] == "gate"}
+        self.assertEqual(gates["r-ok"]["status"], "success")
+        self.assertIsNone(gates["r-ok"]["failure_class"])
+        self.assertEqual(gates["r-ok"]["trace_id"], first["workflow_id"])
+        self.assertEqual(gates["r-bad"]["status"], "failed")
+        self.assertEqual(gates["r-bad"]["failure_class"], "worker_error")
+        self.assertIn("worker reported unresolved blockers", gates["r-bad"]["blockers"])
+        report = workflow_report(self.workspace, second["workflow_id"])
+        gate_group = next(g for g in report["usage"]["by_route"] if g["agent"] == "gate")
+        self.assertEqual((gate_group["success"], gate_group["failed"]), (0, 1))
+        node = report["waves"][0]["nodes"][0]
+        self.assertEqual(node["decisions"]["recovery"]["recommendations"]["action"]["value"], "continue")
+        self.assertFalse(node["decisions"]["recovery"]["applied"])
+        text = format_report(select_report(report))
+        self.assertIn("Gate: 0 accepted, 1 rejected", text)
+        self.assertIn("laya recovery: action=continue", text)
+        self.assertIn("[advisory]", text)
+        # A resume must not recover the gate span as a second paid call.
+        with patch.object(core, "dispatch", side_effect=AssertionError("cached node must not redispatch")):
+            resumed = resume_workflow(self.workspace, self.config, first["workflow_id"])
+        self.assertEqual(len(resumed["attempt_ledger"]), 1)
 
     def test_retry_costs_survive_budget_pause_and_resume(self):
         config = {**self.config, "decisions": {"mode": "off"}}
