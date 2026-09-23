@@ -20,10 +20,12 @@ When clients ship tasks, `tasks/get`/`update`/`cancel` adapt onto these calls.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import time
+import uuid
 from typing import Any
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -354,8 +356,14 @@ def start_run(
     spawn=subprocess.Popen,
     now=time.monotonic,
     sleep=time.sleep,
+    workflow_id: str | None = None,
 ) -> dict[str, Any]:
     """Start a workflow without blocking, and return a durable handle.
+
+    The caller names the run up front and passes it down, so the handle is
+    known before the coordinator has written anything. Watching for a new
+    directory instead - and assuming the newest one is ours - returns the wrong
+    handle the moment two runs start at once.
 
     The handle is the workflow id, which is on disk, so it survives a restart
     of both this server and the client. `spawn`/`now`/`sleep` are injected so
@@ -367,7 +375,9 @@ def start_run(
     if kind not in RUN_KINDS:
         raise ValueError(f"kind must be one of {', '.join(sorted(RUN_KINDS))}")
 
-    before = _workflow_ids(workspace)
+    workflow_id = workflow_id or (
+        time.strftime("%Y%m%d-%H%M%S") + f"-wf-{uuid.uuid4().hex[:8]}"
+    )
     argv = [
         sys.executable,
         str(Path(__file__).resolve().parent / "fusion"),
@@ -383,6 +393,8 @@ def start_run(
     if base:
         argv += ["--base", base]
 
+    from fusion_workflow import WORKFLOW_ID_ENV
+
     logs = workspace / ".fusion"
     logs.mkdir(parents=True, exist_ok=True)
     handle = open(logs / "mcp-launch.log", "ab")
@@ -390,6 +402,7 @@ def start_run(
         proc = spawn(
             argv,
             cwd=str(workspace),
+            env={**os.environ, WORKFLOW_ID_ENV: workflow_id},
             stdin=subprocess.DEVNULL,
             stdout=handle,
             stderr=handle,
@@ -398,26 +411,26 @@ def start_run(
     finally:
         handle.close()
 
-    # The workflow id is minted by the coordinator, so poll for the directory
-    # rather than guessing it. Intake (config, model catalog, Laya) runs first,
-    # and measured against this repo that takes ~30s before registration.
     pid = getattr(proc, "pid", None)
+    evidence = [f"orc://workflow/{workflow_id}/{leaf}" for leaf in ("manifest", "report")]
+    registered = workspace / ".fusion" / "workflows" / workflow_id
+
+    # Confirm the run actually came up, so a launch that dies immediately is
+    # reported as failed rather than as a handle that will never resolve.
     deadline = now() + wait_seconds
     while now() < deadline:
-        new = _workflow_ids(workspace) - before
-        if new:
-            workflow_id = sorted(new)[-1]
+        if registered.is_dir():
             return {
                 "workflow_id": workflow_id,
                 "status": "running",
                 "kind": kind,
                 "pid": pid,
                 "poll_with": "fusion_run_status",
-                "evidence": [f"orc://workflow/{workflow_id}/report"],
+                "evidence": evidence,
             }
         if _launch_died(proc):
             return {
-                "workflow_id": None,
+                "workflow_id": workflow_id,
                 "status": "failed",
                 "kind": kind,
                 "pid": pid,
@@ -426,17 +439,14 @@ def start_run(
             }
         sleep(0.25)
 
-    # Still alive but slow. Say so honestly rather than inventing a handle, and
-    # leave the caller a way to recover one.
+    # Slow, but the handle is real either way - it was chosen, not guessed.
     return {
-        "workflow_id": None,
+        "workflow_id": workflow_id,
         "status": "starting",
         "kind": kind,
         "pid": pid,
-        "note": (
-            "Launched, but it has not registered a workflow directory yet. It is "
-            "still running: call fusion_here to pick up the handle."
-        ),
+        "evidence": evidence,
+        "note": "Launched and still starting. Poll fusion_run_status with this workflow_id.",
     }
 
 
@@ -480,7 +490,31 @@ def run_status(workspace: Path, workflow_id: str) -> dict[str, Any]:
     }
 
 
-def cancel_run(workspace: Path, workflow_id: str, *, kill=None) -> dict[str, Any]:
+def process_matches(pid: int, workflow_id: str) -> bool:
+    """Is this pid still the coordinator we recorded, or a stranger wearing it?
+
+    A pid recorded minutes ago can be recycled by the OS onto something else
+    entirely, and signalling it would interrupt an unrelated program. Confirm
+    the command line still looks like the fusion run we mean before acting.
+    Unknowable is treated as a match, so a platform whose `ps` we cannot read
+    keeps working rather than silently refusing every cancel.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    command = (out.stdout or "").strip()
+    if not command:
+        return False  # ps ran and found nothing: the process is gone.
+    if workflow_id and workflow_id in command:
+        return True
+    return "fusion" in command
+
+
+def cancel_run(workspace: Path, workflow_id: str, *, kill=None, matches=None) -> dict[str, Any]:
     """Ask a run's coordinator to stop. Cooperative: the run may already be over."""
     import os
     import signal
@@ -499,6 +533,13 @@ def cancel_run(workspace: Path, workflow_id: str, *, kill=None) -> dict[str, Any
     # the cleanup path that stops each worker. Workers start their own session,
     # so killing the coordinator does not cascade to them: a SIGTERM here would
     # take down the coordinator and leave its workers running, still billing.
+    identify = matches or process_matches
+    if not identify(int(pid), workflow_id):
+        return {
+            "workflow_id": workflow_id,
+            "cancelled": False,
+            "reason": f"pid {pid} is no longer this workflow's coordinator",
+        }
     killer = kill or (lambda target, sig: os.kill(target, sig))
     try:
         killer(int(pid), signal.SIGINT)

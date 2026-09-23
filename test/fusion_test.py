@@ -1584,6 +1584,43 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
         self.assertIn("nothing to fetch", errors.getvalue())
 
 
+class WorkflowIdAdoptionTest(unittest.TestCase):
+    """A caller that spawns a run must be able to name it up front.
+
+    Without this, the only way to learn the id of a run you just started is to
+    watch .fusion/workflows for a new directory and assume the newest one is
+    yours — which is wrong as soon as two runs start at once.
+    """
+
+    def setUp(self):
+        import fusion_workflow
+
+        self.workflow = fusion_workflow
+        self.addCleanup(os.environ.pop, fusion_workflow.WORKFLOW_ID_ENV, None)
+
+    def test_generates_an_id_when_none_is_given(self):
+        first, second = self.workflow._run_id(), self.workflow._run_id()
+        self.assertNotEqual(first, second)
+        self.assertIn("-wf-", first)
+
+    def test_adopts_the_id_from_the_environment(self):
+        os.environ[self.workflow.WORKFLOW_ID_ENV] = "chosen-run-01"
+        self.assertEqual(self.workflow._run_id(), "chosen-run-01")
+
+    def test_consumes_it_so_a_second_run_cannot_collide(self):
+        os.environ[self.workflow.WORKFLOW_ID_ENV] = "chosen-run-01"
+        self.assertEqual(self.workflow._run_id(), "chosen-run-01")
+        self.assertNotEqual(self.workflow._run_id(), "chosen-run-01")
+
+    def test_refuses_an_id_that_could_escape_the_workflows_directory(self):
+        # The id becomes a directory name under .fusion/workflows.
+        for bad in ("../escape", "a/b", ".hidden", "x" * 70, "with space", "-leading"):
+            with self.subTest(bad=bad):
+                os.environ[self.workflow.WORKFLOW_ID_ENV] = bad
+                with self.assertRaises(ValueError):
+                    self.workflow._run_id()
+
+
 class HandoffParsingTest(unittest.TestCase):
     """A worker that reports no blockers must not be failed for saying so.
 

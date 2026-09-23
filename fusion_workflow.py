@@ -32,8 +32,31 @@ TERMINAL_PAUSED = {"paused_quota", "paused_budget"}
 LANE_COOLDOWN_SECONDS = core.LANE_COOLDOWN_SECONDS
 
 
+WORKFLOW_ID_ENV = "FUSION_WORKFLOW_ID"
+# The id becomes a directory name under .fusion/workflows, so it must not be
+# able to escape it. No dots, separators, or anything but these characters.
+_SAFE_RUN_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+
+
 def _run_id(prefix: str = "wf") -> str:
-    return time.strftime("%Y%m%d-%H%M%S") + f"-{prefix}-{uuid.uuid4().hex[:8]}"
+    """Mint a workflow id, or adopt one the caller chose.
+
+    A caller that spawns `build --execute` cannot otherwise learn the id it
+    just started: it has to watch the filesystem for a new directory and
+    assume the newest one is its own, which is wrong the moment two runs start
+    at once. Setting FUSION_WORKFLOW_ID lets it name the run up front. It is
+    consumed, so it applies to exactly one workflow and a second run in the
+    same process cannot collide with it.
+    """
+    chosen = os.environ.pop(WORKFLOW_ID_ENV, "").strip()
+    if not chosen:
+        return time.strftime("%Y%m%d-%H%M%S") + f"-{prefix}-{uuid.uuid4().hex[:8]}"
+    if not _SAFE_RUN_ID.match(chosen):
+        raise ValueError(
+            f"{WORKFLOW_ID_ENV} must be 1-64 characters of letters, digits, dash or "
+            f"underscore and start alphanumeric; got {chosen!r}"
+        )
+    return chosen
 
 
 def _as_list(value: Any) -> list[Any]:
