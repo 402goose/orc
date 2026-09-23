@@ -241,6 +241,46 @@ class ControlRoomTest(unittest.TestCase):
         self.assertEqual(result["status"], "cancelled")
 
 
+    def test_launch_dispatches_the_configured_checkpoint_from_outside_the_workspace(self):
+        """The wiring, not just the helper.
+
+        A test that only calls model_path_for proves nothing about whether
+        launch() uses it — reverting the call site is invisible to it. This
+        reads the argv launch actually persists.
+        """
+        checkpoint = self.root / "hf-cache" / "models--laya-en"
+        checkpoint.mkdir(parents=True)
+        config = read_json(self.workspace / ".fusion.json")
+        config["decisions"] = {**config.get("decisions", {}), "model_path": str(checkpoint)}
+        atomic_json(self.workspace / ".fusion.json", config)
+        dataset = self.workspace / ".fusion" / "decisions" / "dataset.jsonl"
+        dataset.parent.mkdir(parents=True, exist_ok=True)
+        dataset.write_text("{}\n")
+
+        with patch("fusion_ui.subprocess.Popen") as spawn:
+            spawn.return_value.poll.return_value = None
+            job = self.app.launch(self.workspace, {
+                "action": "evaluate",
+                "dataset": "decisions/dataset.jsonl",
+                "model_path": str(checkpoint),
+            })
+        argv = read_json(self.workspace / ".fusion/ui/jobs" / job["id"] / "request.json")["argv"]
+        self.assertIn("--model-path", argv)
+        self.assertEqual(argv[argv.index("--model-path") + 1], str(checkpoint.resolve()))
+
+    def test_launch_still_refuses_a_checkpoint_nothing_declares(self):
+        stranger = self.root / "somewhere-else"
+        stranger.mkdir()
+        dataset = self.workspace / ".fusion" / "decisions" / "dataset.jsonl"
+        dataset.parent.mkdir(parents=True, exist_ok=True)
+        dataset.write_text("{}\n")
+        with self.assertRaises(ValueError):
+            self.app.launch(self.workspace, {
+                "action": "evaluate",
+                "dataset": "decisions/dataset.jsonl",
+                "model_path": str(stranger),
+            })
+
     def test_workspace_registration_does_not_scan_or_launch_other_repositories(self):
         second = self.root / "another-repo"
         second.mkdir()
@@ -391,6 +431,69 @@ class CancelEscalationTest(unittest.TestCase):
 
         with patch("fusion_ui.os.getpgid", side_effect=ProcessLookupError):
             fusion_ui.signal_job(GoneProc(), signal.SIGKILL)  # must not raise
+
+
+class ModelPathTest(unittest.TestCase):
+    """A checkpoint is a read-only input and may live outside the workspace.
+
+    `decisions setup` downloads one through snapshot_download into the Hugging
+    Face cache, and a machine sharing one checkpoint across repositories keeps
+    it somewhere central. Requiring it under .fusion refused both, and the
+    automatic training loop turned that refusal into a permanent stall: it
+    re-dispatches the identical request on retry, so the round never recovers.
+
+    Containment still matters, because the value arrives in an HTTP body. The
+    rule is to trust the project's config, not the request.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.workspace = Path(self.temp.name) / "repo"
+        (self.workspace / ".fusion").mkdir(parents=True)
+        self.outside = Path(self.temp.name) / "shared-checkpoints" / "laya-en"
+        self.outside.mkdir(parents=True)
+
+    def configure(self, model_path=None):
+        body = {"decisions": {"model_path": str(model_path)}} if model_path else {}
+        atomic_json(self.workspace / ".fusion.json", body)
+
+    def test_a_checkpoint_inside_fusion_is_always_allowed(self):
+        self.configure()
+        resolved = fusion_ui.model_path_for(self.workspace, ".fusion/decisions/candidate")
+        self.assertTrue(resolved.is_relative_to((self.workspace / ".fusion").resolve()))
+
+    def test_an_outside_checkpoint_is_refused_when_nothing_declares_it(self):
+        self.configure()
+        with self.assertRaisesRegex(ValueError, "must be inside"):
+            fusion_ui.model_path_for(self.workspace, str(self.outside))
+
+    def test_the_configured_checkpoint_is_allowed_even_outside(self):
+        self.configure(self.outside)
+        self.assertEqual(
+            fusion_ui.model_path_for(self.workspace, str(self.outside)), self.outside.resolve()
+        )
+
+    def test_a_subdirectory_of_the_configured_checkpoint_is_allowed(self):
+        self.configure(self.outside)
+        snapshot = self.outside / "snapshots" / "abc"
+        self.assertEqual(
+            fusion_ui.model_path_for(self.workspace, str(snapshot)), snapshot.resolve()
+        )
+
+    def test_declaring_one_checkpoint_does_not_open_the_filesystem(self):
+        # The whole point of keeping a containment check: a request may not
+        # name some other path just because the config names one.
+        self.configure(self.outside)
+        for other in ("/etc/passwd", str(self.outside.parent / "unrelated"), "../../secrets"):
+            with self.subTest(path=other):
+                with self.assertRaises(ValueError):
+                    fusion_ui.model_path_for(self.workspace, other)
+
+    def test_an_unreadable_config_refuses_rather_than_opening_up(self):
+        (self.workspace / ".fusion.json").write_text("{ not json")
+        with self.assertRaises(ValueError):
+            fusion_ui.model_path_for(self.workspace, str(self.outside))
 
 
 if __name__ == "__main__":

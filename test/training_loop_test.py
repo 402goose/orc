@@ -181,4 +181,54 @@ class TrainingLoopTest(unittest.TestCase):
             self.assertEqual(loop.status(self.app, self.w)['state'], 'paused')
 
 
+class ConfiguredCheckpointDispatchTest(unittest.TestCase):
+    """The round must be able to dispatch the checkpoint the project configured.
+
+    This is the seam that broke and that nothing covered: the loop reads
+    model_path through DecisionEngine, which resolves it, and hands it to
+    launch, which used to require it under .fusion. `decisions setup`
+    downloads checkpoints into the Hugging Face cache, so the documented
+    "explicit model_path experiment" was rejected at the baseline step, and
+    Retry re-dispatched the identical request forever.
+
+    Both existing suites mock ControlRoom.launch, which is exactly why this
+    was invisible. This exercises the real resolution chain.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.w = Path(self.temp.name) / "repo"
+        (self.w / ".fusion").mkdir(parents=True)
+        self.checkpoint = Path(self.temp.name) / "hf-cache" / "models--laya-en"
+        self.checkpoint.mkdir(parents=True)
+
+    def resolved_source(self):
+        from fusion_decisions import DecisionEngine
+        import fusion_core as core
+
+        config, _ = core.load_config(self.w)
+        return DecisionEngine(self.w, config).options["model_path"]
+
+    def test_a_checkpoint_outside_the_workspace_dispatches(self):
+        import fusion_ui
+
+        (self.w / ".fusion.json").write_text(json.dumps(
+            {"decisions": {"mode": "shadow", "model_path": str(self.checkpoint)}}))
+        source = self.resolved_source()
+        self.assertFalse(Path(source).is_relative_to(self.w / ".fusion"))
+        # The loop forwards exactly this value as request['model_path'].
+        self.assertEqual(fusion_ui.model_path_for(self.w, source), self.checkpoint.resolve())
+
+    def test_a_checkpoint_inside_the_workspace_still_dispatches(self):
+        import fusion_ui
+
+        inner = self.w / ".fusion" / "decisions" / "candidate"
+        inner.mkdir(parents=True)
+        (self.w / ".fusion.json").write_text(json.dumps(
+            {"decisions": {"mode": "shadow", "model_path": ".fusion/decisions/candidate"}}))
+        source = self.resolved_source()
+        self.assertEqual(fusion_ui.model_path_for(self.w, source), inner.resolve())
+
+
 if __name__=='__main__':unittest.main()
