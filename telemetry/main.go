@@ -1,11 +1,11 @@
-// orc-telemetry is a minimal ingestion endpoint for Fusion's opt-in remote
+// orc-telemetry is a minimal ingestion endpoint for Fusion's default-on remote
 // telemetry (see fusion_core.py: send_remote_telemetry). It accepts a small,
 // deliberately reduced batch of span records -- no prompts, no file paths,
 // no raw blocker text -- and stores them in Postgres for later analysis.
 //
 // This is sized for a handful of known collaborators, not public internet
 // scale: no rate limiting, no per-install quotas, a single shared bearer
-// token rather than per-user auth.
+// token for reading summaries rather than per-user auth. Ingest is open.
 package main
 
 import (

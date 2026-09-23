@@ -163,7 +163,7 @@ printf 'fusion dogfood passed: claude/codex/agy subprocesses, handoffs, traces, 
 # must record one recovery decision per node and change no node outcome.
 if [ "${FUSION_DOGFOOD_PAIRED:-0}" = "1" ]; then
   LAYA_PYTHON="$HOME/.local/share/orc/laya/bin/python"
-  test -x "$LAYA_PYTHON" || { printf 'dogfood-paired: run `orc fusion decisions setup` first\n' >&2; exit 1; }
+  test -x "$LAYA_PYTHON" || { printf 'dogfood-paired: run orc fusion decisions setup first\n' >&2; exit 1; }
   fail() { printf 'dogfood-paired failed: %s\n' "$1" >&2; exit 1; }
   PAIRED_RESULT="$(FUSION_DECISIONS_MODE=shadow PYTHONDONTWRITEBYTECODE=1 "$ROOT/fusion" --workspace "$WORKSPACE" --json workflow run "$WORKSPACE/workflow.json")" \
     || fail "shadow workflow run exited non-zero"

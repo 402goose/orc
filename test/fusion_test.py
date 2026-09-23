@@ -1070,7 +1070,7 @@ print(json.dumps({{'type':'result','subtype':'success','is_error':False,'session
                 else:
                     os.environ["ORC_HOME"] = old_home
 
-    def test_remote_telemetry_disabled_by_default_sends_nothing(self):
+    def test_remote_telemetry_defaults_on_and_environment_opt_out_stops_sends(self):
         received = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -1265,10 +1265,12 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
             server.server_close()
 
     def test_telemetry_report_fails_clearly_when_remote_disabled(self):
-        self.config()
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
+        (self.workspace / ".fusion.json").write_text(json.dumps({"telemetry": {"remote": {"enabled": False}}}))
+        errors = io.StringIO()
+        with patch("fusion_core.fetch_remote_summary") as fetch, contextlib.redirect_stderr(errors):
             self.assertEqual(fusion_core.main(["--workspace", str(self.workspace), "telemetry", "report"]), 1)
+        fetch.assert_not_called()
+        self.assertIn("nothing to fetch", errors.getvalue())
 
 
 if __name__ == "__main__":

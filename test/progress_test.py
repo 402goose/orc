@@ -25,7 +25,7 @@ class ProgressTest(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.workspace = Path(directory.name)
-        self.env = {**os.environ, "FUSION_DECISIONS_MODE": "off"}
+        self.env = {**os.environ, "FUSION_DECISIONS_MODE": "off", "FUSION_TELEMETRY": "0"}
         self.env.pop("FUSION_PROGRESS", None)
 
     def fake_worker(self, body):

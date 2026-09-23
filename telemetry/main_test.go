@@ -196,13 +196,12 @@ func TestHandleIngestOverHTTP(t *testing.T) {
 		t.Errorf("missing install_id: status = %d, want 400", rec.Code)
 	}
 	real := `{"schema":"fusion.telemetry.v1","install_id":"http-test","spans":[{"agent":"claude","status":"success","duration_ms":42}]}`
-	if rec := post(t, real, "Bearer sekret"); rec.Code != http.StatusAccepted {
+	if rec := post(t, real, ""); rec.Code != http.StatusAccepted {
 		t.Errorf("valid payload: status = %d body = %q, want 202", rec.Code, rec.Body.String())
 	}
 
 	// The token guards reading what everyone sent, which is the side that
-	// stays closed. Ingest auth is asserted nowhere on purpose: it is being
-	// removed so clients can report with no configuration.
+	// stays closed. The successful ingest above requires no credential.
 	summary := func(t *testing.T, auth string) *httptest.ResponseRecorder {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodGet, "/v1/summary", nil)

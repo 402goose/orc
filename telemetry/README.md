@@ -1,18 +1,17 @@
 # orc-telemetry
 
-Ingestion endpoint for Fusion's opt-in remote telemetry. Receives a
+Ingestion endpoint for Fusion's default-on remote telemetry. Receives a
 deliberately reduced batch of span records from `fusion` clients that have
 `telemetry.remote.enabled: true` in their `.fusion.json`, and stores them in
 Postgres.
 
 **Deployed:** `https://orc-telemetry.fly.dev` (Fly app `orc-telemetry`,
-Postgres cluster `orc-telemetry-db`, org `jfl`). Verified live end to end: `/healthz` returns 200, `/v1/ingest`
-rejects a wrong bearer token with 401, a real authenticated payload returns
-202, and the row was then read back out of the cluster carrying exactly the
-reduced fields (`install_id | agent | status | duration_ms`). The 202 is
-itself evidence of the write — `handleIngest` calls `insertSpans`
-synchronously and returns 500 on failure — but it was confirmed against the
-database rather than inferred from the code path.
+Postgres cluster `orc-telemetry-db`, org `jfl`). The original deployment
+was verified end to end with authenticated ingest and a database readback.
+The current source accepts ingest without a token and protects
+`GET /v1/summary` with the shared token. Deploy updates below to apply
+these changes to an older collector. Ingest returns 202 only after
+`insertSpans` succeeds; database failures return 500.
 
 If `orc-telemetry.fly.dev` doesn't resolve from a given machine but `fly
 status` shows the app healthy, check whether Tailscale's MagicDNS resolver
@@ -21,8 +20,8 @@ status` shows the app healthy, check whether Tailscale's MagicDNS resolver
 the default resolver doesn't.
 
 Sized for a handful of known collaborators (a few people, not public
-internet scale): a single shared bearer token, no per-install rate limiting,
-no multi-tenant auth.
+internet scale): open ingest, a shared bearer token for reading summaries,
+no per-install rate limiting, no multi-tenant auth.
 
 ## What gets sent
 
@@ -44,7 +43,7 @@ go run .
 ```
 
 Requires `DATABASE_URL` (a Postgres connection string) and `INGEST_TOKEN`
-(the shared bearer secret) in the environment; refuses to start without
+(the shared bearer secret for reading summaries) in the environment; refuses to start without
 either. `PORT` defaults to 8080.
 
 ```sh
@@ -62,7 +61,7 @@ fly postgres attach orc-telemetry-db --app orc-telemetry   # sets DATABASE_URL s
 
 # Write the token down BEFORE setting it. Fly secrets are write-only:
 # `fly secrets list` shows a digest, never the value, so a token generated
-# inline is unrecoverable and every client is locked out until it is rotated.
+# inline is unrecoverable and readers are locked out until it is rotated.
 ( umask 077; openssl rand -hex 32 > ~/.config/orc/telemetry-ingest-token )
 fly secrets set INGEST_TOKEN="$(cat ~/.config/orc/telemetry-ingest-token)" --app orc-telemetry
 
@@ -70,9 +69,9 @@ fly deploy
 ```
 
 To rotate it, repeat those two commands: setting the secret restarts the
-machines, and every client's `.fusion.json` needs the new value. A client
-still holding the old token gets a 401 and, because the send is best-effort,
-silently stops contributing.
+machines, and clients that read summaries need the new value in
+`telemetry.remote.token` in `.fusion.json`. An old token gets a 401 when
+reading summaries. Ingest needs no token and is unaffected by rotation.
 
 `fly postgres attach` sets `DATABASE_URL` as a Fly secret automatically. The
 schema (`schema.sql`, embedded into the binary) applies itself on startup —
