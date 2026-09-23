@@ -15,6 +15,7 @@ def context(task):
 
 def route_candidates(config, task, store):
     import fusion_core as core
+    yolo = core.execution_mode(config) == "yolo"
     history = defaultdict(list)
     outcomes = {event["task_id"]: event["accepted"] for event in read_jsonl(DecisionStore(task["workspace"]).path)
                 if event.get("event") == "outcome"}
@@ -38,7 +39,7 @@ def route_candidates(config, task, store):
         settings = {**config.get(agent, {}), **lane}
         family = (agent, settings.get("command", agent))
         if key not in seen and 0 <= time.time() * 1000 - span.get("end_time_ms", 0) < core.LANE_COOLDOWN_SECONDS * 1000:
-            if span.get("failure_class") in {"quota", "permission_denied"}:
+            if span.get("failure_class") == "quota" or (span.get("failure_class") == "permission_denied" and span.get("execution_mode", "restricted") == core.execution_mode(config)):
                 unhealthy.add(key)
                 if family not in seen_commands and Path(str(family[1])).name != "orc":
                     unavailable_commands.add(family)
@@ -46,22 +47,24 @@ def route_candidates(config, task, store):
         seen_commands.add(family)
     choices = []
     preferred = config.get("sidekick", "codex")
-    candidates = [(name, name, None) for name in dict.fromkeys([preferred, "codex", "claude", "agy"])]
+    candidates = [(name, name, None) for name in dict.fromkeys([preferred, "codex", "claude", "agy", "grok"])]
     candidates += [(name, settings.get("agent"), name) for name, settings in config.get("routes", {}).items()]
     if task.get("prefer_different_agent"):
         candidates.sort(key=lambda item: item[1] == task["prefer_different_agent"])
     for key, agent, route in candidates:
-        if key in unhealthy or agent not in {"claude", "codex", "agy"}:
+        if key in unhealthy or agent not in {"claude", "codex", "agy", "grok"}:
             continue
         settings = core.agent_settings(config, {"agent": agent, "route": route})
         if (agent, settings.get("command", agent)) in unavailable_commands:
             continue
         if not core.executable(settings.get("command", agent)):
             continue
-        # Named read-only routes cannot be repurposed into writer routes.
-        if task.get("write") and (settings.get("sandbox") == "read-only" or settings.get("permission_mode") == "plan" or settings.get("mode") == "plan"):
+        if not yolo and agent == "agy" and not core.agy_headless_status(settings)["automatic_ready"]:
             continue
-        if not task.get("write") and settings.get("mode") in {"yolo", "auto", "accept-edits"}:
+        # Named read-only routes cannot be repurposed into writer routes.
+        if not yolo and task.get("write") and (settings.get("sandbox") == "read-only" or settings.get("permission_mode") == "plan" or settings.get("mode") == "plan"):
+            continue
+        if not yolo and not task.get("write") and settings.get("mode") in {"yolo", "auto", "accept-edits"}:
             continue
         command = str(settings.get("command", agent))
         if Path(command).name == "orc":
@@ -102,7 +105,7 @@ def route_task(config, task, store):
     automatic = task["agent"] == "auto" and not task.get("route")
     if task["agent"] == "auto" and task.get("route"):
         task["agent"] = config.get("routes", {}).get(task["route"], {}).get("agent")
-        if task["agent"] not in {"codex", "claude", "agy"}:
+        if task["agent"] not in {"codex", "claude", "agy", "grok"}:
             raise ValueError("automatic task specifies an unknown route")
     if not automatic and engine.options["mode"] == "off":
         return
@@ -186,6 +189,15 @@ def recovery(config, workspace, workflow_id, node, result, accepted, max_attempt
     repeated = bool(node.get("repeated_failure"))
     can_retry = node["attempts"] < max_attempts and not repeated
     actual = "continue" if accepted else "stop" if failure in {"quota", "permission_denied"} or not can_retry else "repair"
+    automatic = node["agent"] == "auto" and not node.get("route")
+    if not accepted and failure == "quota" and automatic:
+        failed_route = result.get("route") or result.get("agent")
+        excluded = node.setdefault("excluded_routes", [])
+        if failed_route and failed_route not in excluded:
+            excluded.append(failed_route)
+        candidate_task = {"workspace": workspace, "write": node.get("write", False), "excluded_routes": excluded}
+        if can_retry and route_candidates(config, candidate_task, core.RunStore(workspace)):
+            actual = "switch"
     record = engine.decide("recovery", {"status": result.get("status"), "accepted": accepted,
                                        "failure": failure, "blockers": result.get("blockers", []),
                                        "attempt": node["attempts"], "max_attempts": max_attempts,
@@ -199,7 +211,10 @@ def recovery(config, workspace, workflow_id, node, result, accepted, max_attempt
             actual, applied = suggested, True
         elif can_retry and suggested == "switch" and node["agent"] == "auto" and not node.get("route"):
             actual, applied = "switch", True
-            node.setdefault("excluded_routes", []).append(result.get("route") or result.get("agent"))
+            excluded = node.setdefault("excluded_routes", [])
+            lane = result.get("route") or result.get("agent")
+            if lane not in excluded:
+                excluded.append(lane)
     engine.applied(record, actual, applied, "acceptance, permissions and attempt limits enforced")
     if engine.options["mode"] != "off":
         engine.store.append("outcome", task_id=result.get("run_id"), group=workflow_id, accepted=accepted,

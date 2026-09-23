@@ -59,6 +59,7 @@ class FusionHarnessTest(unittest.TestCase):
             "codex": {"command": str(codex or "missing-codex")},
             "claude": {"command": str(claude or "missing-claude")},
             "agy": {"command": str(agy or "missing-agy")},
+            "grok": {"command": "missing-fusion-test-grok"},
             "timeout_seconds": 30,
         }
         (self.workspace / ".fusion.json").write_text(json.dumps(value), encoding="utf-8")
@@ -183,6 +184,144 @@ print(json.dumps({{'type':'turn.completed','usage':{{'input_tokens':12,'output_t
             "reasoning_output_tokens": 0,
         })
         self.assertEqual(normalized["cache_creation_input_tokens"], 512)
+
+    def quota_workflow_fixture(self, max_attempts):
+        codex = self.write_agent("fallback-codex", f'''
+import json, pathlib, sys
+prompt = sys.stdin.read()
+role = 'implement' if 'Role: implementation' in prompt else 'review'
+with pathlib.Path({str(self.calls)!r}).open('a') as out:
+    out.write(json.dumps({{'role': role, 'argv': sys.argv[1:]}}) + '\\n')
+print(json.dumps({{'type':'thread.started','thread_id': role + '-session'}}))
+print(json.dumps({{'type':'item.completed','item':{{'type':'agent_message','text':'STATUS: success\\nSUMMARY: fixture complete\\nCHANGED: none\\nTESTS: fixture verification passed\\nBLOCKERS: none'}}}}))
+''')
+        claude = self.write_agent("fallback-claude", '''
+import json
+print(json.dumps({'type':'result','is_error':True,'session_id':'exhausted-claude-session','result':'API usage limit reached; resets at next month'}))
+''')
+        self.config(codex=codex, claude=claude)
+        config, _ = fusion_core.load_config(self.workspace)
+        config["routes"] = {}
+        path = self.workspace / "workflow.json"
+        path.write_text(json.dumps({"max_attempts": max_attempts, "nodes": [
+            {"id":"implement", "agent":"codex", "write":True, "role":"implementation", "task":"Implement the fixture"},
+            {"id":"review", "agent":"auto", "write":False, "role":"review", "needs":["implement"],
+             "independent_of":"implement", "task":"Independently verify the fixture", "acceptance":{"required_handoff":["tests"]}},
+        ]}))
+        return config, path
+
+    def test_automatic_quota_fallback_works_without_active_laya(self):
+        config, path = self.quota_workflow_fixture(2)
+        result = run_workflow(self.workspace, config, path)
+        self.assertEqual(result["status"], "success")
+        review = next(n for n in result["nodes"] if n["id"] == "review")
+        self.assertEqual(review["attempts"], 2)
+        self.assertEqual(review["result"]["agent"], "codex")
+        self.assertEqual(review["excluded_routes"], ["claude"])
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertEqual([c["role"] for c in calls], ["implement", "review"])
+        argv = calls[-1]["argv"]
+        self.assertEqual(argv[argv.index("-s") + 1], "read-only")
+        self.assertNotIn("resume", argv)
+
+    def test_resume_can_switch_only_the_unfinished_stage_and_preserves_attempts(self):
+        config, path = self.quota_workflow_fixture(1)
+        first = run_workflow(self.workspace, config, path)
+        self.assertEqual(first["status"], "paused_quota")
+        run_id = first["workflow_id"]
+        with self.assertRaisesRegex(ValueError, "attempt limit"):
+            resume_workflow(self.workspace, config, run_id, node_id="review", agent="codex")
+        with self.assertRaisesRegex(ValueError, "accepted stages"):
+            resume_workflow(self.workspace, config, run_id, node_id="implement", agent="claude", max_attempts=2)
+        result = resume_workflow(self.workspace, config, run_id, node_id="review", agent="codex", max_attempts=2)
+        self.assertEqual(result["status"], "success")
+        review = next(n for n in result["nodes"] if n["id"] == "review")
+        self.assertEqual(review["attempts"], 2)
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertEqual([c["role"] for c in calls], ["implement", "review"])
+        self.assertNotIn("exhausted-claude-session", calls[-1]["argv"])
+
+    def test_grok_headless_review_uses_plan_mode_and_reports_unknown_usage(self):
+        grok = self.write_agent("grok-fake", f'''
+import json, pathlib, sys
+pathlib.Path({str(self.calls)!r}).write_text(json.dumps(sys.argv[1:]))
+print('STATUS: success\\nSUMMARY: Grok review complete\\nCHANGED: none\\nTESTS: fixture check passed\\nBLOCKERS: none')
+''')
+        config = fusion_core.deep_merge(fusion_core.DEFAULTS, {"grok":{"command":str(grok)}})
+        task = fusion_core.make_task(self.workspace, "grok", "Review fixture", "review", [], [], None, False, False)
+        result = fusion_core.dispatch(config, task, fusion_core.RunStore(self.workspace))
+        self.assertEqual(result["status"], "success")
+        argv = json.loads(self.calls.read_text())
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "plan")
+        self.assertEqual(argv[argv.index("--output-format") + 1], "plain")
+        self.assertIn("--no-subagents", argv)
+        self.assertEqual(result["usage"], {})
+
+    def test_resume_auto_excludes_permission_denied_worker_and_preserves_implementation(self):
+        config, path = self.quota_workflow_fixture(2)
+        agy = self.write_agent("agy-headless-denied", '''
+import json
+print(json.dumps({'status':'SUCCESS','response':'','denied_actions':[{'action':'command','display_name':'RunCommand'}]}))
+''')
+        config["agy"]["command"] = str(agy)
+        with patch.object(fusion_core, "agy_headless_status", return_value={"automatic_ready": True}):
+            first = run_workflow(self.workspace, config, path)
+            self.assertEqual(first["status"], "failed")
+            review = next(n for n in first["nodes"] if n["id"] == "review")
+            self.assertEqual(review["result"]["agent"], "agy")
+            self.assertEqual(fusion_core.failure_class(review["result"]), "permission_denied")
+            # Old manifests misclassified this error. Re-read their original
+            # blocker text on resume; do not rely on the old trace category.
+            result = resume_workflow(self.workspace, config, first["workflow_id"],
+                                     node_id="review", agent="auto", max_attempts=3)
+        self.assertEqual(result["status"], "success")
+        review = next(n for n in result["nodes"] if n["id"] == "review")
+        self.assertEqual(review["attempts"], 3)
+        self.assertEqual(review["excluded_routes"], ["claude", "agy"])
+        self.assertEqual(review["result"]["agent"], "codex")
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertEqual([c["role"] for c in calls], ["implement", "review"])
+        self.assertNotIn("resume", calls[-1]["argv"])
+        self.assertEqual(calls[-1]["argv"][calls[-1]["argv"].index("-s") + 1], "read-only")
+
+    def test_agy_headless_setup_check_does_not_mutate_permissions(self):
+        home = self.workspace / "home"
+        path = home / ".gemini/antigravity-cli/settings.json"
+        path.parent.mkdir(parents=True)
+        with patch.object(Path, "home", return_value=home):
+            self.assertFalse(fusion_core.agy_headless_status({})["automatic_ready"])
+            path.write_text(json.dumps({"toolPermission":"proceed-in-sandbox",
+                                        "permissions":{"deny":["command(git push)"]}}))
+            original = path.read_bytes()
+            self.assertTrue(fusion_core.agy_headless_status({})["automatic_ready"])
+            self.assertFalse(fusion_core.agy_headless_status({"sandbox":False})["automatic_ready"])
+            self.assertEqual(path.read_bytes(), original)
+            path.write_text('[]')
+            self.assertFalse(fusion_core.agy_headless_status({})["automatic_ready"])
+
+    def test_explicit_permission_retry_starts_a_fresh_session(self):
+        config, path = self.quota_workflow_fixture(1)
+        denied = self.write_agent("agy-denied-then-ready", f'''
+import json, pathlib, sys
+with pathlib.Path({str(self.calls)!r}).open('a') as out:
+    out.write(json.dumps({{'role':'agy', 'argv':sys.argv[1:]}}) + '\\n')
+print(json.dumps({{'conversation_id':'denied-session', 'status':'SUCCESS', 'response':'', 'denied_actions':[{{'action':'command'}}]}}))
+''')
+        config["agy"]["command"] = str(denied)
+        spec = json.loads(path.read_text())
+        spec["nodes"][1]["agent"] = "agy"
+        path.write_text(json.dumps(spec))
+        first = run_workflow(self.workspace, config, path)
+        self.assertEqual(first["status"], "failed")
+        denied.write_text(denied.read_text().replace(
+            "'response':'', 'denied_actions':[{'action':'command'}]",
+            "'response':'STATUS: success\\nSUMMARY: checked\\nTESTS: checks passed\\nBLOCKERS: none'"))
+        result = resume_workflow(self.workspace, config, first["workflow_id"],
+                                 node_id="review", agent="agy", max_attempts=2)
+        self.assertEqual(result["status"], "success")
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertEqual([c["role"] for c in calls], ["implement", "agy", "agy"])
+        self.assertNotIn("--conversation", calls[-1]["argv"])
 
     def test_codex_command_execution_failure_is_surfaced_as_evidence(self):
         # Matches the real command_execution item shape from a live
@@ -311,6 +450,8 @@ print(json.dumps({{'conversation_id':'conv-123','status':'SUCCESS','response':'S
         self.assertIn("json", argv)
         self.assertIn("--mode", argv)
         self.assertIn("plan", argv)
+        self.assertIn("--sandbox", argv)
+        self.assertNotIn("--dangerously-skip-permissions", argv)
 
         second = io.StringIO()
         with contextlib.redirect_stdout(second):
@@ -347,6 +488,7 @@ print(json.dumps({'conversation_id':'conv-denied','status':'SUCCESS','response':
         self.assertEqual(result["status"], "error")
         self.assertIn("auto-denied", " ".join(result["blockers"]))
         self.assertIn("RunCommand", " ".join(result["blockers"]))
+        self.assertEqual(fusion_core.failure_class(result), "permission_denied")
 
     def test_agy_denial_alongside_success_text_is_still_surfaced(self):
         # Unlike the no-text case above, a denial alongside an otherwise

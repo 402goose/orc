@@ -7,6 +7,7 @@ export FUSION_TELEMETRY=0
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
+export ORC_HOME="$TMP/orc-home"
 trap 'rm -rf "$TMP"' EXIT
 WORKSPACE="$TMP/workspace"
 BIN="$TMP/bin"
@@ -58,6 +59,7 @@ cat > "$WORKSPACE/.fusion.json" <<JSON
   "claude": {"command": "$BIN/claude"},
   "codex": {"command": "$BIN/codex"},
   "agy": {"command": "$BIN/agy"},
+  "grok": {"command": "missing-fusion-dogfood-grok"},
   "routes": {
     "fixture-claude": {"agent": "claude", "command": "$BIN/claude"}
   },

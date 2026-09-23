@@ -1,0 +1,67 @@
+const { chromium, expect } = require('@playwright/test');
+const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+(async () => {
+  const fixture = spawn('python3', ['-u', path.join(__dirname, 'publish_browser_fixture.py')], {env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'}});
+  let stderr = '', browser;
+  fixture.stderr.on('data', b => stderr += b);
+  try {
+    const info = await new Promise((resolve, reject) => {
+      let output = '';
+      const timeout=setTimeout(()=>reject(Error('Fixture timeout '+stderr)),20000);
+      fixture.stdout.on('data', b=> { output+=b; const line=output.split('\n').find(l=>l.startsWith('{"url"')); if(line) { clearTimeout(timeout);resolve(JSON.parse(line)); }});
+      fixture.on('exit',code=>{clearTimeout(timeout);reject(Error('Fixture exited '+code+' '+stderr));});
+    });
+    browser = await chromium.launch({headless:true});
+    const page = await browser.newPage({viewport:{width:1440,height:1000}});
+    const errors=[];
+    page.on('pageerror', e=>errors.push(e.message));
+    await page.goto(info.url);
+    await page.waitForSelector('.worker-strip');
+    await page.evaluate(()=>navigate('workflow','wf-test'));
+    await page.getByRole('button',{name:'Open PR',exact:true}).click();
+    await expect(page.locator('#pr-publish-base')).toHaveValue('staging');
+    await page.getByRole('button',{name:'Preview PR →'}).click();
+    await expect(page.locator('.publish-diff')).toContainText('manually published fix');
+    expect(fs.existsSync(path.join(info.root,'github.json'))).toBe(false);
+    await page.locator('#pr-title').fill('fix: payment routing');
+    await expect(page.locator('[name=accept_legacy_diff]')).not.toBeChecked();
+    await page.getByRole('button',{name:'Publish PR →'}).click();
+    expect(fs.existsSync(path.join(info.root,'github.json'))).toBe(false);
+    await page.locator('[name=accept_legacy_diff]').check();
+    await page.screenshot({path:'/tmp/orc-publish-preview.png',fullPage:true});
+    await page.getByRole('button',{name:'Publish PR →'}).click();
+    await expect(page.locator('#job-content .status')).toHaveText('success',{timeout:20000});
+    await page.getByRole('button',{name:'Close dialog'}).click();
+    await expect(page.locator('.publication-panel')).toContainText('Open PR #1');
+    await page.getByRole('button',{name:'Refresh PR checks'}).click();
+    await expect(page.locator('.publication-panel')).toContainText('unit tests · SUCCESS');
+    await page.screenshot({path:'/tmp/orc-published-workflow.png',fullPage:true});
+    await page.setViewportSize({width:390,height:844});
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    await page.setViewportSize({width:1440,height:1000});
+    await page.locator('[data-view=settings]').click();
+    await page.selectOption('#settings-publish-mode','auto');
+    await page.getByRole('button',{name:'Save Fusion settings'}).click();
+    await expect(page.locator('#toast')).toContainText('Workspace settings saved');
+    expect(JSON.parse(fs.readFileSync(path.join(info.workspace,'.fusion.json'))).publish.mode).toBe('auto');
+    await page.locator('#launch-top').click();
+    await page.selectOption('#launch-kind','build');
+    await expect(page.locator('#launch-publish-mode')).toHaveValue('auto');
+    await page.locator('#launch-text').fill('Implement the fixture routing fix with tests');
+    await page.locator('#allow-write').check();
+    await page.locator('#launch-submit').click();
+    await expect(page.locator('#job-content .status')).toHaveText('success',{timeout:30000});
+    const github=JSON.parse(fs.readFileSync(path.join(info.root,'github.json')));
+    expect(github.prs).toHaveLength(2);
+    expect(github.prs.every(p=>p.baseRefName==='staging'&&p.isDraft)).toBe(true);
+    expect(fs.readFileSync(path.join(info.workspace,'app.txt'),'utf8')).toBe('manually published fix\n');
+    expect(errors).toEqual([]);
+    console.log('Publishing browser checks passed: preview, legacy confirmation, PR creation, CI refresh, mobile, saved defaults, automatic worktree publication.');
+  } finally {
+    if(browser) await browser.close();
+    fixture.kill('SIGINT');
+    await new Promise(resolve=>fixture.once('exit',resolve));
+  }
+})().catch(e=>{console.error(e);process.exitCode=1;});

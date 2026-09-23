@@ -55,7 +55,7 @@ class DecisionsTest(unittest.TestCase):
         os.environ.pop("FUSION_READ_ONLY", None)
         self.config = {"decisions": {"mode": "shadow"}, "routes": {},
                        "codex": {"command": sys.executable}, "claude": {"command": sys.executable},
-                       "agy": {"command": "missing-fusion-test-agent"}}
+                       "agy": {"command": "missing-fusion-test-agent"}, "grok": {"command": "missing-fusion-test-agent"}}
 
     def engine(self, choices=None, mode="shadow"):
         config = {**self.config, "decisions": {"mode": mode, "auto_actions": ["intake", "routing", "recovery", "review", "acceptance"], "calibration_file": "calibration.json"}}
@@ -234,6 +234,20 @@ class DecisionsTest(unittest.TestCase):
         task = self.task("agy")
         argv, _, _ = core.agent_command({"agy": {"mode": "yolo"}}, task, None)
         self.assertEqual(argv[argv.index("--mode") + 1], "plan")
+        self.assertIn("--sandbox", argv)
+
+    def test_auto_routing_requires_agy_headless_setup_but_explicit_selection_survives(self):
+        self.config["agy"] = {"command":sys.executable}
+        with patch.object(core, "agy_headless_status", return_value={"automatic_ready":False}):
+            choices = route_candidates(self.config, self.task(), core.RunStore(self.workspace))
+            self.assertNotIn("agy", [c["agent"] for c in choices])
+            explicit = self.task("agy")
+            with patch("fusion_policy.DecisionEngine", return_value=self.engine(mode="off")):
+                route_task(self.config, explicit, core.RunStore(self.workspace))
+            self.assertEqual(explicit["agent"], "agy")
+        with patch.object(core, "agy_headless_status", return_value={"automatic_ready":True}):
+            choices = route_candidates(self.config, self.task(), core.RunStore(self.workspace))
+            self.assertIn("agy", [c["agent"] for c in choices])
 
     def test_specialist_review_adds_scrutiny_only_when_qualified(self):
         engine = self.engine({"specialty": "payments"}, "active")

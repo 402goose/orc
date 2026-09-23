@@ -120,6 +120,9 @@ def _prepare(workspace, config, idea, kind, budget_usd, max_attempts, build_id, 
     spec = {"schema": "fusion.workflow.v1", "task": idea, "max_parallel": 1, "max_parallel_writers": 0 if read_only else 1,
             "max_attempts": max_attempts, "budget_usd": budget_usd, "nodes": nodes,
             "acceptance": {"required_nodes": [node["id"] for node in nodes]}}
+    if not read_only:
+        from fusion_publish import options
+        spec["publish"] = options(config)
     from fusion_workflow import validate_spec
     validate_spec(spec)
     path = root / "workflow.json"

@@ -59,6 +59,8 @@ def read_answer(workspace, result):
                 if event.get("type") == "item.completed" and isinstance(item, dict) and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
                     messages.append(item["text"])
             text = messages[-1] if messages else ""
+        elif result.get("agent") == "grok":
+            text = raw  # The native Grok adapter requests its plain headless output.
         elif result.get("agent") in {"claude", "agy"}:
             try:
                 envelope = json.loads(raw)
@@ -169,6 +171,13 @@ def format_report(report, *, brief=False):
         lines.append(f"Reported cost: ${report['spent_usd']:.4f} ({cost['reported_calls']}/{cost['calls']} calls supplied cost; not a billing total).")
     if report.get("budget_usd"):
         lines.append(f"Recorded-spend budget: ${report['budget_usd']:.2f}")
+    publication = report.get("publication") or {}
+    if publication.get("url"):
+        lines.append(f"PR: {terminal_text(publication['url'])} (base: {terminal_text(publication.get('base', ''))})")
+    elif publication.get("status"):
+        lines.append(f"Publication: {terminal_text(publication['status'])}")
+        if publication.get("error"):
+            lines.append(f"Publication error: {terminal_text(publication['error'])}")
     lines.append("")
     for node in stages:
         duration = f", {progress.elapsed(node['duration_ms'] / 1000)}" if node.get("duration_ms") is not None else ""

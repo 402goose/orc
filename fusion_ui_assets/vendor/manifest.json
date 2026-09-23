@@ -1,0 +1,14 @@
+{
+  "marked": {
+    "version": "18.0.14",
+    "integrity": "sha512-mBHK6FBHuBAlhgRe88w9F0O1AbwwXJUcQibUbC/QcdTbVGAD7aWza+xt3N6oT/jCZx3/OMeS+8rnuiHZcQ9s7A==",
+    "source": "lib/marked.umd.js",
+    "file": "marked.js"
+  },
+  "dompurify": {
+    "version": "3.4.15",
+    "integrity": "sha512-EUBjM+B+lkDE41iE82DDSCfkoPGfXx8IxFxPMjNzm/Uk4xDet77rTN9wqlxlVg71kK7XGuUMv6wUxJUwwv+Xyw==",
+    "source": "dist/purify.min.js",
+    "file": "purify.js"
+  }
+}
