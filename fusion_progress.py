@@ -1,7 +1,7 @@
 """Terminal progress and live subprocess logs, separate from machine output."""
 from __future__ import annotations
 
-from contextlib import contextmanager, ExitStack
+from contextlib import contextmanager, ExitStack, suppress
 import json
 import codecs
 import os
@@ -162,18 +162,30 @@ def worker_message(line):
 
 def _stop_process(proc):
     # Workers start their own session so Ctrl-C/timeout also cleans up CLI children.
+    # Teardown is best effort. Between the timeout and the kill a group can stop
+    # being signalable by us — the leader is already reaped, or its pid was
+    # recycled into a group we do not own — and the OS reports that as EPERM, not
+    # ESRCH. Raising here would turn a handled timeout into a crash for the
+    # caller, so fall back to signalling the child directly and give up quietly.
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
+    except PermissionError:
+        with suppress(OSError):
+            proc.terminate()
     try:
         proc.wait(timeout=1)
     except subprocess.TimeoutExpired:
         pass
+    # Still signal the group after a clean wait: descendants outlive the leader.
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        with suppress(OSError):
+            proc.kill()
     proc.wait()
 
 
