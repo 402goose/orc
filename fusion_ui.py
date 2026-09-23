@@ -31,8 +31,7 @@ from fusion_report import finding_request, format_report, reported_cost, select_
 from fusion_workflow import validate_spec, workflow_report, workflow_status
 
 ASSETS = Path(__file__).with_name("fusion_ui_assets")
-MASK = "••••••••"
-SECRET = re.compile(r"token|secret|password|api.?key|authorization", re.I)
+from fusion_core import MASK, SECRET, redact  # one definition, shared with `fusion doctor`
 IDENTIFIER = re.compile(r"^[A-Za-z0-9_.-]+$")
 ACTIVE = {"queued", "running", "stopping"}
 
@@ -70,14 +69,6 @@ def inside(root, path):
     if not path.is_relative_to(root):
         raise ValueError("Path must stay inside this workspace")
     return path
-
-
-def redact(value):
-    if isinstance(value, dict):
-        return {key: MASK if SECRET.search(key) and item else redact(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [redact(item) for item in value]
-    return value
 
 
 def restore_secrets(value, previous):
