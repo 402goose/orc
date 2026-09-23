@@ -151,6 +151,47 @@ class SurveyTest(unittest.TestCase):
         self.assertNotIn('active_run_id', r)
         self.assertEqual(survey.latest(self.workspace)['grade_counts']['U'], 2)
 
+    def stale_survey(self, pid):
+        """A survey left mid-flight, holding a pid it no longer owns."""
+        with patch.object(core, 'dispatch', side_effect=self.worker):
+            survey.survey(self.workspace, self.config, sync_only=True)
+        record = survey.latest(self.workspace)
+        path = truffle.root_for(self.workspace, record['id']) / 'hunt.json'
+        saved = json.loads(path.read_text())
+        saved.update(status='scouting', pid=pid)
+        path.write_text(json.dumps(saved))
+        return record['id']
+
+    def test_a_recycled_pid_does_not_strand_the_woodland(self):
+        """process_alive answers "is something alive", not "is it ours".
+
+        After a crash or reboot the recorded pid gets recycled onto an
+        unrelated program. Gating on liveness alone locked every saved grade
+        behind a stranger that would never exit, with no override.
+        """
+        import os
+
+        survey_id = self.stale_survey(os.getpid())   # alive, but not our coordinator
+        with patch.object(core, 'process_matches', return_value=False):
+            with patch.object(core, 'dispatch', side_effect=self.worker):
+                survey.survey(self.workspace, self.config, resume=survey_id)  # must not raise
+
+    def test_a_genuine_live_coordinator_still_blocks(self):
+        import os
+
+        survey_id = self.stale_survey(os.getpid())
+        with patch.object(core, 'process_matches', return_value=True):
+            with self.assertRaisesRegex(ValueError, "already has an active coordinator"):
+                survey.survey(self.workspace, self.config, resume=survey_id)
+
+    def test_takeover_overrides_a_coordinator_the_user_says_is_gone(self):
+        import os
+
+        survey_id = self.stale_survey(os.getpid())
+        with patch.object(core, 'process_matches', return_value=True):
+            with patch.object(core, 'dispatch', side_effect=self.worker):
+                survey.survey(self.workspace, self.config, resume=survey_id, takeover=True)
+
     def test_stale_checkout_and_issue_pause_before_dispatch(self):
         r = survey.survey(self.workspace, self.config, sync_only=True)
         self.issues[1]['updatedAt'] = 'new date'
