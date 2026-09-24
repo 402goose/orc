@@ -1953,3 +1953,11 @@ summary {
 .learning-scope .actions { margin-top:12px; }
 @media(max-width:1000px) { .workspace-activity-grid,.model-catalog-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 @media(max-width:650px) { .workspace-activity-grid,.model-catalog-grid,.model-provenance-grid { grid-template-columns:1fr; } .workspace-activity .section-bar { align-items:flex-start; flex-direction:column; gap:8px; } }
+
+.product-progress { margin:0 0 28px; }
+.product-progress-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; }
+.product-progress-card h3 { font-size:23px; margin:12px 0 18px; }
+.product-progress-card dt { font:11px var(--mono); color:var(--muted); margin-top:16px; }
+.product-progress-card dd { margin:5px 0 0; font-size:13px; line-height:1.6; overflow-wrap:anywhere; }
+.product-progress-card .actions { margin-top:20px; }
+@media(max-width:1000px) { .product-progress-grid { grid-template-columns:1fr; } .product-progress .section-bar { align-items:flex-start; flex-direction:column; gap:8px; } }
