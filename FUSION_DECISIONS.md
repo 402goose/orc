@@ -74,6 +74,29 @@ it. Interactive lead sessions use their own provider controls.
    native lanes. Explicit agent/route selections stay pinned, and a lane
    with a single candidate records no routing decision: there is nothing
    to choose.
+
+   Without a qualified classifier, automatic lanes follow the configured
+   preference order. `"decisions": {"rank_by_outcomes": true}` orders them
+   by verified outcomes instead: a lane with fewer than 3 checked runs (or
+   the integer you set) is tried first so it earns evidence, then lanes
+   follow smoothed acceptance `(accepted + 1) / (checked + 2)`. Workflow
+   gate outcomes and lead verdicts count, and so does an observed error
+   (not quota or permission, which are lane health); a worker's
+   `STATUS: success` is its own claim until a gate or lead checks it. A qualified classifier still
+   overrides the order. An ORC route with `"arms": 3` offers orc's top three
+   tool-fit models as separate candidates (`orc-free:<model id>`), each with
+   its own history; the default of one arm keeps the route's key and stats.
+
+   Delegations have no acceptance gate. After inspecting one, the lead
+   records its verdict so it counts:
+
+   ```sh
+   fusion outcome RUN_ID --accepted --reason "diff reviewed, tests pass"
+   fusion outcome RUN_ID --rejected --reason "empty diff"
+   ```
+
+   MCP leads call `fusion_outcome` with `run_id`, `accepted` and `reason`.
+   The latest verdict for a run wins.
 3. **Recovery:** classifies actual acceptance results as continue, repair,
    switch, ask or stop. A classifier cannot accept a failed check, bypass a
    permission denial, increase attempts, or discard prior spend. A qualified

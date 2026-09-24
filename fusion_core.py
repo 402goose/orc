@@ -1159,14 +1159,20 @@ def select_orc_model(command: str, selector: str, allow_untested: bool = False) 
     """
     if selector not in {"free", "best"}:
         return None
-    ranked = _orc_model_ids(command, ["--free", "--tools"] if selector == "free" else ["--tools"])
     if allow_untested:
+        ranked = _orc_model_ids(command, ["--free", "--tools"] if selector == "free" else ["--tools"])
         return ranked[0] if ranked else None
+    fitted = fitted_orc_models(command, selector, 1)
+    return fitted[0] if fitted else None
+
+
+def fitted_orc_models(command: str, selector: str, limit: int) -> list[str]:
+    """orc's quality ranking, restricted to models that passed `orc probe --fit`."""
+    if selector not in {"free", "best"}:
+        return []
+    ranked = _orc_model_ids(command, ["--free", "--tools"] if selector == "free" else ["--tools"])
     fit_ids = set(_orc_model_ids(command, ["--fit"]))
-    for candidate in ranked:
-        if candidate in fit_ids:
-            return candidate
-    return None
+    return [candidate for candidate in ranked if candidate in fit_ids][:max(0, limit)]
 
 
 def codex_permission_args(workspace: Path, settings: dict[str, Any], write: bool) -> list[str]:
@@ -1305,6 +1311,29 @@ def agent_command(
         argv += ["--", brief_for(task)]
         return argv, env, {"command": command, "model": selected_model}
     raise ValueError(f"unsupported agent: {agent}")
+
+
+def record_outcome(workspace: Path, run_id: str, accepted: bool, reason: str = "") -> dict[str, Any]:
+    """The lead's verdict on a delegation, after inspecting its diff and tests.
+
+    Delegations have no coordinator gate, so without this their only signal is
+    the worker's own claim. Outcomes feed decisions.rank_by_outcomes; the
+    latest verdict for a run wins.
+    """
+    from fusion_decisions import DecisionStore
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id or ""):
+        raise ValueError("run_id must be a Fusion run id")
+    result_path = RunStore(workspace).runs / run_id / "result.json"
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"no completed Fusion run {run_id} in this workspace") from exc
+    event = {"task_id": run_id, "group": result.get("trace_id") or run_id, "accepted": bool(accepted),
+             "status": result.get("status"), "source": "lead", "reason": str(reason)[:2000],
+             "route": result.get("route"), "agent": result.get("agent"), "model": result.get("model"),
+             "evidence": str(result_path)}
+    DecisionStore(workspace).append("outcome", **event)
+    return {"recorded": True, **event}
 
 
 def dispatch(
@@ -1668,6 +1697,20 @@ def tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "fusion_outcome",
+            "outputSchema": {"type": "object", "properties": {"recorded": {"type": "boolean"}, "task_id": {"type": "string"}, "accepted": {"type": "boolean"}}, "required": ["recorded"]},
+            "description": "Record your verdict on a delegated run after inspecting its diff and tests. Accepted/rejected outcomes rank future automatic routes; a worker's own success claim does not.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string", "description": "run_id from the fusion_delegate result."},
+                    "accepted": {"type": "boolean"},
+                    "reason": {"type": "string", "description": "What you verified or why you rejected it."},
+                },
+                "required": ["run_id", "accepted"],
+            },
+        },
+        {
             "name": "fusion_decisions",
             "outputSchema": {"type": "object", "properties": {"decisions": {"type": "array", "items": {"type": "object"}}}, "required": ["decisions"]},
             "description": "Inspect local classifier advice; recommendations never confer permissions or replace verification.",
@@ -1775,6 +1818,10 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
                 elif name == "fusion_decisions":
                     from fusion_decisions import DecisionStore
                     payload = {"decisions": DecisionStore(workspace).records()[-max(1, min(50, int(args.get("limit", 10)))):]}
+                elif name == "fusion_outcome":
+                    if not isinstance(args.get("accepted"), bool):
+                        raise ValueError("accepted must be true or false")
+                    payload = record_outcome(workspace, str(args.get("run_id", "")), args["accepted"], str(args.get("reason", "")))
                 elif name == "fusion_delegate":
                     agent = args.get("agent")
                     if agent not in {"auto", "codex", "claude", "agy", "grok"}:
@@ -1819,7 +1866,7 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
     return 0
 
 
-LEAD_PROMPT = """You are the lead agent in a Fusion harness. Own the user conversation, the plan, ambiguity, and final judgment. Use fusion_delegate for bounded work that benefits from a fresh context or a cheaper sidekick. Send a precise brief with success criteria and constraints. Keep writes single-threaded in the shared workspace. Review the returned handoff, inspect the diff and tests yourself, and take control back when the sidekick is out of depth. Do not delegate the final decision or silently accept an unverified result."""
+LEAD_PROMPT = """You are the lead agent in a Fusion harness. Own the user conversation, the plan, ambiguity, and final judgment. Use fusion_delegate for bounded work that benefits from a fresh context or a cheaper sidekick. Send a precise brief with success criteria and constraints. Keep writes single-threaded in the shared workspace. Review the returned handoff, inspect the diff and tests yourself, and take control back when the sidekick is out of depth. Do not delegate the final decision or silently accept an unverified result. After you inspect a delegated result, record your verdict with fusion_outcome."""
 
 
 BUILD_PROMPT = """You are the lead for a Fusion feature build. Take the user's idea through requirements, implementation, verification, and review fixes. The user supplies the outcome; you own the coordination. Follow the repository instructions.
@@ -2042,6 +2089,13 @@ def build_parser() -> argparse.ArgumentParser:
     delegate.add_argument("--success", action="append", default=[])
     delegate.add_argument("--constraint", action="append", default=[])
     delegate.add_argument("task")
+
+    outcome = sub.add_parser("outcome", help="record the lead's verdict on a delegated run")
+    outcome.add_argument("run_id")
+    verdict = outcome.add_mutually_exclusive_group(required=True)
+    verdict.add_argument("--accepted", dest="accepted", action="store_true")
+    verdict.add_argument("--rejected", dest="accepted", action="store_false")
+    outcome.add_argument("--reason", default="")
 
     ultra = sub.add_parser("ultra", help="run a bounded UltraCode-style explore/plan/implement/review pipeline")
     ultra.add_argument("--stages", type=int, help="maximum number of configured stages")
@@ -2322,6 +2376,9 @@ def _main(args, parser) -> int:
     if args.command in {"lead", "run"}:
         lead = args.agent or config.get("lead", "claude")
         return launch_lead(workspace, config, lead, args.task, interactive=args.command == "lead")
+    if args.command == "outcome":
+        print(json_text(record_outcome(workspace, args.run_id, args.accepted, args.reason)))
+        return 0
     if args.command == "delegate":
         task = make_task(
             workspace,
