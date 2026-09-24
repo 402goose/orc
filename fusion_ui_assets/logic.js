@@ -50,6 +50,18 @@
 
   const focusWorkflow = (runs = []) => runs.find(run => active(run.status)) || runs[0] || null;
 
+  // Receipt linkage comes from the server. A newer executor result is evidence
+  // to inspect, not authority to rewrite the original workflow outcome.
+  const followupReceipt = (report) => {
+    if (!report || active(report.status)) return null;
+    const runs = (report.tenet?.runs || []).filter(run => Number.isFinite(Date.parse(run.started_at)))
+      .sort((a, b) => Date.parse(a.started_at) - Date.parse(b.started_at));
+    if (runs.length < 2) return null;
+    return [...runs].reverse().find(run => run.terminal && ["succeeded", "failed"].includes(run.status)
+      && Date.parse(run.started_at) > Date.parse(runs[0].started_at)
+      && Date.parse(run.started_at) > report.started_at_ms) || null;
+  };
+
   /**
    * A draft may be approved only with at least one answer AND written
    * evidence. Approved labels enter training exports, so a false positive
@@ -113,6 +125,7 @@
     active,
     acceptanceSummary,
     focusWorkflow,
+    followupReceipt,
     canApproveLabels,
     commandPreview,
     age,

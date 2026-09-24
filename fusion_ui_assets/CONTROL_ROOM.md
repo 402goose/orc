@@ -21,6 +21,15 @@ Laya, models, and settings remain under Tools & learning.
 The homepage no longer repeats the previous guild hero, cost statistics, and
 template gallery. New run and the existing functional tools remain available.
 
+Laya and Truffle use the authenticated local capability projection to show the
+selected workspace and prerequisites. A configured GitHub remote is distinct
+from checked authentication or a saved issue snapshot. Laya's last observed
+inference is historical evidence; training data and runtime gates remain separate.
+Unknown/damaged records do not display as zero approved examples. Source switching
+does not pool labels, fetch issues, launch scouts or enable training. A newer
+explicitly linked TENET terminal receipt is follow-up evidence; the original
+workflow outcome stays unchanged.
+
 ## Design references and shell consolidation
 
 The functional base is ORC's workspace navigation, worker activity timeline,
