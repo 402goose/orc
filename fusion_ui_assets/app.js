@@ -872,7 +872,7 @@ function decisions() {
   let body = "";
   if (state.labTab === "overview") body = trainingQuest(true) + learningDashboard();
   else if (state.labTab === "review") body = decisionReview();
-  else if (state.labTab === "garden") body = gardenPanel() + `<div id="garden-live-region">${gardenLive() || empty("The garden is quiet.", "Enable automatic drafts to follow new labeling runs here. You can inspect decisions in Review at any time.")}</div>`;
+  else if (state.labTab === "garden") body = gardenPanel() + `<div id="garden-live-region">${gardenLive() || empty("The garden is quiet.", state.garden?.enabled ? "Waiting for eligible decisions. New drafting activity will appear here; existing drafts are in Review." : "Enable automatic drafts to follow new labeling runs here. You can inspect decisions in Review at any time.")}</div>`;
   else if (state.labTab === "training") body = trainingDashboard();
   else if (state.labTab === "quality" && state.learning) body = qualityDashboard(state.learning);
   else if (state.labTab === "results" && state.learning) body = trainingQuest() + impactDashboard(state.learning);
@@ -1244,7 +1244,7 @@ function openResume() {
 const labTabs = [
   ["overview", "Overview", "Your model, teaching coverage, and progress at a glance."],
   ["review", "Review", "Inspect decisions, edit suggested labels, and approve the useful lessons."],
-  ["garden", "Garden", "Configure automatic labeling and watch the council work live."],
+  ["garden", "Garden", "Configure automatic drafts and follow their progress."],
   ["training", "Training", "Export approved data, train candidates, and run evaluations."],
   ["quality", "Quality", "Understand the evidence, balance, and provenance of your training data."],
   ["results", "Results", "Compare candidates with their source model on the same held-out examples."],
