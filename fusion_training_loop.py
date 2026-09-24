@@ -118,6 +118,22 @@ def proof(round):
             'promoted':False}
 
 
+LIVE_JOB_FIELDS = ('id', 'status', 'started_at_ms', 'progress')
+
+
+def live_job(job):
+    """The fields the round display actually uses, and nothing else.
+
+    ControlRoom.job attaches a 60 KB stderr tail as `console` and an 80 KB
+    stdout tail as `output`. This rides on /api/decisions, which the control
+    room polls every two seconds while a round runs, and `learning_progress`
+    writes a line per optimizer step, so those tails are reliably near their
+    caps rather than occasionally large. The live view reads four fields; the
+    logs are a click away under the job itself.
+    """
+    return {key: job.get(key) for key in LIVE_JOB_FIELDS} if isinstance(job, dict) else job
+
+
 def status(app, workspace, rows=None):
     value = settings(workspace)
     history = rounds(workspace)
@@ -130,7 +146,7 @@ def status(app, workspace, rows=None):
     active_job = None
     if running and running.get('active_job'):
         try:
-            active_job = app.job(workspace,running['active_job'])
+            active_job = live_job(app.job(workspace,running['active_job']))
         except (ValueError, OSError):
             # The job directory can be pruned, or simply absent in a copied or
             # restored workspace. A vanished job must not take out the lab:

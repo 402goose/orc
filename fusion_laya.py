@@ -123,6 +123,24 @@ def learning_progress(args, phase, **value):
     print(f"laya {phase}: {message}", file=sys.stderr, flush=True)
 
 
+CURVE_POINTS = 200
+
+
+def emits_progress(step, total):
+    """Should this step write a progress update?
+
+    loss_curve downsamples to CURVE_POINTS, so a new point only appears every
+    `stride` steps. Writing every step rebuilt the whole curve and rewrote the
+    progress file each time for a display that could not show the difference.
+    Short runs are unaffected: stride is 1 until there are more steps than
+    points. The final step always emits so the curve ends where the run did.
+    """
+    if total <= 0:
+        return True
+    stride = max(1, (total + CURVE_POINTS - 1) // CURVE_POINTS)
+    return step % stride == 0 or step >= total
+
+
 def loss_curve(losses):
     stride = max(1, (len(losses) + 199) // 200)
     indices = sorted(set(range(0,len(losses),stride)) | ({len(losses)-1} if losses else set()))
@@ -263,7 +281,15 @@ def train(args):
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
             steps += 1
-            learning_progress(args, 'training', done=steps, total=args.epochs*len(train_rows), loss=losses[-1], loss_curve=loss_curve(losses))
+            # The curve is downsampled to 200 points, so a new point only
+            # appears every `stride` steps. Emitting every step rewrote the
+            # progress file and rebuilt the whole curve each time -- O(steps^2)
+            # work, and a write+rename per step, for a display that could not
+            # show the difference.
+            total_steps = args.epochs * len(train_rows)
+            if emits_progress(steps, total_steps):
+                learning_progress(args, 'training', done=steps, total=total_steps,
+                                  loss=losses[-1], loss_curve=loss_curve(losses))
     output.mkdir(parents=True)
     agent.model.encoder.config.save_pretrained(output / "encoder")
     agent.tok.save_pretrained(output / "tokenizer")
