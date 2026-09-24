@@ -596,8 +596,9 @@ class ControlRoom:
             raise ValueError("Job does not exist")
         job = read_json(directory / "job.json")
         request = read_json(directory / "request.json")
-        if request.get("admission"):
-            job["admission"] = admission_provider.observation(workspace, request["admission"])
+        if job.get("admission") or request.get("admission"):
+            # Query the requested job identity, not an editable receipt pointer.
+            job["admission"] = admission_provider.observation(workspace, {"run_id": job_id})
         if job.get("action") in {"train", "evaluate"}:
             job["progress"] = read_json(directory / ("candidate.progress.json" if job["action"] == "train" else "dataset.jsonl.progress.json"))
         job["console"] = tail(directory / "stderr.log", 60000)
