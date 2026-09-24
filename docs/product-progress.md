@@ -19,3 +19,8 @@ supported by their linked evidence and update them when project status changes.
 Missing input hides the optional section; damaged or unknown-source input is
 shown as unavailable. The reader does not execute any supplied content or fetch
 external URLs. No TENET-specific plan or workspace paths are embedded in ORC.
+
+An optional `milestones` array (up to eight entries) gives each milestone a `name`,
+`exit` condition and `status`: `planned`, `in_progress`, or `qualified`. The room
+shows these in a collapsed roadmap. These are explicit coordinator checkpoints,
+not statuses inferred from successful execution or model predictions.

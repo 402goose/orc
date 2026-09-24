@@ -41,7 +41,16 @@ def product_progress(workspaces):
                         or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", ref["run_id"])
                         or not isinstance(ref.get("label"), str) or not 1 <= len(ref["label"]) <= 200):
                     raise ValueError("Project evidence must reference a registered workspace and run")
+        milestones = value.get("milestones", [])
+        if not isinstance(milestones, list) or len(milestones) > 8:
+            raise ValueError("Invalid product milestones")
+        for milestone in milestones:
+            if (not isinstance(milestone, dict) or milestone.get("status") not in {"planned", "in_progress", "qualified"}
+                    or any(not isinstance(milestone.get(field), str) or not 1 <= len(milestone[field]) <= 1000
+                           for field in ("name", "exit"))):
+                raise ValueError("Invalid milestone checkpoint")
         return {"status": "ready", "source": "operator_checkpoint", "updated_at": value["updated_at"],
-                "projects": projects, "note": "Coordinator checkpoint; live run evidence is shown separately."}
+                "projects": projects, "milestones": milestones,
+                "note": "Coordinator checkpoint; live run evidence is shown separately."}
     except (ValueError, TypeError, OSError, AttributeError) as exc:
         return {"status": "unreadable", "source": "operator_checkpoint", "error": str(exc)}
