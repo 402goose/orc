@@ -453,9 +453,9 @@ class ControlRoom:
                 break
         return runs
 
-    def garden_tick(self):
+    def garden_tick(self, workspaces=None):
         with self.lock:
-            workspaces = list(self.workspaces.values())
+            workspaces = list(self.workspaces.values() if workspaces is None else workspaces)
         for workspace in workspaces:
             try:
                 garden.tick(self, workspace)
