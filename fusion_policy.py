@@ -201,6 +201,10 @@ def route_task(config, task, store):
             candidates = route_candidates(config, task, store)
             if ranking:
                 candidates = rank_by_outcomes(candidates, int(ranking) if not isinstance(ranking, bool) else 3)
+                if task.get("prefer_different_agent"):
+                    # Independence outranks track record: a review stays with a
+                    # different harness than the implementer when one is available.
+                    candidates.sort(key=lambda item: item["agent"] == task["prefer_different_agent"])
         else:
             import fusion_core as core
             from fusion_reasoning import pair_candidates, pair_key
