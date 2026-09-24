@@ -549,6 +549,10 @@ are reused, not repeated. Jobs survive closing the browser, and records live und
 
 ```sh
 orc fusion --progress truffle hunt --count 5 --scan-limit 40 --search 'label:bug'
+# Scout on a free OpenRouter route; with arms and rank_by_outcomes the model is
+# picked inside the route by verified outcomes. --model pins one instead.
+orc fusion --progress truffle hunt --count 3 --route orc-free
+orc fusion --progress truffle hunt --count 3 --agent claude --model claude-haiku-4-5-20251001
 orc fusion truffle show truffle-0123456789ab
 # Use the saved hunt ID and only the issue numbers you chose from its shortlist:
 orc fusion --progress truffle run truffle-0123456789ab --issues 123 456 --base staging --publish manual

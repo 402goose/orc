@@ -86,6 +86,9 @@ it. Interactive lead sessions use their own provider controls.
    overrides the order. An ORC route with `"arms": 3` offers orc's top three
    tool-fit models as separate candidates (`orc-free:<model id>`), each with
    its own history; the default of one arm keeps the route's key and stats.
+   A task that names such a route without pinning a model gets its model
+   chosen inside that route the same way (when decisions mode is not off);
+   the named route itself is never swapped for another lane.
 
    Delegations have no acceptance gate. After inspecting one, the lead
    records its verdict so it counts:

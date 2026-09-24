@@ -192,9 +192,10 @@ def route_task(config, task, store):
         raise ValueError("agent=auto cannot use per-agent settings overrides; configure named routes")
     # Explicit lanes are never silently substituted, even if unhealthy.
     with progress.activity(task.get("progress_label", task["role"]), "checking available workers and model fit" if automatic else "checking selected worker"):
+        ranking = config.get("decisions", {}).get("rank_by_outcomes")
+        within_route = False
         if automatic:
             candidates = route_candidates(config, task, store)
-            ranking = config.get("decisions", {}).get("rank_by_outcomes")
             if ranking:
                 candidates = rank_by_outcomes(candidates, int(ranking) if not isinstance(ranking, bool) else 3)
         else:
@@ -202,7 +203,14 @@ def route_task(config, task, store):
             from fusion_reasoning import pair_candidates, pair_key
             settings = core.agent_settings(config, task)
             pairs = pair_candidates(config, settings, task.get("write", False)) if task["agent"] == "codex" else []
-            candidates = [{"key": pair_key(pair), "agent": "codex", "route": task.get("route"), **pair} for pair in pairs] or [{
+            # A named route with several arms still chooses a model inside that
+            # route; the lane itself is never substituted.
+            arms = [] if pairs or not task.get("route") or settings.get("model") or int(settings.get("arms", 1)) < 2 else [
+                c for c in route_candidates(config, task, store) if c["route"] == task["route"]]
+            if arms and ranking:
+                arms = rank_by_outcomes(arms, int(ranking) if not isinstance(ranking, bool) else 3)
+            within_route = len(arms) > 1
+            candidates = arms or [{"key": pair_key(pair), "agent": "codex", "route": task.get("route"), **pair} for pair in pairs] or [{
                 "key": task.get("route") or task["agent"], "agent": task["agent"], "route": task.get("route"),
                 "model": settings.get("model", ""),
                 **({"reasoning_effort": settings["reasoning_effort"]} if settings.get("reasoning_effort") is not None else {}),
@@ -224,6 +232,9 @@ def route_task(config, task, store):
             value = record["recommendations"]["route"]["value"]
             selected = next(c for c in candidates if c["key"] == value)
             applied = True
+    if within_route:
+        task.setdefault("settings_overrides", {})["model"] = selected["model"]
+        task["session_key"] += ":" + selected["key"]
     if automatic:
         task["requested_agent"] = "auto"
         task["agent"], task["route"] = selected["agent"], selected["route"]
@@ -236,6 +247,8 @@ def route_task(config, task, store):
     if record:
         task.setdefault("decisions", {})["routing"] = record["id"]
         reason = ("qualified automatic route" if applied else
+                  ("model chosen inside the named route by " + ("verified outcomes" if ranking else "orc's quality order")
+                   + "; advice does not change dispatch") if within_route else
                   "explicit route or pair retained; advice does not change dispatch" if not automatic else
                   "ranked by verified outcomes; advice does not change dispatch" if config.get("decisions", {}).get("rank_by_outcomes") else
                   "configured preference order; advice does not change dispatch")
