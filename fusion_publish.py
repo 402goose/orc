@@ -99,7 +99,13 @@ def snapshot(workspace, paths=None):
 
 
 def repo_for(workspace, remote):
-    raw = text(workspace, "config", "--get", f"remote.{remote}.url")
+    configured = subprocess.run(["git", "config", "--get", f"remote.{remote}.url"],
+                                cwd=workspace, capture_output=True, text=True, timeout=5)
+    if configured.returncode == 1:
+        raise ValueError(f"No Git remote named '{remote}' in this workspace. Choose an existing GitHub remote or configure one first.")
+    if configured.returncode:
+        raise ValueError("Git could not read this workspace's remote configuration")
+    raw = configured.stdout.strip()
     match = re.fullmatch(r"(?:git@github\.com:|https://github\.com/|ssh://git@github\.com/)([\w.-]+/[\w.-]+?)(?:\.git)?/?", raw)
     if not match:
         raise ValueError("Publishing requires a GitHub remote (SSH or HTTPS)")
