@@ -113,7 +113,8 @@ class LabelingTest(unittest.TestCase):
         secret = self.workspace / "secret"
         secret.write_text("Do not include")
         (directory / "answer.md").symlink_to(secret)
-        self.assertEqual(len(evidence_bundle(self.workspace, self.record)), 2)
+        with self.assertRaisesRegex(ValueError, "symlinks"):
+            evidence_bundle(self.workspace, self.record)
         self.assertEqual(len(evidence_bundle(self.workspace, {**self.record, "context": {"task_id": "../../outside"}})), 1)
 
     def test_unavailable_and_truncated_decisions_cannot_be_suggested(self):

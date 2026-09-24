@@ -263,7 +263,10 @@ def parse_handoff(text: str) -> dict[str, Any]:
             # examples cannot introduce/override labels. The planner's separate
             # contract is not a continuation of its final BLOCKERS: none field.
             handoff_fence = not blocks and language in {"", "text", "plaintext", "markdown"} and bool(label_pattern.match(following))
-            if language == "acceptance-contract":
+            label_block_closed = language == "label-suggestion" and any(
+                re.fullmatch(re.escape(fence[0]) + "{" + str(len(fence)) + r",}\s*", value.strip())
+                for value in lines[index + 1:])
+            if language == "acceptance-contract" or label_block_closed:
                 active = None
             elif not handoff_fence and active:
                 blocks[active].append(line)

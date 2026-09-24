@@ -280,7 +280,7 @@ def run_job(directory):
         # not reread from a request file editable by the candidate.
         request.update(workspace=pinned["workspace"], action="workflow", admission=pinned,
                        argv=[], mode="off")
-    elif admission_provider.binding(Path(request["workspace"])) and request.get("action") == "workflow":
+    elif admission_provider.binding(Path(request["workspace"])) and request.get("action") in {"workflow", "suggest-labels"}:
         raise ValueError("Required admission binding is missing from supervisor launch")
     state = {"id": directory.name, "action": request["action"], "title": request["title"],
              "decision_id": request.get("decision_id"),
@@ -296,14 +296,20 @@ def run_job(directory):
         environment["FUSION_TRUFFLE_SURVEY_ID"] = request["survey_id"]
     admitted = request.get("admission")
     claimed = False
+    label_packet = None
     try:
         argv = request["argv"]
         if admitted:
-            _, argv, overrides = admission_provider.execution(Path(request["workspace"]), admitted)
+            receipt, argv, overrides = admission_provider.execution(Path(request["workspace"]), admitted)
             claimed = True
             environment.update(overrides)
             state["workflow_id"] = admitted["run_id"]
             state["admission"] = admitted
+            if receipt.get("request", {}).get("intent", {}).get("label_draft"):
+                from fusion_label_drafts import frozen_packet
+                label_packet = frozen_packet(request["workspace"], receipt)
+                state.update(action="suggest-labels", decision_id=label_packet["decision"]["id"],
+                             title="Draft labels for " + label_packet["decision"]["id"], phase="assessing")
         with (directory / "stdout.log").open("wb") as out, (directory / "stderr.log").open("wb") as err:
             proc = subprocess.Popen(argv, cwd=request["workspace"], env=environment,
                                     stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
@@ -348,6 +354,15 @@ def run_job(directory):
                         "workflow_id": admitted["run_id"], "checks": []})
         except ValueError as exc:
             state["admission_error"] = str(exc)
+    if label_packet and state["status"] == "success":
+        try:
+            if state.get("admission_error"):
+                raise ValueError("Worker completed, but terminal admission receipt is not recorded")
+            from fusion_label_drafts import finalize
+            state["result"] = finalize(request["workspace"], admitted["run_id"])
+            state["phase"] = "needs_review"
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            state.update(status="failed", phase="draft_pending", error=str(exc))
     state["finished_at_ms"] = core.now_ms()
     atomic_json(directory / "job.json", state)
     return 0
@@ -688,7 +703,7 @@ class ControlRoom:
         # GitHub inventory is an explicitly non-model operation. Other model,
         # training, resume and publishing routes cannot bypass admission.
         inventory_only = action == "truffle-survey" and body.get("sync_only") is True and not body.get("resume")
-        if provider and action != "workflow" and not inventory_only:
+        if provider and action not in {"workflow", "suggest-labels"} and not inventory_only:
             raise ValueError("TENET mode currently supports bounded workflows and GitHub inventory. This action has no admitted execution contract yet.")
         job_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
         if provider and action == "workflow":
@@ -706,6 +721,7 @@ class ControlRoom:
         writes = False
         spec = None
         survey_id = None
+        label_draft = None
         if action == "build":
             kind = body.get("kind", "discovery")
             if kind not in {"discovery", "review", "build", "debug", "sweep"}:
@@ -833,11 +849,20 @@ class ControlRoom:
         elif action == "suggest-labels":
             from fusion_labeling import labelable, labeling_options, approval_options, council_rule
             labelable(DecisionStore(workspace), body.get("decision_id"))
-            agent = body.get("agent", "auto")
+            agent = body.get("agent", "codex" if provider else "auto")
             if agent not in {"auto", "codex", "claude", "agy", "grok"}:
                 raise ValueError("Choose a labeling worker")
             options = labeling_options(body.get("labeling_mode", "single"), body.get("council_agents"))
             approval = approval_options(body.get("approval_mode", "human"), options['labeling_mode'])
+            if provider:
+                if agent != "codex" or options["labeling_mode"] != "single" or approval != "human":
+                    raise ValueError("TENET label drafts require one Codex worker and human approval")
+                if body.get("mode") not in {None, "off"}:
+                    raise ValueError("Label drafting requires Laya mode off")
+                from fusion_label_drafts import draft_request
+                draft = draft_request(workspace, body["decision_id"], body.get("model"), body.get("reasoning_effort"))
+                job_id, spec, label_draft = draft["run_id"], draft["spec"], draft["label_draft"]
+                directory = inside(workspace / ".fusion", "ui/jobs/" + job_id)
             argv += ["decisions", "suggest", "--agent", agent, "--approval", approval,
                      "--council-rule", council_rule(body.get("council_rule", "unanimous"))]
             if garden and body.get('garden_policy'):
@@ -869,6 +894,13 @@ class ControlRoom:
         if writes and body.get("allow_write") is not True:
             raise ValueError("This workflow includes implementation. Enable workspace edits before launching.")
         with self.lock, garden_lock(workspace, action):
+            if provider and label_draft and directory.exists():
+                # A repeated click or garden tick may recover completion, never
+                # admit another request or repeat the worker inference.
+                previous = self.job(workspace, job_id)
+                if previous.get("admission", {}).get("terminal") and previous["admission"].get("status") == "success":
+                    return self.finalize_label_draft(workspace, job_id)
+                return previous
             if action in {"export", "train", "evaluate", "calibrate"} and any(j["status"] in ACTIVE and j["action"] in {"export", "train", "evaluate", "calibrate"} for j in self.jobs(workspace, limit=None)):
                 raise ValueError("A local learning job is already active. Follow or stop it before starting another.")
             if action == "publish" and any(j["status"] in ACTIVE and j["action"] == "publish" for j in self.jobs(workspace)):
@@ -878,10 +910,11 @@ class ControlRoom:
             if action in {"build", "delegate", "resume", "workflow", "truffle-hunt", "truffle-run", "truffle-survey"} and not (action == "truffle-survey" and body.get("sync_only") and not body.get("resume")) and any(j["status"] in ACTIVE and j["action"] in {"build", "delegate", "resume", "workflow", "truffle-hunt", "truffle-run", "truffle-survey"} for j in self.jobs(workspace)):
                 raise ValueError("A UI workflow is already active in this workspace. Follow or stop it before launching another.")
             admitted = None
-            if provider and action == "workflow":
+            if provider and action in {"workflow", "suggest-labels"}:
                 config, _ = core.load_config(workspace)
                 # Provider receives authored inputs, without ORC's derived graph.
-                response = admission_provider.admit(workspace, job_id, body["spec"], config, mode=mode or "off")
+                response = admission_provider.admit(workspace, job_id, spec if label_draft else body["spec"], config,
+                                                     mode=mode or "off", label_draft=label_draft)
                 admitted = {"run_id": response["run_id"], "workspace_id": response["workspace_id"],
                             "request_sha256": response["request_sha256"]}
             directory.mkdir(parents=True, mode=0o700)
@@ -910,6 +943,20 @@ class ControlRoom:
                                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, env=supervisor_env)
             self.children = [child for child in self.children if child.poll() is None] + [proc]
         return self.job(workspace, job_id)
+
+    def finalize_label_draft(self, workspace, run_id):
+        from fusion_label_drafts import finalize
+        result = finalize(workspace, run_id)
+        directory = inside(workspace / ".fusion", "ui/jobs/" + run_id)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        state = read_json(directory / "job.json", {})
+        state.update(id=run_id, action="suggest-labels", decision_id=result["decision_id"],
+                     status="success", phase="needs_review", result=result, workflow_id=run_id,
+                     admission={"run_id": run_id, "request_sha256": result["admission_request_sha256"]},
+                     finished_at_ms=state.get("finished_at_ms") or core.now_ms())
+        state.pop("error", None)
+        atomic_json(directory / "job.json", state)
+        return state
 
 
 def persistent_token():
@@ -1104,6 +1151,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Suggested labels require explicit human approval")
                 DecisionStore(workspace).label(body.get("id"), body.get("answers", {}), body.get("evidence", ""), body.get("suggestion_id"), replace=True)
                 result = {"saved": True}
+            elif path == "/api/label-draft/finalize":
+                result = app.finalize_label_draft(workspace, body.get("run_id"))
             elif path == "/api/training-loop":
                 result = training_loop.configure(app, workspace, body)
             elif path == "/api/garden":
