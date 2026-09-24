@@ -231,4 +231,91 @@ class ConfiguredCheckpointDispatchTest(unittest.TestCase):
         self.assertEqual(fusion_ui.model_path_for(self.w, source), inner.resolve())
 
 
+class LivePayloadTest(unittest.TestCase):
+    """The round display polls /api/decisions every two seconds.
+
+    ControlRoom.job attaches a 60 KB stderr tail and an 80 KB stdout tail, and
+    training status carried both on every poll for the whole of a round. The
+    live view reads four fields; the logs are a click away under the job.
+    """
+
+    def test_only_the_fields_the_live_view_uses_survive(self):
+        job = {'id': 'j1', 'status': 'running', 'started_at_ms': 7,
+               'progress': {'phase': 'training'},
+               'console': 'x' * 60000, 'output': 'y' * 80000,
+               'result': {'noise': 'z' * 4000}}
+        slim = loop.live_job(job)
+        self.assertEqual(sorted(slim), ['id', 'progress', 'started_at_ms', 'status'])
+        self.assertLess(len(str(slim)), 500)
+        self.assertGreater(len(str(job)), 100_000)
+
+    def test_status_sends_the_slim_job_not_the_whole_thing(self):
+        """The projection must actually be on the path status() returns.
+
+        Testing live_job alone proves nothing about whether status() calls it.
+        """
+        import fusion_training_loop as tl
+
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        w = Path(self.tmp.name) / "repo"
+        tl.save(tl.root(w) / 'settings.json', {"enabled": True, "min_new_answers": 5})
+        tl.save(tl.root(w) / 'rounds' / 'r1' / 'round.json', {
+            "id": "r1", "number": 1, "status": "running", "phase": "train",
+            "active_job": "job-1", "tokens": {}, "started_at_ms": 1})
+
+        fat = {'id': 'job-1', 'status': 'running', 'started_at_ms': 7,
+               'progress': {'phase': 'training'},
+               'console': 'x' * 60000, 'output': 'y' * 80000}
+
+        class App:
+            lock = None
+            def job(self, workspace, job_id): return dict(fat)
+            def jobs(self, workspace, limit=None): return []
+
+        state = tl.status(App(), w, rows=[])
+        self.assertEqual(sorted(state['active_job']), ['id', 'progress', 'started_at_ms', 'status'])
+        self.assertLess(len(json.dumps(state)), 5000)
+
+    def test_a_missing_job_passes_through_untouched(self):
+        self.assertIsNone(loop.live_job(None))
+
+
+class TrainingProgressThrottleTest(unittest.TestCase):
+    """loss_curve downsamples to 200 points, so emitting every step rebuilt the
+    whole curve and rewrote the progress file for a display that could not show
+    the difference -- O(steps^2) work during training."""
+
+    def setUp(self):
+        from fusion_laya import emits_progress, CURVE_POINTS
+        self.emits, self.points = emits_progress, CURVE_POINTS
+
+    def test_a_short_run_still_emits_every_step(self):
+        for total in (1, 10, self.points):
+            with self.subTest(total=total):
+                self.assertTrue(all(self.emits(s, total) for s in range(1, total + 1)))
+
+    def test_a_long_run_is_capped_at_the_curve_resolution(self):
+        for total in (1000, 5000, 50000):
+            with self.subTest(total=total):
+                emitted = sum(self.emits(s, total) for s in range(1, total + 1))
+                self.assertLessEqual(emitted, self.points + 1)
+                self.assertGreater(emitted, self.points // 2)
+
+    def test_the_final_step_always_emits(self):
+        # Totals that are NOT a multiple of their stride: without the explicit
+        # final-step guarantee these end the curve short of where the run did.
+        for total in (1001, 4999, 317, 999, 1003):
+            with self.subTest(total=total):
+                stride = max(1, (total + self.points - 1) // self.points)
+                self.assertNotEqual(total % stride, 0, "pick a total that needs the guard")
+                self.assertTrue(self.emits(total, total))
+        for total in (1, 37, 1000, 5000):
+            with self.subTest(total=total):
+                self.assertTrue(self.emits(total, total))
+
+    def test_an_unknown_total_does_not_silence_progress(self):
+        self.assertTrue(self.emits(1, 0))
+        self.assertTrue(self.emits(9, -1))
+
+
 if __name__=='__main__':unittest.main()
