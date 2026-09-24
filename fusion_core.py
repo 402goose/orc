@@ -212,39 +212,102 @@ NONE_ANSWERS = {"none", "n/a", "na", "nil", "nothing", "-", "—"}
 
 def parse_handoff(text: str) -> dict[str, Any]:
     """Extract the small handoff contract from a worker's final message."""
-    fields: dict[str, str] = {}
-    labels = ("STATUS", "SUMMARY", "CHANGED", "TESTS", "BLOCKERS")
-    for line in text.splitlines():
+    blocks: dict[str, list[str]] = {}
+    label_pattern = re.compile(r"^(STATUS|SUMMARY|CHANGED|TESTS|BLOCKERS):\s*(.*)$", re.I)
+    active: str | None = None
+    fence: str | None = None
+    handoff_fence = False
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
         stripped = line.strip()
-        for label in labels:
-            prefix = f"{label}:"
-            if stripped.upper().startswith(prefix):
-                fields[label] = stripped[len(prefix):].strip()
-                break
+        marker = re.match(r"^(`{3,}|~{3,})(.*)$", stripped)
+        if fence:
+            if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence) and not marker[2].strip():
+                if not handoff_fence and active:
+                    blocks[active].append(line)
+                fence = None
+                if handoff_fence:
+                    active = None
+                handoff_fence = False
+                continue
+            if not handoff_fence:
+                if active:
+                    blocks[active].append(line)
+                continue
+        elif marker:
+            fence = marker[1]
+            language = marker[2].strip().lower()
+            following = next((value.strip() for value in lines[index + 1:] if value.strip()), "")
+            # A whole handoff may be wrapped in a text fence. Other fenced
+            # examples cannot introduce/override labels. The planner's separate
+            # contract is not a continuation of its final BLOCKERS: none field.
+            handoff_fence = not blocks and language in {"", "text", "plaintext", "markdown"} and bool(label_pattern.match(following))
+            if language == "acceptance-contract":
+                active = None
+            elif not handoff_fence and active:
+                blocks[active].append(line)
+            continue
+        matched = label_pattern.match(stripped)
+        if matched:
+            active = matched[1].upper()
+            blocks[active] = [matched[2]]
+        elif active:
+            blocks[active].append(line)
+    fields = {label: "\n".join(value).strip() for label, value in blocks.items()}
 
     def list_field(name: str) -> list[str]:
         value = fields.get(name, "").strip()
         if not value or value.lower() in NONE_ANSWERS:
             return []
-        # Workers answer "none" in prose: "none.", "N/A", "None - read-only node".
-        # Only the leading clause decides, so an explanation after it is not
-        # comma-split into phantom entries. A trailing comma-split on a real
-        # answer is fine; a phantom blocker fails a node that actually passed.
-        # Require a prose boundary: names such as none.py and nil-cache.json
-        # are real changed files, not a statement that nothing changed.
-        lead = re.split(r"[.;:,—-](?:\s+|$)", value, maxsplit=1)[0].strip().lower()
-        if lead in NONE_ANSWERS:
-            return []
-        if _reads_as_prose(value):
-            # One statement, not a comma-delimited list. Splitting prose on
-            # commas produces fragments that read as gibberish, and these
-            # fields are not only displayed - they become the state a Laya
-            # decision is classified from, so the debris degrades the model's
-            # input. One honest sentence beats three nonsense entries.
-            return [value]
-        return [item.strip() for item in value.split(",") if item.strip()]
+        # A blank line is not evidence that a worker finished listing blockers.
+        # Remove only complete, familiar signoff paragraphs; arbitrary prose,
+        # including an unindented failure after a blank line, remains evidence.
+        paragraphs = re.split(r"\n(?:[ \t]*\n)+", value)
+        value = "\n\n".join(
+            paragraph for index, paragraph in enumerate(paragraphs)
+            if index == 0 or paragraph[:1].isspace() or not re.fullmatch(
+                r"(?:Let me know if you (?:want|need) anything else|Thanks(?: again)?|Thank you|Done)[.!]?",
+                paragraph.strip(), re.I,
+            )
+        ).strip()
+        values: list[str] = []
+        for item in re.split(r"\n(?=[ \t]*(?:[-*+]|\d+[.)])\s+)", value):
+            item = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", item.strip()).strip()
+            if not item:
+                continue
+            first, _, continuation = item.partition("\n")
+            # A leading none may explain a workaround. Keep explicit failure
+            # signals and all later lines. This vocabulary is a conservative
+            # normalization heuristic, not proof of completion or recovery;
+            # provider denials and coordinator checks remain separate evidence.
+            # Filename punctuation (none.py, nil-cache.json) is not a boundary.
+            lead = re.split(r"[.;:,—-](?:\s+|$)", first, maxsplit=1)[0].strip().lower()
+            explanation = first[len(lead):].lstrip(".;:,—- \t") if lead in NONE_ANSWERS else ""
+            benign_explanation = (
+                not explanation
+                or not re.search(
+                    r"\b(?:denied|fail\w*|block\w*|unable|can['’]t|cannot|could not|"
+                    r"error\w*|timed out|still|requires?|pending|incomplete|unreviewed|"
+                    r"unverified|unresolved|unavailable|broken|awaiting|outstanding|"
+                    r"not\s+(?:yet\s+)?"
+                    r"(?:run|verified|reviewed|happened))\b",
+                    explanation, re.I,
+                )
+            )
+            discard_none = lead in NONE_ANSWERS and (name != "BLOCKERS" or benign_explanation)
+            if discard_none:
+                item = continuation.strip()
+                if not item:
+                    continue
+            if item.lower() in NONE_ANSWERS:
+                continue
+            if _reads_as_prose(item):
+                values.append(item)
+            else:
+                values.extend(part.strip() for part in re.split(r"[,\n]", item) if part.strip())
+        return values
 
-    reported_status = fields.get("STATUS", "").lower()
+    reported_status = fields.get("STATUS", "").split("\n", 1)[0].strip().lower()
     if reported_status not in {"success", "partial", "blocked", "error"}:
         reported_status = ""
     return {
@@ -1214,7 +1277,9 @@ def agent_command(
             argv += ["--allowedTools", *allowed]
         if session_id:
             argv += ["--resume", session_id]
-        argv.append(brief_for(task))
+        # Claude's --allowedTools consumes variadic values. Terminate options
+        # explicitly so a fresh task's prompt cannot be swallowed as a tool.
+        argv += ["--", brief_for(task)]
         return argv, env, {"command": command, "model": selected_model}
     raise ValueError(f"unsupported agent: {agent}")
 
