@@ -9,6 +9,44 @@ import "../fusion_ui_assets/logic.js";
 
 const L = globalThis.ORCLogic;
 
+describe("acceptance evidence", () => {
+  it("does not infer acceptance from a successful worker or its reported tests", () => {
+    expect(L.acceptanceSummary([{ status: "success", result: { status: "success", tests: ["all passed"] } }]))
+      .toMatchObject({ total: 0, passed: 0, failed: 0, unknown: 0, label: "Not recorded", tone: "unknown" });
+  });
+
+  it("preserves passing coordinator checks when the workflow failed", () => {
+    expect(L.acceptanceSummary([{ status: "failed", result: { acceptance_checks: [
+      { status: "passed", exit_code: 0 }, { status: "passed", exit_code: 0 },
+    ] } }])).toMatchObject({ total: 2, passed: 2, failed: 0, unknown: 0, label: "2 passed", tone: "success" });
+  });
+
+  it("treats nonzero exits and timeouts as failures even if a status claims passed", () => {
+    expect(L.acceptanceSummary([{ result: { acceptance_checks: [
+      { status: "passed", exit_code: 1 }, { status: "passed", exit_code: 0, timed_out: true },
+      { status: "failed", exit_code: 0 }, { status: "passed" }, { exit_code: 0 },
+    ] } }])).toMatchObject({ total: 5, passed: 0, failed: 3, unknown: 2, tone: "failed" });
+  });
+
+  it("distinguishes incomplete saved check records from absent records", () => {
+    expect(L.acceptanceSummary([{ result: { acceptance_checks: [null, { status: "passed" }] } }]))
+      .toMatchObject({ total: 2, unknown: 2, label: "2 unknown", tone: "unknown" });
+  });
+});
+
+describe("control room focus", () => {
+  it("keeps active work visible ahead of a more recent failed run", () => {
+    const runs = [{ id: "recent", status: "failed" }, { id: "working", status: "running" }];
+    expect(L.focusWorkflow(runs)).toBe(runs[1]);
+  });
+
+  it("shows the latest recorded outcome or a real empty state", () => {
+    const runs = [{ id: "recent", status: "failed" }, { id: "older", status: "success" }];
+    expect(L.focusWorkflow(runs)).toBe(runs[0]);
+    expect(L.focusWorkflow([])).toBe(null);
+  });
+});
+
 describe("esc", () => {
   it("neutralizes every character that can break out of an HTML context", () => {
     expect(L.esc(`<script>alert("x")</script>`)).toBe(

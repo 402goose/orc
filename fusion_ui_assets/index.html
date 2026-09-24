@@ -11,6 +11,7 @@
     <link rel="stylesheet" href="/brand.css" />
     <link rel="stylesheet" href="/woodland.css" />
     <link rel="stylesheet" href="/learning-game.css" />
+    <link rel="stylesheet" href="/control-room.css" />
     <script src="/brand.js" defer></script>
     <script src="/vendor/marked.js" defer></script>
     <script src="/vendor/purify.js" defer></script>
@@ -23,7 +24,7 @@
     <aside class="sidebar">
       <a class="brand" href="#overview" aria-label="ORC home">
         <span class="brand-crest"><svg viewBox="250 150 1280 595" role="img" aria-label="ORC — tusked orc emblem and wordmark"><image href="/brand/orc-logo.png" width="1774" height="887" /></svg></span>
-        <span class="brand-label">THE GUILD · CONTROL ROOM</span>
+        <span class="brand-label">ORC × TENET · CONTROL ROOM</span>
       </a>
       <div class="workspace-label">
         WORKSPACE
@@ -39,11 +40,12 @@
       <div id="workspace-path" class="workspace-path"></div>
       <nav aria-label="Main navigation">
         <button data-view="overview" class="nav-item active">
-          <span data-brand-icon="orc" aria-hidden="true"></span> Overview <kbd>1</kbd>
+          <span data-brand-icon="orc" aria-hidden="true"></span> Control room <kbd>1</kbd>
         </button>
         <button data-view="workflows" class="nav-item">
-          <span data-brand-icon="forge" aria-hidden="true"></span> Workflows <kbd>2</kbd>
+          <span data-brand-icon="forge" aria-hidden="true"></span> Runs <kbd>2</kbd>
         </button>
+        <details class="room-tools"><summary>Tools & learning</summary>
         <button data-view="truffle" class="nav-item">
           <span data-brand-icon="truffle" aria-hidden="true"></span> Truffle pig
         </button>
@@ -56,6 +58,7 @@
         <button data-view="settings" class="nav-item">
           <span data-brand-icon="gear" aria-hidden="true"></span> Settings <kbd>5</kbd>
         </button>
+        </details>
       </nav>
       <div class="sidebar-bottom">
         <button class="subtle guild-guide-link" data-action="guild-guide"><span data-brand-icon="scroll" aria-hidden="true"></span> Meet the guild</button>
@@ -78,7 +81,7 @@
     <main>
       <header class="topbar">
         <div class="breadcrumb">
-          ORC <span>/</span> <span id="view-name">Overview</span>
+          ORC × TENET <span>/</span> <span id="view-name">Control room</span>
         </div>
         <div class="top-actions">
           <div class="runtime-status">

@@ -43,6 +43,8 @@ const state = {
   overview: null,
   config: null,
   report: null,
+  focusReport: null,
+  focusError: null,
   scout: null,
   truffleSelection: {},
   forest: {tab:"woodland", patch:"all", grade:"all", query:""},
@@ -343,58 +345,46 @@ function jobRows(jobs) {
     )
     .join("");
 }
+function acceptanceCard(report) {
+  const checks = ORCLogic.acceptanceSummary(report?.live_nodes || []);
+  return `<div class="room-outcome"><span>Workflow outcome</span>${badge(report?.status || "unknown")}</div><div class="room-outcome"><span>Coordinator checks</span><span class="status ${checks.tone}">${esc(checks.label)}</span><small>${checks.total ? `${checks.passed} passed · ${checks.failed} failed${checks.unknown ? ` · ${checks.unknown} unknown` : ""}` : "No check receipts saved"}</small></div>`;
+}
+function artifactButtons(artifact, workflowId) {
+  const attrs = `data-workflow="${esc(workflowId)}" data-artifact="${esc(artifact.id)}"`;
+  return `<div class="room-artifact"><div><strong>${esc(artifact.label)}</strong><small class="room-path" title="${esc(artifact.path)}">${esc(artifact.path?.split("/").slice(-2).join("/") || "Path unavailable")}</small>${!artifact.available ? `<small class="room-evidence-missing">${esc(artifact.error || "Not available")}</small>` : ""}</div><div class="room-artifact-actions">${button("View", "run-artifact", `${attrs} ${artifact.available ? "" : "disabled"}`, "small ghost")}${button("↓", "run-artifact-download", `${attrs} aria-label="Download ${esc(artifact.label)}" ${artifact.available ? "" : "disabled"}`, "small ghost")}${button("Copy path", "copy-artifact-path", `data-path="${esc(artifact.path || "")}"`, "small ghost")}</div></div>`;
+}
+function tenetEvidence(report, compact = false) {
+  const evidence = report?.tenet;
+  const runs = evidence?.runs || [];
+  if (!evidence) return '<p class="help-copy">TENET receipt evidence is not available from this server.</p>';
+  return `${(evidence.errors || []).map(message => `<p class="room-evidence-missing">${esc(message)}</p>`).join("")}${runs.length ? runs.map(run => {
+    const projection = run.state_projection || {status:"not-recorded"};
+    const stateLabels = {recorded:"Saved observation", stale:"Stale observation", "not-recorded":"Not recorded", unreadable:"Unreadable"};
+    return `<div class="room-receipt"><div class="room-receipt-heading"><strong>${esc(run.title || run.run_id)}</strong>${badge(run.status || "unknown")}</div><code>${esc(run.run_id)}</code><div class="facts"><span>Terminal receipt</span><span>${run.terminal ? "Recorded" : "Not recorded"}</span><span>Worker liveness</span><span>${esc(run.liveness || "unknown")}</span><span>State projection</span><span>${esc(stateLabels[projection.status] || projection.status)}</span></div>${projection.observed_at ? `<small>Observed ${esc(projection.observed_at)}</small>` : ""}${!compact && projection.note ? `<p class="help-copy">${esc(projection.note)}</p>` : ""}${!compact ? (run.artifacts || []).map(artifact => artifactButtons(artifact, report.workflow_id)).join("") : ""}</div>`;
+  }).join("") : '<p class="help-copy">No linked TENET recipe receipt.</p>'}${!compact ? (evidence.artifacts || []).map(artifact => artifactButtons(artifact, report.workflow_id)).join("") : ""}`;
+}
+function coordinatorEvidence(node) {
+  const checks = Array.isArray(node?.result?.acceptance_checks) ? node.result.acceptance_checks : [];
+  const summary = ORCLogic.acceptanceSummary(node ? [node] : []);
+  return `<section class="room-checks"><div class="section-bar"><h2>Coordinator acceptance</h2><span class="status ${summary.tone}">${esc(summary.label)}</span></div>${checks.length ? checks.map((check, i) => `<div class="room-check"><div><strong>Check ${i + 1}</strong>${badge(check.status || "unknown")}<span>Exit ${check.exit_code ?? "unknown"}</span></div>${check.error ? `<p class="room-evidence-missing">${esc(check.error)}</p>` : ""}<details data-disclosure-key="check-${esc(node.id)}-${i}"><summary>Command & timing</summary><pre class="console">${esc(pretty(check.argv || []))}</pre><p class="help-copy">${check.duration_ms != null ? `${number(check.duration_ms)} ms` : "Duration unknown"}${check.timed_out ? " · timed out" : ""}</p></details></div>`).join("") : '<p class="help-copy">No coordinator check receipts for this stage.</p>'}</section>`;
+}
 function overview() {
-  const data = state.overview,
-    runs = data.workflows,
-    usage = data.usage,
-    workerGroups = usage.by_route.filter((g) => g.agent !== "gate");
-  const running = runs.filter((r) => r.status === "running").length,
-    finished = runs.filter((r) => r.status === "success").length;
-  const tokens =
-    (usage.total.input_tokens || 0) + (usage.total.output_tokens || 0);
-  const configured = state.config,
-    qualified = configured?.qualified_buckets || 0;
-  mount(
-    ORCBrand.hero() +
-      `<div class="stats"><div class="stat"><div class="stat-label">Active workflows <span>↗</span></div><div class="stat-number">${running}<span class="unit">running</span></div><div class="stat-detail">${runs.length} saved workflows in this workspace</div></div><div class="stat"><div class="stat-label">Completed <span>✓</span></div><div class="stat-number">${finished}</div><div class="stat-detail">All required stages accepted</div></div><div class="stat"><div class="stat-label">Worker calls <span>⌘</span></div><div class="stat-number">${number(workerGroups.reduce((n, g) => n + g.calls - (g.cache_hit || 0), 0))}</div><div class="stat-detail">${number(tokens)} reported input + output tokens</div></div><div class="stat"><div class="stat-label">Reported spend <span>＄</span></div><div class="stat-number">${data.cost.reported_calls ? "$" + Number(usage.total.cost_usd || usage.total.cost || 0).toFixed(2) : "—"}</div><div class="stat-detail">${data.cost.reported_calls} / ${data.cost.calls} calls reported a cost</div></div></div>` +
-      `<div class="grid-main"><div><div class="section-bar"><h2>Recent workflows <small>${runs.length}</small></h2><button class="subtle" data-view="workflows">View all →</button></div>${runs.length ? `<div class="panel">${runRows(runs.slice(0, 6))}</div>` : empty("Your next idea starts here.", "Launch a discovery run to map the code and surface useful improvements.", button("Start discovery", "template", 'data-template="audit"', "primary"))}
-    ${data.jobs.length ? `<div class="section-bar"><h2>Launch activity</h2><small>Jobs keep running when you close this tab</small></div><div class="panel">${jobRows(data.jobs.slice(0, 5))}</div>` : ""}
-    ${data.builds
-      .filter((b) => b.status === "running")
-      .map(
-        (b) =>
-          `<div class="info-box"><h3>Preparing a workflow · ${esc(b.phase)}</h3><p>${esc(b.message)} · ${age(b.started_at_ms)}</p></div>`,
-      )
-      .join("")}</div>
-    <aside><div class="section-bar"><h2>Start with a direction</h2></div><div class="panel">${[
-      ["truffle", "truffle", "Send in the Truffle pig", "Find tractable open issues. Queue the fixes worth doing."],
-      [
-        "audit",
-        "compass",
-        "Find the next improvement",
-        "Evidence, ranked findings, and a concrete plan.",
-      ],
-      [
-        "feature",
-        "forge",
-        "Build something useful",
-        "Explore, plan, implement, independently review.",
-      ],
-      [
-        "debug",
-        "bug",
-        "Hunt down a bug",
-        "Reproduce the failure, fix it, prove it.",
-      ],
-    ]
-      .map(
-        ([key, icon, title, desc]) =>
-          `<div class="template" role="button" tabindex="0" data-action="template" data-template="${key}"><div class="template-top"><span class="template-icon">${sigil(icon)}</span><span class="template-arrow">↗</span></div><h3>${title}</h3><p>${desc}</p></div>`,
-      )
-      .join(
-        "",
-      )}</div><div class="info-box"><h3 class="guild-section-emblem">${sigil("rune")} Laya is ${esc(configured?.mode || "unavailable")}</h3><p>${configured?.mode === "shadow" ? "Local decisions are recorded as advice. Your workflow rules remain in control." : configured?.mode === "active" ? `${qualified} qualified calibration buckets. Only qualified, permitted actions can apply.` : "Classification is disabled. Existing orchestration still works."}</p><div class="worker-strip">${(configured?.workers || []).map((w) => `<span class="worker-chip"><b>${w.available ? "●" : "○"}</b>${esc(w.agent)}</span>`).join("")}</div></div></aside></div>`,
-  );
+  const data = state.overview, runs = data.workflows;
+  const workspace = state.workspaces.find(w => w.id === state.workspace);
+  const focus = ORCLogic.focusWorkflow(runs), report = state.focusReport;
+  const nodes = report?.live_nodes || [];
+  const node = nodes.find(n => active(n.status)) || nodes.find(n => ["failed", "interrupted"].includes(n.status)) || nodes[0];
+  const latest = [...(node?.activity_entries || [])].reverse().find(entry => entry.kind === "message");
+  const command = active(node?.status) && [...(node?.activity_entries || [])].reverse().find(entry => entry.kind === "command" && entry.status === "running");
+  const update = (active(node?.status) ? latest?.text : node?.result?.summary || latest?.text) || node?.messages?.at(-1);
+  const running = runs.filter(r => active(r.status)).length;
+  const attention = runs.filter(r => ["failed", "interrupted", "paused_quota", "paused_budget"].includes(r.status)).length;
+  const nextTab = active(focus?.status) ? "activity" : ["failed", "interrupted", "paused_quota", "paused_budget"].includes(focus?.status) ? "evidence" : "report";
+  const nextLabel = nextTab === "activity" ? "Follow current work" : nextTab === "evidence" ? "Inspect this outcome" : "Read the handoff";
+  mount(`<section class="room-heading"><div><div class="eyebrow">YOUR WORKSPACE · CONTROL ROOM</div><h1>${esc(workspace?.name || "Workspace")}</h1><p>${runs.length} saved runs · ${running} recorded active${attention ? ` · ${attention} need attention` : ""}</p></div>${button("Copy workspace path", "copy-workspace", "", "small ghost")}</section>
+    <div class="room-grid"><div>${focus ? `<section class="panel room-focus"><div class="panel-body"><div class="room-focus-label"><span class="eyebrow">${active(focus.status) ? '<span class="live-dot"></span> CURRENT WORK' : "LATEST OUTCOME"}</span>${badge(focus.status)}</div><h2>${esc(focus.task)}</h2><div class="room-worker-line">${sigil("forge")}<strong>${esc(node?.agent || focus.agents?.join(" + ") || "Harness unknown")}</strong>${node ? `<span>${esc(node.id)} · attempt ${node.attempts ?? "?"}</span>` : ""}${node?.last_output_at_ms ? `<span>Output ${age(node.last_output_at_ms)} ago</span>` : ""}</div>${state.focusError ? `<p class="room-evidence-missing">${esc(state.focusError)}</p>` : `<div class="room-latest"><div class="eyebrow">${active(node?.status) ? "LATEST WORKER UPDATE" : "WORKER HANDOFF"}</div>${update ? `<div class="markdown">${markdown(update.length > 1100 ? update.slice(0, 1100) + "…" : update)}</div>` : '<p>No worker update has been saved yet.</p>'}${command ? `<div class="room-current-command"><span>Command in progress</span><code>${esc(commandPreview(command))}</code></div>` : ""}</div>`}<div class="room-next">${button(nextLabel + " →", "run", `data-id="${esc(focus.id)}" data-tab="${nextTab}"`, "primary")}<span class="mono">${esc(focus.id)}</span></div></div></section>` : empty("What do you want to build?", "Your runs and their evidence will appear here.", button("Start a run", "template", 'data-template="feature"', "primary"))}
+    <div class="section-bar room-history-heading"><h2>Run history</h2><button class="subtle" data-view="workflows">All runs →</button></div>${runs.length ? `<div class="panel">${runRows(runs.slice(0, 7))}</div>` : '<p class="help-copy">No runs saved in this workspace.</p>'}</div>
+    <aside class="room-evidence-rail"><section class="panel"><div class="panel-header"><h3>Outcome & proof</h3></div><div class="panel-body">${acceptanceCard(report)}${report ? button("Open evidence →", "run", `data-id="${esc(report.workflow_id)}" data-tab="evidence"`, "small ghost") : ""}</div></section><section class="panel"><div class="panel-header"><h3>TENET record</h3><span class="room-local-label">LOCAL</span></div><div class="panel-body">${report ? tenetEvidence(report, true) : '<p class="help-copy">Select a run to inspect its receipts.</p>'}</div></section>${data.builds.filter(b => b.status === "running").map(b => `<section class="panel"><div class="panel-body"><h3>Preparing work</h3><p>${esc(b.message)}</p></div></section>`).join("")}</aside></div>`);
 }
 function workflows() {
   const runs = state.overview.workflows.filter((run) =>
@@ -527,6 +517,7 @@ function workflow() {
       nodes[0]?.id;
   const node = nodes.find((n) => n.id === state.node),
     output = report.outputs.find((o) => o.node_id === state.node);
+  if (state.tab === "auto") state.tab = active(report.status) ? "activity" : ["failed", "interrupted", "paused_quota", "paused_budget"].includes(report.status) ? "evidence" : "report";
   const decisions =
     report.waves.flatMap((w) => w.nodes).find((n) => n.id === state.node)
       ?.decisions || {};
@@ -547,7 +538,7 @@ function workflow() {
         );
   if (state.tab === "activity") body = workerActivity(node, report);
   if (state.tab === "evidence")
-    body = `<h2>Verification &amp; handoff</h2>${(node?.result?.blockers || []).map((b) => `<div class="blocker">${esc(b)}</div>`).join("")}<h3>Reported checks</h3><pre class="console">${esc((node?.result?.tests || []).join("\n") || "No verification reported yet.")}</pre>${node?.result?.command_evidence?.length ? `<h3>Command observations</h3><p class="help-copy">These commands returned a nonzero exit during the turn. They may include searches with no matches, corrected lookups, or tests run before a fix. Unresolved issues belong in the final handoff above.</p><pre class="console">${esc(node.result.command_evidence.join("\n"))}</pre>` : ""}<h3>Changed files</h3><pre class="console">${esc((node?.result?.changed || []).join("\n") || "No changed files reported.")}</pre><p class="help-copy">These are worker receipts. Inspect the actual checks and diff before treating a claim as verified.</p>`;
+    body = `${coordinatorEvidence(node)}${(node?.result?.blockers || []).map(b => `<div class="blocker">${esc(b)}</div>`).join("")}<h2>TENET receipts & state</h2>${tenetEvidence(report)}<details class="room-handoff" data-disclosure-key="worker-handoff-${esc(state.node)}"><summary>Worker-reported checks & changed files</summary><h3>Reported checks</h3><pre class="console">${esc((node?.result?.tests || []).join("\n") || "No verification reported yet.")}</pre>${node?.result?.command_evidence?.length ? `<h3>Nonzero command observations</h3><pre class="console">${esc(node.result.command_evidence.join("\n"))}</pre>` : ""}<h3>Changed files</h3><pre class="console">${esc((node?.result?.changed || []).join("\n") || "No changed files reported.")}</pre></details>`;
   if (state.tab === "spec")
     body = `<div class="article-head"><h2>Workflow definition</h2>${button("Use as a new workflow", "custom-from-run", "", "small")}</div><pre class="console">${esc(pretty(report.spec))}</pre>`;
   if (node?.quota)
@@ -576,7 +567,7 @@ function workflow() {
       )
       .join(
         "",
-      )}</div>${body}</div></div><aside class="detail-aside">${publicationCard(report)}<div class="panel"><div class="panel-header"><h3>Run at a glance</h3></div><div class="panel-body"><div class="facts"><span>Stages accepted</span><span>${nodes.filter((n) => n.status === "success").length} / ${nodes.length}</span><span>Reported cost</span><span>${report.cost.reported_calls ? "$" + Number(report.spent_usd).toFixed(4) : "Not reported"}</span><span>Cost coverage</span><span>${report.cost.reported_calls} / ${report.cost.calls} calls</span><span>Recorded-spend budget</span><span>${report.budget_usd ? "$" + report.budget_usd : "No limit"}</span></div>${!job && report.status === "running" ? '<p class="help-copy" style="margin:18px 0 0">Started outside this UI. Observe here; interrupt it from its original terminal.</p>' : ""}</div></div>
+      )}</div>${body}</div></div><aside class="detail-aside">${publicationCard(report)}<div class="panel"><div class="panel-header"><h3>Outcome & proof</h3></div><div class="panel-body">${acceptanceCard(report)}<details class="room-budget" data-disclosure-key="run-budget"><summary>Budget & runtime details</summary><div class="facts"><span>Stages complete</span><span>${nodes.filter(n => n.status === "success").length} / ${nodes.length}</span><span>Reported cost</span><span>${report.cost.reported_calls ? "$" + Number(report.spent_usd).toFixed(4) : "Not reported"}</span><span>Cost coverage</span><span>${report.cost.reported_calls} / ${report.cost.calls} calls</span><span>Recorded-spend budget</span><span>${report.budget_usd ? "$" + report.budget_usd : "No limit"}</span></div>${!job && report.status === "running" ? '<p class="help-copy" style="margin:18px 0 0">Started outside this UI. Observe here; interrupt it from its original terminal.</p>' : ""}</details></div></div><div class="panel"><div class="panel-header"><h3>TENET record</h3></div><div class="panel-body">${tenetEvidence(report, true)}</div></div>
     ${
       Object.keys(decisions).length
         ? `<div class="panel"><div class="panel-header"><h3 class="guild-section-emblem">${sigil("rune")} Laya decisions</h3></div>${Object.entries(
@@ -1190,7 +1181,7 @@ async function navigate(view, id = null, options = {}) {
   state.view = view;
   state.id = id;
   state.node = null;
-  state.tab = "report";
+  state.tab = options.tab || "auto";
   state.signature = "";
   state.epoch++;
   writeRoute(options.history || "push");
@@ -1200,11 +1191,12 @@ async function navigate(view, id = null, options = {}) {
       b.dataset.view === (view === "workflow" ? "workflows" : view),
     ),
   );
+  if (!["overview", "workflows", "workflow"].includes(view)) $(".room-tools").open = true;
   $("#view-name").textContent =
     {
-      overview: "Overview",
-      workflows: "Workflows",
-      workflow: "Workflow",
+      overview: "Control room",
+      workflows: "Runs",
+      workflow: "Run",
       truffle: "Truffle pig",
       decisions: "Laya lab",
       models: "ORC models",
@@ -1237,6 +1229,18 @@ async function refresh(force = false) {
           : "Restricted runtime";
     }
     let signature = pretty({ ...data, now_ms: 0 });
+    if (state.view === "overview") {
+      const focus = ORCLogic.focusWorkflow(data.workflows);
+      let focusReport = null, focusError = null;
+      if (focus) {
+        try { focusReport = await api("workflow?id=" + encodeURIComponent(focus.id), undefined, w); }
+        catch (e) { focusError = e.message; }
+        if (epoch !== state.epoch) return;
+      }
+      state.focusReport = focusReport;
+      state.focusError = focusError;
+      signature = pretty({data: {...data, now_ms:0}, report:state.focusReport, error:state.focusError});
+    }
     if (state.view === "truffle") {
       const scout = await api("truffle" + (state.id ? "?id=" + encodeURIComponent(state.id) : ""), undefined, w);
       if (epoch !== state.epoch) return;
@@ -1362,7 +1366,14 @@ document.addEventListener("click", async (event) => {
     else if (a === "forest-filter") forestNavigate({tab:"issues",grade:state.forest.grade === target.dataset.grade ? "all" : target.dataset.grade});
     else if (a === "forest-issue") openForestIssue(Number(target.dataset.number));
     else if (a === "truffle-queue") openTruffleQueue();
-    else if (a === "run") { closeModal(); await navigate("workflow", target.dataset.id); }
+    else if (a === "run") { closeModal(); await navigate("workflow", target.dataset.id, {tab:target.dataset.tab || "auto"}); }
+    else if (a === "copy-workspace") copy(state.workspaces.find(w => w.id === state.workspace)?.path || "");
+    else if (a === "copy-artifact-path") copy(target.dataset.path || "");
+    else if (a === "run-artifact" || a === "run-artifact-download") {
+      const file = await api("run-artifact?id=" + encodeURIComponent(target.dataset.workflow) + "&artifact=" + encodeURIComponent(target.dataset.artifact));
+      if (a === "run-artifact-download") download(file.path.split("/").at(-1), file.text);
+      else modal(file.path.split("/").at(-1), file.path, `<div class="actions">${button("Copy path", "copy-artifact-path", `data-path="${esc(file.path)}"`, "small")}${button("Download ↓", "run-artifact-download", `data-workflow="${esc(target.dataset.workflow)}" data-artifact="${esc(target.dataset.artifact)}"`, "small")}</div>${file.text.length > 200000 ? '<p class="help-copy">Preview truncated. Download for the complete saved artifact.</p>' : ""}<pre class="console">${esc(file.text.slice(0, 200000) || "(Empty file)")}</pre>`);
+    }
     else if (a === "stage") {
       state.node = target.dataset.node;
       workflow();
