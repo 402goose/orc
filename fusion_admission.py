@@ -70,7 +70,9 @@ def describe(workspace):
         return {"mode": "tenet", "ready": False, "provider": "tenet", "error": str(exc)}
 
 
-def admit(workspace, run_id, spec, config):
+def admit(workspace, run_id, spec, config, mode="off"):
+    if mode not in {"off", "shadow"}:
+        raise ValueError("Admitted observations must be off or shadow")
     codex = config.get("codex") or {}
     if (config.get("execution_mode") != "restricted" or codex.get("sandbox") not in {"read-only", "workspace-write"}
             or codex.get("approval") != "never" or codex.get("git_write") is not False
@@ -85,7 +87,7 @@ def admit(workspace, run_id, spec, config):
     profile = {"execution_mode": "restricted", "timeout_seconds": min(config.get("timeout_seconds", 600), 600),
                "codex": {**codex, "command": str(Path(command).resolve()),
                          "sandbox": codex["sandbox"] if writes else "read-only"},
-               "publish": {"mode": "off"}, "decisions": {"mode": "off"},
+               "publish": {"mode": "off"}, "decisions": {"mode": mode},
                "telemetry": {"remote": {"enabled": False}}}
     try:
         revision = subprocess.run(["git", "-C", str(workspace), "rev-parse", "HEAD"],
@@ -108,20 +110,33 @@ def execution(workspace, admission):
     claimed = call(workspace, "claim", run_id=run_id,
                    expected_request_sha256=admission["request_sha256"])
     paths = {}
+    frozen_config = None
     for name in ("spec", "config"):
         artifact = claimed["artifacts"][name]
         path = Path(artifact["path"])
         if not path.is_absolute() or path.resolve().is_relative_to(Path(workspace).resolve()):
             raise ValueError("Admitted execution inputs must be outside the worker workspace")
-        if hashlib.sha256(path.read_bytes()).hexdigest() != artifact["sha256"]:
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != artifact["sha256"]:
             raise ValueError(f"Admitted {name} changed before dispatch")
+        if name == "config":
+            frozen_config = json.loads(raw)
         paths[name] = str(path)
+    decisions = frozen_config.get("decisions") or {}
+    mode = decisions.get("mode")
+    if mode not in {"off", "shadow"}:
+        raise ValueError("Admitted observations must be off or shadow")
+    python = decisions.get("python", "") if mode == "shadow" else ""
+    if mode == "shadow" and (not isinstance(python, str) or not Path(python).is_absolute()
+                             or Path(python).resolve().is_relative_to(Path(workspace).resolve())):
+        raise ValueError("Shadow observations require operator-pinned Python outside the workspace")
     argv = [sys.executable, str(Path(__file__).with_name("fusion")), "--workspace", str(workspace),
             "--json", "--progress", "workflow", "run", paths["spec"]]
     environment = {"FUSION_CONFIG": paths["config"],
                    "FUSION_CONFIG_SHA256": claimed["artifacts"]["config"]["sha256"],
                    "FUSION_SPEC_SHA256": claimed["artifacts"]["spec"]["sha256"],
-                   "FUSION_WORKFLOW_ID": run_id, "FUSION_DECISIONS_MODE": "off", "FUSION_TELEMETRY": "0"}
+                   "FUSION_WORKFLOW_ID": run_id, "FUSION_DECISIONS_MODE": mode,
+                   "FUSION_LAYA_PYTHON": python, "FUSION_TELEMETRY": "0"}
     return claimed, argv, environment
 
 
