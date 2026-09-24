@@ -346,6 +346,26 @@ def _workflow_ids(workspace: Path) -> set[str]:
     return {p.name for p in root.iterdir()} if root.is_dir() else set()
 
 
+# Coordinators launched by this server. They outlive the call that started
+# them by design, so nothing waits on them -- and a child that is never waited
+# on becomes a zombie the moment it exits, for the lifetime of this process.
+# Poll them whenever we are here anyway; poll() reaps an exited child.
+_LAUNCHED: list[Any] = []
+
+
+def reap_launched() -> int:
+    """Reap any coordinator that has exited. Returns how many were collected."""
+    reaped = 0
+    for proc in list(_LAUNCHED):
+        try:
+            if proc.poll() is not None:
+                _LAUNCHED.remove(proc)
+                reaped += 1
+        except (OSError, ValueError):
+            _LAUNCHED.remove(proc)
+    return reaped
+
+
 def start_run(
     workspace: Path,
     request: str,
@@ -369,6 +389,7 @@ def start_run(
     of both this server and the client. `spawn`/`now`/`sleep` are injected so
     the registration logic is testable without launching real workers.
     """
+    reap_launched()
     request = (request or "").strip()
     if not request:
         raise ValueError("request is required")
@@ -411,6 +432,7 @@ def start_run(
     finally:
         handle.close()
 
+    _LAUNCHED.append(proc)
     pid = getattr(proc, "pid", None)
     evidence = [f"orc://workflow/{workflow_id}/{leaf}" for leaf in ("manifest", "report")]
     registered = workspace / ".fusion" / "workflows" / workflow_id
@@ -464,6 +486,7 @@ def _tail(path: Path, limit: int = 2000) -> str:
 
 def run_status(workspace: Path, workflow_id: str) -> dict[str, Any]:
     """Poll a handle. Cheap, read-only, safe to call in a loop."""
+    reap_launched()
     manifest_path = workspace / ".fusion" / "workflows" / workflow_id / "manifest.json"
     if not manifest_path.is_file():
         raise ValueError(f"no such workflow: {workflow_id}")
