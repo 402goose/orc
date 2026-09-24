@@ -84,7 +84,13 @@ def admit(workspace, run_id, spec, config, mode="off", label_draft=None):
     if not command:
         raise ValueError("Configured Codex executable is unavailable")
     writes = any(n.get("write") for n in spec["nodes"])
-    profile = {"execution_mode": "restricted", "timeout_seconds": min(config.get("timeout_seconds", 600), 600),
+    # The provider validates the configured workflow bound. Silently reducing it
+    # here truncates legitimate builds and hides the operator's actual choice.
+    # Label teachers retain their separate bounded single-attempt profile.
+    timeout = config.get("timeout_seconds", 600)
+    if label_draft is not None:
+        timeout = min(timeout, 600)
+    profile = {"execution_mode": "restricted", "timeout_seconds": timeout,
                "codex": {**codex, "command": str(Path(command).resolve()),
                          "sandbox": codex["sandbox"] if writes else "read-only"},
                "publish": {"mode": "off"}, "decisions": {"mode": mode},
