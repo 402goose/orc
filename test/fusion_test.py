@@ -839,6 +839,51 @@ print(json.dumps({'type':'turn.completed','usage':{}}))
         self.assertEqual(task["role"], "reviewer")
         self.assertEqual(task["constraints"], ["do not edit files"])
 
+    def test_delegate_pins_model_and_effort_from_mcp_and_cli(self):
+        argv_log = self.workspace / "argv.jsonl"
+        codex = self.write_agent(
+            "codex-fake",
+            f"""
+import json, sys
+open({str(argv_log)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')
+print(json.dumps({{'type':'thread.started','thread_id':'pin-thread'}}))
+print(json.dumps({{'type':'item.completed','item':{{'type':'agent_message','text':'STATUS: success\\nSUMMARY: pinned\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}}}}))
+print(json.dumps({{'type':'turn.completed','usage':{{}}}}))
+""",
+        )
+        self.config(codex=codex)
+
+        def call(arguments):
+            request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                  "params": {"name": "fusion_delegate", "arguments": arguments}}) + "\n"
+            proc = subprocess.run(
+                [sys.executable, str(ROOT / "fusion"), "--workspace", str(self.workspace), "mcp-serve"],
+                input=request, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return json.loads(proc.stdout)["result"]
+
+        result = call({"agent": "codex", "task": "inspect", "write": False, "resume": False,
+                       "model": "gpt-pinned", "reasoning_effort": "low"})
+        self.assertEqual(result["structuredContent"]["status"], "success", result)
+        argv = json.loads(argv_log.read_text().splitlines()[-1])
+        self.assertIn('model_reasoning_effort="low"', argv)
+        self.assertEqual(argv[argv.index("-m") + 1], "gpt-pinned")
+
+        refused = call({"agent": "codex", "task": "inspect", "reasoning_effort": "low"})
+        self.assertTrue(refused.get("isError"), refused)
+        self.assertIn("explicit model", json.dumps(refused))
+
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "fusion"), "--workspace", str(self.workspace), "delegate",
+             "--agent", "codex", "--read-only", "--fresh", "--model", "gpt-cli", "--reasoning-effort", "high", "inspect"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        argv = json.loads(argv_log.read_text().splitlines()[-1])
+        self.assertIn('model_reasoning_effort="high"', argv)
+        self.assertEqual(argv[argv.index("-m") + 1], "gpt-cli")
+
     def test_ultra_pipeline_keeps_stage_artifacts_and_stops_at_limit(self):
         claude = self.write_agent(
             "claude-fake",

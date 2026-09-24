@@ -24,6 +24,7 @@ from typing import Any, Iterator
 
 from fusion_decisions import DEFAULTS as DECISION_DEFAULTS
 import fusion_progress as progress
+from fusion_reasoning import EFFORTS, validate_pair
 
 
 SCHEMA = "fusion.v1"
@@ -901,6 +902,16 @@ def make_task(
     }
 
 
+def choice_overrides(model: Any, reasoning_effort: Any) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    if model:
+        overrides["model"] = str(model)
+    if reasoning_effort:
+        validate_pair(overrides.get("model"), reasoning_effort)
+        overrides["reasoning_effort"] = reasoning_effort
+    return overrides
+
+
 def brief_for(task: dict[str, Any]) -> str:
     criteria = "\n".join(f"- {item}" for item in task["success_criteria"]) or "- Report what you verified."
     constraints = "\n".join(f"- {item}" for item in task["constraints"]) or "- Keep the change scoped to the task."
@@ -1645,6 +1656,8 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "session_key": {"type": "string"},
                     "workspace": {"type": "string", "description": "Optional workspace path for the delegated task."},
                     "route": {"type": "string", "description": "Optional named route such as orc-free or orc-best."},
+                    "model": {"type": "string", "description": "Model for this task, overriding the route and agent settings."},
+                    "reasoning_effort": {"type": "string", "enum": sorted(EFFORTS), "description": "Codex only; requires model."},
                 },
                 "required": ["agent", "task"],
             },
@@ -1778,6 +1791,7 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
                         bool(args.get("resume", True)),
                         bool(args.get("write", True)),
                         route=args.get("route"),
+                        settings_overrides=choice_overrides(args.get("model"), args.get("reasoning_effort")),
                     )
                     if not task["task"]:
                         raise ValueError("task is required")
@@ -2018,6 +2032,8 @@ def build_parser() -> argparse.ArgumentParser:
     delegate.add_argument("--fresh", action="store_true", help="start a fresh agent session")
     delegate.add_argument("--session-key", help="persistent lane name; defaults to agent:role")
     delegate.add_argument("--route", help="named route from .fusion.json, for example orc-free or orc-best")
+    delegate.add_argument("--model", help="model for this task, overriding the route and agent settings")
+    delegate.add_argument("--reasoning-effort", choices=sorted(EFFORTS), help="Codex only; requires --model")
     delegate.add_argument("--success", action="append", default=[])
     delegate.add_argument("--constraint", action="append", default=[])
     delegate.add_argument("task")
@@ -2313,6 +2329,7 @@ def _main(args, parser) -> int:
             not args.fresh,
             not args.read_only,
             route=args.route,
+            settings_overrides=choice_overrides(args.model, args.reasoning_effort),
         )
         result = dispatch(config, task, RunStore(workspace))
         print_result(result, args.json)

@@ -19,6 +19,18 @@ An authored workflow node can override the configured Codex pair:
 ```
 
 The same fields work in `codex` settings and existing named Codex routes.
+One-off delegations take the same pair from the CLI or the MCP `fusion_delegate`
+tool; `model` alone also pins Claude and other workers:
+
+```sh
+fusion delegate --agent codex --read-only --model gpt-6-astra --reasoning-effort high "Inspect the persistence boundaries"
+fusion delegate --agent claude --model claude-haiku-4-5-20251001 "Summarize the failing test"
+```
+
+```json
+{"agent": "codex", "task": "Inspect the persistence boundaries", "write": false,
+ "model": "gpt-6-astra", "reasoning_effort": "high"}
+```
 Explicit effort requires an explicit resolved model. Fusion passes
 `-c model_reasoning_effort="high"` to stock Codex for fresh and resumed workers.
 Pinned pairs separate worker sessions and invalidate a workflow receipt when
