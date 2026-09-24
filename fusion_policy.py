@@ -93,6 +93,7 @@ def route_candidates(config, task, store, rejected=None):
             drop(key, f"{settings.get('mode')} mode is too permissive for a read-only task")
             continue
         command = str(settings.get("command", agent))
+        arms = max(1, int(settings.get("arms", 1)))
         if Path(command).name == "orc":
             # Automatic ORC routes require passing tool-fit evidence even for explicit models.
             model = settings.get("model")
@@ -100,31 +101,44 @@ def route_candidates(config, task, store, rejected=None):
                 if model not in core._orc_model_ids(command, ["--fit"]):
                     drop(key, f"{model} has no passing `orc probe --fit` evidence")
                     continue
+                models = [model]
             else:
                 try:
-                    model = core.select_orc_model(command, str(settings.get("model_selector", "best")), False)
+                    models = core.fitted_orc_models(command, str(settings.get("model_selector", "best")), arms)
                 except (ValueError, RuntimeError, OSError) as exc:
                     drop(key, f"no ORC model passed tool-fit for this route ({exc})")
                     continue
-            if not model:
+            if not models:
                 drop(key, "no ORC model passed tool-fit for this route")
                 continue
         else:
-            model = settings.get("model", "")
-        spans = history[key]
-        verified = [outcomes[span["run_id"]] for span in spans if span.get("run_id") in outcomes]
-        costs = [core.number(span["usage"].get("cost_usd", span["usage"].get("cost", 0))) for span in spans
-                 if "cost_usd" in span.get("usage", {}) or "cost" in span.get("usage", {})]
-        mean_cost = sum(costs) / len(costs) if costs else None
-        if task.get("budget_remaining_usd") is not None and mean_cost is not None and mean_cost > task["budget_remaining_usd"]:
-            drop(key, f"its average reported cost ${mean_cost:.4f} exceeds the ${task['budget_remaining_usd']:.4f} left in the budget")
-            continue
-        choices.append({"key": key, "agent": agent, "route": route, "model": model,
-                        **({"reasoning_effort": settings["reasoning_effort"]} if settings.get("reasoning_effort") is not None else {}),
-                        "runs": len(spans), "reported_success_rate": sum(s.get("status") == "success" for s in spans) / len(spans) if spans else None,
-                        "checked_runs": len(verified), "acceptance_rate": sum(verified) / len(verified) if verified else None,
-                        "mean_cost_usd": mean_cost,
-                        "mean_ms": sum(s.get("duration_ms", 0) for s in spans) / len(spans) if spans else None})
+            models = [settings.get("model", "")]
+        # A route with arms offers each fitted model as its own candidate, with
+        # its own history; one arm keeps the route's historical key and stats.
+        split = arms > 1 and len(models) > 1
+        for model in models:
+            spans = [span for span in history[key] if not split or span.get("model") == model]
+            # A success is the worker's claim until a gate or lead checks it; an
+            # error is observed. Quota and permission failures are lane health
+            # (cooldown), not evidence about quality.
+            verified = [outcomes[span["run_id"]] if span.get("run_id") in outcomes else False for span in spans
+                        if span.get("run_id") in outcomes or (span.get("status") == "error"
+                                                              and span.get("failure_class") not in {"quota", "permission_denied"})]
+            costs = [core.number(span["usage"].get("cost_usd", span["usage"].get("cost", 0))) for span in spans
+                     if "cost_usd" in span.get("usage", {}) or "cost" in span.get("usage", {})]
+            mean_cost = sum(costs) / len(costs) if costs else None
+            arm = f"{key}:{model}" if split else key
+            if task.get("budget_remaining_usd") is not None and mean_cost is not None and mean_cost > task["budget_remaining_usd"]:
+                drop(arm, f"its average reported cost ${mean_cost:.4f} exceeds the ${task['budget_remaining_usd']:.4f} left in the budget")
+                continue
+            choices.append({"key": arm, "agent": agent, "route": route, "model": model,
+                            **({"reasoning_effort": settings["reasoning_effort"]} if settings.get("reasoning_effort") is not None else {}),
+                            "runs": len(spans), "reported_success_rate": sum(s.get("status") == "success" for s in spans) / len(spans) if spans else None,
+                            "checked_runs": len(verified), "acceptance_rate": sum(verified) / len(verified) if verified else None,
+                            "mean_cost_usd": mean_cost,
+                            "mean_ms": sum(s.get("duration_ms", 0) for s in spans) / len(spans) if spans else None})
+            if len(choices) == 8:
+                break
         if len(choices) == 8:
             break
     return choices
@@ -145,6 +159,25 @@ def no_route_reason(config, task, store):
             "Run `fusion doctor` to see every lane and its command.")
 
 
+def rank_by_outcomes(candidates, minimum=3):
+    """Order automatic candidates by verified outcomes, not by worker self-reports.
+
+    A candidate with fewer than `minimum` checked runs is tried first, in the
+    configured preference order, so every arm earns evidence. The rest follow by
+    smoothed acceptance rate (accepted + 1) / (checked + 2). Stable: ties keep
+    preference order. Only gate and lead outcomes count; `status: success` alone
+    is a worker's claim.
+    """
+    def score(item):
+        index, candidate = item
+        checked = candidate.get("checked_runs") or 0
+        if checked < minimum:
+            return (0, 0.0, index)
+        accepted = (candidate.get("acceptance_rate") or 0) * checked
+        return (1, -(accepted + 1) / (checked + 2), index)
+    return [candidate for _, candidate in sorted(enumerate(candidates), key=score)]
+
+
 def route_task(config, task, store):
     """Record advice for explicit routing, apply only to a genuinely automatic lane."""
     engine = DecisionEngine(task["workspace"], config)
@@ -161,6 +194,9 @@ def route_task(config, task, store):
     with progress.activity(task.get("progress_label", task["role"]), "checking available workers and model fit" if automatic else "checking selected worker"):
         if automatic:
             candidates = route_candidates(config, task, store)
+            ranking = config.get("decisions", {}).get("rank_by_outcomes")
+            if ranking:
+                candidates = rank_by_outcomes(candidates, int(ranking) if not isinstance(ranking, bool) else 3)
         else:
             import fusion_core as core
             from fusion_reasoning import pair_candidates, pair_key
@@ -199,7 +235,11 @@ def route_task(config, task, store):
                 task["settings_overrides"]["reasoning_effort"] = selected["reasoning_effort"]
     if record:
         task.setdefault("decisions", {})["routing"] = record["id"]
-        engine.applied(record, selected["key"], applied, "qualified automatic route" if applied else "explicit route or pair retained; advice does not change dispatch")
+        reason = ("qualified automatic route" if applied else
+                  "explicit route or pair retained; advice does not change dispatch" if not automatic else
+                  "ranked by verified outcomes; advice does not change dispatch" if config.get("decisions", {}).get("rank_by_outcomes") else
+                  "configured preference order; advice does not change dispatch")
+        engine.applied(record, selected["key"], applied, reason)
 
 
 def review_task(config, task):
