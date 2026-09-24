@@ -1948,5 +1948,8 @@ summary {
 .model-catalog-card code { display:block; overflow-wrap:anywhere; font-size:11px; color:var(--muted); margin-bottom:18px; }
 .model-catalog-card .facts { margin-bottom:16px; }
 .model-diagnostics { margin-top:28px; }
+.learning-scope { margin-bottom:20px; }
+.learning-scope details { margin-top:14px; }
+.learning-scope .actions { margin-top:12px; }
 @media(max-width:1000px) { .workspace-activity-grid,.model-catalog-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 @media(max-width:650px) { .workspace-activity-grid,.model-catalog-grid,.model-provenance-grid { grid-template-columns:1fr; } .workspace-activity .section-bar { align-items:flex-start; flex-direction:column; gap:8px; } }
