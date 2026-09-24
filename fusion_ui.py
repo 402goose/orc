@@ -524,6 +524,74 @@ class ControlRoom:
                 "cost": {"calls": len(worker_spans), "reported_calls": sum(reported_cost(span.get("usage")) is not None for span in worker_spans)},
                 "now_ms": core.now_ms()}
 
+    def activity(self):
+        """Bounded saved observations across registered workspaces; never a PID health check."""
+        response = {"schema": "fusion.activity.v1", "observed_at_ms": core.now_ms(), "workspaces": [], "runs": [], "errors": []}
+        with self.lock:
+            registered = list(self.workspaces.items())
+        for key, workspace in registered:
+            summary = {"id": key, "name": workspace.name, "path": str(workspace), "run_count": 0, "scan_limited": False, "errors": []}
+            response["workspaces"].append(summary)
+            def saved(relative):
+                path = inside(workspace, relative)
+                if not path.is_file() or path.stat().st_size > 4_000_000:
+                    raise ValueError("Missing or oversized saved observation")
+                value = json.loads(path.read_text())
+                if not isinstance(value, dict):
+                    raise ValueError("Saved observation is not an object")
+                return value
+            try:
+                directory = inside(workspace, ".fusion/workflows")
+                paths = sorted(directory.glob("*/manifest.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+                summary["scan_limited"] = len(paths) > 200
+                rows = []
+                for path in paths[:200]:
+                    try:
+                        run_id = identifier(path.parent.name)
+                        manifest = saved(f".fusion/workflows/{run_id}/manifest.json")
+                        nodes = list((manifest.get("nodes") or {}).values())
+                        if any(not isinstance(n, dict) for n in nodes):
+                            raise ValueError("Invalid workflow nodes")
+                        status = manifest.get("status") or "unknown"
+                        if not isinstance(status, str):
+                            raise ValueError("Invalid recorded workflow status")
+                        started = manifest.get("started_at_ms") or int(path.stat().st_mtime * 1000)
+                        if not isinstance(started, (int, float)) or not math.isfinite(started):
+                            raise ValueError("Invalid workflow timestamp")
+                        row = {"workspace_id": key, "workspace_name": workspace.name, "id": run_id,
+                               "task": str(manifest.get("task") or "Untitled workflow")[:2000], "status": status,
+                               "terminal": status in {"success", "failed", "cancelled"}, "liveness": "unknown",
+                               "started_at_ms": started,
+                               "agents": sorted({str((n.get("result") or {}).get("agent") or n.get("agent") or "unknown") for n in nodes})}
+                        for node_id, node in (manifest.get("nodes") or {}).items():
+                            if node.get("status") not in ACTIVE:
+                                continue
+                            try:
+                                result = node.get("result") or {}
+                                worker_id = result.get("run_id")
+                                if not worker_id:
+                                    worker_id = saved(f".fusion/workflows/{run_id}/nodes/{identifier(node_id)}/active.json").get("run_id")
+                                directory = inside(workspace, f".fusion/runs/{identifier(worker_id)}")
+                                activity = saved(str((directory / "activity.json").relative_to(workspace)))
+                                row["last_output_at_ms"] = activity.get("updated_at_ms")
+                                messages = [entry.get("text") for entry in activity_entries(tail(inside(workspace, str((directory / "stdout.log").relative_to(workspace))), 64000)) if entry.get("kind") == "message"]
+                                if messages:
+                                    row["latest_update"] = messages[-1][-300:]
+                                break
+                            except (ValueError, OSError, TypeError):
+                                continue  # No saved worker observation is not proof of a live or dead process.
+                        rows.append(row)
+                    except (ValueError, OSError, TypeError, AttributeError) as exc:
+                        summary["errors"].append(f"{path.parent.name}: {exc}")
+                summary["run_count"] = len(rows)
+                # Active observations plus recent outcomes; no arbitrary default-project substitution.
+                response["runs"].extend(sorted(rows, key=lambda r: (r["status"] in ACTIVE, r["started_at_ms"]), reverse=True)[:6])
+            except (ValueError, OSError, TypeError) as exc:
+                summary["errors"].append(str(exc))
+            response["errors"].extend({"workspace_id": key, "workspace_name": workspace.name, "error": error} for error in summary["errors"])
+        response["runs"].sort(key=lambda r: (r["status"] in ACTIVE, r["started_at_ms"]), reverse=True)
+        return response
+
     def workflow(self, workspace, run_id):
         run_id = identifier(run_id)
         manifest_path = inside(workspace / ".fusion", f"workflows/{run_id}/manifest.json")
@@ -934,6 +1002,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = {"default": app.default, "workspaces": [{"id": key, "name": p.name, "path": str(p)} for key, p in app.workspaces.items()]}
             elif path == "/api/overview":
                 result = app.overview(workspace)
+            elif path == "/api/activity":
+                result = app.activity()
             elif path == "/api/capabilities":
                 from fusion_capabilities import capabilities
                 result = capabilities(app, workspace)

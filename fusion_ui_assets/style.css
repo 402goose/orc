@@ -1933,3 +1933,20 @@ summary {
 @media (prefers-reduced-motion:reduce) { .lab-tabs [role=tab] { transition:none; } }
 .label-saved-status { display:flex; align-items:center; gap:12px; color:var(--green); border:1px solid var(--success-line); background:var(--success-soft); padding:14px 18px; border-radius:10px; margin:18px 0; }
 .label-saved-status .guild-icon { flex:none; }
+.workspace-activity { margin:0 0 32px; }
+.workspace-activity-grid,.model-catalog-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
+.workspace-activity-card { display:flex; flex-direction:column; gap:10px; text-align:left; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:17px; cursor:pointer; min-width:0; }
+.workspace-activity-card.recorded-active { border-color:var(--accent-line); background:var(--accent-soft); }
+.workspace-activity-card:hover { border-color:var(--lime); }
+.workspace-activity-head { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+.workspace-activity-card small { color:var(--muted); font-size:11px; }
+.workspace-activity-task,.workspace-activity-update { overflow-wrap:anywhere; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; line-height:1.45; }
+.workspace-activity-update { color:var(--text-soft); font-size:12px; }
+.model-provenance-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:18px; }
+.model-catalog-card { padding:20px; min-width:0; }
+.model-catalog-card h3 { margin:0 0 8px; }
+.model-catalog-card code { display:block; overflow-wrap:anywhere; font-size:11px; color:var(--muted); margin-bottom:18px; }
+.model-catalog-card .facts { margin-bottom:16px; }
+.model-diagnostics { margin-top:28px; }
+@media(max-width:1000px) { .workspace-activity-grid,.model-catalog-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+@media(max-width:650px) { .workspace-activity-grid,.model-catalog-grid,.model-provenance-grid { grid-template-columns:1fr; } .workspace-activity .section-bar { align-items:flex-start; flex-direction:column; gap:8px; } }
