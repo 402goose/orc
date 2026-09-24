@@ -1324,7 +1324,8 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool, reason: str = "
 
     Delegations have no coordinator gate, so without this their only signal is
     the worker's own claim. Outcomes feed decisions.rank_by_outcomes; the
-    latest verdict for a run wins.
+    latest verdict for a run wins. A verdict with a reason on a reported
+    success also becomes an acceptance label (fusion_labeling.verdict_label).
     """
     from fusion_decisions import DecisionStore
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id or ""):
@@ -1339,7 +1340,9 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool, reason: str = "
              "route": result.get("route"), "agent": result.get("agent"), "model": result.get("model"),
              "evidence": str(result_path)}
     DecisionStore(workspace).append("outcome", **event)
-    return {"recorded": True, **event}
+    from fusion_labeling import verdict_label
+    label = verdict_label(workspace, load_config(workspace)[0], run_id, result, bool(accepted), reason, str(result_path))
+    return {"recorded": True, **event, "label": label}
 
 
 def dispatch(
@@ -1704,14 +1707,14 @@ def tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "fusion_outcome",
-            "outputSchema": {"type": "object", "properties": {"recorded": {"type": "boolean"}, "task_id": {"type": "string"}, "accepted": {"type": "boolean"}}, "required": ["recorded"]},
-            "description": "Record your verdict on a delegated run after inspecting its diff and tests. Accepted/rejected outcomes rank future automatic routes; a worker's own success claim does not.",
+            "outputSchema": {"type": "object", "properties": {"recorded": {"type": "boolean"}, "task_id": {"type": "string"}, "accepted": {"type": "boolean"}, "label": {"type": "object"}}, "required": ["recorded"]},
+            "description": "Record your verdict on a delegated run after inspecting its diff and tests. Accepted/rejected outcomes rank future automatic routes; a worker's own success claim does not. With a reason, a verdict on a reported success also becomes a local acceptance training label (source lead_verdict).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "run_id": {"type": "string", "description": "run_id from the fusion_delegate result."},
                     "accepted": {"type": "boolean"},
-                    "reason": {"type": "string", "description": "What you verified or why you rejected it."},
+                    "reason": {"type": "string", "description": "What you verified or why you rejected it. Required for the verdict to become a training label."},
                 },
                 "required": ["run_id", "accepted"],
             },
@@ -2101,7 +2104,7 @@ def build_parser() -> argparse.ArgumentParser:
     verdict = outcome.add_mutually_exclusive_group(required=True)
     verdict.add_argument("--accepted", dest="accepted", action="store_true")
     verdict.add_argument("--rejected", dest="accepted", action="store_false")
-    outcome.add_argument("--reason", default="")
+    outcome.add_argument("--reason", default="", help="what you verified; required for the verdict to become an acceptance label")
 
     ultra = sub.add_parser("ultra", help="run a bounded UltraCode-style explore/plan/implement/review pipeline")
     ultra.add_argument("--stages", type=int, help="maximum number of configured stages")

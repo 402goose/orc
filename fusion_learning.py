@@ -3,7 +3,7 @@ from collections import Counter, defaultdict
 import json
 from pathlib import Path
 
-from fusion_decisions import DecisionEngine, DecisionStore, digest, read_jsonl, reviewed_labels, label_provenance
+from fusion_decisions import DecisionEngine, DecisionStore, digest, labelable_record, read_jsonl, reviewed_labels, label_provenance
 
 
 def read_object(path):
@@ -33,7 +33,7 @@ def decision_rows(workspace):
         approved_at = max((e.get('time_ms', 0) for e in row['labels'] if e.get('verified')), default=-1)
         if row['excluded']:
             state = 'excluded'
-        elif row.get('status') != 'ok' or row.get('truncated'):
+        elif not labelable_record(row):
             state = 'ineligible'
         elif suggestion and (suggestion.get('time_ms', 0) > approved_at or
                              any(e.get('source') == 'council_approved_suggestion' and e.get('suggestion_id') == suggestion.get('suggestion_id') for e in row['labels'])
@@ -86,7 +86,7 @@ def learning_summary(workspace, config, rows=None):
     labeled, questions, agreed, compared = 0, 0, 0, 0
     for row in rows:
         kind = kinds.setdefault(row['kind'], {'eligible': 0, 'reviewed': 0, 'questions': 0, 'labeled': 0})
-        if row.get('status') != 'ok' or row.get('truncated') or row['excluded']:
+        if not labelable_record(row) or row['excluded']:
             continue
         kind['eligible'] += 1
         kind['questions'] += len(row['questions'])

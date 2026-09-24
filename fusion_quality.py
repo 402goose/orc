@@ -1,7 +1,7 @@
 """Measured dataset health and evaluation evidence; no model calls or inferred grades."""
 from collections import Counter, defaultdict
 
-from fusion_decisions import digest, labels_for
+from fusion_decisions import digest, labelable_record, labels_for
 
 
 def input_key(row):
@@ -50,7 +50,7 @@ def review_quality(rows):
     examples, sources, evidence, edits, revisions = [], Counter(), 0, Counter(), 0
     council = Counter()
     for row in rows:
-        if row.get("excluded") or row.get("truncated") or row.get("status") != "ok":
+        if row.get("excluded") or not labelable_record(row):
             continue
         suggestion = (row.get("suggestions") or [None])[-1]
         if suggestion and suggestion.get("council"):

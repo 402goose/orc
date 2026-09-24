@@ -23,9 +23,12 @@ import fusion_progress as progress
 DEFAULTS = {
     "mode": "shadow", "python": "", "device": "cpu", "model_path": "",
     "timeout_seconds": 120, "auto_actions": [], "threshold": 0.90,
-    "calibration_file": "", "max_state_chars": 2200,
+    "calibration_file": "", "max_state_chars": 2200, "verdict_labels": True,
 }
 KINDS = {"intake", "routing", "recovery", "review", "acceptance"}
+# "unscored": the input was recorded without running the model, so a verified
+# answer can be attached to it. It has no prediction and never drives an action.
+LABELABLE_STATUSES = {"ok", "unscored"}
 INTAKE_QUESTIONS = {
     "workflow": {"type": "choice", "instructions": "Which work is requested and permitted?",
                  "criteria": {"discovery": "investigate or plan only", "build": "implement a feature",
@@ -70,7 +73,13 @@ def config_for(config):
         raise ValueError("decisions.auto_actions must contain only intake, routing, recovery, review, acceptance")
     if not 0 < float(options["threshold"]) <= 1:
         raise ValueError("decisions.threshold must be in (0, 1]")
+    if not isinstance(options["verdict_labels"], bool):
+        raise ValueError("decisions.verdict_labels must be true or false")
     return options
+
+
+def labelable_record(record):
+    return record.get("status") in LABELABLE_STATUSES and not record.get("truncated")
 
 
 def runtime_python(options):
@@ -268,7 +277,7 @@ class DecisionStore:
 
     def _label(self, decision_id, answers, evidence, suggestion_id=None, replace=False):
         record = self.get(decision_id)
-        if record.get("status") != "ok" or record.get("truncated"):
+        if not labelable_record(record):
             raise ValueError("label only successful, complete model inputs; shorten truncated inputs and run again")
         if not isinstance(evidence, str) or not evidence.strip() or not isinstance(answers, dict) or not answers:
             raise ValueError("reviewed labels require answers and verification evidence")
@@ -282,21 +291,25 @@ class DecisionStore:
             provenance = approval_provenance(self, record, suggestion_id, answers)
         self.append("label", id=decision_id, answers=answers, evidence=evidence, verified=True, replace=replace, **provenance)
 
-    def export(self, destination):
+    def export(self, destination, exclude_sources=()):
         events = read_jsonl(self.path)
         labels, exclusions = reviewed_labels(events)
         provenance = label_provenance(events)
+        excluded_sources = set(exclude_sources)
         rows = []
         records = {e["id"]: e for e in events if e.get("event") == "decision"}
         for record in records.values():
-            if not labels.get(record["id"]) or exclusions.get(record["id"]) or record.get("status") != "ok" or record.get("truncated"):
+            origin = provenance.get(record["id"], {})
+            kept = {key: value for key, value in labels.get(record["id"], {}).items()
+                    if origin.get(key, {}).get("source", "human") not in excluded_sources}
+            if not kept or exclusions.get(record["id"]) or not labelable_record(record):
                 continue
             group = record.get("context", {}).get("group") or record.get("context", {}).get("task_id") or digest(record["state"])
             split = "validation" if int(digest(group)[:8], 16) % 5 == 0 else "train"
             rows.append({"schema": "fusion.training.v1", "id": record["id"], "group": group, "split": split,
                          "kind": record["kind"], "state": record["state"], "questions": record["questions"],
-                         "labels": labels[record["id"]], "prediction": record["prediction"],
-                         "label_provenance": provenance.get(record["id"], {}),
+                         "labels": kept, "prediction": record["prediction"],
+                         "label_provenance": {key: origin[key] for key in kept if key in origin},
                          "model_identity": record.get("model_identity"), "schema_hash": record["schema_hash"]})
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -371,18 +384,37 @@ class DecisionEngine:
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             return {}
 
-    def decide(self, kind, state, questions, context=None):
+    def new_record(self, kind, questions, context):
         if kind not in KINDS:
             raise ValueError(f"unknown decision kind: {kind}")
-        record = {"id": uuid.uuid4().hex, "kind": kind, "mode": self.options["mode"],
-                  "context": context or {}, "questions": questions, "schema_hash": digest(questions),
-                  "status": "off", "recommendations": {}, "prediction": {}}
-        if self.options["mode"] == "off":
-            return record
+        return {"id": uuid.uuid4().hex, "kind": kind, "mode": self.options["mode"],
+                "context": context or {}, "questions": questions, "schema_hash": digest(questions),
+                "status": "off", "recommendations": {}, "prediction": {}}
+
+    def encode(self, record, state):
         text = json.dumps(state, ensure_ascii=False, sort_keys=True)
         cap = max(200, min(6000, int(self.options["max_state_chars"])))
         record["state"] = text[:cap]
         record["truncated"] = len(text) > cap or bool(isinstance(state, dict) and state.get("source_truncated"))
+
+    def record_unscored(self, kind, state, questions, context=None, encoded=None, **extra):
+        """Record a decision input without inference, so a verified answer can be
+        attached to it. Same encoding and truncation as decide(), or an already
+        encoded complete input; no prediction, no recommendation, and allowed()
+        can never act on it."""
+        record = {**self.new_record(kind, questions, context), "status": "unscored", "duration_ms": 0, **extra}
+        if encoded is None:
+            self.encode(record, state)
+        else:
+            record.update(state=encoded, truncated=False)
+        self.store.append("decision", **record)
+        return record
+
+    def decide(self, kind, state, questions, context=None):
+        record = self.new_record(kind, questions, context)
+        if self.options["mode"] == "off":
+            return record
+        self.encode(record, state)
         started = time.monotonic()
         try:
             for key, question in questions.items():
@@ -452,6 +484,12 @@ def fit_calibration(dataset, output, threshold=0.9):
     rows = dataset_rows(dataset)
     if not 0 < threshold <= 1:
         raise ValueError("threshold must be in (0, 1]")
+    # Examples recorded without inference (verdict labels) carry no prediction
+    # to calibrate; evaluate a checkpoint on the dataset to score them.
+    scored = [row for row in rows if all(key in (row.get("prediction") or {}) for key in row["labels"])]
+    unscored, rows = len(rows) - len(scored), scored
+    if not rows:
+        raise ValueError("no example in this dataset has stored predictions; run evaluate on it, then calibrate the evaluation output")
     identities = {row["model_identity"] for row in rows}
     if len(identities) != 1:
         raise ValueError("calibration requires reviewed examples from exactly one model identity")
@@ -471,7 +509,8 @@ def fit_calibration(dataset, output, threshold=0.9):
                 raise ValueError("invalid stored probabilities")
             bucket[split].append((probs, label, group))
     report = {"schema": "fusion.calibration.v1", "model_identity": next(iter(identities)),
-              "dataset_hash": hashlib.sha256(Path(dataset).read_bytes()).hexdigest(), "buckets": {}}
+              "dataset_hash": hashlib.sha256(Path(dataset).read_bytes()).hexdigest(), "buckets": {},
+              "unscored_examples": unscored}
     for key, samples in buckets.items():
         train, validation = samples["train"], samples["validation"]
         candidates = [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8]

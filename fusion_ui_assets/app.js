@@ -837,7 +837,7 @@ function decisionReview() {
             .join(
               "",
             )}<h3 style="margin-top:25px">What actually happened</h3>${record.applications?.length ? record.applications.map((a) => `<p class="help-copy"><strong>${esc(a.actual)}</strong> · ${a.applied ? "Model recommendation applied" : "Policy decision; recommendation advisory"}<br>${esc(a.reason || "")}</p>`).join("") : '<p class="help-copy">This probe has no workflow action attached.</p>'}<details><summary>Input &amp; model evidence</summary><pre class="console">${esc(pretty({ state: record.state, prediction: record.prediction, model: record.model_identity, context: record.context }))}</pre></details>${
-            record.status === "ok" && !record.truncated
+            (record.status === "ok" || record.status === "unscored") && !record.truncated
               ? `<div class="garden-record-tools">${record.excluded ? "Excluded from future exports and automatic drafts. Existing datasets and trained models are unchanged." : "Keep useful examples; exclude noisy or unsuitable inputs from future exports."}${button(record.excluded ? "Restore example" : "Exclude example", "exclude-label", `data-id="${esc(record.id)}" data-excluded="${!record.excluded}"`, "small")}</div>` + (record.excluded ? "" : labelEditor(record))
               : ""
           }`
