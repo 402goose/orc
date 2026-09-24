@@ -55,12 +55,19 @@ observed bytes and does not prove a malicious workspace cannot forge them.
 
 ## Completion and recovery
 
-The supervisor first records the terminal executor result with the provider.
-For a successful label worker it then parses one strict `label-suggestion`
-block against the frozen question schema and source IDs. Draft completion
-requires the worker task to belong to this admitted read-only labeling attempt.
-The stored suggestion retains the admission request hash, original decision
-fingerprint, answer/task/manifest hashes and worker execution evidence.
+Before recording a successful terminal result, the supervisor supplies hashes
+of the exact workflow manifest and linked worker task, result and answer. The
+provider independently verifies their bytes and this admitted read-only label
+attempt's identity, then freezes `label_output.json` outside the workspace and
+binds it to the terminal receipt. Completion parses one strict
+`label-suggestion` block from that frozen answer against the frozen question
+schema and source IDs. It never rereads mutable teacher output files. A missing
+or changed frozen output refuses completion, including for an older receipt
+that lacks this binding. The stored suggestion retains both external artifact
+provenance and the original decision fingerprint. Hashes freeze observed local
+bytes; they do not establish that the workspace was honest before collection.
+Completion inputs are limited to 2 MiB combined; the external JSON artifact
+is limited to 8,000,000 bytes to allow encoding overhead.
 
 Under the existing review lock, completion checks for an already persisted
 suggestion and returns it. A repeated launch of the same local job retries
@@ -68,6 +75,9 @@ completion or returns current status; it does not run another worker. An
 explicit authenticated `POST /api/label-draft/finalize` with
 `{"run_id":"label-..."}` recovers completion from a successful terminal receipt,
 including when the local UI job file was lost. This operation starts no worker.
+Changed or removed local teacher files cannot substitute the frozen answer or
+prevent its recovery. An interruption after output freezing but before terminal
+persistence still lacks a terminal receipt and remains unknown.
 Missing, claimed, failed or changed-provenance receipts cannot be finalized.
 A crash after claim but before terminal persistence remains unknown; there is
 no automatic redispatch or generic exactly-once/power-loss guarantee.
@@ -93,5 +103,6 @@ TENET_LABEL_TEST_PROVIDER=/absolute/tenet/dist/commands/admission-provider.js \
 
 The optional integration test launches the real compiled provider and detached
 ORC supervisor, verifies one worker invocation across service reconstruction,
-and checks that drafts remain excluded from training. It does not measure label
+recovers the original answer after local teacher output removal, and checks
+that drafts remain excluded from training. It does not measure label
 quality or verify that a real model obeys every instruction.

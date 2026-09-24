@@ -348,11 +348,15 @@ def run_job(directory):
         state.update(status="failed", error=str(exc))
     if claimed:
         try:
+            terminal = {"status": state["status"], "exit_code": state.get("exit_code"),
+                        "workflow_id": admitted["run_id"], "checks": []}
+            if label_packet and state["status"] == "success":
+                from fusion_label_drafts import completion_observation
+                terminal["label_completion"] = completion_observation(request["workspace"], admitted["run_id"])
             admission_provider.call(Path(request["workspace"]), "finish", run_id=admitted["run_id"],
                 expected_request_sha256=admitted["request_sha256"],
-                result={"status": state["status"], "exit_code": state.get("exit_code"),
-                        "workflow_id": admitted["run_id"], "checks": []})
-        except ValueError as exc:
+                result=terminal)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
             state["admission_error"] = str(exc)
     if label_packet and state["status"] == "success":
         try:

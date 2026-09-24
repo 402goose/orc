@@ -14,6 +14,7 @@ SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 FILE_LIMIT = 2_000_000
 TOTAL_LIMIT = 4_000_000
 SOURCE_LIMIT = 32
+COMPLETION_LIMIT = 2 * 1024 * 1024
 
 
 def _read(workspace, relative, limit=FILE_LIMIT):
@@ -153,21 +154,56 @@ def draft_request(workspace, decision_id, model=None, reasoning_effort=None):
                  "max_parallel_writers": 0, "max_attempts": 1, "budget_usd": 1, "publish": {"mode": "off"}}}
 
 
-def frozen_packet(workspace, response):
-    artifact = response.get("artifacts", {}).get("label_draft")
+def _frozen_artifact(workspace, response, name, schema, limit=FILE_LIMIT):
+    artifact = response.get("artifacts", {}).get(name)
     if not isinstance(artifact, dict):
-        raise ValueError("Admission has no frozen label draft packet")
+        raise ValueError(f"Admission has no frozen {name} artifact")
     path = Path(artifact["path"])
-    if not path.is_absolute() or path.is_symlink() or path.resolve().is_relative_to(Path(workspace).resolve()):
-        raise ValueError("Label draft packet must be outside the worker workspace")
-    with path.open("rb") as handle:
-        raw = handle.read(2_000_001)
-    if len(raw) > 2_000_000 or hashlib.sha256(raw).hexdigest() != artifact["sha256"]:
-        raise ValueError("Frozen label packet changed")
+    if not path.is_absolute() or path.resolve().is_relative_to(Path(workspace).resolve()):
+        raise ValueError("Frozen label artifacts must be outside the worker workspace")
+    raw = _read(Path(path.anchor), str(path.relative_to(path.anchor)), limit)
+    if hashlib.sha256(raw).hexdigest() != artifact["sha256"]:
+        raise ValueError(f"Frozen {name} artifact changed")
     packet = json.loads(raw)
-    if packet.get("schema") != "fusion.label-draft-packet.v1":
-        raise ValueError("Unsupported frozen label packet schema")
+    if packet.get("schema") != schema:
+        raise ValueError(f"Unsupported frozen {name} schema")
     return packet
+
+
+def frozen_packet(workspace, response):
+    return _frozen_artifact(workspace, response, "label_draft", "fusion.label-draft-packet.v1")
+
+
+def completion_observation(workspace, run_id):
+    """Capture hashes before finish; the provider independently verifies them.
+
+    This is an observation of local artifacts, not a claim that a malicious
+    workspace could not forge them before the external freeze.
+    """
+    if not isinstance(run_id, str) or not re.fullmatch(r"label-[a-f0-9]{56}", run_id):
+        raise ValueError("Invalid admitted label run ID")
+    manifest_raw = _read(workspace, f".fusion/workflows/{run_id}/manifest.json", COMPLETION_LIMIT)
+    manifest = json.loads(manifest_raw)
+    if manifest.get("schema") != "fusion.workflow.v1" or manifest.get("workflow_id") != run_id:
+        raise ValueError("Label workflow identity does not match admission")
+    node = (manifest.get("nodes") or {}).get("label") or {}
+    result = node.get("result") or {}
+    worker_id = result.get("run_id")
+    if (node.get("status") != "success" or result.get("status") != "success" or result.get("exit_code") != 0
+            or not isinstance(worker_id, str) or not SAFE_ID.fullmatch(worker_id)):
+        raise ValueError("Completed label workflow has no successful worker evidence")
+    files = {"manifest": manifest_raw}
+    for name, filename in (("task", "task.json"), ("result", "result.json"), ("answer", "answer.md")):
+        files[name] = _read(workspace, f".fusion/runs/{worker_id}/{filename}", COMPLETION_LIMIT)
+    if sum(map(len, files.values())) > COMPLETION_LIMIT:
+        raise ValueError("Label completion exceeds its bounded evidence budget")
+    task, saved_result = json.loads(files["task"]), json.loads(files["result"])
+    if task.get("parent_task_id") != run_id or task.get("agent") != "codex" or task.get("role") != "labeling" or task.get("write") is not False:
+        raise ValueError("Label worker does not belong to this admitted read-only attempt")
+    if saved_result.get("run_id") != worker_id or saved_result.get("status") != "success" or saved_result.get("exit_code") != 0:
+        raise ValueError("Label worker result does not match its completed attempt")
+    files["answer"].decode("utf-8")  # Refuse lossy output before the immutable freeze.
+    return {"worker_id": worker_id, **{name + "_sha256": hashlib.sha256(raw).hexdigest() for name, raw in files.items()}}
 
 
 def finalize(workspace, run_id):
@@ -185,6 +221,9 @@ def finalize(workspace, run_id):
     packet = frozen_packet(workspace, response)
     if not response.get("terminal") or response.get("status") != "success":
         raise ValueError("Label worker has no successful terminal admission receipt")
+    output = _frozen_artifact(workspace, response, "label_output", "fusion.label-draft-output.v1", 8_000_000)
+    if output.get("run_id") != run_id or output.get("request_sha256") != response["request_sha256"]:
+        raise ValueError("Frozen teacher output has different admission provenance")
     record = packet["decision"]
     current_record, fingerprint = decision_source(workspace, record["id"])
     if fingerprint != packet["decision_line_sha256"] or run_id != "label-" + fingerprint[:56]:
@@ -197,23 +236,8 @@ def finalize(workspace, run_id):
             if existing.get("admission_request_sha256") != response["request_sha256"]:
                 raise ValueError("Existing draft has different admission provenance")
             return {"decision_id": record["id"], **existing, "approval": {"status": "needs_review"}, "recovered": True}
-        manifest_raw = _read(workspace, f".fusion/workflows/{run_id}/manifest.json")
-        manifest = json.loads(manifest_raw)
-        if manifest.get("schema") != "fusion.workflow.v1" or manifest.get("workflow_id") != run_id:
-            raise ValueError("Label workflow identity does not match admission")
-        node = (manifest.get("nodes") or {}).get("label") or {}
-        result = node.get("result") or {}
-        worker_id = result.get("run_id")
-        if (node.get("status") != "success" or result.get("status") != "success" or result.get("exit_code") != 0
-                or not isinstance(worker_id, str) or not SAFE_ID.fullmatch(worker_id)):
-            raise ValueError("Completed label workflow has no successful worker evidence")
-        task_raw = _read(workspace, f".fusion/runs/{worker_id}/task.json")
-        task = json.loads(task_raw)
-        if task.get("parent_task_id") != run_id or task.get("agent") != "codex" or task.get("role") != "labeling" or task.get("write") is not False:
-            raise ValueError("Label worker does not belong to this admitted read-only attempt")
-        answer_raw = _read(workspace, f".fusion/runs/{worker_id}/answer.md")
-        answer = answer_raw.decode("utf-8")
-        parsed = parse_suggestion(answer, record, packet["sources"])
+        result, worker_id = output["result"], output["worker_id"]
+        parsed = parse_suggestion(output["answer_text"], record, packet["sources"])
         teacher_answers = parsed["answers"]
         # Success of a chosen option is not a counterfactual comparison.
         if record.get("kind") == "routing" and packet.get("comparative_evidence") != "matched":
@@ -225,9 +249,6 @@ def finalize(workspace, run_id):
                       "sources": packet["sources"], "labeling_mode": "single", "approval_mode": "human", "verified": False,
                       "admission_run_id": run_id, "admission_request_sha256": response["request_sha256"],
                       "source_decision_line_sha256": fingerprint, "teacher_answers": teacher_answers}
-        suggestion["teacher_artifacts"] = {
-            "workflow_manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
-            "worker_task_sha256": hashlib.sha256(task_raw).hexdigest(),
-            "answer_sha256": hashlib.sha256(answer_raw).hexdigest()}
+        suggestion["teacher_artifacts"] = {**output["hashes"], "frozen_output": response["artifacts"]["label_output"]}
         store.append("label_suggestion", id=record["id"], **suggestion)
         return {"decision_id": record["id"], **suggestion, "approval": {"status": "needs_review"}, "recovered": False}
