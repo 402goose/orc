@@ -89,6 +89,9 @@ const fs=require('node:fs'),path=require('node:path');
     await expect(page.locator('.garden-panel .pill')).toHaveText('paused');
     const exportPath=path.join(info.workspace,'.fusion/ui/jobs');
     await tab('Training');
+    // The manual tools live in a collapsed disclosure since the training loop
+    // landed; Playwright cannot click a button inside a closed <details>.
+    await page.locator('details.manual-learning').evaluate(el=>{el.open=true;});
     await page.getByRole('button',{name:'Export approved labels',exact:true}).click();
     await page.getByRole('button',{name:'Start learning job →',exact:true}).click();
     await expect(page.locator('#job-content .status')).toHaveText('success',{timeout:10000});

@@ -120,6 +120,9 @@ const path = require('node:path');
     await tab('Overview');
     await expect(page.locator('.learning-columns').first()).toContainText('Bundled Laya checkpoint');
     await tab('Training');
+    // Saved candidates moved inside a collapsed disclosure when the training
+    // loop landed; a button in a closed <details> cannot be clicked.
+    await page.locator('details.manual-learning').evaluate(el=>{el.open=true;});
     await page.getByRole('button',{name:'Evaluate candidate',exact:true}).click();
     await expect(page.locator('#learning-action')).toHaveValue('evaluate');
     await expect(page.locator('#learning-form [name=model_path]')).toHaveValue(fs.realpathSync(candidate));

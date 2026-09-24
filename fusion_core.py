@@ -1533,6 +1533,7 @@ def tool_definitions() -> list[dict[str, Any]]:
     return fusion_mcp.ASYNC_TOOLS + [
         {
             "name": "fusion_delegate",
+            "outputSchema": {"type": "object", "properties": {"status": {"type": "string"}, "summary": {"type": "string"}, "blockers": {"type": "array", "items": {"type": "string"}}, "artifacts": {"type": "object"}}, "required": ["status"]},
             "description": "Delegate a bounded task to the other coding agent and receive a structured handoff. The lead keeps final judgment.",
             "inputSchema": {
                 "type": "object",
@@ -1553,11 +1554,13 @@ def tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "fusion_decisions",
+            "outputSchema": {"type": "object", "properties": {"decisions": {"type": "array", "items": {"type": "object"}}}, "required": ["decisions"]},
             "description": "Inspect local classifier advice; recommendations never confer permissions or replace verification.",
             "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50}}},
         },
         {
             "name": "fusion_status",
+            "outputSchema": {"type": "object", "properties": {"runs": {"type": "array", "items": {"type": "object"}}}, "required": ["runs"]},
             "description": "List recent Fusion runs and their structured results.",
             "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50}}},
         },
@@ -1591,6 +1594,18 @@ def _reported_cost(row: dict[str, Any]) -> str:
 
 
 def mcp_result(payload: Any) -> dict[str, Any]:
+    """Wrap a tool payload. `structuredContent` must be a JSON object.
+
+    MCP requires an object there, not an array or a scalar, so a tool that
+    returns a bare list produces a response a strict client rejects. Refusing
+    here surfaces it as a tool error during development instead of shipping an
+    invalid response; every tool names its collection instead.
+    """
+    if not isinstance(payload, dict):
+        raise TypeError(
+            f"MCP structuredContent must be a JSON object, got {type(payload).__name__}; "
+            "name the collection, e.g. {\"runs\": [...]}"
+        )
     return {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}], "structuredContent": payload}
 
 
@@ -1641,7 +1656,7 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
             args = params.get("arguments") or {}
             try:
                 if name == "fusion_status":
-                    payload = store.recent(int(args.get("limit", 10)))
+                    payload = {"runs": store.recent(int(args.get("limit", 10)))}
                 elif name == "fusion_decisions":
                     from fusion_decisions import DecisionStore
                     payload = {"decisions": DecisionStore(workspace).records()[-max(1, min(50, int(args.get("limit", 10)))):]}
