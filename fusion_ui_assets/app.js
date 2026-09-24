@@ -388,6 +388,7 @@ function artifactButtons(artifact, workflowId) {
   return `<div class="room-artifact"><div><strong>${esc(artifact.label)}</strong><small class="room-path" title="${esc(artifact.path)}">${esc(artifact.path?.split("/").slice(-2).join("/") || "Path unavailable")}</small>${!artifact.available ? `<small class="room-evidence-missing">${esc(artifact.error || "Not available")}</small>` : ""}</div><div class="room-artifact-actions">${button("View", "run-artifact", `${attrs} ${artifact.available ? "" : "disabled"}`, "small ghost")}${button("↓", "run-artifact-download", `${attrs} aria-label="Download ${esc(artifact.label)}" ${artifact.available ? "" : "disabled"}`, "small ghost")}${button("Copy path", "copy-artifact-path", `data-path="${esc(artifact.path || "")}"`, "small ghost")}</div></div>`;
 }
 function tenetEvidence(report, compact = false) {
+  if (report?.admission?.request_sha256) return admissionCard(report.admission);
   const evidence = report?.tenet;
   const runs = evidence?.runs || [];
   if (!evidence) return '<p class="help-copy">TENET receipt evidence is not available from this server.</p>';
@@ -1004,6 +1005,7 @@ const templates = {
   debug: { kind: "debug", text: "" },
 };
 function openLaunch(options = {}) {
+  if (state.config?.admission?.mode === "tenet") return openAdmittedLaunch(options);
   const kind = options.kind || "discovery";
   modal(
     options.from_workflow ? "Implement a finding" : "Start a new run",
@@ -1034,6 +1036,31 @@ function openLaunch(options = {}) {
   );
   $("#launch-form").addEventListener("change", updateLaunch);
   updateLaunch();
+}
+function admissionCard(value) {
+  if (!value) return "";
+  const refs = value.context?.refs || [];
+  return `<section class="launch-note"><div class="pill-row"><strong>TENET admission</strong>${badge(value.status)}</div>
+    ${value.error ? `<p class="blocker">${esc(value.error)}</p>` : ""}
+    <p>Task ${esc(value.run_id || "unknown")} · workspace ${esc(value.workspace_id || "unknown")}</p>
+    <p class="help-copy">${value.terminal ? "Executor observation saved. Acceptance is shown separately in coordinator checks." : "No terminal executor observation. Worker liveness is unknown; this record does not restart work."}</p>
+    ${refs.length ? `<details><summary>${refs.length} frozen context source(s)</summary>${refs.map(ref => `<p class="room-path">${esc(ref.path || ref.source_path)}<br><small>${esc(ref.sha256)}</small></p>`).join("")}</details>` : ""}
+    ${value.request_sha256 ? `<details><summary>Saved admission and policy</summary><p class="room-path">${esc(value.request_sha256)}</p><pre class="console">${esc(pretty(value.request?.intent?.permissions || {}))}</pre>${Object.entries(value.artifacts || {}).map(([name, artifact]) => `<p>${esc(name)} ${button("Copy path", "copy-artifact-path", `data-path="${esc(artifact.path || "")}"`, "small ghost")}</p>`).join("")}</details>` : ""}</section>`;
+}
+function openAdmittedLaunch(options = {}) {
+  const provider = state.config.admission;
+  const requestId = "task-" + crypto.randomUUID();
+  modal("Start a TENET task", "TENET saves the task and context; ORC executes the admitted workflow.",
+    `<form id="admitted-launch-form"><input type="hidden" name="request_id" value="${requestId}">
+      ${!provider.ready ? `<p class="blocker">${esc(provider.error || "The required provider is unavailable.")}</p>` : ""}
+      <div class="field"><label for="admitted-task">What should happen?</label><textarea id="admitted-task" name="text" rows="6" required>${esc(options.text || options.spec?.task || "")}</textarea></div>
+      <p class="help-copy">${esc(provider.executor?.model || provider.binding?.executor?.model || "Operator-selected Codex")} · one attempt · up to 10 minutes per worker. Laya is disabled for this dispatch.</p>
+      <p class="help-copy">Context to freeze: ${esc(provider.context_paths?.join(", ") || "No context files selected in operator policy")}</p>
+      <label class="check-field"><input type="checkbox" name="allow_write"> Allow workspace edits for this task</label>
+      <p class="help-copy">Without edits, Codex runs read-only. With edits, it uses workspace-write with approvals disabled and no extra Git metadata write roots. Service permissions are not qualified by this setting.</p>
+      <details><summary>Authored workflow (optional)</summary><div class="field"><label for="admitted-spec">Override the single-worker task with a bounded Codex workflow</label><textarea id="admitted-spec" class="editor" name="spec" rows="5" spellcheck="false">${options.spec ? esc(pretty(withoutDerived(options.spec))) : ""}</textarea></div></details>
+      <p class="launch-note">Task, policy, workflow and selected context are frozen before execution. Reported-spend budget: $3; native provider costs may be unknown, so this is not a billing cap. An executor success alone does not establish independently accepted changes.</p>
+      <div class="dialog-footer"><small>Required provider: TENET · no standalone fallback</small><button type="submit" class="button primary" ${provider.ready ? "" : "disabled"}>Admit and start →</button></div></form>`, "launch");
 }
 function updateLaunch() {
   const k = $("#launch-kind").value,
@@ -1094,7 +1121,7 @@ function renderJob(job) {
   const controls = `<div class="actions" style="margin:16px 0">${job.action?.startsWith("truffle-") ? button("Open hunt →", "truffle-open", `data-id="${esc(result.id || "")}"`, "primary") : ""}${job.workflow_id ? button("Open workflow →", "job-workflow", `data-id="${esc(job.workflow_id)}"`, "primary") : ""}${active(job.status) ? button(job.status === "stopping" ? "Stopping…" : "Stop job", "cancel", `data-id="${esc(job.id)}" ${job.status === "stopping" ? "disabled" : ""}`, "danger") : ""}${result.workflow && !result.workflow_id ? button("Inspect prepared workflow", "prepared", `data-path="${esc(result.workflow)}"`) : ""}</div>`;
   replaceContent(
     $("#job-content"),
-    `<div class="pill-row">${badge(job.status)}<small>${active(job.status) ? age(job.started_at_ms) + " elapsed" : date(job.finished_at_ms)}</small></div>${controls}${job.label_run ? labelRunCard(job.label_run) : ""}${job.error ? `<div class="blocker">${esc(job.error)}</div>` : ""}<pre class="console job-console" data-scroll-key="job-console" data-follow-tail>${esc(job.console || (active(job.status) ? "Starting the local coordinator…" : "Job finished. See its result below."))}</pre>${job.output ? `<details ${!active(job.status) && !job.workflow_id ? "open" : ""}><summary>Result</summary><pre class="console">${esc(typeof result === "object" && Object.keys(result).length ? pretty(result) : job.output)}</pre></details>` : ""}<p class="help-copy" style="margin:16px 0 0">You can close this dialog. The job and its logs remain available under Launch activity.</p>`,
+    `<div class="pill-row">${badge(job.status)}<small>${active(job.status) ? age(job.started_at_ms) + " elapsed" : date(job.finished_at_ms)}</small></div>${controls}${admissionCard(job.admission)}${job.admission_error ? `<p class="blocker">${esc(job.admission_error)}</p>` : ""}${job.label_run ? labelRunCard(job.label_run) : ""}${job.error ? `<div class="blocker">${esc(job.error)}</div>` : ""}<pre class="console job-console" data-scroll-key="job-console" data-follow-tail>${esc(job.console || (active(job.status) ? "Starting the local coordinator…" : "Job finished. See its result below."))}</pre>${job.output ? `<details ${!active(job.status) && !job.workflow_id ? "open" : ""}><summary>Result</summary><pre class="console">${esc(typeof result === "object" && Object.keys(result).length ? pretty(result) : job.output)}</pre></details>` : ""}<p class="help-copy" style="margin:16px 0 0">You can close this dialog. The job and its logs remain available under Launch activity.</p>`,
     JSON.stringify([state.workspace, job.id]),
   );
 }
@@ -1262,7 +1289,7 @@ async function refresh(force = false) {
       if (epoch !== state.epoch) return;
       $("#mode-chip").textContent = "Laya · " + state.config.mode;
       $("#execution-chip").textContent =
-        state.config.execution_mode === "yolo"
+        state.config.admission?.mode === "tenet" ? (state.config.admission.ready ? "TENET admission" : "TENET unavailable") : state.config.execution_mode === "yolo"
           ? "YOLO · full access"
           : "Restricted runtime";
     }
@@ -1605,6 +1632,16 @@ document.addEventListener("submit", async (event) => {
     } else if (form.id === "truffle-queue-form") {
       await launch({action: "truffle-run", scout_id: state.scout.id, issues: [...truffleSelected(state.scout)],
         attempts: values.attempts, publish: publishValues("truffle"), allow_write: !!values.allow_write});
+    } else if (form.id === "admitted-launch-form") {
+      const writes = !!values.allow_write;
+      const spec = values.spec.trim() ? JSON.parse(values.spec) : {
+        schema: "fusion.workflow.v1", task: values.text, max_attempts: 1, max_parallel: 1,
+        max_parallel_writers: writes ? 1 : 0, budget_usd: 3, publish: {mode: "off"},
+        nodes: [{id: "work", agent: "codex", write: writes, role: writes ? "implementation" : "discovery",
+          task: values.text + "\nDo not delegate, publish, or broaden this task. Return evidence and explicit unresolved blockers.",
+          acceptance: {required_handoff: ["summary", "tests"]}}], acceptance: {required_nodes: ["work"]},
+      };
+      await launch({action: "workflow", request_id: values.request_id, text: values.text, spec, allow_write: writes, mode: "off"});
     } else if (form.id === "launch-form") {
       const kind = values.kind;
       await launch({
