@@ -692,12 +692,23 @@ function labelDraft(record) {
   return draft;
 }
 function labelingControls(prefix, options) {
+  if (state.config?.admission?.mode === "tenet") {
+    const pairs = admittedPairs(state.config.admission).filter(p => p.reasoning_effort !== "ultra");
+    const preferred = options.model ? options : state.config.admission.executor;
+    return `<div class="labeling-controls" data-labeling="${prefix}"><div class="field"><label for="${prefix}-pair">Drafting model and reasoning</label><select id="${prefix}-pair">${pairs.map((p,i)=>`<option value="${i}" ${p.model === preferred.model && p.reasoning_effort === preferred.reasoning_effort ? "selected" : ""}>${esc(p.model)} / ${esc(p.reasoning_effort)}</option>`).join("")}</select></div><p class="help-copy">One read-only Codex worker. TENET freezes the evidence and selection; Laya stays off during drafting. Drafts need human review. No automatic approval or training.</p></div>`;
+  }
   const council = options.labeling_mode === "council";
   const workers = state.config?.workers || [];
   const members = options.council_agents?.length ? options.council_agents : workers.filter(w => w.available).slice(0, 3).map(w => w.agent);
   return `<div class="labeling-controls" data-labeling="${prefix}"><div class="form-grid"><div class="field"><label for="${prefix}-mode">Drafting method</label><select id="${prefix}-mode" name="labeling_mode"><option value="single" ${!council ? "selected" : ""}>Single worker</option><option value="council" ${council ? "selected" : ""}>Agent council</option></select></div><div class="field single-worker" ${council ? "hidden" : ""}><label for="${prefix}-worker">Labeling worker</label><select id="${prefix}-worker" name="agent"><option value="auto">Auto · available worker</option>${workers.map(w => `<option value="${esc(w.agent)}" ${options.worker === w.agent ? "selected" : ""} ${!w.available ? "disabled" : ""}>${esc(w.agent)}</option>`).join("")}</select></div></div><fieldset class="council-members" ${!council ? "hidden" : ""}><legend>Council members · choose at least two</legend><div>${workers.map(w => `<label class="check-field"><input type="checkbox" name="council_agents" value="${esc(w.agent)}" ${members.includes(w.agent) ? "checked" : ""} ${!w.available ? "disabled" : ""}> ${esc(w.agent)}${!w.available ? " · unavailable" : ""}</label>`).join("")}</div><p class="help-copy">Each member independently reads the same evidence. One worker call per member, run in sequence. Disagreements and abstentions remain visible.</p><div class="field"><label for="${prefix}-rule">Council agreement</label><select id="${prefix}-rule"><option value="unanimous" ${options.council_rule !== "available" ? "selected" : ""}>Every selected member must agree</option><option value="available" ${options.council_rule === "available" ? "selected" : ""}>Available members agree · minimum two</option></select><small>Available-member agreement skips quota limits, timeouts, missing runtimes and permission failures. At least two workers must answer with evidence; all participating members must agree. Abstentions and invalid assessments still block that answer.</small></div></fieldset><div class="field council-approval"><label for="${prefix}-approval">Label approval</label><select id="${prefix}-approval"><option value="human" ${options.approval_mode !== "council" ? "selected" : ""}>I approve the drafts</option><option value="council" ${options.approval_mode === "council" ? "selected" : ""}>Council approves unanimous answers</option></select><small>Choose council approval to assess and save unanimous answers automatically. This uses at least two workers. Human reviews are preserved; disputed or unsupported answers remain pending.</small></div></div>`;
 }
 function labelingValues(prefix) {
+  if (state.config?.admission?.mode === "tenet") {
+    const pairs = admittedPairs(state.config.admission).filter(p => p.reasoning_effort !== "ultra");
+    const pair = pairs[Number($(`#${prefix}-pair`)?.value)];
+    if (!pair) throw new Error("Choose an allowed model and reasoning pair for drafting.");
+    return {agent:"codex", labeling_mode:"single", approval_mode:"human", council_rule:"unanimous", council_agents:[], ...pair};
+  }
   return {agent: $(`#${prefix}-worker`).value, labeling_mode: $(`#${prefix}-mode`).value,
     council_rule: $(`#${prefix}-rule`).value,
     approval_mode: $(`#${prefix}-mode`).value === "council" ? $(`#${prefix}-approval`).value : "human",
@@ -837,7 +848,7 @@ function gardenPanel() {
     : g.state === "drafting" ? "Your next draft is in progress."
     : !g.enabled ? "Automatic drafting is paused." : g.queued ? "Your next drafts are queued." : "Ready for new decisions.";
   return `<section class="panel garden-panel"><div class="garden-main"><div class="eyebrow guild-section-emblem">${sigil("seed")} DATA GARDEN · NO DAILY CAP</div><h2>${title}</h2><p>${ready ? (automatic ? "Supported council answers are approved automatically. These remaining drafts need attention: inspect their votes, unavailable workers and evidence." : "Open Review to inspect the pending labels and evidence. Choose council approval in Garden settings to automate supported answers.") : automatic ? "The council assesses new decisions and approves unanimous answers automatically. Disagreements stay in your review queue." : "Automatically draft labels as decisions arrive. You edit and approve the useful ones."}</p>
-    <div class="garden-usage"><span>${g.used_today} automatic drafts started today (UTC)</span><span>${g.queued} queued · one draft at a time</span><span>${automatic ? (g.council_rule === "available" ? "Auto-approve · available members agree (minimum two)" : "Auto-approve · every selected member") : "Human approval"}</span><span>${g.labeling_mode === "council" ? `Council · ${esc(g.council_agents.join(" + "))}` : `Single worker · ${esc(g.agent)}`}</span></div>
+    <div class="garden-usage"><span>${g.used_today}${g.max_drafts_per_day ? " / " + g.max_drafts_per_day : ""} automatic drafts started today (UTC)</span><span>${g.queued} queued · one draft at a time</span><span>${automatic ? (g.council_rule === "available" ? "Auto-approve · available members agree (minimum two)" : "Auto-approve · every selected member") : "Human approval"}</span><span>${g.labeling_mode === "council" ? `Council · ${esc(g.council_agents.join(" + "))}` : `Single worker · ${esc(g.agent)}`}</span></div>
     ${g.error ? `<p class="blocker">${esc(g.error)}</p>` : ""}${g.latest_job?.status === "failed" ? '<p class="help-copy">The last draft failed. Review its activity and retry explicitly; garden does not repeatedly call a failing worker for the same decision.</p>' : ""}</div>
     <div class="garden-controls"><span class="pill">${esc(g.state.replaceAll("_", " "))}</span>${ready ? button(`Review ${ready} ${ready === 1 ? "draft" : "drafts"} →`, "garden-review", "", "primary") : ""}${button(g.enabled ? "Garden settings" : "Enable auto-drafts", "garden-settings", "", ready ? "" : "primary")}${g.enabled ? button("Pause garden", "garden-pause", "", "small ghost") : ""}${g.active_job ? button("View current draft", "job", `data-id="${esc(g.active_job.id)}"`, "small") : g.latest_job ? button("Latest activity", "job", `data-id="${esc(g.latest_job.id)}"`, "small ghost") : ""}</div></section>`;
 }
@@ -847,7 +858,7 @@ function gardenToolbar() {
 }
 function openGarden() {
   const g = state.garden;
-  modal("Tend your data garden", "Continuous labeling. Your choice of approver.", `<form id="garden-form"><label class="check-field"><input type="checkbox" name="enabled" ${g.enabled ? "checked" : ""}> Automatically label new decisions</label>${labelingControls("garden", {...g, worker: g.agent})}<label class="check-field"><input type="checkbox" name="include_existing"> Include existing eligible decisions and drafts in this setup</label><div class="launch-note">No daily cap. Uses your configured worker accounts and their provider quotas. One assessment runs at a time, with one attempt per decision under this council approval setup. Human-reviewed examples are preserved. Pause also withdraws pending garden approvals. Only approved answers enter training exports. The queue runs while the control-room server is running, even with the browser closed.</div><button class="button primary" type="submit">Save garden settings</button></form>`, "garden");
+  modal("Tend your data garden", "Continuous labeling. Your choice of approver.", `<form id="garden-form"><label class="check-field"><input type="checkbox" name="enabled" ${g.enabled ? "checked" : ""}> Automatically draft labels for new decisions</label>${labelingControls("garden", {...g, worker: g.agent})}<div class="field"><label for="garden-draft-limit">Automatic drafts per UTC day</label><input id="garden-draft-limit" name="max_drafts_per_day" type="number" min="1" max="100" step="1" value="${esc(g.max_drafts_per_day ?? "")}" ${state.config?.admission?.mode === "tenet" ? "required" : ""}><small>Counts started drafts, including failures. This limits attempts, not provider charges.${state.config?.admission?.mode === "tenet" ? "" : " Leave blank for no daily cap."}</small></div><label class="check-field"><input type="checkbox" name="include_existing"> Include existing eligible decisions and drafts in this setup</label><div class="launch-note">Uses your configured worker accounts and their provider quotas. The daily attempt limit persists across restarts. One assessment runs at a time, with one attempt per decision under this council approval setup. Human-reviewed examples are preserved. Pause also withdraws pending garden approvals. Only approved answers enter training exports. The queue runs while the control-room server is running, even with the browser closed.</div><button class="button primary" type="submit">Save garden settings</button></form>`, "garden");
 }
 
 function decisions() {
@@ -1725,7 +1736,7 @@ document.addEventListener("submit", async (event) => {
     }
     else if (form.id === "garden-form") {
       const options = labelingValues("garden");
-      await api("garden", {enabled: !!values.enabled, ...options, include_existing: !!values.include_existing});
+      await api("garden", {enabled: !!values.enabled, ...options, max_drafts_per_day: values.max_drafts_per_day ? Number(values.max_drafts_per_day) : null, include_existing: !!values.include_existing});
       closeModal();
       toast(values.enabled ? (options.approval_mode === "council" ? "Garden enabled. Supported council answers will be approved automatically." : "Garden enabled. New drafts will arrive for your review.") : "Garden paused.");
       await refresh(true);
@@ -1823,8 +1834,9 @@ document.addEventListener("change", (event) => {
     if (event.target.id === prefix + "-mode" && event.target.value === "single")
       $("#" + prefix + "-approval").value = "human";
     const options = labelingValues(prefix);
-    controls.querySelector(".single-worker").hidden = options.labeling_mode === "council";
-    controls.querySelector(".council-members").hidden = options.labeling_mode !== "council";
+    const singleWorker = controls.querySelector(".single-worker"), councilMembers = controls.querySelector(".council-members");
+    if (singleWorker) singleWorker.hidden = options.labeling_mode === "council";
+    if (councilMembers) councilMembers.hidden = options.labeling_mode !== "council";
     if (prefix === "label") {
       const draft = labelDraft(state.decisions.find(r => r.id === state.decision));
       Object.assign(draft, options, {worker: options.agent, optionsDirty:true});
