@@ -139,6 +139,49 @@ class LearningTest(unittest.TestCase):
             launch.assert_called_once()
         self.assertNotIn('daily_limit', garden.status(self.app, self.workspace))
 
+    def test_explicit_draft_cap_counts_failures_survives_restart_and_resets_at_utc_day(self):
+        self.seed('first')
+        self.seed('second')
+        garden.save(self.app, self.workspace, {'enabled': True, 'include_existing': True, 'max_drafts_per_day': 1})
+        with patch.object(self.app, 'launch', side_effect=self.fake_launch) as launch:
+            garden.tick(self.app, self.workspace)
+            self.assertEqual(launch.call_count, 1)
+            key = launch.call_args.args[1]['decision_id']
+            path = self.workspace / '.fusion/ui/jobs' / key / 'job.json'
+            job = json.loads(path.read_text())
+            atomic_json(path, {**job, 'status': 'failed'})
+            restored = ControlRoom(self.workspace)
+            self.assertEqual(garden.status(restored, self.workspace)['state'], 'daily_limit')
+            garden.tick(self.app, self.workspace)
+            self.assertEqual(launch.call_count, 1)
+            with patch.object(garden.time, 'time', return_value=(job['started_at_ms'] // 86400000 + 1) * 86400 + 1):
+                garden.tick(self.app, self.workspace)
+                self.assertEqual(launch.call_count, 2)
+                self.assertNotEqual(launch.call_args.args[1]['decision_id'], key)
+
+    def test_invalid_or_tampered_cap_never_dispatches(self):
+        self.seed()
+        for limit in (True, 0, -1, 101, 1.5, '2'):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                garden.save(self.app, self.workspace, {'enabled': True, 'max_drafts_per_day': limit})
+        atomic_json(self.workspace / '.fusion/decisions/garden.json',
+                    {'enabled': True, 'max_drafts_per_day': 'invalid', 'since_ms': 0})
+        with patch.object(self.app, 'launch') as launch:
+            garden.tick(self.app, self.workspace)
+            launch.assert_not_called()
+        self.assertEqual(garden.status(self.app, self.workspace)['state'], 'invalid_limit')
+
+    def test_admitted_garden_defaults_to_bounded_human_review(self):
+        descriptor = {'ready': True, 'executor': {'model': 'fixture-sol', 'reasoning_effort': 'high'}}
+        with patch('fusion_admission.binding', return_value={'required': True}), patch('fusion_admission.describe', return_value=descriptor):
+            value = garden.save(self.app, self.workspace, {'enabled': True})
+            self.assertEqual(value['max_drafts_per_day'], 10)
+            self.assertEqual(value['agent'], 'codex')
+            self.assertEqual(value['approval_mode'], 'human')
+            self.assertEqual(value['model'], 'fixture-sol')
+            with self.assertRaises(ValueError):
+                garden.save(self.app, self.workspace, {'enabled': True, 'agent': 'claude'})
+
     def test_candidate_and_evaluation_are_distinct_from_configured_model(self):
         root = self.workspace / '.fusion/ui/jobs'
         candidate = root / 'training/candidate'
