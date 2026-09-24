@@ -45,6 +45,10 @@ const state = {
   report: null,
   focusReport: null,
   focusError: null,
+  capabilities: null,
+  capabilitiesError: null,
+  decisionsError: null,
+  scoutError: null,
   scout: null,
   truffleSelection: {},
   forest: {tab:"woodland", patch:"all", grade:"all", query:""},
@@ -349,6 +353,36 @@ function acceptanceCard(report) {
   const checks = ORCLogic.acceptanceSummary(report?.live_nodes || []);
   return `<div class="room-outcome"><span>Workflow outcome</span>${badge(report?.status || "unknown")}</div><div class="room-outcome"><span>Coordinator checks</span><span class="status ${checks.tone}">${esc(checks.label)}</span><small>${checks.total ? `${checks.passed} passed · ${checks.failed} failed${checks.unknown ? ` · ${checks.unknown} unknown` : ""}` : "No check receipts saved"}</small></div>`;
 }
+function sourceWorkspaceButtons(view, githubOnly = false) {
+  return (state.capabilities?.workspaces || []).filter(w => w.id !== state.workspace && (!githubOnly || w.github_repo))
+    .map(w => button(`Open ${esc(w.name)}${githubOnly ? " · " + esc(w.github_repo) : ""} →`, "source-workspace", `data-workspace="${esc(w.id)}" data-destination="${view}"`, "small ghost")).join("");
+}
+function sourceUnavailable() {
+  return `<section class="panel room-readiness"><div class="panel-body"><strong>Source readiness unavailable</strong><p>${esc(state.capabilitiesError || "This server has not reported capability prerequisites.")}</p><small>Saved evidence remains available below.</small></div></section>`;
+}
+function learningReadiness() {
+  const c = state.capabilities, learning = c?.learning;
+  if (!learning) return sourceUnavailable();
+  if (learning.status === "unreadable" || !learning.labels) return `<section class="panel room-readiness"><div class="panel-body"><div class="eyebrow">LEARNING IN ${esc(c.workspace.name)}</div><h2>Learning evidence needs attention</h2><p>${esc(learning.reason || "Saved learning evidence could not be read.")}</p><p class="help-copy">Approval counts, training groups and automation state are unknown.</p><p class="room-path">${esc(learning.source_path || "")}</p><div class="actions">${sourceWorkspaceButtons("decisions")}</div></div></section>`;
+  const labels = learning.labels, runtime = learning.runtime;
+  const ready = labels.train_groups >= labels.min_train_groups && labels.validation_groups >= labels.min_validation_groups;
+  const title = !labels.approved_answers ? "No approved examples yet" : !ready ? "More independent reviewed runs needed" : "Group prerequisites present";
+  const model = runtime.status === "observed" ? `Local model last observed ${date(runtime.last_observed_at_ms)}` : runtime.status === "unavailable" ? "Local model runtime unavailable" : "Local model runtime not checked";
+  return `<section class="panel room-readiness"><div class="panel-body"><div class="room-readiness-heading"><div><div class="eyebrow">LEARNING IN ${esc(c.workspace.name)}</div><h2>${title}</h2></div><span class="pill">Workspace evidence</span></div><p>${labels.approved_answers} approved answers · ${labels.train_groups} training groups · ${labels.validation_groups} held-out groups</p><p class="help-copy">${ready ? "Training still checks duplicate inputs, conflicts, lineage and runtime availability." : `Automatic rounds need at least ${labels.min_train_groups} training and ${labels.min_validation_groups} held-out groups after data checks. Review supported decisions from independent runs first.`}</p><div class="actions">${button("Review decisions →", "lab-tab", 'data-tab="review"', "small primary")}${sourceWorkspaceButtons("decisions")}</div><details data-disclosure-key="learning-source"><summary>Source & runtime</summary><p>${esc(model)}. ${runtime.status === "observed" ? "This is a saved observation, not a fresh health check." : esc(runtime.reason || "")}</p><p>Labels and rounds belong to this workspace; switching does not combine datasets.</p><p class="room-path">${esc(learning.source_path)}</p></details></div></section>`;
+}
+function githubReadiness() {
+  const c = state.capabilities, github = c?.github;
+  if (!github) return sourceUnavailable();
+  const configured = github.status === "configured", snapshot = github.snapshot;
+  const title = configured ? github.repo : github.status === "missing_remote" ? "No GitHub remote in this workspace" : "GitHub source needs attention";
+  const inventoryError = github.snapshot_error || state.scoutError;
+  const message = inventoryError ? `Saved issue inventory could not be read: ${inventoryError}` : !configured ? github.reason : !github.cli_available ? "The GitHub CLI is unavailable on this machine." : snapshot?.matches_remote ? `${snapshot.issue_count} issues in the saved ${snapshot.complete ? "complete" : "partial"} snapshot · ${date(snapshot.synced_at_ms)}` : "No saved issue inventory for this repository yet.";
+  return `<section class="panel room-readiness"><div class="panel-body"><div class="room-readiness-heading"><div><div class="eyebrow">GITHUB SOURCE · ${esc(c.workspace.name)}</div><h2>${esc(title)}</h2></div>${configured ? `<span class="pill">${esc(github.remote)}</span>` : ""}</div><p>${esc(message)}</p><p class="help-copy">${configured ? "GitHub authentication has not been checked by this local readiness view. A saved snapshot describes its last fetch." : "Choose a configured repository workspace, or select another Git remote for this workspace."}</p><div class="actions">${!configured ? button("Choose repository remote", "forest-sync", "", "small") : ""}${sourceWorkspaceButtons("truffle", true)}</div></div></section>`;
+}
+function followupNotice(report) {
+  const run = ORCLogic.followupReceipt(report);
+  return run ? `<div class="room-followup"><strong>Follow-up result available</strong><p>${esc(run.title || run.run_id)} · TENET execution ${esc(run.status)}</p><small>${esc(run.run_id)} · ${date(Date.parse(run.started_at))}</small></div>` : "";
+}
 function artifactButtons(artifact, workflowId) {
   const attrs = `data-workflow="${esc(workflowId)}" data-artifact="${esc(artifact.id)}"`;
   return `<div class="room-artifact"><div><strong>${esc(artifact.label)}</strong><small class="room-path" title="${esc(artifact.path)}">${esc(artifact.path?.split("/").slice(-2).join("/") || "Path unavailable")}</small>${!artifact.available ? `<small class="room-evidence-missing">${esc(artifact.error || "Not available")}</small>` : ""}</div><div class="room-artifact-actions">${button("View", "run-artifact", `${attrs} ${artifact.available ? "" : "disabled"}`, "small ghost")}${button("↓", "run-artifact-download", `${attrs} aria-label="Download ${esc(artifact.label)}" ${artifact.available ? "" : "disabled"}`, "small ghost")}${button("Copy path", "copy-artifact-path", `data-path="${esc(artifact.path || "")}"`, "small ghost")}</div></div>`;
@@ -379,10 +413,10 @@ function overview() {
   const update = (active(node?.status) ? latest?.text : node?.result?.summary || latest?.text) || node?.messages?.at(-1);
   const running = runs.filter(r => active(r.status)).length;
   const attention = runs.filter(r => ["failed", "interrupted", "paused_quota", "paused_budget"].includes(r.status)).length;
-  const nextTab = active(focus?.status) ? "activity" : ["failed", "interrupted", "paused_quota", "paused_budget"].includes(focus?.status) ? "evidence" : "report";
-  const nextLabel = nextTab === "activity" ? "Follow current work" : nextTab === "evidence" ? "Inspect this outcome" : "Read the handoff";
+  const nextTab = ORCLogic.followupReceipt(report) ? "evidence" : active(focus?.status) ? "activity" : ["failed", "interrupted", "paused_quota", "paused_budget"].includes(focus?.status) ? "evidence" : "report";
+  const nextLabel = ORCLogic.followupReceipt(report) ? "Review follow-up evidence" : nextTab === "activity" ? "Follow current work" : nextTab === "evidence" ? "Inspect this outcome" : "Read the handoff";
   mount(`<section class="room-heading"><div><div class="eyebrow">YOUR WORKSPACE · CONTROL ROOM</div><h1>${esc(workspace?.name || "Workspace")}</h1><p>${runs.length} saved runs · ${running} recorded active${attention ? ` · ${attention} need attention` : ""}</p></div>${button("Copy workspace path", "copy-workspace", "", "small ghost")}</section>
-    <div class="room-grid"><div>${focus ? `<section class="panel room-focus"><div class="panel-body"><div class="room-focus-label"><span class="eyebrow">${active(focus.status) ? '<span class="live-dot"></span> CURRENT WORK' : "LATEST OUTCOME"}</span>${badge(focus.status)}</div><h2>${esc(focus.task)}</h2><div class="room-worker-line">${sigil("forge")}<strong>${esc(node?.agent || focus.agents?.join(" + ") || "Harness unknown")}</strong>${node ? `<span>${esc(node.id)} · attempt ${node.attempts ?? "?"}</span>` : ""}${node?.last_output_at_ms ? `<span>Output ${age(node.last_output_at_ms)} ago</span>` : ""}</div>${state.focusError ? `<p class="room-evidence-missing">${esc(state.focusError)}</p>` : `<div class="room-latest"><div class="eyebrow">${active(node?.status) ? "LATEST WORKER UPDATE" : "WORKER HANDOFF"}</div>${update ? `<div class="markdown">${markdown(update.length > 1100 ? update.slice(0, 1100) + "…" : update)}</div>` : '<p>No worker update has been saved yet.</p>'}${command ? `<div class="room-current-command"><span>Command in progress</span><code>${esc(commandPreview(command))}</code></div>` : ""}</div>`}<div class="room-next">${button(nextLabel + " →", "run", `data-id="${esc(focus.id)}" data-tab="${nextTab}"`, "primary")}<span class="mono">${esc(focus.id)}</span></div></div></section>` : empty("What do you want to build?", "Your runs and their evidence will appear here.", button("Start a run", "template", 'data-template="feature"', "primary"))}
+    <div class="room-grid"><div>${focus ? `<section class="panel room-focus"><div class="panel-body"><div class="room-focus-label"><span class="eyebrow">${active(focus.status) ? '<span class="live-dot"></span> CURRENT WORK' : "LATEST OUTCOME"}</span>${badge(focus.status)}</div><h2>${esc(focus.task)}</h2><div class="room-worker-line">${sigil("forge")}<strong>${esc(node?.agent || focus.agents?.join(" + ") || "Harness unknown")}</strong>${node ? `<span>${esc(node.id)} · attempt ${node.attempts ?? "?"}</span>` : ""}${node?.last_output_at_ms ? `<span>Output ${age(node.last_output_at_ms)} ago</span>` : ""}</div>${state.focusError ? `<p class="room-evidence-missing">${esc(state.focusError)}</p>` : `<div class="room-latest"><div class="eyebrow">${active(node?.status) ? "LATEST WORKER UPDATE" : "WORKER HANDOFF"}</div>${update ? `<div class="markdown">${markdown(update.length > 1100 ? update.slice(0, 1100) + "…" : update)}</div>` : '<p>No worker update has been saved yet.</p>'}${command ? `<div class="room-current-command"><span>Command in progress</span><code>${esc(commandPreview(command))}</code></div>` : ""}</div>`}${followupNotice(report)}<div class="room-next">${button(nextLabel + " →", "run", `data-id="${esc(focus.id)}" data-tab="${nextTab}"`, "primary")}<span class="mono">${esc(focus.id)}</span></div></div></section>` : empty("What do you want to build?", "Your runs and their evidence will appear here.", button("Start a run", "template", 'data-template="feature"', "primary"))}
     <div class="section-bar room-history-heading"><h2>Run history</h2><button class="subtle" data-view="workflows">All runs →</button></div>${runs.length ? `<div class="panel">${runRows(runs.slice(0, 7))}</div>` : '<p class="help-copy">No runs saved in this workspace.</p>'}</div>
     <aside class="room-evidence-rail"><section class="panel"><div class="panel-header"><h3>Outcome & proof</h3></div><div class="panel-body">${acceptanceCard(report)}${report ? button("Open evidence →", "run", `data-id="${esc(report.workflow_id)}" data-tab="evidence"`, "small ghost") : ""}</div></section><section class="panel"><div class="panel-header"><h3>TENET record</h3><span class="room-local-label">LOCAL</span></div><div class="panel-body">${report ? tenetEvidence(report, true) : '<p class="help-copy">Select a run to inspect its receipts.</p>'}</div></section>${data.builds.filter(b => b.status === "running").map(b => `<section class="panel"><div class="panel-body"><h3>Preparing work</h3><p>${esc(b.message)}</p></div></section>`).join("")}</aside></div>`);
 }
@@ -791,6 +825,10 @@ function openGarden() {
 }
 
 function decisions() {
+  if (state.decisionsError) {
+    mount(intro("LOCAL INTELLIGENCE", "Laya lab.", "Saved learning evidence needs attention.") + learningReadiness() + `<section class="panel"><div class="panel-body"><h2>Decision records unavailable</h2><p class="room-evidence-missing">${esc(state.decisionsError)}</p><p class="help-copy">This view will retry its read. Saved evidence has not been changed.</p></div></section>`);
+    return;
+  }
   const focusedTab = document.activeElement?.closest('[role="tab"][data-action="lab-tab"]')?.id;
   const tabScroll = $(".lab-tabs")?.scrollLeft || 0;
   const selected = labTabs.find(([id]) => id === state.labTab) || labTabs[0];
@@ -803,7 +841,7 @@ function decisions() {
   else if (state.labTab === "results" && state.learning) body = trainingQuest() + impactDashboard(state.learning);
   const ready = state.decisions.filter(r => r.garden_state === "needs_review").length;
   mount(intro("LOCAL INTELLIGENCE", "Laya lab.", selected[2], `<div class="actions">${button("Learning tools", "learning")}${button("New probe", "probe", "", "primary")}</div>`) +
-    `<div class="lab-tabs" role="tablist" aria-label="Laya lab sections">${labTabs.map(([id, label]) => `<button type="button" id="lab-tab-${id}" role="tab" aria-selected="${state.labTab === id}" aria-controls="lab-panel" tabindex="${state.labTab === id ? 0 : -1}" data-action="lab-tab" data-tab="${id}">${label}${id === "review" && ready ? `<small aria-label="${ready} ready to review">${ready}</small>` : ""}${id === "garden" && state.garden?.active_job ? '<i class="lab-live-dot" aria-label="Labeling in progress"></i>' : ""}</button>`).join("")}</div>` +
+    learningReadiness() + `<div class="lab-tabs" role="tablist" aria-label="Laya lab sections">${labTabs.map(([id, label]) => `<button type="button" id="lab-tab-${id}" role="tab" aria-selected="${state.labTab === id}" aria-controls="lab-panel" tabindex="${state.labTab === id ? 0 : -1}" data-action="lab-tab" data-tab="${id}">${label}${id === "review" && ready ? `<small aria-label="${ready} ready to review">${ready}</small>` : ""}${id === "garden" && state.garden?.active_job ? '<i class="lab-live-dot" aria-label="Labeling in progress"></i>' : ""}</button>`).join("")}</div>` +
     `<section id="lab-panel" class="lab-panel" role="tabpanel" aria-labelledby="lab-tab-${state.labTab}" tabindex="0" data-lab-section="${state.labTab}">${body}</section>`);
   $(".lab-tabs").scrollLeft = tabScroll;
   if (focusedTab) document.getElementById(focusedTab)?.focus({preventScroll:true});
@@ -1228,6 +1266,14 @@ async function refresh(force = false) {
           ? "YOLO · full access"
           : "Restricted runtime";
     }
+    if (["decisions", "truffle"].includes(state.view)) {
+      let capabilities = null, capabilitiesError = null;
+      try { capabilities = await api("capabilities", undefined, w); }
+      catch (e) { capabilitiesError = e.message; }
+      if (epoch !== state.epoch) return;
+      state.capabilities = capabilities;
+      state.capabilitiesError = capabilitiesError;
+    }
     let signature = pretty({ ...data, now_ms: 0 });
     if (state.view === "overview") {
       const focus = ORCLogic.focusWorkflow(data.workflows);
@@ -1242,10 +1288,13 @@ async function refresh(force = false) {
       signature = pretty({data: {...data, now_ms:0}, report:state.focusReport, error:state.focusError});
     }
     if (state.view === "truffle") {
-      const scout = await api("truffle" + (state.id ? "?id=" + encodeURIComponent(state.id) : ""), undefined, w);
+      let scout = null, scoutError = null;
+      try { scout = await api("truffle" + (state.id ? "?id=" + encodeURIComponent(state.id) : ""), undefined, w); }
+      catch (e) { scoutError = e.message; }
       if (epoch !== state.epoch) return;
       state.scout = scout;
-      signature = pretty({scout, hunts:data.hunts, jobs:data.jobs});
+      state.scoutError = scoutError;
+      signature = pretty({scout, scoutError, hunts:data.hunts, jobs:data.jobs});
     }
     if (state.view === "workflow") {
       const report = await api(
@@ -1260,15 +1309,20 @@ async function refresh(force = false) {
     if (
       state.view === "decisions"
     ) {
-      const d = await api("decisions", undefined, w);
+      let d = null, decisionsError = null;
+      try { d = await api("decisions", undefined, w); }
+      catch (e) { decisionsError = e.message; }
       if (epoch !== state.epoch) return;
-      state.decisions = d.records;
-      state.learning = d.learning;
-      state.trainingLoop = d.training_loop;
-      state.garden = d.garden;
-      state.labelRuns = d.label_runs || [];
-      signature = pretty(d);
+      state.decisionsError = decisionsError;
+      state.decisions = d?.records || [];
+      state.learning = d?.learning || null;
+      state.trainingLoop = d?.training_loop || null;
+      state.garden = d?.garden || null;
+      state.labelRuns = d?.label_runs || [];
+      signature = pretty({data:d, decisionsError});
     }
+    if (["decisions", "truffle"].includes(state.view)) signature = pretty({view:signature,
+      capabilities:state.capabilities && {...state.capabilities, observed_at_ms:0}, error:state.capabilitiesError});
     let didRender = false;
     const formsActive =
       !!$("input:focus,textarea:focus,select:focus");
@@ -1310,6 +1364,8 @@ async function chooseWorkspace(id, route = null) {
   forestRoute(route || {});
   localStorage.setItem("fusion-workspace", id);
   state.config = null;
+  state.capabilities = state.capabilitiesError = null;
+  state.decisionsError = state.scoutError = null;
   state.learning = state.garden = state.trainingLoop = null;
   state.learningRound = null;
   state.labelRuns = [];
@@ -1367,6 +1423,7 @@ document.addEventListener("click", async (event) => {
     else if (a === "forest-issue") openForestIssue(Number(target.dataset.number));
     else if (a === "truffle-queue") openTruffleQueue();
     else if (a === "run") { closeModal(); await navigate("workflow", target.dataset.id, {tab:target.dataset.tab || "auto"}); }
+    else if (a === "source-workspace") await chooseWorkspace(target.dataset.workspace, {view:target.dataset.destination});
     else if (a === "copy-workspace") copy(state.workspaces.find(w => w.id === state.workspace)?.path || "");
     else if (a === "copy-artifact-path") copy(target.dataset.path || "");
     else if (a === "run-artifact" || a === "run-artifact-download") {

@@ -9,6 +9,28 @@ import "../fusion_ui_assets/logic.js";
 
 const L = globalThis.ORCLogic;
 
+describe("follow-up receipt evidence", () => {
+  const started_at_ms = Date.parse("2026-09-23T12:01:00Z");
+  const original = { run_id: "original", started_at: "2026-09-23T12:00:00Z", terminal: true, status: "failed" };
+  const later = { run_id: "reviewed", started_at: "2026-09-23T13:00:00Z", terminal: true, status: "succeeded" };
+  it("surfaces an explicitly linked later terminal result without changing workflow failure", () => {
+    const report = { status: "failed", started_at_ms, tenet: { runs: [later, original] } };
+    expect(L.followupReceipt(report)).toBe(later);
+    expect(report.status).toBe("failed");
+    expect(report.tenet.runs).toEqual([later, original]);
+  });
+  it("does not infer a follow-up from one green receipt, an invalid date, or unfinished work", () => {
+    for (const runs of [[later], [original, { ...later, started_at: "unknown" }], [original, { ...later, terminal: false }]]) {
+      expect(L.followupReceipt({ status: "failed", started_at_ms, tenet: { runs } })).toBe(null);
+    }
+  });
+  it("retains newer failed follow-ups as evidence without calling them recovery", () => {
+    const failed = { ...later, status: "failed" };
+    expect(L.followupReceipt({ status: "failed", started_at_ms, tenet: { runs: [original, failed] } })).toBe(failed);
+    expect(L.followupReceipt({ status: "running", started_at_ms, tenet: { runs: [original, later] } })).toBe(null);
+  });
+});
+
 describe("acceptance evidence", () => {
   it("does not infer acceptance from a successful worker or its reported tests", () => {
     expect(L.acceptanceSummary([{ status: "success", result: { status: "success", tests: ["all passed"] } }]))
