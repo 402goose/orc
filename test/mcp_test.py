@@ -354,6 +354,62 @@ class ProcessIdentityTest(unittest.TestCase):
             self.assertTrue(fusion_core.process_matches(4242, "unrelated"))  # 'fusion' in command
 
 
+class ReapTest(unittest.TestCase):
+    """A child that is never waited on becomes a zombie when it exits.
+
+    start_run launches a coordinator that deliberately outlives the call, so
+    nothing waits on it. The MCP server is a long-lived stdio loop, which made
+    that one zombie per fusion_run_start for the life of the session.
+    """
+
+    def setUp(self):
+        fusion_mcp._LAUNCHED.clear()
+        self.addCleanup(fusion_mcp._LAUNCHED.clear)
+
+    def test_an_exited_coordinator_is_collected(self):
+        import subprocess
+        import sys
+        import time
+
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        fusion_mcp._LAUNCHED.append(proc)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and proc.poll() is None:
+            time.sleep(0.02)
+        fusion_mcp._LAUNCHED.append(proc) if not fusion_mcp._LAUNCHED else None
+        self.assertEqual(fusion_mcp.reap_launched(), 1)
+        self.assertEqual(fusion_mcp._LAUNCHED, [])
+
+    def test_a_running_coordinator_is_left_alone(self):
+        class Running:
+            def poll(self):
+                return None
+
+        fusion_mcp._LAUNCHED.append(Running())
+        self.assertEqual(fusion_mcp.reap_launched(), 0)
+        self.assertEqual(len(fusion_mcp._LAUNCHED), 1)
+
+    def test_an_unpollable_entry_is_dropped_rather_than_leaked(self):
+        class Broken:
+            def poll(self):
+                raise OSError("gone")
+
+        fusion_mcp._LAUNCHED.append(Broken())
+        fusion_mcp.reap_launched()
+        self.assertEqual(fusion_mcp._LAUNCHED, [])
+
+    def test_status_reaps_while_a_client_polls(self):
+        # A client loops on run_status; that is the natural place to collect.
+        class Exited:
+            def poll(self):
+                return 0
+
+        fusion_mcp._LAUNCHED.append(Exited())
+        with self.assertRaises(ValueError):
+            fusion_mcp.run_status(Path(tempfile.gettempdir()), "no-such-workflow")
+        self.assertEqual(fusion_mcp._LAUNCHED, [])
+
+
 class ToolContractTest(unittest.TestCase):
     def test_every_async_tool_is_dispatchable_and_declares_schemas(self):
         for tool in fusion_mcp.ASYNC_TOOLS:
