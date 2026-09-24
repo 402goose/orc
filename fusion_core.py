@@ -1425,6 +1425,11 @@ def dispatch(
         # Codex command exits remain evidence; provider permission denials fail.
         if failure or (task["agent"] != "codex" and evidence_notes):
             status = "error"
+        elif exit_code == 0 and not summary.strip():
+            # A clean exit with nothing said is not a result. Free OpenRouter
+            # models do this; without an acceptance gate it read as success.
+            status = "error"
+            failure = "worker returned an empty answer"
         elif exit_code == 0:
             status = handoff.get("reported_status") or "success"
         else:

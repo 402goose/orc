@@ -711,6 +711,29 @@ print(json.dumps({
         self.assertIn("Bash", " ".join(result["blockers"]))
         self.assertIn("command not in allowlist", " ".join(result["blockers"]))
 
+    def test_empty_answer_with_clean_exit_is_an_error(self):
+        # Observed live: route orc-free on cohere/north-mini-code:free, 2026-09-24.
+        claude = self.write_agent(
+            "claude-empty",
+            """
+import json
+print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False,
+                  'session_id': 'empty', 'num_turns': 2, 'result': ''}))
+""",
+        )
+        self.config(claude=claude)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                fusion_core.main(
+                    ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "do it"]
+                ),
+                1,
+            )
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["status"], "error")
+        self.assertIn("worker returned an empty answer", result["blockers"])
+
     def test_claude_permission_denials_fall_back_to_raw_entry_when_unrecognized(self):
         claude = self.write_agent(
             "claude-denied-unknown-shape",
