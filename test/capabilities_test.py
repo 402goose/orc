@@ -22,6 +22,7 @@ from urllib.request import Request, urlopen
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fusion_capabilities
 import fusion_core
+import fusion_publish
 from fusion_decisions import DecisionStore, digest
 from fusion_ui import ControlRoom, Server
 
@@ -108,6 +109,11 @@ class CapabilitiesTest(unittest.TestCase):
         self.assertEqual(result['remote'], 'product')
         self.assertEqual(result['repo'], 'owned/product')
         self.assertEqual(result['auth'], 'unchecked')
+
+    def test_actual_survey_repository_resolver_explains_missing_source(self):
+        self.repo()
+        with self.assertRaisesRegex(ValueError, "No Git remote named 'origin'.*Choose an existing GitHub remote"):
+            fusion_publish.repo_for(self.workspace, 'origin')
 
     def test_unsupported_remote_urls_do_not_leak_credentials(self):
         self.repo()
