@@ -874,6 +874,9 @@ class Handler(BaseHTTPRequestHandler):
                 result = {"default": app.default, "workspaces": [{"id": key, "name": p.name, "path": str(p)} for key, p in app.workspaces.items()]}
             elif path == "/api/overview":
                 result = app.overview(workspace)
+            elif path == "/api/capabilities":
+                from fusion_capabilities import capabilities
+                result = capabilities(app, workspace)
             elif path == "/api/truffle":
                 from fusion_truffle_survey import latest
                 result = truffle.receipt(workspace, query["id"]) if query.get("id") else latest(workspace)
