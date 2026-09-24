@@ -111,10 +111,16 @@ A run moves left to right, and nothing advances on a worker's say-so alone:
 ```
 
 `STATUS: success` from a worker is a self-report. A stage is accepted only when
-its declared `required_files` exist and its acceptance commands exit zero — and
-structural signals (`turn.failed`, `is_error`, a nonzero `command_execution`
-exit code) override a "success" claim outright. The gap between what a worker
-says it did and what the run can actually prove is the point of the whole thing.
+its declared `required_files` exist, its acceptance commands exit zero, and — for
+a node that may write — the repository actually changed. Structural signals
+(`turn.failed`, `is_error`, a nonzero `command_execution` exit code) override a
+"success" claim outright. The gap between what a worker says it did and what the
+run can actually prove is the point of the whole thing.
+
+The change check reads Git, not the worker's `CHANGED` line, because a worker
+can misreport that. A writer with nothing to do can opt out with
+`acceptance.allow_no_changes`; a workspace without Git abstains rather than
+failing every write.
 
 Start here, from the repository you want worked on:
 

@@ -353,6 +353,81 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'output_tok
         self.assertIn("command exited 1", result["command_evidence"][0])
         self.assertIn("pytest", result["command_evidence"][0])
 
+    def write_node_workflow(self, *, writes, acceptance=None, write=True):
+        """One node that either touches a file or does not, and reports success."""
+        body = ("open('made.txt','w').write('x')\n" if writes else "")
+        handoff = ("STATUS: success\\nSUMMARY: No implementation was performed\\n"
+                   "CHANGED: none\\nTESTS: not run\\nBLOCKERS: none")
+        codex = self.write_agent("codex-write", (
+            body +
+            "import json\n"
+            f"print(json.dumps({{'type':'item.completed','item':{{'type':'agent_message','text':'{handoff}'}}}}))\n"
+            "print(json.dumps({'type':'turn.completed','usage':{}}))\n"
+        ))
+        self.config(codex=codex)
+        node = {"id": "implement", "role": "implementation", "agent": "codex",
+                "write": write, "task": "Implement it",
+                "acceptance": acceptance if acceptance is not None else {"required_handoff": ["summary", "tests"]}}
+        spec = {"task": "build", "max_attempts": 1, "nodes": [node]}
+        path = self.workspace / "writenode.json"
+        path.write_text(json.dumps(spec))
+        return run_workflow(self.workspace, json.loads((self.workspace / ".fusion.json").read_text()), path)
+
+    def git_workspace(self):
+        """The gate reads the repository, so the fixture needs to be one."""
+        subprocess.run(["git", "init", "-q"], cwd=self.workspace, check=True)
+        (self.workspace / "seed.txt").write_text("seed\n")
+        subprocess.run(["git", "add", "seed.txt"], cwd=self.workspace, check=True)
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-qm", "seed"], cwd=self.workspace, check=True)
+
+    def test_a_write_node_that_changes_nothing_is_not_success(self):
+        """The primary path's whole promise.
+
+        `required_handoff` only asks whether a field is non-empty, so a worker
+        answering "TESTS: not run" satisfies it, and generated builds declare
+        no required_files and no acceptance checks. A node whose summary read
+        "No implementation was performed" was accepted as success.
+        """
+        self.git_workspace()
+        outcome = self.write_node_workflow(writes=False)
+        self.assertEqual(outcome["status"], "failed")
+        self.assertIn("write node finished without changing any file",
+                      outcome["nodes"][0]["result"]["blockers"])
+
+    def test_a_workspace_without_git_is_not_blocked_by_the_gate(self):
+        """Unavailable is not evidence of no change.
+
+        The gate compares the repository against its pre-dispatch tree. Where
+        there is no repository there is no tree, and treating that as "nothing
+        changed" would fail every write node in a non-git workspace. The other
+        gates still apply; this one abstains.
+        """
+        outcome = self.write_node_workflow(writes=False)   # deliberately no git init
+        self.assertEqual(outcome["status"], "success", outcome)
+        self.assertNotIn("write node finished without changing any file",
+                         outcome["nodes"][0]["result"].get("blockers") or [])
+
+    def test_a_write_node_that_changes_a_file_is_accepted(self):
+        self.git_workspace()
+        outcome = self.write_node_workflow(writes=True)
+        self.assertEqual(outcome["status"], "success", outcome)
+
+    def test_a_read_only_node_may_legitimately_change_nothing(self):
+        # Discovery and review nodes are supposed to leave the tree alone.
+        self.git_workspace()
+        outcome = self.write_node_workflow(writes=False, write=False)
+        self.assertEqual(outcome["status"], "success", outcome)
+
+    def test_allow_no_changes_opts_a_write_node_out(self):
+        # A writer asked to fix something already fixed has nothing to write.
+        self.git_workspace()
+        outcome = self.write_node_workflow(
+            writes=False,
+            acceptance={"required_handoff": ["summary"], "allow_no_changes": True},
+        )
+        self.assertEqual(outcome["status"], "success", outcome)
+
     def test_workflow_command_observations_do_not_override_acceptance(self):
         for case in ("recovered", "unresolved", "failed_check", "missing_tests", "provider_error"):
             with self.subTest(case=case):

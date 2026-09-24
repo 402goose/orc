@@ -588,6 +588,19 @@ TESTS: commands run and their outcome, or none
 BLOCKERS: unresolved issues, or none
 """
 
+    def _tree(self) -> str | None:
+        """Git tree hash of the working state, or None when it cannot be read.
+
+        Unavailable is not evidence of no change, so callers must treat None
+        as "unknown" and leave the node's other gates to decide.
+        """
+        try:
+            from fusion_publish import snapshot
+
+            return snapshot(self.workspace)
+        except Exception:
+            return None
+
     def _accept_node(self, node: dict[str, Any], result: dict[str, Any]) -> tuple[bool, list[str]]:
         if core.failure_class(result) == "coordinator_error":
             # The coordinator failed to establish the review evidence. Worker
@@ -629,6 +642,16 @@ BLOCKERS: unresolved issues, or none
                     continue
                 if completed.returncode != 0:
                     problems.append(f"acceptance check failed: {' '.join(command)}")
+        if node.get("write") and not acceptance.get("allow_no_changes"):
+            # required_handoff only asks whether a field is non-empty, so a
+            # worker reporting "TESTS: not run" satisfies it. Generated builds
+            # declare no required_files and no checks, which left the primary
+            # path unable to notice that an implementation node implemented
+            # nothing. Compare the repository against its own pre-dispatch
+            # tree: a worker cannot misreport that the way it can CHANGED.
+            baseline = node.get("_tree_baseline")
+            if baseline and self._tree() == baseline:
+                problems.append("write node finished without changing any file")
         return not problems, problems
 
     def _run_node(self, node_id: str, attempt: int) -> dict[str, Any]:
@@ -870,6 +893,10 @@ BLOCKERS: unresolved issues, or none
                         relative: _fingerprint(self.workspace / relative)
                         for relative in selected.get("required_files", [])
                     }
+                    # A writer that writes nothing did not do the work. Record
+                    # the tree so acceptance can check the repository itself
+                    # rather than the worker's account of it.
+                    selected["_tree_baseline"] = self._tree() if selected["write"] else None
                     attempt = selected["attempts"]
                     writer = bool(selected["write"])
                     if writer:
