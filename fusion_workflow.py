@@ -296,7 +296,11 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
 
 def load_spec(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_bytes()
+        admitted_hash = os.environ.get("FUSION_SPEC_SHA256")
+        if admitted_hash and hashlib.sha256(raw).hexdigest() != admitted_hash:
+            raise ValueError("admitted workflow hash mismatch")
+        value = json.loads(raw)
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read workflow spec {path}: {exc}") from exc
     return validate_spec(value)
