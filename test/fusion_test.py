@@ -15,7 +15,10 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import fusion_core  # noqa: E402
-from fusion_workflow import WorkflowRunner, run_workflow, resume_workflow, workflow_report  # noqa: E402
+from fusion_workflow import (  # noqa: E402
+    WorkflowRunner, run_workflow, resume_workflow, workflow_report,
+    parse_acceptance_contract, MAX_CONTRACT_FILES,
+)
 
 
 class FusionHarnessTest(unittest.TestCase):
@@ -380,6 +383,67 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'output_tok
         subprocess.run(["git", "add", "seed.txt"], cwd=self.workspace, check=True)
         subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
                         "commit", "-qm", "seed"], cwd=self.workspace, check=True)
+
+    CONTRACT_WORKER = '''import json, sys
+prompt = sys.stdin.read()
+is_plan = "node plan" in prompt
+if not is_plan and CREATE:
+    open("hello.py", "w").write("print(1)\\n")
+contract = ("```acceptance-contract\\n"
+            '{"required_files": ["hello.py"], "verification": ["pytest -q"]}\\n'
+            "```")
+plan = "STATUS: success\\nSUMMARY: planned\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none\\n\\n" + contract
+impl = "STATUS: success\\nSUMMARY: done\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none"
+msg = plan if is_plan else impl
+print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": msg}}))
+print(json.dumps({"type": "turn.completed", "usage": {}}))
+'''
+
+    def contract_workflow(self, *, implement_creates):
+        """plan declares an acceptance contract; implement may or may not honour it."""
+        script = f"CREATE = {implement_creates!r}\n" + self.CONTRACT_WORKER
+        codex = self.write_agent("codex-contract", script)
+        self.config(codex=codex)
+        self.git_workspace()
+        spec = {"task": "build", "max_attempts": 1, "nodes": [
+            {"id": "plan", "role": "planning", "agent": "codex", "write": False,
+             "task": "Plan it", "acceptance": {"required_handoff": ["summary"]}},
+            {"id": "implement", "role": "implementation", "agent": "codex", "write": True,
+             "needs": ["plan"], "task": "Implement it",
+             "acceptance": {"required_handoff": ["summary"]}},
+        ]}
+        path = self.workspace / "contract.json"
+        path.write_text(json.dumps(spec))
+        return run_workflow(self.workspace, json.loads((self.workspace / ".fusion.json").read_text()), path)
+
+    def test_the_plan_contract_gates_the_implementation(self):
+        """The generated path's missing link.
+
+        Every generated node got the same two-field handoff check, so nothing
+        connected what the plan said to build with what the implementation
+        actually produced. The plan names hello.py; the implementation does
+        not create it and must not be accepted.
+        """
+        outcome = self.contract_workflow(implement_creates=False)
+        self.assertEqual(outcome["status"], "failed")
+        blockers = " ".join(outcome["nodes"][1]["result"]["blockers"])
+        self.assertIn("hello.py", blockers)
+
+    def test_honouring_the_contract_passes(self):
+        outcome = self.contract_workflow(implement_creates=True)
+        self.assertEqual(outcome["status"], "success", outcome)
+        self.assertTrue((self.workspace / "hello.py").exists())
+
+    def test_a_reviewer_does_not_inherit_the_contract(self):
+        """Only the node that writes is gated on producing the artifacts.
+
+        A reviewer is not the one creating them, so inheriting would blame the
+        wrong node for work that never happened upstream.
+        """
+        node = {"id": "review", "write": False, "needs": ["plan"]}
+        self.assertEqual(WorkflowRunner._inherited_required_files.__get__(
+            type("R", (), {"nodes": {"plan": {"_contract": {"required_files": ["x.py"]}}}})()
+        )(node), [])
 
     def test_a_write_node_that_changes_nothing_is_not_success(self):
         """The primary path's whole promise.
@@ -1781,6 +1845,58 @@ class HandoffParsingTest(unittest.TestCase):
             "STATUS: success\nTESTS: none. This node is read-only; I only ran `git status`."
         )
         self.assertEqual(parsed["tests"], [])
+
+
+class AcceptanceContractTest(unittest.TestCase):
+    """The contract is model output that becomes a gate, so it is parsed strictly.
+
+    A malformed contract must not take a run down -- the node's other gates
+    still apply -- but it also must not widen what is enforced, and it must
+    never name a path outside the workspace.
+    """
+
+    def block(self, payload):
+        return "planning prose\n\n```acceptance-contract\n" + json.dumps(payload) + "\n```\n"
+
+    def files(self, payload):
+        return parse_acceptance_contract(self.block(payload)).get("required_files")
+
+    def test_reads_files_and_verification(self):
+        parsed = parse_acceptance_contract(
+            self.block({"required_files": ["a.py", "src/b.py"], "verification": ["pytest -q"]})
+        )
+        self.assertEqual(parsed["required_files"], ["a.py", "src/b.py"])
+        self.assertEqual(parsed["verification"], ["pytest -q"])
+
+    def test_refuses_paths_that_leave_the_workspace(self):
+        for bad in ("/etc/passwd", "~/.ssh/id_rsa", "../../etc/passwd", "a/../../b"):
+            with self.subTest(path=bad):
+                self.assertIsNone(self.files({"required_files": [bad]}))
+
+    def test_keeps_the_safe_entries_and_drops_the_rest(self):
+        self.assertEqual(self.files({"required_files": ["ok.py", "/etc/passwd", "../x"]}), ["ok.py"])
+
+    def test_ignores_non_strings_and_blanks(self):
+        self.assertEqual(self.files({"required_files": [1, None, {"a": 1}, "", "  ", "ok.py"]}), ["ok.py"])
+
+    def test_caps_how_many_files_a_plan_can_demand(self):
+        parsed = self.files({"required_files": [f"f{i}.py" for i in range(60)]})
+        self.assertEqual(len(parsed), MAX_CONTRACT_FILES)
+
+    def test_requires_exactly_one_block(self):
+        one = self.block({"required_files": ["a.py"]})
+        self.assertEqual(parse_acceptance_contract(one)["required_files"], ["a.py"])
+        # Two blocks is ambiguous: enforcing either one silently picks for the user.
+        self.assertEqual(parse_acceptance_contract(one + one), {})
+        self.assertEqual(parse_acceptance_contract("no block here"), {})
+
+    def test_malformed_json_yields_no_contract_rather_than_raising(self):
+        self.assertEqual(parse_acceptance_contract("```acceptance-contract\n{not json\n```"), {})
+        self.assertEqual(parse_acceptance_contract('```acceptance-contract\n["a"]\n```'), {})
+
+    def test_empty_required_files_is_a_valid_contract(self):
+        # "this request needs no file change" is a legitimate thing to declare.
+        self.assertEqual(parse_acceptance_contract(self.block({"required_files": []})), {})
 
 
 if __name__ == "__main__":

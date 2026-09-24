@@ -54,6 +54,20 @@ def _record_failure(root, exc):
                    message="build interrupted" if interrupted else progress.clean(str(exc), 600))
 
 
+CONTRACT_INSTRUCTION = """End your handoff with one fenced acceptance-contract block naming the
+workspace-relative files the implementation must create or change, and the
+commands that verify it. The orchestrator gates the implementation node on
+those files existing and changing, so name only files the work must actually
+produce, and leave required_files empty when the request needs no file change.
+Verification commands are recorded for the reviewer to rerun; they are not
+executed by the orchestrator.
+
+```acceptance-contract
+{"required_files": ["path/one.py", "tests/test_one.py"], "verification": ["pytest tests/test_one.py"]}
+```
+"""
+
+
 def dimensions(across):
     """Accept --across repeated, comma-separated, or both."""
     items = [part.strip() for value in (across or []) for part in str(value).split(",")]
@@ -145,7 +159,7 @@ def _prepare(workspace, config, idea, kind, budget_usd, max_attempts, build_id, 
                       "task": shared + "Independently review the requested code or diff. Report actionable findings and evidence; return blocked for unresolved findings."})
     else:
         nodes.append({"id": "plan", "agent": "auto", "write": False, "role": "planning", "needs": ["explore"],
-                      "task": shared + "Produce an implementation brief, acceptance criteria, bounded steps and exact verification commands. Return blocked for consequential unanswered questions. Do not delegate further."})
+                      "task": shared + "Produce an implementation brief, acceptance criteria, bounded steps and exact verification commands. Return blocked for consequential unanswered questions. Do not delegate further.\n\n" + CONTRACT_INSTRUCTION})
         if not read_only:
             nodes.extend([
                 {"id": "implement", "agent": "auto", "write": True, "role": "implementation", "needs": ["plan"],
