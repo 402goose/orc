@@ -14,7 +14,7 @@ import hashlib
 import json
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 import time
 import uuid
@@ -75,6 +75,61 @@ def _safe_relative(path: Any, field: str) -> str:
     if candidate.is_absolute() or ".." in candidate.parts:
         raise ValueError(f"{field} must be a workspace-relative path: {value}")
     return value
+
+
+MAX_CONTRACT_FILES = 20
+
+
+def parse_acceptance_contract(answer: str) -> dict[str, Any]:
+    """Read the acceptance contract a planning node declared, if any.
+
+    The plan knows what the implementation must produce; the implementation
+    node is the one that gets gated on it. Without this the generated path
+    gives every node the same two-field handoff check, which cannot tell that
+    nothing was built.
+
+    Returns {} for anything malformed. A plan that writes a bad contract must
+    not take down the run -- the node's other gates still apply -- but it also
+    cannot widen what is enforced by writing nonsense.
+
+    `verification` is recorded and passed on for the reviewer to rerun. It is
+    deliberately NOT executed by the coordinator: acceptance checks run
+    unsandboxed with the user's privileges, and these commands are model
+    output. Authored specs may still supply executable `acceptance.checks`.
+    """
+    blocks = re.findall(r"```acceptance-contract\s*\n(.*?)\n```", answer or "", re.S)
+    if len(blocks) != 1:
+        return {}
+    try:
+        value = json.loads(blocks[0])
+    except ValueError:
+        return {}
+    if not isinstance(value, dict):
+        return {}
+
+    files = []
+    for entry in _as_list(value.get("required_files"))[:MAX_CONTRACT_FILES]:
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        candidate = entry.strip()
+        path = PurePosixPath(candidate)
+        # It becomes a path under the workspace, so it may not escape it.
+        if path.is_absolute() or ".." in path.parts or candidate.startswith("~"):
+            continue
+        if len(candidate) > 200:
+            continue
+        files.append(candidate)
+
+    verification = [
+        str(item)[:400] for item in _as_list(value.get("verification"))[:MAX_CONTRACT_FILES]
+        if isinstance(item, str) and item.strip()
+    ]
+    contract: dict[str, Any] = {}
+    if files:
+        contract["required_files"] = sorted(dict.fromkeys(files))
+    if verification:
+        contract["verification"] = verification
+    return contract
 
 
 def _fingerprint(path: Path) -> dict[str, Any]:
@@ -588,6 +643,30 @@ TESTS: commands run and their outcome, or none
 BLOCKERS: unresolved issues, or none
 """
 
+    def _contract_from(self, result: dict[str, Any]) -> dict[str, Any]:
+        """The acceptance contract this node's answer declared, if any."""
+        path = ((result or {}).get("artifacts") or {}).get("answer")
+        if not path:
+            return {}
+        try:
+            return parse_acceptance_contract(Path(path).read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            return {}
+
+    def _inherited_required_files(self, node: dict[str, Any]) -> list[str]:
+        """Artifacts a dependency's plan says this node must produce.
+
+        Only write nodes inherit: a reviewer is not the one creating the files,
+        and gating it on their existence would blame the wrong node.
+        """
+        if not node.get("write"):
+            return []
+        files: list[str] = []
+        for dependency in node.get("needs") or []:
+            contract = (self.nodes.get(dependency) or {}).get("_contract") or {}
+            files.extend(contract.get("required_files") or [])
+        return files
+
     def _tree(self) -> str | None:
         """Git tree hash of the working state, or None when it cannot be read.
 
@@ -889,6 +968,14 @@ BLOCKERS: unresolved issues, or none
                         break
                     selected["status"] = "running"
                     selected["attempts"] += 1
+                    # A planning node can declare what the implementation must
+                    # produce. Apply it before the baseline is taken, so the
+                    # artifacts it names are actually gated on this node.
+                    inherited = self._inherited_required_files(selected)
+                    if inherited:
+                        selected["required_files"] = sorted(
+                            dict.fromkeys(list(selected.get("required_files") or []) + inherited)
+                        )
                     selected["_artifact_baseline"] = {
                         relative: _fingerprint(self.workspace / relative)
                         for relative in selected.get("required_files", [])
@@ -943,6 +1030,7 @@ BLOCKERS: unresolved issues, or none
                         problems = problems + ["attempt repeated the previous attempt's blockers exactly; stopping instead of retrying"]
                         result["blockers"].append(problems[-1])
                     if accepted:
+                        node["_contract"] = self._contract_from(result)
                         dependency_digests = {dep: (self.nodes[dep].get("result") or {}).get("digest") for dep in node["needs"]}
                         result["digest"] = self._input_digest(self._definition_digest(node), dependency_digests)
                         result["resolved"] = payload.get("task", {}).get("resolved") or {}
