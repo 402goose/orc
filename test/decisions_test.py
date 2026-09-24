@@ -18,7 +18,7 @@ from fusion_decisions import (DecisionEngine, DecisionStore, ACCEPTANCE_QUESTION
                               REVIEW_QUESTIONS, LayaRuntime, DEFAULTS, digest, fit_calibration, read_jsonl,
                               temperature_scale)
 from fusion_laya import dataset_rows
-from fusion_policy import accept_node, route_task, route_candidates, recovery, review_task
+from fusion_policy import accept_node, rank_by_outcomes, route_task, route_candidates, recovery, review_task
 from fusion_report import format_report, select_report
 from fusion_workflow import WorkflowRunner, expand_spec, resume_workflow, validate_spec, workflow_report
 
@@ -293,6 +293,79 @@ class DecisionsTest(unittest.TestCase):
             candidates = route_candidates(self.config, task, store)
         self.assertNotIn("codex", [c["key"] for c in candidates])
         self.assertIsNone(next(c for c in candidates if c["key"] == "claude")["mean_cost_usd"])
+
+    def test_orc_route_arms_offer_each_fitted_model_with_its_own_history(self):
+        self.config["routes"] = {"orc-free": {"agent": "claude", "command": "orc", "model_selector": "free", "arms": 3}}
+        ranked = {("--free", "--tools"): ["free/a", "free/b", "free/untested", "free/c"], ("--fit",): ["free/c", "free/b", "free/a"]}
+        store = core.RunStore(self.workspace)
+        spans = [{"agent": "claude", "route": "orc-free", "model": "free/b", "run_id": "r1", "status": "success"}]
+        DecisionStore(self.workspace).append("outcome", task_id="r1", accepted=True)
+        with patch.object(core, "executable", return_value="/fixture/agent"), \
+                patch.object(core, "_orc_model_ids", side_effect=lambda command, args: ranked[tuple(args)]), \
+                patch.object(store, "traces", return_value=spans):
+            candidates = {c["key"]: c for c in route_candidates(self.config, self.task(), store)}
+        # orc's quality order, fitted models only, capped at arms.
+        self.assertEqual([k for k in candidates if k.startswith("orc-free")], ["orc-free:free/a", "orc-free:free/b", "orc-free:free/c"])
+        self.assertEqual(candidates["orc-free:free/b"]["checked_runs"], 1)
+        self.assertEqual(candidates["orc-free:free/a"]["runs"], 0)
+        self.config["routes"]["orc-free"]["arms"] = 1
+        with patch.object(core, "executable", return_value="/fixture/agent"), \
+                patch.object(core, "_orc_model_ids", side_effect=lambda command, args: ranked[tuple(args)]):
+            keys = [c["key"] for c in route_candidates(self.config, self.task(), store)]
+        self.assertIn("orc-free", keys)
+
+    def test_rank_by_outcomes_explores_then_prefers_verified_acceptance(self):
+        candidates = [{"key": "weak", "checked_runs": 5, "acceptance_rate": .2},
+                      {"key": "strong", "checked_runs": 5, "acceptance_rate": .8},
+                      {"key": "new", "checked_runs": 0, "acceptance_rate": None},
+                      {"key": "claimed", "checked_runs": 2, "acceptance_rate": 1.0, "reported_success_rate": 1.0}]
+        self.assertEqual([c["key"] for c in rank_by_outcomes(candidates)], ["new", "claimed", "strong", "weak"])
+        self.assertEqual([c["key"] for c in rank_by_outcomes(candidates, 1)], ["new", "claimed", "strong", "weak"])
+        self.assertEqual([c["key"] for c in rank_by_outcomes(candidates, 0)], ["claimed", "strong", "new", "weak"])
+
+    def test_shadow_automatic_routing_follows_verified_outcomes_when_enabled(self):
+        store = core.RunStore(self.workspace)
+        spans = [{"agent": agent, "run_id": f"{agent}-{n}", "status": "success"} for agent in ("codex", "claude") for n in range(3)]
+        for n in range(3):
+            DecisionStore(self.workspace).append("outcome", task_id=f"codex-{n}", accepted=False)
+            DecisionStore(self.workspace).append("outcome", task_id=f"claude-{n}", accepted=True)
+        engine = self.engine({"route": "codex"})
+        with patch("fusion_policy.DecisionEngine", return_value=engine), patch.object(store, "traces", return_value=spans):
+            preference = self.task()
+            route_task(self.config, preference, store)
+            self.assertEqual(preference["agent"], "codex")
+            self.config["decisions"]["rank_by_outcomes"] = True
+            ranked = self.task()
+            route_task(self.config, ranked, store)
+        self.assertEqual(ranked["agent"], "claude")
+        application = [e for e in read_jsonl(DecisionStore(self.workspace).path) if e.get("event") == "application"][-1]
+        self.assertFalse(application["applied"])
+        self.assertIn("verified outcomes", application["reason"])
+
+    def test_observed_errors_count_as_rejections_but_claims_and_quota_do_not(self):
+        store = core.RunStore(self.workspace)
+        spans = [{"agent": "codex", "run_id": "e1", "status": "error", "failure_class": None},
+                 {"agent": "codex", "run_id": "q1", "status": "error", "failure_class": "quota", "end_time_ms": 0},
+                 {"agent": "codex", "run_id": "s1", "status": "success"},
+                 {"agent": "codex", "run_id": "e2", "status": "error"}]
+        DecisionStore(self.workspace).append("outcome", task_id="e2", accepted=True, source="lead")
+        with patch.object(store, "traces", return_value=spans):
+            codex = next(c for c in route_candidates(self.config, self.task(), store) if c["key"] == "codex")
+        self.assertEqual((codex["checked_runs"], codex["acceptance_rate"]), (2, .5))
+
+    def test_lead_outcome_is_recorded_for_an_existing_run_only(self):
+        run = core.RunStore(self.workspace).runs / "20260924-000000-abcdef12"
+        run.mkdir(parents=True)
+        (run / "result.json").write_text(json.dumps({"status": "success", "route": "orc-free", "agent": "claude", "model": "free/a"}))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(core.main(["--workspace", str(self.workspace), "outcome", run.name, "--rejected", "--reason", "tests fail"]), 0)
+        event = [e for e in read_jsonl(DecisionStore(self.workspace).path) if e.get("event") == "outcome"][-1]
+        self.assertEqual((event["task_id"], event["accepted"], event["source"], event["model"]), (run.name, False, "lead", "free/a"))
+        with self.assertRaisesRegex(ValueError, "no completed Fusion run"):
+            core.record_outcome(self.workspace, "missing-run", True)
+        with self.assertRaisesRegex(ValueError, "run id"):
+            core.record_outcome(self.workspace, "../escape", True)
 
     def test_automatic_worker_cannot_override_permissions_or_commands(self):
         task = self.task()

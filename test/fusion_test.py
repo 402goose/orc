@@ -800,6 +800,7 @@ print(json.dumps({
             names,
             {
                 "fusion_delegate",
+                "fusion_outcome",
                 "fusion_status",
                 "fusion_decisions",
                 "fusion_here",

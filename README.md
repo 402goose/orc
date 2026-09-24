@@ -587,7 +587,7 @@ Three primitives, mapped onto what ORC already is:
 | --- | --- |
 | **Prompts** | the verbs — `where-am-i`, `ship-feature`, `review-changes`, `explain-run`, surfaced as slash commands |
 | **Resources** | the evidence — `orc://here`, `orc://workflows`, `orc://workflow/{id}/manifest`, `.../report` |
-| **Tools** | the operations — `fusion_here`, `fusion_run_start`, `fusion_run_status`, `fusion_run_cancel`, plus `fusion_delegate` |
+| **Tools** | the operations — `fusion_here`, `fusion_run_start`, `fusion_run_status`, `fusion_run_cancel`, plus `fusion_delegate` and `fusion_outcome` (the lead's verdict on a delegation) |
 
 Long-running work uses **durable handles rather than blocking calls**.
 `fusion_run_start` returns a `workflow_id` immediately; poll `fusion_run_status`
