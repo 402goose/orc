@@ -87,6 +87,20 @@ class TruffleTest(unittest.TestCase):
         self.assertIn("Linked open PR", result["skipped"][1]["reason"])
         self.assertFalse(any(c[:2] in [("issue", "comment"), ("pr", "create")] for c in self.calls))
 
+    def test_hunt_scouts_with_the_chosen_route_and_model(self):
+        seen = []
+        worker = self.draft_worker(dict(candidates=[candidate(1)], skipped=[dict(number=n, reason="Not tractable") for n in (2, 3, 4)]))
+        def dispatch(config, task, store):
+            seen.append(task)
+            return worker(config, task, store)
+        with patch.object(core, "dispatch", side_effect=dispatch):
+            result = truffle.hunt(self.workspace, self.config, count=3, route="orc-free", model="free/model")
+        self.assertEqual(result["status"], "ready", result)
+        self.assertEqual((seen[0]["route"], seen[0]["settings_overrides"]), ("orc-free", {"model": "free/model"}))
+        self.assertEqual((result["settings"]["route"], result["settings"]["model"]), ("orc-free", "free/model"))
+        with self.assertRaisesRegex(ValueError, "explicit agent or route"):
+            truffle.hunt_options(agent="auto", model="free/model")
+
     def test_zero_candidates_and_github_failures_are_explicit(self):
         self.issues = []
         with patch.object(core, "dispatch", side_effect=AssertionError("No worker needed")):

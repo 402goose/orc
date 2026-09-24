@@ -197,11 +197,12 @@ def latest(workspace):
 
 
 def survey(workspace, config, agent="auto", remote="origin", resume=None, sync_only=False,
-           include_assigned=False, takeover=False):
+           include_assigned=False, takeover=False, route=None, model=None):
     if (agent not in truffle.WORKERS or type(sync_only) is not bool
             or type(include_assigned) is not bool or type(takeover) is not bool):
         raise ValueError("Choose a scout worker and survey options")
     truffle.hunt_options(agent=agent, remote=remote)
+    choice = truffle.worker_choice(agent, route, model)
     workspace = Path(workspace)
     # Inventory-only snapshots have unique paths and never dispatch a worker.
     # They can coexist with an investigation or an isolated implementation queue.
@@ -228,9 +229,9 @@ def survey(workspace, config, agent="auto", remote="origin", resume=None, sync_o
             repo, _ = repo_for(workspace, record["settings"]["remote"])
             if repo != record["repo"]:
                 raise ValueError("Repository remote changed; sync a new woodland")
-            settings = {**record["settings"], "agent": agent}
+            settings = {**record["settings"], **choice}
         else:
-            settings = {"agent": agent, "remote": remote, "include_assigned": include_assigned}
+            settings = {**choice, "remote": remote, "include_assigned": include_assigned}
             record = dict(id="truffle-" + uuid.uuid4().hex[:12], kind="survey", started_at_ms=core.now_ms(),
                           target=0, candidates=[], skipped=[], issues=[], patches=[], batches=[], inventory_complete=False)
         root = truffle.root_for(workspace, record["id"])
@@ -274,9 +275,8 @@ def survey(workspace, config, agent="auto", remote="origin", resume=None, sync_o
                     packet.append(current)
                 packet_path = root / f"batch-{len(record['batches']) + 1}.json"
                 save(packet_path, packet)
-                task = core.make_task(workspace, agent, SURVEY_PROMPT.replace("PATH", str(packet_path)), "discovery", [],
-                                      ["Read-only issue grading. No edits, implementation, publication or delegation."], record["id"], False, False)
-                task["progress_label"] = "truffle"
+                task = truffle.worker_task(workspace, choice, SURVEY_PROMPT.replace("PATH", str(packet_path)),
+                                           ["Read-only issue grading. No edits, implementation, publication or delegation."], record["id"])
                 attempt = {"numbers": [r["number"] for r in batch], "run_id": task["run_id"], "status": "running", "started_at_ms": core.now_ms()}
                 record["batches"].append(attempt)
                 record.update(active_run_id=task["run_id"], message=f"Snout is grading {', '.join('#' + str(r['number']) for r in batch)}")

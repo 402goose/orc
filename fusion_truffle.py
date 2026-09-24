@@ -52,7 +52,24 @@ def gh(workspace, *args):
     return json.loads(proc.stdout)
 
 
-def hunt_options(count=5, scan_limit=40, search="", agent="auto", remote="origin", include_assigned=False):
+def worker_choice(agent="auto", route=None, model=None):
+    """Which worker scouts: an agent, a named route, and an optional model pin."""
+    for value in (route, model):
+        if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > 200):
+            raise ValueError("Route and model must be short names")
+    if model and agent == "auto" and not route:
+        raise ValueError("Pinning a model needs an explicit agent or route; automatic routing chooses the model")
+    return {"agent": agent, "route": route or None, "model": model or None}
+
+
+def worker_task(workspace, choice, prompt, constraints, session_key):
+    task = core.make_task(workspace, choice["agent"], prompt, "discovery", [], constraints, session_key, False, False,
+                          route=choice.get("route"), settings_overrides=core.choice_overrides(choice.get("model"), None))
+    task["progress_label"] = "truffle"
+    return task
+
+
+def hunt_options(count=5, scan_limit=40, search="", agent="auto", remote="origin", include_assigned=False, route=None, model=None):
     if type(count) is not int or not 1 <= count <= 20:
         raise ValueError("Choose 1–20 issues to find")
     if type(scan_limit) is not int or not count <= scan_limit <= 200:
@@ -62,7 +79,8 @@ def hunt_options(count=5, scan_limit=40, search="", agent="auto", remote="origin
     if agent not in WORKERS or type(include_assigned) is not bool:
         raise ValueError("Choose a scout worker and whether to include assigned issues")
     options({}, {"remote": remote})
-    return dict(count=count, scan_limit=scan_limit, search=search, agent=agent, remote=remote, include_assigned=include_assigned)
+    return dict(count=count, scan_limit=scan_limit, search=search, remote=remote, include_assigned=include_assigned,
+                **worker_choice(agent, route, model))
 
 
 def linked_issues(workspace, repo):
@@ -271,9 +289,7 @@ def hunt(workspace, config, **settings):
             save(root / "hunt.json", record)
             if eligible:
                 prompt = SCOUT_PROMPT.replace("PATH", str(root / "issues.json")).replace("TARGET", str(settings["count"]))
-                task = core.make_task(workspace, settings["agent"], prompt, "discovery", [],
-                                      ["Investigate only; no edits, publication or delegation."], scout_id, False, False)
-                task["progress_label"] = "truffle"
+                task = worker_task(workspace, settings, prompt, ["Investigate only; no edits, publication or delegation."], scout_id)
                 result = core.dispatch(config, task, core.RunStore(workspace))
                 record["worker"] = {k: result.get(k) for k in ("agent", "model", "run_id", "usage")}
                 if result.get("status") != "success" or result.get("exit_code") != 0:
@@ -404,10 +420,14 @@ def add_parser(sub):
     scout.add_argument("--scan-limit", type=int, default=40)
     scout.add_argument("--search", default="")
     scout.add_argument("--agent", choices=sorted(WORKERS), default="auto")
+    scout.add_argument("--route", help="named route from .fusion.json, for example orc-free")
+    scout.add_argument("--model", help="model for the scout, overriding the route and agent settings")
     scout.add_argument("--remote", default="origin")
     scout.add_argument("--include-assigned", action="store_true")
     survey = commands.add_parser("survey", help="map every open issue into tracking patches and grade in resumable batches")
     survey.add_argument("--agent", choices=sorted(WORKERS), default="auto")
+    survey.add_argument("--route", help="named route from .fusion.json, for example orc-free")
+    survey.add_argument("--model", help="model for grading, overriding the route and agent settings")
     survey.add_argument("--remote", default="origin")
     survey.add_argument("--resume", help="continue a saved survey's unassessed issues")
     survey.add_argument("--sync-only", action="store_true", help="map all issues without starting grading workers")
@@ -429,9 +449,9 @@ def add_parser(sub):
 def command(workspace, config, args):
     if args.truffle_command == "survey":
         from fusion_truffle_survey import survey
-        result = survey(workspace, config, **{k: getattr(args, k) for k in ("agent", "remote", "resume", "sync_only", "include_assigned", "takeover")})
+        result = survey(workspace, config, **{k: getattr(args, k) for k in ("agent", "route", "model", "remote", "resume", "sync_only", "include_assigned", "takeover")})
     elif args.truffle_command == "hunt":
-        result = hunt(workspace, config, **{k: getattr(args, k) for k in ("count", "scan_limit", "search", "agent", "remote", "include_assigned")})
+        result = hunt(workspace, config, **{k: getattr(args, k) for k in ("count", "scan_limit", "search", "agent", "route", "model", "remote", "include_assigned")})
     elif args.truffle_command == "show":
         result = receipt(workspace, args.scout_id)
     else:

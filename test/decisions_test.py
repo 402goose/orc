@@ -353,6 +353,29 @@ class DecisionsTest(unittest.TestCase):
             codex = next(c for c in route_candidates(self.config, self.task(), store) if c["key"] == "codex")
         self.assertEqual((codex["checked_runs"], codex["acceptance_rate"]), (2, .5))
 
+    def test_named_route_with_arms_picks_its_model_by_outcomes(self):
+        self.config["routes"] = {"orc-free": {"agent": "claude", "command": "orc", "model_selector": "free", "arms": 2}}
+        self.config["decisions"]["rank_by_outcomes"] = 1
+        ranked = {("--free", "--tools"): ["free/top", "free/next"], ("--fit",): ["free/top", "free/next"]}
+        store = core.RunStore(self.workspace)
+        spans = [{"agent": "claude", "route": "orc-free", "model": "free/top", "run_id": "t1", "status": "error"},
+                 {"agent": "claude", "route": "orc-free", "model": "free/next", "run_id": "n1", "status": "success"}]
+        DecisionStore(self.workspace).append("outcome", task_id="n1", accepted=True)
+        task = core.make_task(self.workspace, "claude", "Scout issues", "discovery", [], [], None, False, False, route="orc-free")
+        with patch.object(core, "executable", return_value="/fixture/agent"), \
+                patch.object(core, "_orc_model_ids", side_effect=lambda command, args: ranked[tuple(args)]), \
+                patch.object(store, "traces", return_value=spans):
+            route_task(self.config, task, store)
+        self.assertEqual((task["agent"], task["route"], task["settings_overrides"]), ("claude", "orc-free", {"model": "free/next"}))
+        application = [e for e in read_jsonl(DecisionStore(self.workspace).path) if e.get("event") == "application"][-1]
+        self.assertIn("inside the named route", application["reason"])
+        pinned = core.make_task(self.workspace, "claude", "Scout issues", "discovery", [], [], None, False, False,
+                                route="orc-free", settings_overrides={"model": "free/top"})
+        with patch.object(core, "executable", return_value="/fixture/agent"), \
+                patch.object(core, "_orc_model_ids", side_effect=lambda command, args: ranked[tuple(args)]):
+            route_task(self.config, pinned, store)
+        self.assertEqual(pinned["settings_overrides"], {"model": "free/top"})
+
     def test_lead_outcome_is_recorded_for_an_existing_run_only(self):
         run = core.RunStore(self.workspace).runs / "20260924-000000-abcdef12"
         run.mkdir(parents=True)
