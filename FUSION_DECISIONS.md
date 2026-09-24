@@ -284,9 +284,104 @@ The UI shows live optimizer loss, paired held-out scores, controls, sample sizes
 and lineage checks. Comparisons require identical source/candidate benchmarks and
 verified independent holdouts. Loss or knowledge XP is not evidence of improved
 generalization. Small-sample and changing-benchmark limitations remain visible.
-The server must remain running to advance the loop; detached steps and saved rounds
+The loop advances while the control-room server is running, or whenever
+`fusion learn tick` runs (see below); detached steps and saved rounds
 survive restarts. Errors wait for an explicit retry. Automatic rounds do not change
 the configured checkpoint, calibration file, decision mode, or permitted actions.
+
+## Run the loop without the UI
+
+Label drafting (the garden) and training rounds are advanced by a tick. The
+control-room server ticks every three seconds. Without the server, run the
+same tick yourself or on a schedule:
+
+```sh
+orc fusion learn tick                          # the current workspace
+orc fusion learn tick --workspace ~/a --workspace ~/b
+orc fusion learn tick --all                    # every workspace the control room knows
+orc fusion learn status [--all]                # read-only: is it on, and is it improving?
+
+orc fusion learn schedule install [--interval 300] [--all | --workspace W ...]
+orc fusion learn schedule status
+orc fusion learn schedule uninstall
+```
+
+**Nothing runs unless a workspace opts in.** A tick on a workspace whose
+garden and training are both off reads its settings and exits. It creates no
+files there, including lock files. Turn each part on per workspace:
+
+- **Garden** (label drafting): **Laya lab → Garden → Enable auto-drafts**.
+  The setting is saved in `.fusion/decisions/garden.json` (`enabled`, `agent`:
+  `auto|codex|claude|agy|grok`, `labeling_mode`: `single|council`,
+  `council_agents`, `council_rule`: `unanimous|available`, `approval_mode`:
+  `human|council`). Use the UI rather than editing this file. The UI also
+  records when drafting started (`since_ms`), so only new decisions are
+  drafted unless you choose to include existing ones. It also records a
+  `policy_id`, which is how pausing or changing the policy withdraws council
+  approval from a draft that is still running. A hand-written
+  `{"enabled": true}` queues every existing undrafted decision and has no
+  `policy_id`.
+- **Training** (automatic rounds): **Laya lab → Training → Enable
+  auto-training**, or write `.fusion/decisions/training/settings.json` as
+  `{"enabled": true, "min_new_answers": 10}` (`min_new_answers` is 1–10,000).
+
+Each tick, for each selected workspace:
+
+- **Garden:** if no label draft is running and a decision is waiting, it
+  starts one `suggest-labels` job for the oldest waiting decision. Otherwise
+  it does nothing. There is one draft at a time per workspace. Drafts call
+  your configured worker CLI, so provider usage may be charged.
+- **Training:** it takes one step of the round. That step is one of: start
+  a round when there is enough new evidence and no manual learning job is
+  running; record a finished step's result and launch the next of export,
+  baseline, train, evaluate and calibrate; or mark the round as needing
+  attention. It waits while a step is running or a round needs a retry.
+
+Jobs run as the same detached supervisors the UI starts, under
+`.fusion/ui/jobs`, and keep running after the tick exits. Short, repeated
+ticks make the same progress a running server would. Ticks take the same
+per-workspace file locks as the server (`.fusion/decisions/garden.lock`,
+`label-jobs.lock`, `training-loop.lock`). A scheduled tick and an open
+control room can run together without launching the same step twice.
+
+`tick` prints one JSON line per workspace with the time (`at_ms`), garden
+state, queue size and active job, training state and last round, the jobs
+this tick `launched`, and any `error`. It exits 1 if any workspace reported
+an error. `status` prints, per workspace:
+
+- garden `enabled`, `approval_mode`, `queued` and `latest_job`
+- training `enabled`, `min_new_answers`, `completed_rounds` and `last_round`
+  (with `outcome` and held-out `delta` once a round completes)
+- decision counts by state, `drafts` awaiting review, and approved decisions
+  and answers
+- Laya `mode`, `model_path`, `qualified_buckets` and prediction/label
+  agreement
+
+`--all` means every workspace in the control room's registry
+(`$ORC_HOME/ui-workspaces.json`, default `~/.config/orc`), plus the current
+workspace if it has `.fusion/decisions`. The server never writes its own
+start-up workspace to that registry.
+
+`schedule install` on macOS writes
+`~/Library/LaunchAgents/ai.orc.fusion-learn.plist` and prints it, then loads
+it with `launchctl bootstrap gui/$UID`, replacing any loaded copy. The agent
+runs `learn tick` at load and then every `--interval` seconds (default 300,
+minimum 60). It appends output to `~/.local/share/orc/learn.log`, which is
+not rotated. Details of the plist:
+
+- It pins the Python interpreter and the `fusion` script that ran `install`.
+  Run it from the installed `fusion`, and run it again after upgrading Python
+  or moving the install.
+- launchd's `PATH` is minimal, so the plist's `PATH` lists the directories
+  where `claude`, `codex`, `agy`, `grok`, `orc` and `node` were found at
+  install time. Install a worker later and you need to reinstall the schedule.
+- `ORC_HOME` is copied into the plist if it is set.
+- `--all` is resolved at every tick, so workspaces added later are included.
+- `AbandonProcessGroup` keeps launchd from stopping the jobs a tick started.
+
+`schedule uninstall` runs `launchctl bootout` and removes the plist. On
+other systems, `install` prints the equivalent crontab line to add with
+`crontab -e` and installs nothing.
 
 Decision states and labels live locally in `.fusion/decisions/events.jsonl`
 with private file permissions. They may contain project text; they are

@@ -2165,6 +2165,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     from fusion_decision_cli import add_parser
     add_parser(sub)
+    from fusion_learn_cli import add_parser as learn_parser
+    learn_parser(sub)
     sub.add_parser("mcp-serve", help=argparse.SUPPRESS)
     return parser
 
@@ -2191,6 +2193,13 @@ def _main(args, parser) -> int:
     if args.command == "ui":
         from fusion_ui import serve
         return serve(workspace, args.port, not args.no_open)
+    if args.command == "learn":
+        # Before load_config: each ticked workspace loads its own configuration.
+        from fusion_learn_cli import run as run_learn
+        try:
+            return run_learn(args, workspace)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            parser.error(str(exc))
     config, config_path = load_config(workspace)
     if args.command == "truffle":
         from fusion_truffle import command as truffle_command

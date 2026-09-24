@@ -46,7 +46,7 @@ cp "$(cd "$(dirname "$0")" && pwd)/data/quality.json" "$DEST/data/quality.json"
 cp "$FUSION_SRC" "$DEST/fusion"
 cp "$FUSION_CORE_SRC" "$DEST/fusion_core.py"
 cp "$FUSION_WORKFLOW_SRC" "$DEST/fusion_workflow.py"
-for module in fusion_decisions fusion_laya fusion_policy fusion_build fusion_decision_cli fusion_progress fusion_report fusion_ui fusion_labeling fusion_publish fusion_learning fusion_garden fusion_quality fusion_truffle fusion_truffle_survey fusion_training_loop fusion_mcp fusion_reasoning; do
+for module in fusion_decisions fusion_laya fusion_policy fusion_build fusion_decision_cli fusion_learn_cli fusion_progress fusion_report fusion_ui fusion_labeling fusion_publish fusion_learning fusion_garden fusion_quality fusion_truffle fusion_truffle_survey fusion_training_loop fusion_mcp fusion_reasoning; do
   cp "$(dirname "$FUSION_CORE_SRC")/$module.py" "$DEST/$module.py"
 done
 mkdir -p "$DEST/fusion_ui_assets"

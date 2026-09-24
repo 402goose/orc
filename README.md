@@ -274,7 +274,7 @@ not establish generalization. Known leakage or unknown model lineage prevents an
 improvement claim. Candidates are never automatically promoted.
 
 The loop runs while the control-room server is running, including with the browser
-closed. Pausing prevents subsequent steps; the active job may finish. A failed or
+closed, or without the server via `fusion learn tick` (see FUSION_DECISIONS.md). Pausing prevents subsequent steps; the active job may finish. A failed or
 cancelled job waits for **Retry this step**. Saved rounds resume after a server restart,
 and manual and automatic learning jobs share one workspace slot. Settings, curated
 datasets, progress, and round receipts live under `.fusion/decisions/training`;
@@ -285,7 +285,7 @@ candidates** keeps the original controls available below the training grounds.
 labeling worker. There is **no daily cap**, including for gardens with an old saved
 limit. Optionally include existing eligible decisions and drafts in the selected setup.
 Garden runs one assessment at a time while the control-room server is running, even
-with the browser closed. Settings, attempted decisions and daily usage survive
+with the browser closed, or on each `fusion learn tick` without it. Settings, attempted decisions and daily usage survive
 restart. Pausing stops new calls and withdraws automatic approval from the active
 garden run; its assessment can finish as a draft or be cancelled from the live view.
 Provider usage may be charged to your worker account.
