@@ -70,7 +70,7 @@ def describe(workspace):
         return {"mode": "tenet", "ready": False, "provider": "tenet", "error": str(exc)}
 
 
-def admit(workspace, run_id, spec, config, mode="off"):
+def admit(workspace, run_id, spec, config, mode="off", label_draft=None):
     if mode not in {"off", "shadow"}:
         raise ValueError("Admitted observations must be off or shadow")
     codex = config.get("codex") or {}
@@ -78,7 +78,7 @@ def admit(workspace, run_id, spec, config, mode="off"):
             or codex.get("approval") != "never" or codex.get("git_write") is not False
             or config.get("publish", {}).get("mode") != "off"):
         raise ValueError("TENET admission requires restricted Codex, approval never, git_write false and publishing off")
-    if set(codex) - {"command", "model", "sandbox", "approval", "git_write"}:
+    if set(codex) - {"command", "model", "reasoning_effort", "sandbox", "approval", "git_write"}:
         raise ValueError("Unsupported Codex settings must be removed before TENET admission")
     command = shutil.which(codex.get("command", "codex"))
     if not command:
@@ -98,6 +98,7 @@ def admit(workspace, run_id, spec, config, mode="off"):
     return call(workspace, "admit", run_id=run_id, intent={
         "action": "workflow", "task": spec.get("task", ""), "spec": spec, "config": profile,
         "executor": {"system": "fusion", "workflow_id": run_id},
+        **({"label_draft": label_draft} if label_draft is not None else {}),
         "source_revision": source_revision,
         "permissions": {"execution_mode": "restricted", "sandbox": profile["codex"]["sandbox"],
                         "approval": "never", "git_write": False, "publish": "off", "allow_write": writes},

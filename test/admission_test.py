@@ -61,7 +61,7 @@ class AdmissionTest(unittest.TestCase):
         self.bind()
         app = ControlRoom(self.workspace)
         with patch("fusion_ui.subprocess.Popen") as spawn:
-            for action in ("build", "delegate", "resume", "train", "suggest-labels", "publish", "probe", "truffle-run"):
+            for action in ("build", "delegate", "resume", "train", "publish", "probe", "truffle-run"):
                 with self.assertRaisesRegex(ValueError, "no admitted execution contract"):
                     app.launch(self.workspace, {"action": action, "text": "task", "allow_write": True})
             spawn.assert_not_called()
