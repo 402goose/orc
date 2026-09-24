@@ -1079,15 +1079,21 @@ function admissionCard(value) {
     ${refs.length ? `<details><summary>${refs.length} frozen context source(s)</summary>${refs.map(ref => `<p class="room-path">${esc(ref.path || ref.source_path)}<br><small>${esc(ref.sha256)}</small></p>`).join("")}</details>` : ""}
     ${value.request_sha256 ? `<details><summary>Saved admission and policy</summary><p class="room-path">${esc(value.request_sha256)}</p><pre class="console">${esc(pretty(value.request?.intent?.permissions || {}))}</pre>${Object.entries(value.artifacts || {}).map(([name, artifact]) => `<p>${esc(name)} ${button("Copy path", "copy-artifact-path", `data-path="${esc(artifact.path || "")}"`, "small ghost")}</p>`).join("")}</details>` : ""}</section>`;
 }
+function admittedPairs(provider) {
+  return (provider?.executor?.allowed_pairs || []).filter(pair => typeof pair.model === "string" && typeof pair.reasoning_effort === "string" && (pair.reasoning_effort !== "ultra" || provider.executor.allow_native_delegation === true));
+}
 function openAdmittedLaunch(options = {}) {
   const provider = state.config.admission;
+  const pairs = admittedPairs(provider);
+  const defaultPair = pairs.findIndex(pair => pair.model === provider.executor.model && pair.reasoning_effort === provider.executor.reasoning_effort);
   const modes = ["off", "shadow"].filter(mode => mode === "off" || provider.observations?.supported_modes?.includes(mode));
   const requestId = "task-" + crypto.randomUUID();
   modal("Start a TENET task", "TENET saves the task and context; ORC executes the admitted workflow.",
     `<form id="admitted-launch-form"><input type="hidden" name="request_id" value="${requestId}">
       ${!provider.ready ? `<p class="blocker">${esc(provider.error || "The required provider is unavailable.")}</p>` : ""}
       <div class="field"><label for="admitted-task">What should happen?</label><textarea id="admitted-task" name="text" rows="6" required>${esc(options.text || options.spec?.task || "")}</textarea></div>
-      <p class="help-copy">${esc(provider.executor?.model || provider.binding?.executor?.model || "Operator-selected Codex")} · one attempt · up to 10 minutes per worker.</p>
+      <p class="help-copy">${esc(provider.executor?.model || provider.binding?.executor?.model || "Operator-selected Codex")} · one top-level attempt · up to 10 minutes per worker.</p>
+      ${pairs.length ? `<div class="field"><label for="admitted-model-pair">Model and reasoning for the single-worker task</label><select id="admitted-model-pair" name="model_pair">${pairs.map((pair, i) => `<option value="${i}" ${i === defaultPair ? "selected" : ""}>${esc(pair.model)} / ${esc(pair.reasoning_effort)}${pair.reasoning_effort === "ultra" ? " · read-only delegation" : ""}</option>`).join("")}</select><small>The chosen pair is frozen before dispatch. Shadow advice cannot change it. Ultra is currently limited to read-only planning; nested worker usage and visibility remain incomplete. Authored workflows specify their own per-node pairs.</small></div>` : `<p class="help-copy">Reasoning effort is unspecified by this operator policy.</p>`}
       <div class="field"><label for="admitted-laya-mode">Laya observations for this task</label><select id="admitted-laya-mode" name="mode">${modes.map(mode => `<option value="${mode}">${mode === "off" ? "Off · no model observations" : "Shadow · advisory only"}</option>`).join("")}</select><small>${modes.includes("shadow") ? "The operator configured a local runtime; this view has not checked inference. Shadow records observations without changing routing, acceptance, retries or permissions." : "The operator has not enabled a shadow runtime for this workspace."} Active mode is unavailable.</small></div>
       <p class="help-copy">Context to freeze: ${esc(provider.context_paths?.join(", ") || "No context files selected in operator policy")}</p>
       <label class="check-field"><input type="checkbox" name="allow_write"> Allow workspace edits for this task</label>
@@ -1678,11 +1684,17 @@ document.addEventListener("submit", async (event) => {
         attempts: values.attempts, publish: publishValues("truffle"), allow_write: !!values.allow_write});
     } else if (form.id === "admitted-launch-form") {
       const writes = !!values.allow_write;
+      const pairs = admittedPairs(state.config.admission);
+      const pair = values.model_pair !== undefined ? pairs[Number(values.model_pair)] : null;
+      if (!values.spec.trim() && pairs.length && !pair) throw new Error("Choose an allowed model and reasoning pair.");
+      if (!values.spec.trim() && writes && pair?.reasoning_effort === "ultra") throw new Error("Ultra currently supports read-only planning. Choose another pair for workspace edits.");
+      const delegation = pair?.reasoning_effort === "ultra" && state.config.admission.executor.allow_native_delegation === true;
       const spec = values.spec.trim() ? JSON.parse(values.spec) : {
         schema: "fusion.workflow.v1", task: values.text, max_attempts: 1, max_parallel: 1,
         max_parallel_writers: writes ? 1 : 0, budget_usd: 3, publish: {mode: "off"},
         nodes: [{id: "work", agent: "codex", write: writes, role: writes ? "implementation" : "discovery",
-          task: values.text + "\nDo not delegate, publish, or broaden this task. Return evidence and explicit unresolved blockers.",
+          ...(pair ? {model: pair.model, reasoning_effort: pair.reasoning_effort} : {}),
+          task: values.text + (delegation ? "\nRead-only native delegation is authorized within this task. Preserve any stricter instructions above. Do not publish or broaden the task. Return evidence and explicit unresolved blockers." : "\nDo not delegate, publish, or broaden this task. Return evidence and explicit unresolved blockers."),
           acceptance: {required_handoff: writes ? ["summary", "tests"] : ["summary"]}}], acceptance: {required_nodes: ["work"]},
       };
       await launch({action: "workflow", request_id: values.request_id, text: values.text, spec, allow_write: writes, mode: values.mode || "off"});
