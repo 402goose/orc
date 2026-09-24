@@ -376,6 +376,32 @@ class DecisionsTest(unittest.TestCase):
             route_task(self.config, pinned, store)
         self.assertEqual(pinned["settings_overrides"], {"model": "free/top"})
 
+    def test_native_model_pin_does_not_leak_into_orc_routes(self):
+        config = {**self.config, "claude": {"command": sys.executable, "model": "claude-sonnet-5"},
+                  "routes": {"orc-free": {"agent": "claude", "command": "orc", "model_selector": "free"},
+                             "pinned": {"agent": "claude", "command": "orc", "model": "free/pinned"},
+                             "native": {"agent": "claude", "permission_mode": "plan"}}}
+        self.assertNotIn("model", core.agent_settings(config, {"agent": "claude", "route": "orc-free"}))
+        self.assertEqual(core.agent_settings(config, {"agent": "claude", "route": "pinned"})["model"], "free/pinned")
+        self.assertEqual(core.agent_settings(config, {"agent": "claude", "route": "native"})["model"], "claude-sonnet-5")
+        self.assertEqual(core.agent_settings(config, {"agent": "claude"})["model"], "claude-sonnet-5")
+
+    def test_outcome_ranking_keeps_review_independent_of_the_implementer(self):
+        store = core.RunStore(self.workspace)
+        spans = [{"agent": "claude", "run_id": f"c{n}", "status": "success"} for n in range(3)]
+        for n in range(3):
+            DecisionStore(self.workspace).append("outcome", task_id=f"c{n}", accepted=True)
+        self.config["decisions"]["rank_by_outcomes"] = 0
+        self.config["codex"] = {"command": "missing-fusion-test-agent"}
+        self.config["agy"] = {"command": sys.executable}
+        engine = self.engine({"route": "claude"})
+        review = self.task()
+        review["prefer_different_agent"] = "claude"
+        with patch("fusion_policy.DecisionEngine", return_value=engine), patch.object(store, "traces", return_value=spans), \
+                patch.object(core, "agy_headless_status", return_value={"automatic_ready": True}):
+            route_task(self.config, review, store)
+        self.assertEqual(review["agent"], "agy")
+
     def test_lead_outcome_is_recorded_for_an_existing_run_only(self):
         run = core.RunStore(self.workspace).runs / "20260924-000000-abcdef12"
         run.mkdir(parents=True)

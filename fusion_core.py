@@ -1120,6 +1120,10 @@ def agent_settings(config: dict[str, Any], task: dict[str, Any]) -> dict[str, An
         route_agent = route.get("agent")
         if route_agent and route_agent != agent:
             raise ValueError(f"route {route_name} is for {route_agent}, not {agent}")
+        if Path(str(route.get("command", settings.get("command", agent)))).name == "orc" and "model" not in route:
+            # A native model id (claude.model) means nothing on OpenRouter and
+            # has no fit evidence there; an orc route picks its own model.
+            settings.pop("model", None)
         settings = deep_merge(settings, route)
     overrides = task.get("settings_overrides") or {}
     if isinstance(overrides, dict):
