@@ -35,6 +35,8 @@ def add_parser(sub):
     suggest.add_argument("--garden-policy", help="saved garden policy; changes or pausing revoke pending automatic approvals")
     export = commands.add_parser("export", help="export reviewed labels, split by workflow group")
     export.add_argument("output")
+    export.add_argument("--exclude-source", action="append", default=[], metavar="SOURCE",
+                        help="leave out answers approved by this source, for example lead_verdict; repeatable")
     calibrate = commands.add_parser("calibrate", help="fit temperature on train and assess held-out groups")
     calibrate.add_argument("dataset")
     calibrate.add_argument("output")
@@ -110,7 +112,7 @@ def run(args, workspace, config):
         store.label(args.id, dict(answer.split("=", 1) for answer in args.answers), args.evidence)
         payload = {"id": args.id, "labeled": True}
     elif command == "export":
-        payload = store.export(args.output)
+        payload = store.export(args.output, getattr(args, "exclude_source", []))
     else:
         payload = fit_calibration(args.dataset, args.output, args.threshold)
     print(json.dumps(payload, indent=2, ensure_ascii=False))

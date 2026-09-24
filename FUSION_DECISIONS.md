@@ -99,7 +99,8 @@ it. Interactive lead sessions use their own provider controls.
    ```
 
    MCP leads call `fusion_outcome` with `run_id`, `accepted` and `reason`.
-   The latest verdict for a run wins.
+   The latest verdict for a run wins. A verdict with a reason also becomes
+   an acceptance label; see [Learn from verified runs](#learn-from-verified-runs).
 3. **Recovery:** classifies actual acceptance results as continue, repair,
    switch, ask or stop. A classifier cannot accept a failed check, bypass a
    permission denial, increase attempts, or discard prior spend. A qualified
@@ -127,8 +128,8 @@ it. Interactive lead sessions use their own provider controls.
    like any other rejected result. It can never accept a node: a structural
    failure is decided before it is called, and there is no path back.
 6. **Learning:** local decisions and acceptance outcomes are logged. Only
-   explicitly reviewed labels with verification evidence enter training
-   exports. Human review, candidate fine-tuning, held-out evaluation and
+   verified labels with evidence enter training exports: human reviews,
+   explicitly enabled council approvals, and lead verdicts on acceptance. Human review, candidate fine-tuning, held-out evaluation and
    calibration are separate steps; no model promotes itself.
 
 ## Shadow, off and active modes
@@ -189,7 +190,8 @@ settings):
     "auto_actions": [],
     "threshold": 0.9,
     "calibration_file": "",
-    "model_path": ""
+    "model_path": "",
+    "verdict_labels": true
   }
 }
 ```
@@ -216,6 +218,68 @@ Fusion's schemas. `setup --checkpoint typed-decisions` makes it available
 for an explicit `model_path` experiment, subject to the same qualification.
 
 ## Learn from verified runs
+
+### Lead verdicts become acceptance labels
+
+`fusion outcome RUN_ID --accepted|--rejected --reason "..."` (MCP
+`fusion_outcome`) is a verified judgment about exactly what the acceptance
+decision asks, so it is saved as an approved acceptance label without a
+click. Only the questions a verdict determines are answered:
+
+| Verdict | `plausible` | `failed_task` |
+| --- | --- | --- |
+| `--accepted` | `true` | `false` |
+| `--rejected` | `false` | unlabeled |
+
+A rejection says the reported success should not have been accepted. It
+does not say the worker failed to do what was asked: the work may have been
+done in an unacceptable way, or the brief may have been wrong. So
+`failed_task` stays unlabeled.
+
+No label is written when the verdict has no `--reason` (the outcome is still
+recorded for route ranking), when the run did not report `success` (acceptance
+is only asked of a reported success), when the run's `task.json` is missing,
+or when the input exceeds `max_state_chars` (the record is kept, marked
+truncated). `mode: off` or `"verdict_labels": false` turn verdict labels off.
+
+The label attaches to the run's acceptance decision. A workflow node that
+already has a complete acceptance decision is labeled in place. Otherwise
+Fusion records an `unscored` acceptance decision, with the same input
+`accept_node` builds (`task`, `summary`, `changed`, `tests`) or the input an
+unavailable workflow gate recorded. Laya does not run, so `fusion outcome`
+stays fast and works without a checkpoint. An `unscored` decision has no
+prediction and can never drive an automatic action. Calibration skips it and
+reports it under `unscored_examples`; score it with `evaluate` first.
+
+Each label is `verified` with `source: "lead_verdict"`, `reviewers:
+[{"agent": "lead", "run_id": ..., "accepted": ...}]` and evidence holding the
+reason and the run's `result.json` path. Its context is `task_id` = run id and
+`group` = the run's workflow or trace, so repeats stay in one split. A later
+verdict on the same run replaces the earlier verdict's answers; a later
+verdict that cannot label retracts them. Labels from a human or council on
+that decision are never overwritten.
+
+Verdict labels count as approved in the Laya lab, the training loop's
+new-answer count and readiness, and exports. Every exported answer carries
+its `label_provenance` source. To audit or leave them out:
+
+```sh
+orc fusion decisions export .fusion/decisions/reviewed.jsonl
+jq -c 'select(.label_provenance[]?.source == "lead_verdict")' .fusion/decisions/reviewed.jsonl
+orc fusion decisions export .fusion/decisions/human.jsonl --exclude-source lead_verdict
+```
+
+Excluding a single example in the lab also removes it. The automatic training
+loop exports every approved source; disable `verdict_labels` before labels
+accumulate if you want them out of automatic rounds.
+
+Verdicts never create routing labels. A worker succeeding does not prove it
+was the best route. Outcomes rank routes (`rank_by_outcomes`) and nothing
+else. Workflow gate outcomes are not labels either: the acceptance question
+is asked only after structural checks pass, so a gate "accept" repeats the
+policy's own choice.
+
+### Review decisions by hand
 
 Read a decision and inspect the task's actual request, diff, checks and
 acceptance receipt before labeling it. Merely echoing the model's choice
