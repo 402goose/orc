@@ -767,6 +767,7 @@ class RunStore:
             "route": task.get("route"),
             "model": metadata.get("model"),
             "write": task.get("write", False),
+            "execution_choice": result.get("execution_choice"),
             "usage": result.get("usage") or {},
             "changed": result.get("changed", []),
             "tests": result.get("tests", []),
@@ -1183,20 +1184,29 @@ def agent_command(
 ) -> tuple[list[str], dict[str, str], dict[str, Any]]:
     agent = task["agent"]
     settings = agent_settings(config, task)
+    if settings.get("reasoning_effort") is not None and agent != "codex":
+        raise ValueError("reasoning_effort is currently supported only for native Codex")
     yolo = execution_mode(config) == "yolo"
     env = os.environ.copy()
     if agent == "codex":
+        from fusion_reasoning import execution_choice
+        choice = execution_choice(settings)
+        if task["write"] and settings.get("reasoning_effort") == "ultra":
+            raise ValueError("ultra is currently limited to read-only workers; nested writer visibility is unqualified")
         command = settings.get("command", "codex")
         permissions = ["--dangerously-bypass-approvals-and-sandbox"] if yolo else [
             *codex_permission_args(Path(task["workspace"]), settings, task["write"]),
             "-a", settings.get("approval", "never") if task["write"] else "never"]
         argv = [command, "-C", task["workspace"], *permissions]
+        if settings.get("reasoning_effort") is not None:
+            argv += ["-c", "model_reasoning_effort=" + json.dumps(settings["reasoning_effort"])]
         argv += ["exec", "resume", session_id, "--json"] if session_id else ["exec", "--json", "--skip-git-repo-check"]
         model = settings.get("model")
         if model:
             argv += ["-m", model]
         argv.append("-")
-        return argv, os.environ.copy(), {"command": command, "model": settings.get("model") or ""}
+        return argv, os.environ.copy(), {"command": command, "model": settings.get("model") or "",
+                                         "execution_choice": choice}
     if agent == "agy":
         command = settings.get("command", "agy")
         mode_key = str(settings.get("mode") or settings.get("permission_mode") or "")
@@ -1291,6 +1301,13 @@ def dispatch(
     if os.environ.get("FUSION_READ_ONLY") == "1" and task["write"]:
         raise ValueError("this Fusion session permits read-only work only")
     route_task(config, task, store)
+    # Pinned choices do not resume a session created for a different pair.
+    # Keep legacy session keys unchanged when effort is inherited.
+    if task["agent"] == "codex":
+        settings = agent_settings(config, task)
+        if settings.get("reasoning_effort") is not None:
+            from fusion_reasoning import pair_key, validate_pair
+            task["session_key"] += ":" + pair_key(validate_pair(settings.get("model"), settings["reasoning_effort"])) + ":delegation=" + str(settings.get("allow_native_delegation", False)).lower()
     if "review" in task["role"].lower() and not task["write"]:
         review_task(config, task)
     run_dir = run_dir or store.create(task)
@@ -1313,6 +1330,7 @@ def dispatch(
             "agent": task["agent"],
             "route": task.get("route"),
             "model": metadata.get("model"),
+            "execution_choice": metadata.get("execution_choice"),
             "summary": f"{argv[0]} is not available on PATH",
             "changed": [],
             "tests": [],
@@ -1342,12 +1360,17 @@ def dispatch(
     label = task.get("progress_label", task["role"])
     scope = "implementation" if task["write"] else "review/investigation only"
     access = "YOLO: no runtime permission prompts or sandbox" if execution_mode(config) == "yolo" else "restricted runtime"
-    progress.emit(label, f"selected {task['agent']} ({task.get('route') or 'native'}); {scope}; {access}")
+    requested = (metadata.get("execution_choice") or {}).get("requested") or {}
+    selection = f"; requested {requested['model']} / {requested['reasoning_effort']} effort" if requested.get("reasoning_effort") else ""
+    progress.emit(label, f"selected {task['agent']} ({task.get('route') or 'native'}){selection}; {scope}; {access}")
     try:
         with contextlib.ExitStack() as stack:
             with progress.activity(label, "acquiring workspace writer lock" if task["write"] else "preparing read-only worker"):
                 stack.enter_context(writer_lock(Path(task["workspace"]), task["write"]))
             store.event(run_dir, "worker.started", {"argv": argv, "resumed_session": bool(session_id)})
+            if metadata.get("execution_choice"):
+                metadata["execution_choice"]["dispatch"] = {"status": "attempted", "argv": argv}
+                store.write_json(run_dir / "task.json", task)
             completed = progress.run_logged(
                 argv,
                 cwd=task["workspace"],
@@ -1358,6 +1381,8 @@ def dispatch(
                 plain_output=task["agent"] == "grok" and metadata.get("output_format") == "plain",
             )
         exit_code = completed.returncode
+        if metadata.get("execution_choice"):
+            metadata["execution_choice"]["dispatch"]["status"] = "returned"
         if task["agent"] == "codex":
             new_session, summary, failure, usage, event_model, evidence_notes = parse_codex_events(completed.stdout)
         elif task["agent"] == "agy":
@@ -1374,6 +1399,10 @@ def dispatch(
             with open(answer_path, "w", encoding="utf-8", opener=lambda name, flags: os.open(name, flags, 0o600)) as stream:
                 stream.write(summary.strip() + "\n")
         model = event_model or model
+        if metadata.get("execution_choice") and event_model:
+            metadata["execution_choice"]["observed"] = {
+                "model": event_model, "reasoning_effort": None, "status": "model_reported",
+                "source": "codex_json", "note": "effort is not attested by the stock exec event stream"}
         handoff = parse_handoff(summary)
         if new_session:
             store.set_session(task["session_key"], new_session)
@@ -1408,6 +1437,7 @@ def dispatch(
         "role": task["role"],
         "route": task.get("route"),
         "model": model,
+        "execution_choice": metadata.get("execution_choice"),
         "summary": compact(str(handoff.get("summary") or summary).strip(), int(config.get("max_result_chars", 12000))),
         "changed": handoff.get("changed", []),
         "tests": handoff.get("tests", []),

@@ -267,6 +267,12 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
 
     for node in nodes:
         visit(node["id"])
+        if "reasoning_effort" in node:
+            from fusion_reasoning import EFFORTS
+            if node["agent"] != "codex" or not isinstance(node["reasoning_effort"], str) or node["reasoning_effort"] not in EFFORTS:
+                raise ValueError("workflow reasoning_effort requires an explicit Codex node and a supported effort")
+        if "allow_native_delegation" in node and (node["agent"] != "codex" or not isinstance(node["allow_native_delegation"], bool)):
+            raise ValueError("allow_native_delegation requires an explicit Codex node and boolean")
         if node.get("independent_of") and node["independent_of"] not in node["needs"]:
             raise ValueError("independent_of must name a direct dependency")
 
@@ -429,6 +435,13 @@ class WorkflowRunner:
         for key in ("independent_of", "decision_context"):
             if key in node:
                 payload[key] = node[key]
+        if node["agent"] == "codex":
+            from fusion_reasoning import validate_pair
+            settings = core.agent_settings(self.config, {"agent": "codex", "route": node.get("route"),
+                "settings_overrides": {key: node[key] for key in ("model", "reasoning_effort", "allow_native_delegation") if key in node}})
+            if settings.get("reasoning_effort") is not None:
+                payload["execution_pair"] = validate_pair(settings.get("model"), settings["reasoning_effort"])
+                payload["allow_native_delegation"] = settings.get("allow_native_delegation", False)
         return hashlib.sha256(core.json_text(payload).encode("utf-8")).hexdigest()
 
     def _input_digest(self, definition_digest: str, dependency_digests: dict[str, str]) -> str:
@@ -840,7 +853,7 @@ BLOCKERS: unresolved issues, or none
         agent = node["agent"]
         write = bool(node.get("write", False))
         settings = {key: node[key] for key in (
-            "command", "model", "model_selector", "profile", "launcher_args",
+            "command", "model", "reasoning_effort", "allow_native_delegation", "model_selector", "profile", "launcher_args",
             "max_budget_usd", "permission_mode", "permission_prompts", "allowed_tools",
             "allow_untested",
         ) if key in node}
@@ -1325,6 +1338,7 @@ def workflow_report(workspace: Path, run_id: str) -> dict[str, Any]:
             "attempts": node.get("attempts"),
             "summary": result.get("summary"),
             "duration_ms": result.get("duration_ms"),
+            "execution_choice": result.get("execution_choice"),
             "changed": result.get("changed", []),
             "tests": result.get("tests", []),
             "digest": digest[:12] if digest else None,

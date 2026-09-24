@@ -65,6 +65,17 @@ def route_candidates(config, task, store, rejected=None):
         if agent not in {"claude", "codex", "agy", "grok"}:
             continue
         settings = core.agent_settings(config, {"agent": agent, "route": route})
+        if settings.get("reasoning_effort") is not None:
+            from fusion_reasoning import native_capability, validate_pair
+            try:
+                if agent != "codex":
+                    raise ValueError("reasoning effort requires native Codex")
+                if settings["reasoning_effort"] == "ultra" and (task.get("write") or settings.get("allow_native_delegation") is not True):
+                    raise ValueError("ultra requires read-only scope and explicit native delegation")
+                native_capability(validate_pair(settings.get("model"), settings["reasoning_effort"]))
+            except ValueError as exc:
+                drop(key, str(exc))
+                continue
         if (agent, settings.get("command", agent)) in unavailable_commands:
             drop(key, f"{settings.get('command', agent)} is already known to be unavailable this run")
             continue
@@ -109,6 +120,7 @@ def route_candidates(config, task, store, rejected=None):
             drop(key, f"its average reported cost ${mean_cost:.4f} exceeds the ${task['budget_remaining_usd']:.4f} left in the budget")
             continue
         choices.append({"key": key, "agent": agent, "route": route, "model": model,
+                        **({"reasoning_effort": settings["reasoning_effort"]} if settings.get("reasoning_effort") is not None else {}),
                         "runs": len(spans), "reported_success_rate": sum(s.get("status") == "success" for s in spans) / len(spans) if spans else None,
                         "checked_runs": len(verified), "acceptance_rate": sum(verified) / len(verified) if verified else None,
                         "mean_cost_usd": mean_cost,
@@ -147,17 +159,28 @@ def route_task(config, task, store):
         raise ValueError("agent=auto cannot use per-agent settings overrides; configure named routes")
     # Explicit lanes are never silently substituted, even if unhealthy.
     with progress.activity(task.get("progress_label", task["role"]), "checking available workers and model fit" if automatic else "checking selected worker"):
-        candidates = route_candidates(config, task, store) if automatic else [{
-            "key": task.get("route") or task["agent"], "agent": task["agent"], "route": task.get("route"),
-            "model": task.get("settings_overrides", {}).get("model", ""),
-        }]
+        if automatic:
+            candidates = route_candidates(config, task, store)
+        else:
+            import fusion_core as core
+            from fusion_reasoning import pair_candidates, pair_key
+            settings = core.agent_settings(config, task)
+            pairs = pair_candidates(config, settings, task.get("write", False)) if task["agent"] == "codex" else []
+            candidates = [{"key": pair_key(pair), "agent": "codex", "route": task.get("route"), **pair} for pair in pairs] or [{
+                "key": task.get("route") or task["agent"], "agent": task["agent"], "route": task.get("route"),
+                "model": settings.get("model", ""),
+                **({"reasoning_effort": settings["reasoning_effort"]} if settings.get("reasoning_effort") is not None else {}),
+            }]
     if not candidates:
         raise ValueError(no_route_reason(config, task, store))
     selected, applied, record = candidates[0], False, None
     # A single candidate is not a choice: nothing to record, and Laya rejects one-option choices.
     if len(candidates) > 1:
         questions = {"route": {"type": "choice", "instructions": "Choose a capable permitted worker for the goal and observed evidence; unknown metrics are unknown.",
-                               "criteria": {c["key"]: f"{c['agent']} {c.get('model') or 'configured default'}" for c in candidates}}}
+                               "criteria": {c["key"]: f"{c['agent']} {c.get('model') or 'configured default'}" +
+                                            (f" / {c['reasoning_effort']} effort" if c.get("reasoning_effort") else "") for c in candidates}}}
+        if any(c.get("reasoning_effort") for c in candidates):
+            questions["route"]["instructions"] = "Choose one model and effort pair for the task. Prioritize correctness; effort names are not comparable across models. Unknown outcomes, latency and cost are unknown."
         record = engine.decide("routing", {"task": task.get("decision_context", task["task"]), "write": task["write"],
                                           "goal": config.get("decisions", {}).get("routing_goal", "quality"),
                                           "budget_remaining_usd": task.get("budget_remaining_usd"), "candidates": candidates}, questions, context(task))
@@ -172,9 +195,11 @@ def route_task(config, task, store):
         task["session_key"] += ":" + selected["key"] + ":" + str(selected.get("model", ""))
         if selected.get("model"):
             task["settings_overrides"] = {"model": selected["model"]}
+            if selected.get("reasoning_effort"):
+                task["settings_overrides"]["reasoning_effort"] = selected["reasoning_effort"]
     if record:
         task.setdefault("decisions", {})["routing"] = record["id"]
-        engine.applied(record, selected["key"], applied, "qualified automatic route" if applied else "explicit route or deterministic fallback")
+        engine.applied(record, selected["key"], applied, "qualified automatic route" if applied else "explicit route or pair retained; advice does not change dispatch")
 
 
 def review_task(config, task):
@@ -192,7 +217,9 @@ def review_task(config, task):
     }
     # Classification only adds scrutiny; it never removes the requested review or grants writes.
     if applied:
-        task["task"] += "\nReview focus: " + instructions[selected] + "\nReport unresolved findings as STATUS: blocked. Do not delegate further."
+        import fusion_core as core
+        delegation = core.agent_settings(config, task).get("allow_native_delegation") is True
+        task["task"] += "\nReview focus: " + instructions[selected] + "\nReport unresolved findings as STATUS: blocked." + ("" if delegation else " Do not delegate further.")
     task.setdefault("decisions", {})["review"] = record["id"]
     engine.applied(record, selected, applied)
 
