@@ -940,6 +940,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/admission":
                 result = (admission_provider.observation(workspace, {"run_id": identifier(query["id"])})
                           if query.get("id") else admission_provider.describe(workspace))
+            elif path == "/api/model-catalog":
+                from fusion_models import catalog
+                result = catalog(workspace)
             elif path == "/api/truffle":
                 from fusion_truffle_survey import latest
                 result = truffle.receipt(workspace, query["id"]) if query.get("id") else latest(workspace)
@@ -995,6 +998,11 @@ class Handler(BaseHTTPRequestHandler):
             path = urlsplit(self.path).path
             if path == "/api/workspaces":
                 result = app.add_workspace(body.get("path", ""))
+            elif path == "/api/model-catalog":
+                if body.get("refresh") is not True:
+                    raise ValueError("Choose refresh to fetch public provider metadata")
+                from fusion_models import refresh
+                result = refresh(workspace)
             elif path == "/api/config":
                 result = app.save_config(workspace, body)
             elif path == "/api/publish-preview":
