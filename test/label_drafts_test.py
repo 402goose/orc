@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fusion_admission as admission
 import fusion_core as core
 from fusion_decisions import DecisionStore, read_jsonl
-from fusion_label_drafts import collect_sources, decision_source, draft_request, evidence_sources, finalize
+from fusion_label_drafts import collect_sources, completion_observation, decision_source, draft_request, evidence_sources, finalize
 from fusion_ui import ControlRoom
 
 
@@ -114,8 +114,18 @@ class LabelDraftEvidenceTest(unittest.TestCase):
             "run_id": "teacher-attempt", "agent": "codex", "status": "success", "exit_code": 0, "model": "fixture-model"}}}}))
         teacher = self.workspace / ".fusion/runs/teacher-attempt"; teacher.mkdir(parents=True)
         (teacher / "task.json").write_text(json.dumps({"parent_task_id": self.identifier, "agent": "codex", "role": "labeling", "write": False}))
+        (teacher / "result.json").write_text(json.dumps({"run_id": "teacher-attempt", "agent": "codex", "status": "success", "exit_code": 0, "model": "fixture-model"}))
         answers = {"route" if routing else "needs_review": {"value": "a" if routing else "true", "reason": "Fixture evidence.", "evidence": ["E1"]}}
         (teacher / "answer.md").write_text('```label-suggestion\n' + json.dumps({"answers": answers, "abstentions": {}}) + '\n```')
+        output = {"schema": "fusion.label-draft-output.v1", "run_id": self.identifier,
+                  "request_sha256": self.response["request_sha256"], "worker_id": "teacher-attempt",
+                  "manifest": json.loads((directory / "manifest.json").read_text()),
+                  "task": json.loads((teacher / "task.json").read_text()),
+                  "result": json.loads((teacher / "result.json").read_text()),
+                  "answer_text": (teacher / "answer.md").read_text(),
+                  "hashes": completion_observation(self.workspace, self.identifier)}
+        frozen_output = self.root / "label_output.json"; frozen_output.write_text(json.dumps(output))
+        self.response["artifacts"]["label_output"] = {"path": str(frozen_output), "sha256": hashlib.sha256(frozen_output.read_bytes()).hexdigest()}
 
     def test_concurrent_completion_and_restart_recovery_append_once_and_never_approve(self):
         self.prepare_completed()
@@ -146,6 +156,38 @@ class LabelDraftEvidenceTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "changed"):
                 finalize(self.workspace, self.identifier)
         self.assertFalse(any(event["event"] == "label_suggestion" for event in read_jsonl(self.store.path)))
+
+    def test_completion_uses_frozen_output_after_mutable_teacher_files_change_or_disappear(self):
+        self.prepare_completed()
+        teacher = self.workspace / ".fusion/runs/teacher-attempt"
+        (teacher / "answer.md").write_text('```label-suggestion\n' + json.dumps({"answers": {"needs_review": {
+            "value": "false", "reason": "Substituted after terminal success", "evidence": ["E1"]}}, "abstentions": {}}) + '\n```')
+        shutil.rmtree(teacher)
+        shutil.rmtree(self.workspace / ".fusion/workflows" / self.identifier)
+        with patch.object(admission, "call", return_value=self.response):
+            result = finalize(self.workspace, self.identifier)
+        self.assertEqual(result["answers"]["needs_review"]["value"], "true")
+        self.assertEqual(result["teacher_artifacts"]["frozen_output"], self.response["artifacts"]["label_output"])
+
+    def test_missing_or_changed_frozen_output_refuses_mutable_fallback(self):
+        self.prepare_completed()
+        missing = copy.deepcopy(self.response); del missing["artifacts"]["label_output"]
+        with patch.object(admission, "call", return_value=missing), self.assertRaisesRegex(ValueError, "label_output"):
+            finalize(self.workspace, self.identifier)
+        Path(self.response["artifacts"]["label_output"]["path"]).write_text('{}')
+        with patch.object(admission, "call", return_value=self.response), self.assertRaisesRegex(ValueError, "changed"):
+            finalize(self.workspace, self.identifier)
+        self.assertFalse(any(event["event"] == "label_suggestion" for event in read_jsonl(self.store.path)))
+
+    def test_completion_observation_refuses_wrong_worker_identity_or_missing_output(self):
+        self.prepare_completed()
+        teacher = self.workspace / ".fusion/runs/teacher-attempt"
+        (teacher / "result.json").write_text(json.dumps({"run_id": "substituted", "status": "success", "exit_code": 0}))
+        with self.assertRaisesRegex(ValueError, "completed attempt"):
+            completion_observation(self.workspace, self.identifier)
+        (teacher / "result.json").unlink()
+        with self.assertRaises(FileNotFoundError):
+            completion_observation(self.workspace, self.identifier)
 
 
 @unittest.skipUnless(os.environ.get("TENET_LABEL_TEST_PROVIDER"), "set compiled optional TENET label provider")
@@ -194,6 +236,18 @@ print(json.dumps({{"type":"turn.completed","usage":{{"input_tokens":10,"output_t
             self.assertEqual(job["status"], "success", {"error": job.get("error"), "stderr": job.get("stderr", "")[-3000:],
                 "nodes": [{k: node.get("result", {}).get(k) for k in ("status", "summary", "blockers")} for node in (job.get("result") or {}).get("nodes", [])]})
             self.assertEqual(job["phase"], "needs_review")
+            receipt = admission.call(self.workspace, "status", run_id=job["id"])
+            frozen_output = json.loads(Path(receipt["artifacts"]["label_output"]["path"]).read_text())
+            # Reconstruct the interruption window after terminal persistence but
+            # before the local suggestion append. This edits fixture data only.
+            self.store.path.write_text(''.join(json.dumps(event) + '\n' for event in read_jsonl(self.store.path)
+                                               if event["event"] != "label_suggestion"))
+            teacher = self.workspace / ".fusion/runs" / frozen_output["worker_id"]
+            (teacher / "answer.md").write_text("post-terminal replacement must never be parsed")
+            shutil.rmtree(teacher)
+            shutil.rmtree(self.workspace / ".fusion/workflows" / job["id"])
+            recovered = ControlRoom(self.workspace).launch(self.workspace, body)
+            self.assertEqual(recovered["result"]["answers"]["needs_review"]["value"], "true")
             again = ControlRoom(self.workspace).launch(self.workspace, body)
             self.assertTrue(again["result"]["recovered"])
             self.assertEqual(counter.read_text().splitlines(), ["dispatch"])
