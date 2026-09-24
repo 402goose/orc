@@ -529,6 +529,8 @@ class ControlRoom:
         response = {"schema": "fusion.activity.v1", "observed_at_ms": core.now_ms(), "workspaces": [], "runs": [], "errors": []}
         with self.lock:
             registered = list(self.workspaces.items())
+        from fusion_product_progress import product_progress
+        response["product_progress"] = product_progress(dict(registered))
         for key, workspace in registered:
             summary = {"id": key, "name": workspace.name, "path": str(workspace), "run_count": 0, "scan_limited": False, "errors": []}
             response["workspaces"].append(summary)
