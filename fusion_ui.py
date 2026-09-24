@@ -879,7 +879,7 @@ class ControlRoom:
             if provider and action == "workflow":
                 config, _ = core.load_config(workspace)
                 # Provider receives authored inputs, without ORC's derived graph.
-                response = admission_provider.admit(workspace, job_id, body["spec"], config)
+                response = admission_provider.admit(workspace, job_id, body["spec"], config, mode=mode or "off")
                 admitted = {"run_id": response["run_id"], "workspace_id": response["workspace_id"],
                             "request_sha256": response["request_sha256"]}
             directory.mkdir(parents=True, mode=0o700)

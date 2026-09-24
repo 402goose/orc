@@ -26,11 +26,45 @@ costs remain unknown: the reported-spend budget is not a billing cap. GitHub
 inventory-only sync remains available. Other model/training/resume/publication
 actions are refused until they have a supported admission contract.
 
+An admitted run may explicitly select Laya `off` (the default) or `shadow`.
+Shadow requires an operator-owned `observations` entry in that workspace's TENET
+policy, for example `"observations": {"python": "/operator/laya-venv/bin/python"}`.
+The launcher and its resolved target must be outside every admitted workspace;
+the launcher path is preserved so a virtualenv retains its dependencies. This
+records operator trust, not binary attestation or successful checkpoint loading.
+Existing policies without observations continue to support off mode.
+
+The provider derives frozen CPU/cached-model settings from that policy. Callers
+may select only off/shadow; they cannot supply Python, model path, calibration,
+automatic actions or `active` mode. The supervisor pins both observation mode
+and runtime from verified admitted configuration, overriding ambient environment
+and mutable workspace/job settings. Laya remains offline and does not set up or
+download a checkpoint. An invalid or missing operator interpreter refuses before
+admission/claim. Once observation begins, missing checkpoint/dependencies or an
+inference error records unavailable advice; it does not veto otherwise valid
+structural acceptance. Its bounded local inference wait is separate from the
+coding worker timeout, not a total-run deadline.
+
 Admission snapshots the task, source commit reference, selected local context,
 effective workflow/configuration and policy. Context is appended as reference
 data, not a permission grant. A stable `request_id` is required by `/api/launch`;
 the browser retains it across a failed submission. Duplicate IDs cannot reserve
 or claim a second execution.
+
+Each frozen node also receives a provider-derived `decision_context` containing
+its original authored task. Caller overrides are refused. This keeps full frozen
+references in the worker prompt without automatically placing them in the small
+classifier input. Long tasks or summaries can still be truncated; that fact is
+recorded and prevents label eligibility rather than being hidden.
+
+Shadow observations belong to the engineering workflow in the selected
+workspace's `.fusion/decisions/events.jsonl`, not to its application/simulation
+learning. Native attempt and workflow IDs link the observed model/schema identity
+and prediction back to the admission's source/context hashes. An accepted
+explicit discovery node normally records post-worker acceptance and recovery
+advice. Explicit Codex routing stays fixed; shadow never gains rejection,
+rerouting, retry or publishing authority. Decisions are not approved labels or
+training examples until separately reviewed.
 
 Before dispatch the supervisor claims once and reconstructs execution from the
 provider's verified artifacts. It does not trust mutable project request argv.
