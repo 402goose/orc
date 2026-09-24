@@ -31,6 +31,7 @@ import fusion_publish as publishing
 import fusion_garden as garden
 import fusion_truffle as truffle
 import fusion_training_loop as training_loop
+import fusion_admission as admission_provider
 from fusion_learning import decision_rows, learning_summary
 from fusion_decisions import DecisionEngine, DecisionStore, config_for, read_jsonl
 from fusion_report import finding_request, format_report, reported_cost, select_report, terminal_text
@@ -270,6 +271,17 @@ def run_job(directory):
     """Detached supervisor owns its child; cancellation never targets a saved PID."""
     directory = Path(directory)
     request = read_json(directory / "request.json")
+    pinned = os.environ.get("FUSION_JOB_ADMISSION")
+    if pinned:
+        pinned = json.loads(pinned)
+        if pinned["run_id"] != directory.name:
+            raise ValueError("Admitted supervisor job identity mismatch")
+        # The supervisor's launch environment is supplied by its owning room,
+        # not reread from a request file editable by the candidate.
+        request.update(workspace=pinned["workspace"], action="workflow", admission=pinned,
+                       argv=[], mode="off")
+    elif admission_provider.binding(Path(request["workspace"])) and request.get("action") == "workflow":
+        raise ValueError("Required admission binding is missing from supervisor launch")
     state = {"id": directory.name, "action": request["action"], "title": request["title"],
              "decision_id": request.get("decision_id"),
              "garden": request.get("garden", False),
@@ -282,9 +294,18 @@ def run_job(directory):
         environment["FUSION_DECISIONS_MODE"] = request["mode"]
     if request.get("survey_id"):
         environment["FUSION_TRUFFLE_SURVEY_ID"] = request["survey_id"]
+    admitted = request.get("admission")
+    claimed = False
     try:
+        argv = request["argv"]
+        if admitted:
+            _, argv, overrides = admission_provider.execution(Path(request["workspace"]), admitted)
+            claimed = True
+            environment.update(overrides)
+            state["workflow_id"] = admitted["run_id"]
+            state["admission"] = admitted
         with (directory / "stdout.log").open("wb") as out, (directory / "stderr.log").open("wb") as err:
-            proc = subprocess.Popen(request["argv"], cwd=request["workspace"], env=environment,
+            proc = subprocess.Popen(argv, cwd=request["workspace"], env=environment,
                                     stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
             cancelled_at = None
             escalated = False
@@ -312,13 +333,21 @@ def run_job(directory):
         result = read_json(directory / "stdout.log")
         state["result"] = result
         if isinstance(result, dict):
-            state["workflow_id"] = result.get("workflow_id")
+            state["workflow_id"] = state.get("workflow_id") or result.get("workflow_id")
         if not state.get("workflow_id"):
             match = re.search(r"(\d{8}-\d{6}-wf-[a-f0-9]+)", tail(directory / "stderr.log"))
             if match:
                 state["workflow_id"] = match[1]
     except Exception as exc:
         state.update(status="failed", error=str(exc))
+    if claimed:
+        try:
+            admission_provider.call(Path(request["workspace"]), "finish", run_id=admitted["run_id"],
+                expected_request_sha256=admitted["request_sha256"],
+                result={"status": state["status"], "exit_code": state.get("exit_code"),
+                        "workflow_id": admitted["run_id"], "checks": []})
+        except ValueError as exc:
+            state["admission_error"] = str(exc)
     state["finished_at_ms"] = core.now_ms()
     atomic_json(directory / "job.json", state)
     return 0
@@ -368,6 +397,7 @@ class ControlRoom:
         return {"local": redact(read_json(local)), "effective": redact(value), "source": str(source) if source else "Built-in defaults",
                 "revision": revision(local), "orc": redact(read_json(orc)), "orc_revision": revision(orc),
                 "mode": options["mode"], "execution_mode": core.execution_mode(value),
+                "admission": admission_provider.describe(workspace),
                 "publish": publishing.git_options(workspace, value),
                 "qualified_buckets": sum(bool(b.get("qualified")) for b in calibration.get("buckets", {}).values()),
                 "environment": {key: os.environ[key] for key in ("FUSION_DECISIONS_MODE", "FUSION_TELEMETRY", "FUSION_CONFIG") if key in os.environ},
@@ -558,6 +588,8 @@ class ControlRoom:
         report["markdown"] = format_report(select_report(report, all_nodes=True))
         from fusion_tenet import workflow_evidence
         report["tenet"] = workflow_evidence(workspace, run_id, manifest)
+        if admission_provider.binding(workspace):
+            report["admission"] = admission_provider.observation(workspace, {"run_id": run_id})
         return report
 
     def job(self, workspace, job_id):
@@ -565,6 +597,9 @@ class ControlRoom:
         if not (directory / "job.json").exists():
             raise ValueError("Job does not exist")
         job = read_json(directory / "job.json")
+        request = read_json(directory / "request.json")
+        if request.get("admission"):
+            job["admission"] = admission_provider.observation(workspace, request["admission"])
         if job.get("action") in {"train", "evaluate"}:
             job["progress"] = read_json(directory / ("candidate.progress.json" if job["action"] == "train" else "dataset.jsonl.progress.json"))
         job["console"] = tail(directory / "stderr.log", 60000)
@@ -577,7 +612,18 @@ class ControlRoom:
 
     def launch(self, workspace, body, *, garden=False):
         action = body.get("action", "build")
+        provider = admission_provider.binding(workspace)
+        # The first integrated command class is an authored bounded workflow.
+        # GitHub inventory is an explicitly non-model operation. Other model,
+        # training, resume and publishing routes cannot bypass admission.
+        inventory_only = action == "truffle-survey" and body.get("sync_only") is True and not body.get("resume")
+        if provider and action != "workflow" and not inventory_only:
+            raise ValueError("TENET mode currently supports bounded workflows and GitHub inventory. This action has no admitted execution contract yet.")
         job_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
+        if provider and action == "workflow":
+            job_id = body.get("request_id")
+            if not isinstance(job_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", job_id):
+                raise ValueError("TENET launch requires a stable request_id (1–64 letters, digits, dashes or underscores)")
         directory = inside(workspace / ".fusion", "ui/jobs/" + job_id)
         argv = [sys.executable, str(Path(__file__).with_name("fusion")), "--workspace", str(workspace), "--json", "--progress"]
         text = body.get("text", "")
@@ -760,6 +806,13 @@ class ControlRoom:
                 raise ValueError("Labels are already being drafted for this decision")
             if action in {"build", "delegate", "resume", "workflow", "truffle-hunt", "truffle-run", "truffle-survey"} and not (action == "truffle-survey" and body.get("sync_only") and not body.get("resume")) and any(j["status"] in ACTIVE and j["action"] in {"build", "delegate", "resume", "workflow", "truffle-hunt", "truffle-run", "truffle-survey"} for j in self.jobs(workspace)):
                 raise ValueError("A UI workflow is already active in this workspace. Follow or stop it before launching another.")
+            admitted = None
+            if provider and action == "workflow":
+                config, _ = core.load_config(workspace)
+                # Provider receives authored inputs, without ORC's derived graph.
+                response = admission_provider.admit(workspace, job_id, body["spec"], config)
+                admitted = {"run_id": response["run_id"], "workspace_id": response["workspace_id"],
+                            "request_sha256": response["request_sha256"]}
             directory.mkdir(parents=True, mode=0o700)
             if spec:
                 atomic_json(directory / "workflow.json", spec)
@@ -770,14 +823,20 @@ class ControlRoom:
             learning = {"dataset": str(dataset) if action in {"train", "evaluate", "calibrate"} else "",
                         "model_path": body.get("model_path", "")}
             atomic_json(directory / "request.json", {"action": action, "title": title, "argv": argv, "workspace": str(workspace), "mode": mode, "decision_id": decision_id, "garden": garden, "learning": learning,
+                                                  "admission": admitted,
                                                       "garden_policy": body.get('garden_policy') if garden else None, "survey_id": survey_id,
                                                   "learning_round": body.get("learning_round"), "learning_dispatch": body.get("learning_dispatch")})
             atomic_json(directory / "job.json", {"id": job_id, "action": action, "title": title, "status": "queued", "started_at_ms": core.now_ms(), "decision_id": decision_id, "garden": garden,
+                                                  "admission": admitted, "workflow_id": job_id if admitted else None,
                                                   "garden_policy": body.get('garden_policy') if garden else None, "survey_id": survey_id,
                                                   "learning_round": body.get("learning_round"), "learning_dispatch": body.get("learning_dispatch")})
             with (directory / "supervisor.log").open("wb") as log:
+                supervisor_env = dict(os.environ)
+                supervisor_env.pop("FUSION_JOB_ADMISSION", None)
+                if admitted:
+                    supervisor_env["FUSION_JOB_ADMISSION"] = json.dumps({**admitted, "workspace": str(workspace)})
                 proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--job", str(directory)],
-                                        stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+                                        stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, env=supervisor_env)
             self.children = [child for child in self.children if child.poll() is None] + [proc]
         return self.job(workspace, job_id)
 
@@ -885,6 +944,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/capabilities":
                 from fusion_capabilities import capabilities
                 result = capabilities(app, workspace)
+            elif path == "/api/admission":
+                result = (admission_provider.observation(workspace, {"run_id": identifier(query["id"])})
+                          if query.get("id") else admission_provider.describe(workspace))
             elif path == "/api/truffle":
                 from fusion_truffle_survey import latest
                 result = truffle.receipt(workspace, query["id"]) if query.get("id") else latest(workspace)

@@ -159,6 +159,23 @@ def workspace_path(value: str | None) -> Path:
 def load_config(workspace: Path) -> tuple[dict[str, Any], Path | None]:
     path_value = os.environ.get("FUSION_CONFIG")
     path = Path(path_value).expanduser().resolve() if path_value else find_upward(".fusion.json", workspace)
+    admitted_hash = os.environ.get("FUSION_CONFIG_SHA256")
+    if admitted_hash:
+        # An admitted execution cannot inherit mutable global/project settings.
+        if not path_value or path is None:
+            raise SystemExit("fusion: admitted configuration path is missing")
+        try:
+            raw = path.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != admitted_hash:
+                raise ValueError("admitted configuration hash mismatch")
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                raise ValueError("admitted configuration must be an object")
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"fusion: {exc}") from exc
+        merged = deep_merge(DEFAULTS, parsed)
+        execution_mode(merged)
+        return merged, path
     global_path = Path(os.environ.get("ORC_HOME") or Path.home() / ".config/orc") / "fusion.json"
     merged, source = deep_merge({}, DEFAULTS), None
     for config_path in dict.fromkeys([global_path, path]):
