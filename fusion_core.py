@@ -279,20 +279,29 @@ def parse_handoff(text: str) -> dict[str, Any]:
         value = fields.get(name, "").strip()
         if not value or value.lower() in NONE_ANSWERS:
             return []
+        # A new unindented prose paragraph ends a list field. Keep bulleted
+        # and indented continuations, including blockers after a leading none.
+        value = re.split(r"\n(?:[ \t]*\n)+(?![ \t]|(?:[-*+]|\d+[.)])\s)", value, maxsplit=1)[0].strip()
         values: list[str] = []
         for item in re.split(r"\n(?=[ \t]*(?:[-*+]|\d+[.)])\s+)", value):
             item = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", item.strip()).strip()
             if not item:
                 continue
             first, _, continuation = item.partition("\n")
-            # Preserve benign historical none explanations, but never let one
-            # suppress later observations or ambiguous blocker explanations.
+            # A leading none may explain a workaround. Keep explicit failure
+            # signals and all later lines; this is normalization, not proof
+            # of recovery. Provider denials and coordinator checks are separate.
             # Filename punctuation (none.py, nil-cache.json) is not a boundary.
             lead = re.split(r"[.;:,—-](?:\s+|$)", first, maxsplit=1)[0].strip().lower()
             explanation = first[len(lead):].lstrip(".;:,—- \t") if lead in NONE_ANSWERS else ""
             benign_explanation = (
                 not explanation
-                or bool(re.fullmatch(r"read[- ]only node\.?", explanation, re.I))
+                or not re.search(
+                    r"\b(?:denied|fail\w*|block\w*|unable|can['’]t|cannot|could not|"
+                    r"error\w*|timed out|still|requires?|not\s+(?:yet\s+)?"
+                    r"(?:run|verified|reviewed|happened))\b",
+                    explanation, re.I,
+                )
             )
             discard_none = lead in NONE_ANSWERS and (name != "BLOCKERS" or benign_explanation)
             if discard_none:
@@ -307,7 +316,7 @@ def parse_handoff(text: str) -> dict[str, Any]:
                 values.extend(part.strip() for part in re.split(r"[,\n]", item) if part.strip())
         return values
 
-    reported_status = fields.get("STATUS", "").lower()
+    reported_status = fields.get("STATUS", "").split("\n", 1)[0].strip().lower()
     if reported_status not in {"success", "partial", "blocked", "error"}:
         reported_status = ""
     return {

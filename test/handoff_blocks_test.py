@@ -60,14 +60,34 @@ none
                 self.assertTrue(core.parse_handoff("BLOCKERS: " + blocker)["blockers"])
         self.assertEqual(core.parse_handoff("BLOCKERS:\n- none\n- permission denied")["blockers"], ["permission denied"])
 
-    def test_explained_recovery_is_not_inferred_from_blocker_prose(self):
-        # Intentional fail-closed change: historical normalization discarded
-        # everything after "None.". A parser cannot establish recovery or
-        # decide whether a later clause changes the operational outcome.
+    def test_none_explanation_preserves_failure_signals_not_workaround_prose(self):
         explanation = "None. The `ls` alias points to `eza`, which isn't installed, so I used `/bin/ls`."
-        self.assertEqual(core.parse_handoff("BLOCKERS: " + explanation)["blockers"], [explanation])
+        self.assertEqual(core.parse_handoff("BLOCKERS: " + explanation)["blockers"], [])
         unresolved = explanation + " The release still requires an independent check."
         self.assertEqual(core.parse_handoff("BLOCKERS: " + unresolved)["blockers"], [unresolved])
+
+    def test_signoff_after_blank_line_is_not_a_blocker(self):
+        parsed = core.parse_handoff("BLOCKERS: none\n\nLet me know if you want anything else!")
+        self.assertEqual(parsed["blockers"], [])
+        for continuation in ("- permission denied", "  permission denied", "1. permission denied"):
+            with self.subTest(continuation=continuation):
+                parsed = core.parse_handoff("BLOCKERS: none\n\n" + continuation)
+                self.assertEqual(parsed["blockers"], ["permission denied"])
+
+    def test_status_survives_trailing_signoff(self):
+        parsed = core.parse_handoff("BLOCKERS: none\nSTATUS: success\n\nDone.")
+        self.assertEqual(parsed["reported_status"], "success")
+        self.assertEqual(parsed["blockers"], [])
+
+    def test_none_explanation_failure_vocabulary(self):
+        for explanation in ("Access denied", "Tests failed", "The task is blocked",
+                            "Unable to check", "I can't run it", "I cannot run it",
+                            "I could not verify", "An error occurred", "The request timed out",
+                            "Approval is still pending", "It requires approval",
+                            "Verification has not happened", "It was not yet reviewed",
+                            "The test was not run", "It was not verified"):
+            with self.subTest(explanation=explanation):
+                self.assertTrue(core.parse_handoff("BLOCKERS: None. " + explanation)["blockers"])
 
     def test_fenced_handoff_and_separate_acceptance_contract(self):
         parsed = core.parse_handoff("""```text
