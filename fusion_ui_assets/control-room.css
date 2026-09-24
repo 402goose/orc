@@ -5,6 +5,17 @@
 .room-heading { display:flex; justify-content:space-between; align-items:center; gap:20px; margin:6px 0 30px; }
 .room-heading h1 { font-family:Georgia,serif; font-size:48px; font-weight:400; letter-spacing:-1.7px; margin:9px 0 10px; }
 .room-heading p { margin:0; font-size:13px; }
+.room-readiness { margin:0 0 24px; border-color:var(--accent-line); }
+.room-readiness h2 { margin:8px 0 0; font-size:20px; }
+.room-readiness-heading { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+.room-readiness .actions { margin-top:15px; flex-wrap:wrap; }
+.room-readiness details { margin-top:16px; font-size:12px; }
+.room-readiness summary { color:var(--muted); cursor:pointer; }
+.room-readiness p { font-size:13px; overflow-wrap:anywhere; }
+.room-followup { margin-top:20px; border-top:1px solid var(--line); padding-top:17px; }
+.room-followup strong { font-size:13px; }
+.room-followup p { margin:8px 0; font-size:12px; }
+.room-followup small { font:10px var(--mono); color:var(--muted); overflow-wrap:anywhere; }
 .room-grid { display:grid; grid-template-columns:minmax(0,1fr) 295px; gap:24px; align-items:start; }
 .room-grid>* { min-width:0; }
 .room-focus { border-color:var(--accent-line); overflow:hidden; }
@@ -61,6 +72,7 @@
 @media(min-width:1450px) { .room-grid { grid-template-columns:minmax(0,1fr) 320px; } }
 @media(max-width:1120px) { .room-grid { grid-template-columns:minmax(0,1fr); } .room-evidence-rail { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 @media(max-width:780px) {
+  .room-readiness-heading { align-items:flex-start; flex-direction:column; }
   .room-heading { margin-top:12px; gap:12px; }
   .room-heading h1 { font-size:38px; }
   .room-heading>.button { max-width:120px; }
