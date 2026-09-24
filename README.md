@@ -138,6 +138,9 @@ with your privileges, so only an authored workflow may supply them.
 
 Start here, from the repository you want worked on:
 
+For explicit native Codex model/effort pairs and optional Laya advice, see
+[model and effort choices](docs/model-effort.md).
+
 ```sh
 orc fusion ui                       # the control room, in your browser
 orc fusion build "Add CSV export to the dashboard, with tests"

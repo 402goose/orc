@@ -1,0 +1,96 @@
+# Native Codex model and effort choices
+
+Fusion accepts an explicit model and reasoning effort for each native Codex
+worker. A pair is one choice: `gpt-6-sol / xhigh` and `gpt-6-astra / high` are
+different candidates, with no assumed ordering across models.
+
+An authored workflow node can override the configured Codex pair:
+
+```json
+{
+  "id": "inspect",
+  "agent": "codex",
+  "write": false,
+  "model": "gpt-6-astra",
+  "reasoning_effort": "high",
+  "task": "Inspect the persistence boundaries and report concrete failure cases.",
+  "acceptance": {"required_handoff": ["summary"]}
+}
+```
+
+The same fields work in `codex` settings and existing named Codex routes.
+Explicit effort requires an explicit resolved model. Fusion passes
+`-c model_reasoning_effort="high"` to stock Codex for fresh and resumed workers.
+Pinned pairs separate worker sessions and invalidate a workflow receipt when
+the pair changes. Workflows without pinned effort retain their legacy digest
+and session behavior.
+
+Local `$CODEX_HOME/models_cache.json` (default `~/.codex/models_cache.json`)
+provides model-specific capabilities. A known unsupported pair is rejected;
+missing, malformed or incomplete metadata is recorded as unchecked and Codex
+validates its live support. Reading this cache makes no network request and
+does not prove current availability, permissions, quota or runtime application.
+
+`ultra` can enable native task delegation. It requires explicit
+`allow_native_delegation: true` in Codex settings or the node, and currently
+requires `write: false`. Child traces and child cost are not qualified by this
+integration. The capability is authorization, not proof that no children exist
+when false. TENET derives this field from external operator policy; an admitted
+caller cannot grant it to itself.
+
+## Laya advice using the existing router
+
+```json
+{
+  "codex": {"model": "gpt-6-astra", "reasoning_effort": "high"},
+  "decisions": {
+    "mode": "shadow",
+    "model_effort_pairs": [
+      {"model": "gpt-6-astra", "reasoning_effort": "high"},
+      {"model": "gpt-6-sol", "reasoning_effort": "xhigh"}
+    ]
+  }
+}
+```
+
+The explicit pair must be in the list (at most eight pairs). The existing
+`routing` decision asks Laya for one pair; its recommendation and the retained
+pair are recorded separately in DecisionStore. Explicit workers retain their
+pair even if standalone decisions mode is active and the classifier is
+qualified. Missing or failed Laya inference leaves the explicit selection
+unchanged. In off mode there is no inference. Ultra is excluded from advice
+for writers and workers without delegation authorization.
+
+Existing `agent: auto` routes retain their existing qualification gate and
+now carry model and effort together. This does not qualify a new model/effort
+policy or turn shadow recommendations into autonomous choices.
+
+## What the evidence means
+
+Worker results, local traces and workflow reports expose `execution_choice`:
+
+- `requested`: the resolved model/effort pair, or null effort for inherited defaults.
+- `dispatch`: prepared, attempted, or returned; attempted records the actual argv.
+- `catalog`: capability cache provenance and observed support, or unchecked.
+- `observed`: model reported by native JSON when available; effort remains null.
+- `native_delegation`: authorization plus explicitly unobserved child visibility.
+
+Successful exit does not attest effective effort. The stock JSON event stream
+does not provide that evidence here. Failed launch can remain attempted; it
+does not prove inference began. Usage remains whatever the harness reports;
+there is no fabricated cost or complete child billing claim.
+
+This is an initial worker-invocation choice, not effort adjustment between
+generations. A future native checkpoint adapter must confirm settings captured
+by the next sampling step, handle replay/cancellation/compaction, and preserve
+operator authority before making that claim.
+
+Acceptance outcomes join routing decisions by task/run ID. An accepted result
+is evidence about the chosen pair, not a label that it was the best pair.
+Keep optimal-pair labels pending matched alternatives, independent behavioral
+checks and review. Model routing and reasoning control do not train a coding
+model or a coding LoRA.
+
+Run local contract tests with
+`python3 -m unittest discover -s test -p reasoning_test.py -v`.
+Fixtures run benign local worker scripts; they do not establish model quality.
