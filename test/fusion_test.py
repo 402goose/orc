@@ -1899,5 +1899,66 @@ class AcceptanceContractTest(unittest.TestCase):
         self.assertEqual(parse_acceptance_contract(self.block({"required_files": []})), {})
 
 
+class McpResponseShapeTest(unittest.TestCase):
+    """MCP requires structuredContent to be a JSON object, not an array.
+
+    fusion_status returned a bare list, which a strict client rejects. The
+    contract is enforced in mcp_result so a tool cannot reintroduce it, and
+    driven here through the real stdio server so the wiring is covered too --
+    testing mcp_result alone would not notice a tool that bypassed it.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.workspace = Path(self.temp.name) / "repo"
+        self.workspace.mkdir(parents=True)
+        (self.workspace / ".fusion.json").write_text(json.dumps(
+            {"decisions": {"mode": "off"}, "telemetry": {"remote": {"enabled": False}}}))
+        self.env = patch.dict(os.environ, {
+            "FUSION_TELEMETRY": "0",
+            "ORC_HOME": str(Path(self.temp.name) / "orc-home"),
+        })
+        self.env.start(); self.addCleanup(self.env.stop)
+
+    def test_mcp_result_refuses_a_non_object(self):
+        for payload in ([1, 2], "text", 7, None):
+            with self.subTest(payload=payload):
+                with self.assertRaises(TypeError):
+                    fusion_core.mcp_result(payload)
+
+    def test_mcp_result_accepts_an_object(self):
+        self.assertEqual(fusion_core.mcp_result({"runs": []})["structuredContent"], {"runs": []})
+
+    def test_every_tool_declares_an_object_output_schema(self):
+        tools = fusion_core.tool_definitions()
+        self.assertTrue(tools)
+        for tool in tools:
+            with self.subTest(tool=tool["name"]):
+                self.assertIn("outputSchema", tool)
+                self.assertEqual(tool["outputSchema"].get("type"), "object")
+                self.assertEqual(tool["inputSchema"].get("type"), "object")
+
+    def test_the_real_server_returns_objects_for_read_only_tools(self):
+        requests = "\n".join(json.dumps(r) for r in [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "fusion_status", "arguments": {"limit": 1}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": {"name": "fusion_here", "arguments": {}}},
+        ]) + "\n"
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "fusion"), "--workspace", str(self.workspace), "mcp-serve"],
+            input=requests, text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        responses = {json.loads(line)["id"]: json.loads(line) for line in proc.stdout.splitlines()}
+        for call_id, tool in ((2, "fusion_status"), (3, "fusion_here")):
+            with self.subTest(tool=tool):
+                result = responses[call_id]["result"]
+                self.assertFalse(result.get("isError"), result)
+                self.assertIsInstance(result["structuredContent"], dict)
+
+
 if __name__ == "__main__":
     unittest.main()
