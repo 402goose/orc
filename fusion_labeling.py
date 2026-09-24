@@ -9,12 +9,12 @@ import re
 import time
 import uuid
 
-from fusion_decisions import DecisionStore, digest, labels_for, read_jsonl
+from fusion_decisions import DecisionStore, digest, labelable_record, labels_for, read_jsonl
 
 
 def labelable(store, decision_id):
     record = store.get(decision_id)
-    if record.get("status") != "ok" or record.get("truncated"):
+    if not labelable_record(record):
         raise ValueError("Suggestions require a successful decision with complete input")
     return record
 
@@ -373,3 +373,88 @@ def approval_provenance(store, record, suggestion_id, answers):
     return {"source": "human_approved_suggestion", "suggestion_id": suggestion_id,
             "suggested_by": {k: suggestion.get(k) for k in ("agent", "model", "run_id", "assessment_id", "labeling_mode")},
             "answers_edited": original != answers}
+
+
+VERDICT_SOURCE = "lead_verdict"
+
+
+def verdict_answers(accepted):
+    """Only what a lead verdict determines about the ACCEPTANCE questions.
+
+    An acceptance determines both: the work satisfied the task, so the reported
+    success plausibly did, and the worker did what was asked. A rejection says
+    only that the reported success should not have been accepted. It does not
+    say the worker failed to do what was asked -- the work may have been done
+    in an unacceptable way, or the brief itself may have been wrong -- so
+    failed_task stays unlabeled.
+    """
+    return {"plausible": "true", "failed_task": "false"} if accepted else {"plausible": "false"}
+
+
+def read_run_task(workspace, run_id):
+    try:
+        task = json.loads((Path(workspace) / ".fusion" / "runs" / run_id / "task.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return task if isinstance(task, dict) else {}
+
+
+def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_path):
+    """Turn the lead's verdict on a run into a provenance-tagged acceptance label.
+
+    Never a routing label: a worker succeeding does not prove it was the best
+    route. The label attaches to the run's complete acceptance decision when a
+    workflow recorded one. Otherwise an unscored acceptance decision is
+    recorded -- the input a workflow gate saw, or the state accept_node builds
+    -- without running Laya. A later verdict replaces an earlier verdict label;
+    labels from any other reviewer are preserved.
+    """
+    from fusion_decisions import ACCEPTANCE_QUESTIONS, DecisionEngine, config_for, reviewed_labels
+    options = config_for(config)
+    if not options["verdict_labels"] or options["mode"] == "off":
+        return {"status": "disabled", "reason": "decisions.mode is off" if options["verdict_labels"] else "decisions.verdict_labels is false"}
+    store = DecisionStore(workspace)
+    reason = str(reason).strip()
+    with store.review_lock():
+        events = read_jsonl(store.path)
+        decisions = [e for e in events if e.get("event") == "decision" and e.get("kind") == "acceptance"
+                     and e.get("context", {}).get("task_id") == run_id]
+        record = next((e for e in reversed(decisions) if labelable_record(e)), None)
+        own = [e for e in events if record and e.get("id") == record["id"]]
+        if any(e.get("event") == "label" and e.get("verified") and e.get("source") != VERDICT_SOURCE for e in own):
+            return {"status": "preserved", "decision_id": record["id"], "reason": "Another reviewer's labels on this decision were kept"}
+        task = read_run_task(workspace, run_id)
+        skip = ("the verdict has no --reason" if not reason else
+                f"the run ended with status {result.get('status')!r}; acceptance is only asked of a reported success"
+                if result.get("status") != "success" else
+                "the run's task.json is missing" if record is None and not task.get("task") else None)
+        if skip:
+            if record and reviewed_labels(own)[0].get(record["id"]):
+                store.append("label", id=record["id"], answers={}, verified=True, replace=True, source=VERDICT_SOURCE,
+                             evidence=f"Retracted: the latest lead verdict on run {run_id} records no label because {skip}.",
+                             reviewers=[{"agent": "lead", "run_id": run_id, "accepted": bool(accepted)}])
+                return {"status": "retracted", "decision_id": record["id"], "reason": f"Earlier verdict label removed: {skip}"}
+            return {"status": "skipped", "reason": f"No label: {skip}"}
+        if record is None:
+            gate = next((e for e in reversed(decisions) if e.get("state") and not e.get("truncated")), None)
+            engine = DecisionEngine(workspace, config)
+            if gate:
+                record = engine.record_unscored("acceptance", None, gate["questions"], gate.get("context"),
+                                                encoded=gate["state"], source=VERDICT_SOURCE)
+            else:
+                state = {"task": task.get("decision_context", task["task"]), "summary": result.get("summary"),
+                         "changed": result.get("changed", []), "tests": result.get("tests", [])}
+                group = task.get("parent_task_id") or task.get("trace_id") or run_id
+                record = engine.record_unscored("acceptance", state, ACCEPTANCE_QUESTIONS,
+                                                {"task_id": run_id, "group": group}, source=VERDICT_SOURCE)
+            if record["truncated"]:
+                return {"status": "skipped", "decision_id": record["id"],
+                        "reason": "No label: the acceptance input was truncated; raise decisions.max_state_chars to label long briefs"}
+        answers = {key: value for key, value in verdict_answers(accepted).items() if key in record["questions"]}
+        if not answers:
+            return {"status": "skipped", "decision_id": record["id"], "reason": "No label: this decision asks none of the questions a verdict answers"}
+        store.append("label", id=record["id"], answers=answers, verified=True, replace=True, source=VERDICT_SOURCE,
+                     evidence=f"Lead {'accepted' if accepted else 'rejected'} run {run_id}: {reason} [{evidence_path}]",
+                     reviewers=[{"agent": "lead", "run_id": run_id, "accepted": bool(accepted)}])
+        return {"status": "labeled", "decision_id": record["id"], "answers": answers, "source": VERDICT_SOURCE,
+                "unlabeled": sorted(set(record["questions"]) - set(answers))}
