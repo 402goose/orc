@@ -22,6 +22,12 @@
 .room-focus>.panel-body { padding:28px; }
 .room-focus-label { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:18px; }
 .room-focus h2 { font-size:23px; font-weight:500; line-height:1.4; letter-spacing:-.65px; max-width:820px; overflow-wrap:anywhere; }
+.room-task-source { font-size:12px; line-height:1.6; overflow-wrap:anywhere; margin:12px 0; }
+.room-task { margin-top:14px; }
+.room-task>summary { cursor:pointer; color:var(--muted); font-size:12px; }
+.room-task>pre { max-height:20rem; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font:12px/1.7 var(--mono); background:var(--panel2); border-radius:8px; padding:16px; }
+.product-progress-card .actions { flex-wrap:wrap; }
+.product-progress-card .actions>a { white-space:normal; overflow-wrap:anywhere; text-align:left; }
 .room-worker-line { display:flex; flex-wrap:wrap; align-items:center; gap:12px; font-size:12px; color:var(--muted); margin:22px 0; }
 .room-worker-line strong { color:var(--text); text-transform:capitalize; }
 .room-worker-line .sigil { width:21px; height:21px; }
