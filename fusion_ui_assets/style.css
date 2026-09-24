@@ -1961,3 +1961,10 @@ summary {
 .product-progress-card dd { margin:5px 0 0; font-size:13px; line-height:1.6; overflow-wrap:anywhere; }
 .product-progress-card .actions { margin-top:20px; }
 @media(max-width:1000px) { .product-progress-grid { grid-template-columns:1fr; } .product-progress .section-bar { align-items:flex-start; flex-direction:column; gap:8px; } }
+
+.product-roadmap { margin-top:18px; padding:16px; border:1px solid var(--border); border-radius:12px; }
+.product-roadmap summary { cursor:pointer; font-weight:600; }
+.product-roadmap ol { padding-left:24px; }
+.product-roadmap li { padding:12px 0; }
+.product-roadmap li > div { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+.product-roadmap p { margin:8px 0 0; line-height:1.6; font-size:13px; }
