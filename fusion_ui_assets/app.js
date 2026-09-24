@@ -47,6 +47,11 @@ const state = {
   focusError: null,
   capabilities: null,
   capabilitiesError: null,
+  activity: null,
+  activityError: null,
+  modelCatalog: null,
+  modelCatalogError: null,
+  modelSearch: "",
   decisionsError: null,
   scoutError: null,
   scout: null,
@@ -354,8 +359,13 @@ function acceptanceCard(report) {
   return `<div class="room-outcome"><span>Workflow outcome</span>${badge(report?.status || "unknown")}</div><div class="room-outcome"><span>Coordinator checks</span><span class="status ${checks.tone}">${esc(checks.label)}</span><small>${checks.total ? `${checks.passed} passed · ${checks.failed} failed${checks.unknown ? ` · ${checks.unknown} unknown` : ""}` : "No check receipts saved"}</small></div>`;
 }
 function sourceWorkspaceButtons(view, githubOnly = false) {
-  return (state.capabilities?.workspaces || []).filter(w => w.id !== state.workspace && (!githubOnly || w.github_repo))
-    .map(w => button(`Open ${esc(w.name)}${githubOnly ? " · " + esc(w.github_repo) : ""} →`, "source-workspace", `data-workspace="${esc(w.id)}" data-destination="${view}"`, "small ghost")).join("");
+  let workspaces = (state.capabilities?.workspaces || []).filter(w => w.id !== state.workspace && (!githubOnly || w.github_repo));
+  if (githubOnly) {
+    const repos = new Map();
+    for (const w of workspaces) if (!repos.has(w.github_repo.toLowerCase()) || w.name === "tenet-integration") repos.set(w.github_repo.toLowerCase(), w);
+    workspaces = [...repos.values()];
+  }
+  return workspaces.map(w => button(`Open ${esc(githubOnly ? w.github_repo : w.name)} →`, "source-workspace", `data-workspace="${esc(w.id)}" data-destination="${view}"`, "small ghost")).join("");
 }
 function sourceUnavailable() {
   return `<section class="panel room-readiness"><div class="panel-body"><strong>Source readiness unavailable</strong><p>${esc(state.capabilitiesError || "This server has not reported capability prerequisites.")}</p><small>Saved evidence remains available below.</small></div></section>`;
@@ -377,7 +387,7 @@ function githubReadiness() {
   const title = configured ? github.repo : github.status === "missing_remote" ? "No GitHub remote in this workspace" : "GitHub source needs attention";
   const inventoryError = github.snapshot_error || state.scoutError;
   const message = inventoryError ? `Saved issue inventory could not be read: ${inventoryError}` : !configured ? github.reason : !github.cli_available ? "The GitHub CLI is unavailable on this machine." : snapshot?.matches_remote ? `${snapshot.issue_count} issues in the saved ${snapshot.complete ? "complete" : "partial"} snapshot · ${date(snapshot.synced_at_ms)}` : "No saved issue inventory for this repository yet.";
-  return `<section class="panel room-readiness"><div class="panel-body"><div class="room-readiness-heading"><div><div class="eyebrow">GITHUB SOURCE · ${esc(c.workspace.name)}</div><h2>${esc(title)}</h2></div>${configured ? `<span class="pill">${esc(github.remote)}</span>` : ""}</div><p>${esc(message)}</p><p class="help-copy">${configured ? "GitHub authentication has not been checked by this local readiness view. A saved snapshot describes its last fetch." : "Choose a configured repository workspace, or select another Git remote for this workspace."}</p><div class="actions">${!configured ? button("Choose repository remote", "forest-sync", "", "small") : ""}${sourceWorkspaceButtons("truffle", true)}</div></div></section>`;
+  return `<section class="panel room-readiness"><div class="panel-body"><div class="room-readiness-heading"><div><div class="eyebrow">GITHUB SOURCE · ${esc(c.workspace.name)}</div><h2>${esc(title)}</h2></div>${configured ? `<span class="pill">${esc(github.remote)}</span>` : ""}</div><p>${esc(message)}</p><p class="help-copy">${configured ? "GitHub authentication has not been checked by this local readiness view. A saved snapshot describes its last fetch." : "GitHub issue discovery needs a repository remote. Local tasks use this workspace and do not need GitHub."}</p><div class="actions">${!configured ? button("Start a local task", "local-task", "", "small primary") + button("Choose repository remote", "forest-sync", "", "small") : ""}${sourceWorkspaceButtons("truffle", true)}</div></div></section>`;
 }
 function followupNotice(report) {
   const run = ORCLogic.followupReceipt(report);
@@ -403,6 +413,12 @@ function coordinatorEvidence(node) {
   const summary = ORCLogic.acceptanceSummary(node ? [node] : []);
   return `<section class="room-checks"><div class="section-bar"><h2>Coordinator acceptance</h2><span class="status ${summary.tone}">${esc(summary.label)}</span></div>${checks.length ? checks.map((check, i) => `<div class="room-check"><div><strong>Check ${i + 1}</strong>${badge(check.status || "unknown")}<span>Exit ${check.exit_code ?? "unknown"}</span></div>${check.error ? `<p class="room-evidence-missing">${esc(check.error)}</p>` : ""}<details data-disclosure-key="check-${esc(node.id)}-${i}"><summary>Command & timing</summary><pre class="console">${esc(pretty(check.argv || []))}</pre><p class="help-copy">${check.duration_ms != null ? `${number(check.duration_ms)} ms` : "Duration unknown"}${check.timed_out ? " · timed out" : ""}</p></details></div>`).join("") : '<p class="help-copy">No coordinator check receipts for this stage.</p>'}</section>`;
 }
+function activityStrip() {
+  const data = state.activity;
+  if (state.activityError) return `<section class="panel workspace-activity"><h2>Across your workspaces</h2><p class="room-evidence-missing">Activity unavailable: ${esc(state.activityError)}</p></section>`;
+  if (!data) return "";
+  return `<section class="workspace-activity" aria-label="Activity across workspaces"><div class="section-bar"><h2>Across your workspaces</h2><small>${data.workspaces.length} registered · saved execution observations</small></div><div class="workspace-activity-grid">${data.runs.slice(0, 6).map(run => `<button class="workspace-activity-card ${active(run.status) ? "recorded-active" : ""}" data-action="workspace-run" data-workspace="${esc(run.workspace_id)}" data-id="${esc(run.id)}"><span class="workspace-activity-head"><strong>${esc(run.workspace_name)}</strong>${badge(run.status)}</span><span class="workspace-activity-task">${esc(run.task)}</span><small>${esc(run.agents.join(" + ") || "Harness unknown")} · ${run.terminal ? "Terminal outcome recorded" : "Liveness unknown"}</small>${run.latest_update ? `<span class="workspace-activity-update">${esc(run.latest_update)}</span>` : ""}<small>${run.last_output_at_ms ? `Worker observation ${age(run.last_output_at_ms)} ago` : date(run.started_at_ms)} · Open run →</small></button>`).join("") || '<p class="help-copy">No saved workflows in registered workspaces.</p>'}</div>${data.errors.length ? `<p class="room-evidence-missing">${data.errors.length} saved observations could not be read. ${esc([...new Set(data.errors.map(e => e.workspace_name))].join(", "))}</p>` : ""}${data.workspaces.some(w => w.scan_limited) ? '<small>Recent history is bounded to 200 manifests per workspace.</small>' : ""}</section>`;
+}
 function overview() {
   const data = state.overview, runs = data.workflows;
   const workspace = state.workspaces.find(w => w.id === state.workspace);
@@ -417,7 +433,7 @@ function overview() {
   const nextTab = ORCLogic.followupReceipt(report) ? "evidence" : active(focus?.status) ? "activity" : ["failed", "interrupted", "paused_quota", "paused_budget"].includes(focus?.status) ? "evidence" : "report";
   const nextLabel = ORCLogic.followupReceipt(report) ? "Review follow-up evidence" : nextTab === "activity" ? "Follow current work" : nextTab === "evidence" ? "Inspect this outcome" : "Read the handoff";
   mount(`<section class="room-heading"><div><div class="eyebrow">YOUR WORKSPACE · CONTROL ROOM</div><h1>${esc(workspace?.name || "Workspace")}</h1><p>${runs.length} saved runs · ${running} recorded active${attention ? ` · ${attention} need attention` : ""}</p></div>${button("Copy workspace path", "copy-workspace", "", "small ghost")}</section>
-    <div class="room-grid"><div>${focus ? `<section class="panel room-focus"><div class="panel-body"><div class="room-focus-label"><span class="eyebrow">${active(focus.status) ? '<span class="live-dot"></span> CURRENT WORK' : "LATEST OUTCOME"}</span>${badge(focus.status)}</div><h2>${esc(focus.task)}</h2><div class="room-worker-line">${sigil("forge")}<strong>${esc(node?.agent || focus.agents?.join(" + ") || "Harness unknown")}</strong>${node ? `<span>${esc(node.id)} · attempt ${node.attempts ?? "?"}</span>` : ""}${node?.last_output_at_ms ? `<span>Output ${age(node.last_output_at_ms)} ago</span>` : ""}</div>${state.focusError ? `<p class="room-evidence-missing">${esc(state.focusError)}</p>` : `<div class="room-latest"><div class="eyebrow">${active(node?.status) ? "LATEST WORKER UPDATE" : "WORKER HANDOFF"}</div>${update ? `<div class="markdown">${markdown(update.length > 1100 ? update.slice(0, 1100) + "…" : update)}</div>` : '<p>No worker update has been saved yet.</p>'}${command ? `<div class="room-current-command"><span>Command in progress</span><code>${esc(commandPreview(command))}</code></div>` : ""}</div>`}${followupNotice(report)}<div class="room-next">${button(nextLabel + " →", "run", `data-id="${esc(focus.id)}" data-tab="${nextTab}"`, "primary")}<span class="mono">${esc(focus.id)}</span></div></div></section>` : empty("What do you want to build?", "Your runs and their evidence will appear here.", button("Start a run", "template", 'data-template="feature"', "primary"))}
+    ${activityStrip()}<div class="room-grid"><div>${focus ? `<section class="panel room-focus"><div class="panel-body"><div class="room-focus-label"><span class="eyebrow">${active(focus.status) ? '<span class="live-dot"></span> CURRENT WORK' : "LATEST OUTCOME"}</span>${badge(focus.status)}</div><h2>${esc(focus.task)}</h2><div class="room-worker-line">${sigil("forge")}<strong>${esc(node?.agent || focus.agents?.join(" + ") || "Harness unknown")}</strong>${node ? `<span>${esc(node.id)} · attempt ${node.attempts ?? "?"}</span>` : ""}${node?.last_output_at_ms ? `<span>Output ${age(node.last_output_at_ms)} ago</span>` : ""}</div>${state.focusError ? `<p class="room-evidence-missing">${esc(state.focusError)}</p>` : `<div class="room-latest"><div class="eyebrow">${active(node?.status) ? "LATEST WORKER UPDATE" : "WORKER HANDOFF"}</div>${update ? `<div class="markdown">${markdown(update.length > 1100 ? update.slice(0, 1100) + "…" : update)}</div>` : '<p>No worker update has been saved yet.</p>'}${command ? `<div class="room-current-command"><span>Command in progress</span><code>${esc(commandPreview(command))}</code></div>` : ""}</div>`}${followupNotice(report)}<div class="room-next">${button(nextLabel + " →", "run", `data-id="${esc(focus.id)}" data-tab="${nextTab}"`, "primary")}<span class="mono">${esc(focus.id)}</span></div></div></section>` : empty("What do you want to build?", "Your runs and their evidence will appear here.", button("Start a run", "template", 'data-template="feature"', "primary"))}
     <div class="section-bar room-history-heading"><h2>Run history</h2><button class="subtle" data-view="workflows">All runs →</button></div>${runs.length ? `<div class="panel">${runRows(runs.slice(0, 7))}</div>` : '<p class="help-copy">No runs saved in this workspace.</p>'}</div>
     <aside class="room-evidence-rail"><section class="panel"><div class="panel-header"><h3>Outcome & proof</h3></div><div class="panel-body">${acceptanceCard(report)}${report ? button("Open evidence →", "run", `data-id="${esc(report.workflow_id)}" data-tab="evidence"`, "small ghost") : ""}</div></section><section class="panel"><div class="panel-header"><h3>TENET record</h3><span class="room-local-label">LOCAL</span></div><div class="panel-body">${report ? tenetEvidence(report, true) : '<p class="help-copy">Select a run to inspect its receipts.</p>'}</div></section>${data.builds.filter(b => b.status === "running").map(b => `<section class="panel"><div class="panel-body"><h3>Preparing work</h3><p>${esc(b.message)}</p></div></section>`).join("")}</aside></div>`);
 }
@@ -927,32 +943,39 @@ function settings() {
   );
 }
 function models() {
-  mount(
-    intro(
-      "OPENROUTER × CLAUDE",
-      "Find the right worker.",
-      "Inspect your resolved ORC model, tool-capable models, quality rankings, and saved profiles.",
-    ) +
-      `<div class="model-toolbar">${[
-        ["status", "Resolved model"],
-        ["models", "Tool-capable models"],
-        ["free", "Free models"],
-        ["quality", "Quality rankings"],
-        ["profiles", "Profiles"],
-      ]
-        .map(([cmd, label]) =>
-          button(
-            label,
-            "orc",
-            `data-command="${cmd}"`,
-            cmd === "status" ? "primary" : "",
-          ),
-        )
-        .join(
-          "",
-        )}</div><div class="panel"><div class="panel-header"><h3 id="orc-title">Resolved model</h3><small>Read through your installed ORC CLI</small></div><div class="panel-body"><pre id="orc-output" class="model-output">Loading…</pre></div></div><div class="info-box"><h3>Tool support ≠ verified tool fit</h3><p>FIT means ORC verified a tool round trip. UNTESTED is not a failure. Manage project model IDs and profiles in Settings.</p></div>`,
-  );
-  loadOrc("status");
+  mount(intro("MODELS & HARNESSES", "Choose with current information.", "Provider metadata, installed harnesses and benchmark evidence have different sources.") +
+    `<div id="model-catalog-summary"><p>Reading the saved catalog…</p></div><div class="filter-bar"><input id="model-search" type="search" aria-label="Search model catalog" placeholder="Search model or provider…" value="${esc(state.modelSearch)}">${button("Refresh public catalog", "refresh-model-catalog", "", "small")}</div><p class="help-copy">Refresh fetches public OpenRouter metadata. It does not run a model. Listed tool support is provider-declared; account access and tool fit are not verified here.</p><div id="model-catalog-results"></div><details class="model-diagnostics"><summary>Installed ORC CLI diagnostics</summary><div class="model-toolbar">${[["status", "Resolved model"], ["profiles", "Saved profiles"], ["quality", "Benchmark CLI output"]].map(([cmd, label]) => button(label, "orc", `data-command="${cmd}"`, "small")).join("")}</div><h3 id="orc-title">Select a diagnostic</h3><pre id="orc-output" class="model-output">The CLI benchmark output is a separate saved source, not the model catalog.</pre></details>`);
+  loadModelCatalog();
+}
+function modelCatalogRows() {
+  const catalog = state.modelCatalog?.catalog;
+  if (!catalog) return `<p class="help-copy">${esc(state.modelCatalogError || "Catalog not loaded.")}</p>`;
+  const rows = (catalog.models || []).filter(m => `${m.id} ${m.name}`.toLowerCase().includes(state.modelSearch.toLowerCase()))
+    .sort((a,b) => (Number(b.created) || 0) - (Number(a.created) || 0) || a.id.localeCompare(b.id));
+  const price = value => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value)) && Number(value) >= 0 ? `$${(Number(value) * 1000000).toLocaleString(undefined, {maximumFractionDigits: 3})}` : "Unknown";
+  return `<p class="help-copy">${rows.length} matches${rows.length > 100 ? " · Showing the first 100; search to narrow" : ""}</p><div class="model-catalog-grid">${rows.slice(0, 100).map(m => `<article class="panel model-catalog-card"><h3>${esc(m.name || m.id)}</h3><code>${esc(m.id)}</code><div class="facts"><span>Context</span><span>${typeof m.context_length === "number" ? number(m.context_length) + " tokens" : "Unknown"}</span><span>Tool support</span><span>${m.tools === true ? "Provider-declared" : m.tools === false ? "Not declared" : "Unknown"}</span><span>Input / 1M tokens</span><span>${price(m.pricing?.prompt)}</span><span>Output / 1M tokens</span><span>${price(m.pricing?.completion)}</span></div>${button("Copy model ID", "copy-model-id", `data-id="${esc(m.id)}"`, "small ghost")}</article>`).join("") || '<p class="help-copy">No matching catalog models.</p>'}</div>`;
+}
+async function loadModelCatalog(refresh = false) {
+  const epoch = state.epoch;
+  const button = $('[data-action="refresh-model-catalog"]');
+  if (button) { button.disabled = true; button.textContent = refresh ? "Refreshing metadata…" : "Reading catalog…"; }
+  try {
+    const data = await api("model-catalog", refresh ? {refresh:true} : undefined);
+    if (epoch !== state.epoch || state.view !== "models") return;
+    state.modelCatalog = data; state.modelCatalogError = null;
+    const c = data.catalog || {}, b = data.benchmark || {};
+    const time = value => value ? date(typeof value === "number" ? value : Date.parse(value)) : "Date not recorded";
+    $("#model-catalog-summary").innerHTML = `${data.refresh?.ok === false ? `<p class="room-evidence-missing">Refresh failed: ${esc(data.refresh.error)}. Showing the saved catalog.</p>` : ""}<div class="model-provenance-grid"><section class="panel"><div class="panel-body"><div class="eyebrow">PROVIDER CATALOG</div><h2>${["cached", "stale"].includes(c.status) ? `${number(c.count)} listed models` : "Catalog not available"}</h2><p>${esc(c.source || "Source unknown")} · ${esc(c.status || "unknown")}</p><p class="help-copy">Metadata fetched ${time(c.cached_at_ms)}</p>${c.error ? `<p class="room-evidence-missing">${esc(c.error)}</p>` : ""}</div></section><section class="panel"><div class="panel-body"><div class="eyebrow">BENCHMARK SNAPSHOT · SEPARATE SOURCE</div><h2>${b.status === "snapshot" ? `${number(b.record_count)} saved records` : "No readable benchmark snapshot"}</h2><p>${esc(b.source || "Source unknown")} · ${esc(b.status || "unknown")}</p><p class="help-copy">Snapshot ${time(b.fetched_at)}. These records do not establish the current model catalog or today's model quality.</p></div></section></div><div class="worker-strip">${(data.workers || []).map(w => `<span class="worker-chip">${esc(w.agent)} · ${w.available ? "installed" : "unavailable"}${w.model ? ` · ${esc(w.model)}` : ""}${w.automatic_ready === false ? " · setup needed" : ""}</span>`).join("")}</div>`;
+  } catch (e) {
+    if (epoch !== state.epoch || state.view !== "models") return;
+    state.modelCatalogError = e.message;
+    $("#model-catalog-summary").innerHTML = `<p class="room-evidence-missing">Catalog unavailable: ${esc(e.message)}</p>`;
+  } finally {
+    if (epoch === state.epoch && state.view === "models") {
+      $("#model-catalog-results").innerHTML = modelCatalogRows();
+      if (button) { button.disabled = false; button.textContent = "Refresh public catalog"; }
+    }
+  }
 }
 async function loadOrc(command) {
   $("#orc-output").textContent = "Reading ORC…";
@@ -1221,7 +1244,7 @@ function routeHash() {
     if (f.query) params.set("q", f.query);
     return "#truffle" + (state.id ? "/" + encodeURIComponent(state.id) : "") + (params.size ? "?" + params : "");
   }
-  if (state.view !== "decisions") return "#" + state.view + (state.id ? "/" + encodeURIComponent(state.id) : "");
+  if (state.view !== "decisions") return "#" + state.view + (state.id ? "/" + encodeURIComponent(state.id) : "") + (state.workspace ? "?w=" + encodeURIComponent(state.workspace) : "");
   const params = new URLSearchParams();
   if (state.workspace) params.set("w", state.workspace);
   if (state.labTab === "review") {
@@ -1303,6 +1326,11 @@ async function refresh(force = false) {
     }
     let signature = pretty({ ...data, now_ms: 0 });
     if (state.view === "overview") {
+      let activity = null, activityError = null;
+      try { activity = await api("activity", undefined, w); }
+      catch (e) { activityError = e.message; }
+      if (epoch !== state.epoch) return;
+      state.activity = activity; state.activityError = activityError;
       const focus = ORCLogic.focusWorkflow(data.workflows);
       let focusReport = null, focusError = null;
       if (focus) {
@@ -1312,7 +1340,8 @@ async function refresh(force = false) {
       }
       state.focusReport = focusReport;
       state.focusError = focusError;
-      signature = pretty({data: {...data, now_ms:0}, report:state.focusReport, error:state.focusError});
+      signature = pretty({data: {...data, now_ms:0}, report:state.focusReport, error:state.focusError,
+        activity: activity && {...activity, observed_at_ms:0}, activityError});
     }
     if (state.view === "truffle") {
       let scout = null, scoutError = null;
@@ -1404,7 +1433,7 @@ async function chooseWorkspace(id, route = null) {
   $("#workspace").value = id;
   $("#workspace-path").textContent = ws?.path || "";
   $("#workspace-path").title = ws?.path || "";
-  await navigate(route?.view || "overview", route?.id || null, {history: route ? "replace" : "push"});
+  await navigate(route?.view || "overview", route?.id || null, {history: route ? "replace" : "push", tab:route?.tab || "auto"});
 }
 function fillWorkspaces() {
   $("#workspace").innerHTML = state.workspaces
@@ -1451,6 +1480,10 @@ document.addEventListener("click", async (event) => {
     else if (a === "truffle-queue") openTruffleQueue();
     else if (a === "run") { closeModal(); await navigate("workflow", target.dataset.id, {tab:target.dataset.tab || "auto"}); }
     else if (a === "source-workspace") await chooseWorkspace(target.dataset.workspace, {view:target.dataset.destination});
+    else if (a === "local-task") openLaunch();
+    else if (a === "workspace-run") await chooseWorkspace(target.dataset.workspace, {view:"workflow", id:target.dataset.id, tab:"activity"});
+    else if (a === "refresh-model-catalog") await loadModelCatalog(true);
+    else if (a === "copy-model-id") copy(target.dataset.id);
     else if (a === "copy-workspace") copy(state.workspaces.find(w => w.id === state.workspace)?.path || "");
     else if (a === "copy-artifact-path") copy(target.dataset.path || "");
     else if (a === "run-artifact" || a === "run-artifact-download") {
@@ -1639,7 +1672,7 @@ document.addEventListener("submit", async (event) => {
         max_parallel_writers: writes ? 1 : 0, budget_usd: 3, publish: {mode: "off"},
         nodes: [{id: "work", agent: "codex", write: writes, role: writes ? "implementation" : "discovery",
           task: values.text + "\nDo not delegate, publish, or broaden this task. Return evidence and explicit unresolved blockers.",
-          acceptance: {required_handoff: ["summary", "tests"]}}], acceptance: {required_nodes: ["work"]},
+          acceptance: {required_handoff: writes ? ["summary", "tests"] : ["summary"]}}], acceptance: {required_nodes: ["work"]},
       };
       await launch({action: "workflow", request_id: values.request_id, text: values.text, spec, allow_write: writes, mode: "off"});
     } else if (form.id === "launch-form") {
@@ -1719,6 +1752,7 @@ document.addEventListener("submit", async (event) => {
   }
 });
 document.addEventListener("input", (event) => {
+  if (event.target.id === "model-search") { state.modelSearch = event.target.value; $("#model-catalog-results").innerHTML = modelCatalogRows(); }
   if (event.target.id === "forest-search") {
     state.forest.query = event.target.value;
     const start = event.target.selectionStart, end = event.target.selectionEnd;
