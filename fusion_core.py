@@ -1206,8 +1206,8 @@ def agent_command(
 ) -> tuple[list[str], dict[str, str], dict[str, Any]]:
     agent = task["agent"]
     settings = agent_settings(config, task)
-    if settings.get("reasoning_effort") is not None and agent != "codex":
-        raise ValueError("reasoning_effort is currently supported only for native Codex")
+    if settings.get("reasoning_effort") is not None and agent not in {"codex", "claude"}:
+        raise ValueError("reasoning_effort is currently supported only for native Codex and Claude Code")
     yolo = execution_mode(config) == "yolo"
     env = os.environ.copy()
     if agent == "codex":
@@ -1292,6 +1292,11 @@ def agent_command(
             argv += ["--permission-prompts", permission_prompts]
         if command_name != "orc" and selected_model:
             argv += ["--model", selected_model]
+        choice = None
+        if settings.get("reasoning_effort") is not None:
+            from fusion_reasoning import claude_choice
+            choice = claude_choice({**settings, "model": selected_model or settings.get("model")})
+            argv += ["--effort", settings["reasoning_effort"]]
         max_budget = settings.get("max_budget_usd")
         free_route = command_name == "orc" and (
             str(settings.get("model_selector", "")) == "free" or selected_model.endswith(":free")
@@ -1309,7 +1314,8 @@ def agent_command(
         # Claude's --allowedTools consumes variadic values. Terminate options
         # explicitly so a fresh task's prompt cannot be swallowed as a tool.
         argv += ["--", brief_for(task)]
-        return argv, env, {"command": command, "model": selected_model}
+        return argv, env, {"command": command, "model": selected_model,
+                           **({"execution_choice": choice} if choice else {})}
     raise ValueError(f"unsupported agent: {agent}")
 
 
@@ -1348,7 +1354,7 @@ def dispatch(
     route_task(config, task, store)
     # Pinned choices do not resume a session created for a different pair.
     # Keep legacy session keys unchanged when effort is inherited.
-    if task["agent"] == "codex":
+    if task["agent"] in {"codex", "claude"}:
         settings = agent_settings(config, task)
         if settings.get("reasoning_effort") is not None:
             from fusion_reasoning import pair_key, validate_pair
@@ -1691,7 +1697,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "workspace": {"type": "string", "description": "Optional workspace path for the delegated task."},
                     "route": {"type": "string", "description": "Optional named route such as orc-free or orc-best."},
                     "model": {"type": "string", "description": "Model for this task, overriding the route and agent settings."},
-                    "reasoning_effort": {"type": "string", "enum": sorted(EFFORTS), "description": "Codex only; requires model."},
+                    "reasoning_effort": {"type": "string", "enum": sorted(EFFORTS), "description": "Codex, or Claude Code (low-max); requires model."},
                 },
                 "required": ["agent", "task"],
             },
@@ -2085,7 +2091,7 @@ def build_parser() -> argparse.ArgumentParser:
     delegate.add_argument("--session-key", help="persistent lane name; defaults to agent:role")
     delegate.add_argument("--route", help="named route from .fusion.json, for example orc-free or orc-best")
     delegate.add_argument("--model", help="model for this task, overriding the route and agent settings")
-    delegate.add_argument("--reasoning-effort", choices=sorted(EFFORTS), help="Codex only; requires --model")
+    delegate.add_argument("--reasoning-effort", choices=sorted(EFFORTS), help="Codex, or Claude Code (low-max); requires --model")
     delegate.add_argument("--success", action="append", default=[])
     delegate.add_argument("--constraint", action="append", default=[])
     delegate.add_argument("task")

@@ -1,4 +1,20 @@
-# Native Codex model and effort choices
+# Native Codex and Claude Code model and effort choices
+
+Claude Code workers take the same `model` + `reasoning_effort` pair and receive
+`claude --effort <level>`. Claude Code accepts `low`, `medium`, `high`, `xhigh`
+and `max`; `none`, `minimal` and `ultra` are Codex-only and refused for Claude.
+Claude Code publishes no per-model effort catalog and its JSON result does not
+report the applied effort, so `execution_choice.catalog` is `unchecked` and
+`observed` stays `unobserved`. Observed on `claude-sonnet-5` (2026-09-24, same
+read-only task): `low` used 730 output tokens in 15 s, `high` 1,596 in 26 s.
+Effort sent through an `orc` (OpenRouter) route is passed to Claude Code; whether
+the upstream model honors it is unverified.
+
+```sh
+fusion delegate --agent claude --read-only --model claude-sonnet-5 --reasoning-effort high "Review the diff"
+```
+
+## Codex
 
 Fusion accepts an explicit model and reasoning effort for each native Codex
 worker. A pair is one choice: `gpt-6-sol / xhigh` and `gpt-6-astra / high` are

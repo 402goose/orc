@@ -68,8 +68,11 @@ def route_candidates(config, task, store, rejected=None):
         if settings.get("reasoning_effort") is not None:
             from fusion_reasoning import native_capability, validate_pair
             try:
-                if agent != "codex":
-                    raise ValueError("reasoning effort requires native Codex")
+                if agent not in {"codex", "claude"}:
+                    raise ValueError("reasoning effort requires native Codex or Claude Code")
+                if agent == "claude":
+                    from fusion_reasoning import claude_choice
+                    claude_choice(settings)
                 if settings["reasoning_effort"] == "ultra" and (task.get("write") or settings.get("allow_native_delegation") is not True):
                     raise ValueError("ultra requires read-only scope and explicit native delegation")
                 native_capability(validate_pair(settings.get("model"), settings["reasoning_effort"]))

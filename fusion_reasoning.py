@@ -1,4 +1,4 @@
-"""Explicit model/effort pairs for native Codex; no runtime or routing authority."""
+"""Explicit model/effort pairs for native Codex and Claude Code; no runtime or routing authority."""
 from __future__ import annotations
 
 import hashlib
@@ -8,6 +8,22 @@ from pathlib import Path
 
 
 EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
+# `claude --effort` accepts exactly these (Claude Code 2.1.x).
+CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+
+def claude_choice(settings):
+    """Claude Code publishes no per-model effort catalog and its JSON result does
+    not report the applied effort, so the request is recorded and the rest stays
+    unobserved rather than assumed."""
+    pair = validate_pair(settings.get("model"), settings.get("reasoning_effort"))
+    if pair["reasoning_effort"] not in CLAUDE_EFFORTS:
+        raise ValueError("Claude Code accepts reasoning_effort " + ", ".join(sorted(CLAUDE_EFFORTS)))
+    return {"schema": "fusion.execution-choice.v1", "requested": pair, "dispatch": {"status": "prepared"},
+            "catalog": {"status": "unchecked", "reason": "Claude Code publishes no per-model effort catalog"},
+            "observed": {"model": None, "reasoning_effort": None, "status": "unobserved"},
+            "native_delegation": {"allowed": False, "child_trace_visibility": "unobserved"},
+            "granularity": "worker_invocation"}
 
 
 def validate_pair(model, effort):
