@@ -37,6 +37,19 @@
   /** A run the server may still be moving. */
   const active = (status) => ["running", "queued", "stopping"].includes(status);
 
+  /** Workflow/handoff success is not evidence that acceptance checks ran. */
+  const acceptanceSummary = (nodes = []) => {
+    const checks = nodes.flatMap(node => Array.isArray(node?.result?.acceptance_checks) ? node.result.acceptance_checks : []);
+    const passed = checks.filter(check => check?.status === "passed" && check.exit_code === 0 && !check.timed_out).length;
+    const failed = checks.filter(check => ["failed", "error", "timed_out"].includes(check?.status) || check?.timed_out || (typeof check?.exit_code === "number" && check.exit_code !== 0)).length;
+    const unknown = checks.length - passed - failed;
+    return { total: checks.length, passed, failed, unknown,
+      label: failed ? `${failed} failed` : passed ? `${passed} passed${unknown ? ` · ${unknown} unknown` : ""}` : unknown ? `${unknown} unknown` : "Not recorded",
+      tone: failed ? "failed" : checks.length && !unknown ? "success" : "unknown" };
+  };
+
+  const focusWorkflow = (runs = []) => runs.find(run => active(run.status)) || runs[0] || null;
+
   /**
    * A draft may be approved only with at least one answer AND written
    * evidence. Approved labels enter training exports, so a false positive
@@ -98,6 +111,8 @@
     safeGithubURL,
     withoutDerived,
     active,
+    acceptanceSummary,
+    focusWorkflow,
     canApproveLabels,
     commandPreview,
     age,

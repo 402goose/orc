@@ -1,0 +1,80 @@
+/* One ORC control room. TENET evidence belongs beside the work, not in another shell. */
+.room-tools { margin-top:18px; border-top:1px solid var(--line); padding-top:17px; }
+.room-tools>summary { color:var(--muted); font-size:12px; cursor:pointer; padding:0 12px 10px; }
+.room-tools .nav-item { width:100%; }
+.room-heading { display:flex; justify-content:space-between; align-items:center; gap:20px; margin:6px 0 30px; }
+.room-heading h1 { font-family:Georgia,serif; font-size:48px; font-weight:400; letter-spacing:-1.7px; margin:9px 0 10px; }
+.room-heading p { margin:0; font-size:13px; }
+.room-grid { display:grid; grid-template-columns:minmax(0,1fr) 295px; gap:24px; align-items:start; }
+.room-grid>* { min-width:0; }
+.room-focus { border-color:var(--accent-line); overflow:hidden; }
+.room-focus>.panel-body { padding:28px; }
+.room-focus-label { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:18px; }
+.room-focus h2 { font-size:23px; font-weight:500; line-height:1.4; letter-spacing:-.65px; max-width:820px; overflow-wrap:anywhere; }
+.room-worker-line { display:flex; flex-wrap:wrap; align-items:center; gap:12px; font-size:12px; color:var(--muted); margin:22px 0; }
+.room-worker-line strong { color:var(--text); text-transform:capitalize; }
+.room-worker-line .sigil { width:21px; height:21px; }
+.room-latest { padding:20px 21px 12px; background:var(--panel2); border-radius:9px; border-left:2px solid var(--accent-line); }
+.room-latest>.eyebrow { margin-bottom:13px; font-size:9px; }
+.room-latest .markdown { font-size:13px; line-height:1.8; overflow-wrap:anywhere; }
+.room-latest .markdown p:last-child { margin-bottom:8px; }
+.room-current-command { display:flex; flex-direction:column; gap:8px; margin:15px 0; border-top:1px solid var(--line); padding-top:14px; }
+.room-current-command span { color:var(--muted); font-size:11px; }
+.room-current-command code { font-size:11px; overflow-wrap:anywhere; }
+.room-next { display:flex; align-items:center; gap:18px; flex-wrap:wrap; margin-top:25px; }
+.room-next>span { font-size:10px; color:var(--muted); overflow-wrap:anywhere; }
+.room-evidence-rail { display:grid; gap:20px; }
+.room-evidence-rail .panel-body { padding:20px; }
+.room-outcome { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; padding:3px 0 18px; }
+.room-outcome>span:first-child { color:var(--muted); font-size:12px; }
+.room-outcome small { grid-column:1/-1; color:var(--muted); font-size:11px; }
+.room-local-label { font:9px var(--mono); color:var(--muted); letter-spacing:1px; }
+.room-receipt { padding:0 0 18px; margin-bottom:18px; border-bottom:1px solid var(--line); }
+.room-receipt:last-child { padding-bottom:0; margin-bottom:0; border-bottom:0; }
+.room-receipt-heading { display:flex; flex-wrap:wrap; gap:9px; align-items:center; justify-content:space-between; margin-bottom:9px; }
+.room-receipt-heading strong { font-size:12px; overflow-wrap:anywhere; }
+.room-receipt>code { color:var(--muted); font-size:10px; overflow-wrap:anywhere; }
+.room-receipt>.facts { margin-top:17px; font-size:11px; gap:10px; }
+.room-receipt>small { color:var(--muted); font-size:10px; display:block; margin-top:13px; overflow-wrap:anywhere; }
+.room-evidence-missing { font-size:12px; color:var(--amber); overflow-wrap:anywhere; }
+.room-artifact { display:flex; align-items:center; gap:14px; padding:15px 0; border-bottom:1px solid var(--line); }
+.room-artifact>div:first-child { min-width:0; flex:1; }
+.room-artifact strong { font-size:12px; font-weight:500; overflow-wrap:anywhere; }
+.room-artifact small { display:block; margin-top:4px; font-size:10px; }
+.room-path { font-family:var(--mono); color:var(--muted); overflow-wrap:anywhere; }
+.dialog-header p { overflow-wrap:anywhere; }
+.room-artifact-actions { display:flex; gap:5px; flex-wrap:wrap; justify-content:flex-end; }
+.room-checks { padding-bottom:21px; }
+.room-check { padding:17px 0; border-top:1px solid var(--line); }
+.room-check>div { display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+.room-check>div>span:last-child { margin-left:auto; color:var(--muted); font:11px var(--mono); }
+.room-check details { margin-top:12px; }
+.room-check summary,.room-budget>summary,.room-handoff>summary { color:var(--muted); font-size:12px; cursor:pointer; }
+.room-budget { margin-top:18px; padding-top:15px; border-top:1px solid var(--line); }
+.room-budget .facts { margin-top:15px; }
+.room-handoff { padding:20px 0; border-top:1px solid var(--line); }
+.room-handoff>summary { color:var(--text); font-size:14px; margin-bottom:16px; }
+.room-history-heading { margin-top:30px; }
+.room-grid .run-title { -webkit-line-clamp:2; display:-webkit-box; -webkit-box-orient:vertical; overflow:hidden; }
+.room-grid .run-meta { gap:9px; }
+.status.unknown { color:var(--muted); background:var(--panel2); }
+@media(min-width:1450px) { .room-grid { grid-template-columns:minmax(0,1fr) 320px; } }
+@media(max-width:1120px) { .room-grid { grid-template-columns:minmax(0,1fr); } .room-evidence-rail { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+@media(max-width:780px) {
+  .room-heading { margin-top:12px; gap:12px; }
+  .room-heading h1 { font-size:38px; }
+  .room-heading>.button { max-width:120px; }
+  .room-focus>.panel-body { padding:20px; }
+  .room-focus h2 { font-size:21px; }
+  .room-evidence-rail { grid-template-columns:1fr; }
+  .room-artifact { align-items:flex-start; flex-direction:column; }
+  .room-artifact-actions { justify-content:flex-start; }
+  .room-latest { padding:16px; }
+  .room-worker-line { gap:9px; }
+  .sidebar nav { display:flex; flex-wrap:wrap; align-items:flex-start; }
+  .room-tools { margin:0; padding:0; border:0; position:relative; }
+  .room-tools>summary { padding:12px; }
+  .room-tools[open] { flex-basis:100%; background:var(--panel); border-radius:9px; }
+  .room-tools[open] .nav-item { display:inline-flex; width:auto; }
+}
+@media(max-width:460px) { .room-heading { align-items:flex-start; } .room-heading p { max-width:210px; line-height:1.7; } .room-focus-label { gap:6px; } .room-focus-label .eyebrow { font-size:9px; } }
