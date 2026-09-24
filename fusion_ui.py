@@ -554,6 +554,8 @@ class ControlRoom:
         report["spec"] = manifest.get("spec")
         report["events"] = read_jsonl(manifest_path.with_name("events.jsonl"))[-150:]
         report["markdown"] = format_report(select_report(report, all_nodes=True))
+        from fusion_tenet import workflow_evidence
+        report["tenet"] = workflow_evidence(workspace, run_id, manifest)
         return report
 
     def job(self, workspace, job_id):
@@ -827,7 +829,7 @@ class Handler(BaseHTTPRequestHandler):
         pass  # Task text and capability credentials do not belong in access logs.
 
     def send(self, status, value, content_type="application/json"):
-        raw = json.dumps(value, ensure_ascii=False).encode() if content_type == "application/json" else value
+        raw = json.dumps(value, ensure_ascii=True).encode() if content_type == "application/json" else value
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(raw)))
@@ -877,6 +879,11 @@ class Handler(BaseHTTPRequestHandler):
                 result = truffle.receipt(workspace, query["id"]) if query.get("id") else latest(workspace)
             elif path == "/api/workflow":
                 result = app.workflow(workspace, query.get("id"))
+            elif path == "/api/run-artifact":
+                from fusion_tenet import artifact, read_json as read_receipt
+                run_id = identifier(query.get("id"))
+                manifest = read_receipt(workspace, workspace / ".fusion/workflows" / run_id / "manifest.json")
+                result = artifact(workspace, run_id, manifest, query.get("artifact"))
             elif path == "/api/job":
                 result = app.job(workspace, query.get("id"))
             elif path == "/api/config":
