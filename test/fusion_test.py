@@ -1761,12 +1761,10 @@ class WorkflowIdAdoptionTest(unittest.TestCase):
 
 
 class HandoffParsingTest(unittest.TestCase):
-    """A worker that reports no blockers must not be failed for saying so.
+    """Plain no-blocker markers are empty; arbitrary explanations are retained.
 
-    Regression: `BLOCKERS: None. The `ls` alias points to `eza`, which isn't
-    installed, so I used `/bin/ls` instead.` was comma-split into three phantom
-    blockers, marking a successful node invalid and blocking every node that
-    depended on it. One real workflow failed this way after spending $1.90.
+    Prose must remain coherent rather than becoming comma fragments. The parser
+    does not infer that an explained tool failure was sufficiently recovered.
     """
 
     def blockers(self, value: str) -> list[str]:
@@ -1784,7 +1782,6 @@ class HandoffParsingTest(unittest.TestCase):
             "nil",
             "-",
             "none - read-only node",
-            "None. The `ls` alias points to `eza`, which isn't installed, so I used `/bin/ls`.",
         ):
             with self.subTest(value=value):
                 self.assertEqual(self.blockers(value), [])

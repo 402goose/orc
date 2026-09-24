@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 from pathlib import Path, PurePosixPath
 import subprocess
 import time
@@ -462,7 +463,19 @@ class WorkflowRunner:
             if node["status"] != "success":
                 continue
             result = node.get("result") or {}
-            if not self._accept_node(node, result)[0]:
+            accepted, problems = self._accept_node(node, result)
+            if result.get("acceptance_checks"):
+                # Resume rechecks have their own receipts; keep node.json and
+                # the manifest pointing at the same latest observations.
+                try:
+                    payload = json.loads(Path(node["artifact"]).read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    payload = {}
+                payload["result"] = result
+                payload["acceptance"] = {"ok": accepted, "problems": problems,
+                                         "checks": result["acceptance_checks"]}
+                self._save_node(node_id, payload)
+            if not accepted:
                 node["status"] = "pending"
                 continue
             dependency_digests = {dep: current_digest.get(dep) for dep in node["needs"]}
@@ -680,7 +693,96 @@ BLOCKERS: unresolved issues, or none
         except Exception:
             return None
 
+    def _acceptance_check(self, node: dict[str, Any], result: dict[str, Any],
+                          command: Any, index: int) -> dict[str, Any]:
+        """Record coordinator observations independently of a worker's handoff.
+
+        Each invocation has its own directory, including resume rechecks. Output
+        goes straight to files so a verbose check cannot exhaust coordinator
+        memory. The initial receipt survives an interrupted coordinator; only a
+        finalized, successful receipt can pass the gate.
+        """
+        attempt = int(result.get("attempt") or node.get("attempts") or 0)
+        directory = (self._node_dir(node["id"]) / "acceptance" / f"attempt-{attempt}"
+                     / f"check-{index + 1}-{uuid.uuid4().hex[:12]}")
+        directory.mkdir(parents=True)
+        receipt_path = directory / "receipt.json"
+        stdout_path, stderr_path = directory / "stdout.log", directory / "stderr.log"
+        started = time.monotonic()
+        receipt = {
+            "schema": "fusion.acceptance-check.v1",
+            "workflow_id": self.run_id,
+            "node_id": node["id"],
+            "run_id": result.get("run_id"),
+            "attempt": attempt,
+            "check_index": index,
+            "argv": command,
+            "cwd": str(self.workspace.resolve()),
+            "started_at_ms": core.now_ms(),
+            "finished_at_ms": None,
+            "duration_ms": None,
+            "status": "running",
+            "exit_code": None,
+            "timed_out": False,
+            "error": None,
+            "artifacts": {"receipt": str(receipt_path), "stdout": str(stdout_path), "stderr": str(stderr_path)},
+        }
+
+        def save() -> None:
+            temp = receipt_path.with_suffix(".tmp")
+            temp.write_text(core.json_text(receipt) + "\n", encoding="utf-8")
+            temp.replace(receipt_path)
+
+        save()
+        self._event("acceptance.check.started", {"node_id": node["id"], "attempt": attempt,
+                                                 "receipt": str(receipt_path)})
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            try:
+                if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
+                    raise ValueError("acceptance checks must be argv arrays")
+                timeout = int(self.config.get("timeout_seconds", 3600))
+                receipt["timeout_seconds"] = timeout
+                with subprocess.Popen(command, cwd=self.workspace, stdin=subprocess.DEVNULL,
+                                      stdout=stdout, stderr=stderr, start_new_session=(os.name == "posix")) as process:
+                    try:
+                        process.wait(timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        receipt["timed_out"] = True
+                        receipt["error"] = f"acceptance check timed out after {timeout} seconds"
+                        if os.name == "posix":
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                        else:
+                            process.kill()
+                        process.wait()
+                    receipt["exit_code"] = process.returncode
+                receipt["status"] = ("timed_out" if receipt["timed_out"] else
+                                     "passed" if receipt["exit_code"] == 0 else "failed")
+            except (OSError, ValueError) as exc:
+                receipt["status"] = "error"
+                receipt["error"] = f"{type(exc).__name__}: {exc}"
+        receipt["finished_at_ms"] = core.now_ms()
+        receipt["duration_ms"] = max(0, round((time.monotonic() - started) * 1000))
+        receipt["outputs"] = {}
+        for name, path in (("stdout", stdout_path), ("stderr", stderr_path)):
+            digest = hashlib.sha256()
+            size = 0
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    size += len(chunk)
+            receipt["outputs"][name] = {"path": str(path), "sha256": digest.hexdigest(), "bytes": size}
+        save()
+        self._event("acceptance.check.finished", {"node_id": node["id"], "attempt": attempt,
+                                                  "status": receipt["status"], "receipt": str(receipt_path)})
+        return receipt
+
     def _accept_node(self, node: dict[str, Any], result: dict[str, Any]) -> tuple[bool, list[str]]:
+        # Worker-provided fields cannot masquerade as coordinator evidence.
+        # Older/rechecked receipts remain on disk in their unique directories.
+        result["acceptance_checks"] = []
         if core.failure_class(result) == "coordinator_error":
             # The coordinator failed to establish the review evidence. Worker
             # handoff checks cannot repair this and only obscure the real error.
@@ -703,24 +805,19 @@ BLOCKERS: unresolved issues, or none
             for field in _as_list(acceptance.get("required_handoff")):
                 if not result.get(str(field)):
                     problems.append(f"required handoff field is empty: {field}")
-            for command in _as_list(acceptance.get("checks")):
-                if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
-                    problems.append("acceptance checks must be argv arrays")
-                    continue
+            for index, command in enumerate(_as_list(acceptance.get("checks"))):
                 try:
-                    completed = subprocess.run(
-                        command,
-                        cwd=self.workspace,
-                        capture_output=True,
-                        text=True,
-                        timeout=int(self.config.get("timeout_seconds", 3600)),
-                        check=False,
-                    )
-                except (OSError, subprocess.TimeoutExpired) as exc:
-                    problems.append(f"acceptance check could not run: {' '.join(command)} ({exc})")
+                    receipt = self._acceptance_check(node, result, command, index)
+                except OSError as exc:
+                    problems.append(f"acceptance check evidence could not be persisted: {exc}")
                     continue
-                if completed.returncode != 0:
-                    problems.append(f"acceptance check failed: {' '.join(command)}")
+                result["acceptance_checks"].append(receipt)
+                if receipt["status"] != "passed":
+                    label = " ".join(command) if isinstance(command, list) and all(isinstance(part, str) for part in command) else str(command)
+                    if receipt["error"]:
+                        problems.append(f"acceptance check could not run: {label} ({receipt['error']})")
+                    else:
+                        problems.append(f"acceptance check failed: {label}")
         if node.get("write") and not acceptance.get("allow_no_changes"):
             # required_handoff only asks whether a field is non-empty, so a
             # worker reporting "TESTS: not run" satisfies it. Generated builds
@@ -1039,7 +1136,8 @@ BLOCKERS: unresolved issues, or none
                     action, decision_id = recovery(self.config, self.workspace, self.run_id, node, result, accepted, self.spec["max_attempts"])
                     result.setdefault("decisions", {})["recovery"] = decision_id
                     self._record_gate(payload.get("task") or {}, result, accepted, problems)
-                    payload["acceptance"] = {"ok": accepted, "problems": problems}
+                    payload["acceptance"] = {"ok": accepted, "problems": problems,
+                                             "checks": result.get("acceptance_checks", [])}
                     self._save_node(node_id, payload)
                     if accepted:
                         node["status"] = "success"
