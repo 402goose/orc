@@ -75,7 +75,7 @@ async function main() {
     page.on('request', async request => {
       if (request.url().includes('/api/config')) {
         const res = await fetch(request.url(), {headers:{'X-Fusion-Token':token}});
-        const config = await res.json(); config.admission={mode:'tenet',ready:true,executor:{model:'fixture-only'},context_paths:[]};
+        const config = await res.json(); config.admission={mode:'tenet',ready:true,executor:{model:'fixture-only'},context_paths:[],observations:{supported_modes:['off','shadow'],python:'/fixture/operator-python',inference:'unchecked'}};
         return request.respond({status:200,contentType:'application/json',body:JSON.stringify(config)});
       }
       if (request.url().includes('/api/launch')) {
@@ -88,14 +88,19 @@ async function main() {
     await page.reload({waitUntil:'networkidle2'});
     await page.click('#launch-top');
     await page.waitForSelector('#admitted-launch-form');
+    assert.deepEqual(await page.$$eval('#admitted-laya-mode option',els=>els.map(el=>el.value)),['off','shadow']);
+    assert.equal(await page.$eval('#admitted-laya-mode',el=>el.value),'off');
     await page.type('#admitted-task','Read-only fixture review');
     await page.click('#admitted-launch-form button[type="submit"]');
     await page.waitForFunction(()=>document.querySelector('#dialog-error')?.innerText.includes('Fixture intercepted'));
     assert.deepEqual(captured[0].spec.nodes[0].acceptance.required_handoff,['summary']);
+    assert.equal(captured[0].mode,'off');
     await page.click('#admitted-launch-form input[name="allow_write"]');
+    await page.select('#admitted-laya-mode','shadow');
     await page.click('#admitted-launch-form button[type="submit"]');
     await new Promise(resolve=>setTimeout(resolve,150));
     assert.deepEqual(captured[1].spec.nodes[0].acceptance.required_handoff,['summary','tests']);
+    assert.equal(captured[1].mode,'shadow');
     await page.click('[data-action="close"]');
     await page.select('#workspace',current);
     await page.waitForFunction(id=>document.querySelector('#workspace').value===id,{},current);
@@ -107,8 +112,25 @@ async function main() {
     await page.screenshot({path:path.join(output,'github-local-task.png'),fullPage:false});
     await page.click('[data-action="local-task"]');
     await page.waitForSelector('#admitted-launch-form');
+    await page.click('[data-action="close"]');
+    await page.evaluate(()=>document.querySelector('[data-view="decisions"]').click());
+    await page.waitForSelector('.learning-scope');
+    assert((await page.$eval('.learning-scope',el=>el.innerText)).includes('Showing oasis decisions only.'));
+    assert((await page.$eval('.learning-scope',el=>el.innerText)).includes('records are not pooled'));
+    assert((await page.$eval('#mode-chip',el=>el.innerText)).startsWith('Workspace Laya · '));
+    assert(await page.$eval('.learning-scope details',el=>!el.open));
+    assert(await page.$$eval('.learning-scope [data-action="source-workspace"]',els=>els.length>0 && els.every(el=>el.closest('details')?.open===false)));
+    await page.screenshot({path:path.join(output,'learning-oasis-desktop.png'),fullPage:false});
+    await page.setViewport({width:390,height:844});
+    await page.screenshot({path:path.join(output,'learning-oasis-mobile.png'),fullPage:true});
+    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+    await page.setViewport({width:1440,height:1100});
+    await page.click('.learning-scope details summary');
+    await page.evaluate(()=>[...document.querySelectorAll('.learning-scope [data-action="source-workspace"]')].find(el=>el.innerText==='Open orc →').click());
+    await page.waitForFunction(()=>document.querySelector('.learning-scope h3')?.innerText==='Showing orc decisions only.');
+    await page.screenshot({path:path.join(output,'learning-orc-desktop.png'),fullPage:false});
     assert.equal(errors.length,0,errors.join('\n')); assert.deepEqual(external,[]);
-    const result={source_workspace:workspace,source_home:sourceHome,cross_workspace:other,workspace_survives_reload:true,model_searches:['gpt-6-astra','gpt-6-sol','claude-opus-5.5','claude-fable-5.1'],catalog_and_benchmark_separate:true,readonly_handoff:['summary'],write_handoff:['summary','tests'],local_task_without_github:true,repository_choices:repositoryChoices,page_errors:errors,external_requests:external};
+    const result={source_workspace:workspace,source_home:sourceHome,cross_workspace:other,workspace_survives_reload:true,model_searches:['gpt-6-astra','gpt-6-sol','claude-opus-5.5','claude-fable-5.1'],catalog_and_benchmark_separate:true,readonly_handoff:['summary'],write_handoff:['summary','tests'],local_task_without_github:true,repository_choices:repositoryChoices,learning_scope_visible:true,other_learning_links_collapsed:true,learning_switch_oasis_to_orc:true,header_mode_workspace_scoped:true,admitted_observation_default:'off',admitted_explicit_shadow:true,page_errors:errors,external_requests:external};
     fs.writeFileSync(path.join(output,'result.json'),JSON.stringify(result,null,2)+'\n');
     console.log(JSON.stringify({output,result},null,2));
   } finally {await browser.close()}

@@ -372,13 +372,16 @@ function sourceUnavailable() {
 }
 function learningReadiness() {
   const c = state.capabilities, learning = c?.learning;
-  if (!learning) return sourceUnavailable();
-  if (learning.status === "unreadable" || !learning.labels) return `<section class="panel room-readiness"><div class="panel-body"><div class="eyebrow">LEARNING IN ${esc(c.workspace.name)}</div><h2>Learning evidence needs attention</h2><p>${esc(learning.reason || "Saved learning evidence could not be read.")}</p><p class="help-copy">Approval counts, training groups and automation state are unknown.</p><p class="room-path">${esc(learning.source_path || "")}</p><div class="actions">${sourceWorkspaceButtons("decisions")}</div></div></section>`;
+  const name = c?.workspace?.name || state.workspaces.find(w => w.id === state.workspace)?.name || "this workspace";
+  const other = sourceWorkspaceButtons("decisions");
+  const scope = `<section class="info-box learning-scope" aria-label="Learning dataset ownership"><h3>Showing ${esc(name)} decisions only.</h3><p>Switching workspaces opens a different dataset; records are not pooled.</p>${other ? `<details data-disclosure-key="other-learning-workspaces"><summary>Other workspace evidence</summary><div class="actions">${other}</div></details>` : ""}</section>`;
+  if (!learning) return scope + sourceUnavailable();
+  if (learning.status === "unreadable" || !learning.labels) return scope + `<section class="panel room-readiness"><div class="panel-body"><div class="eyebrow">LEARNING IN ${esc(c.workspace.name)}</div><h2>Learning evidence needs attention</h2><p>${esc(learning.reason || "Saved learning evidence could not be read.")}</p><p class="help-copy">Approval counts, training groups and automation state are unknown.</p><p class="room-path">${esc(learning.source_path || "")}</p></div></section>`;
   const labels = learning.labels, runtime = learning.runtime;
   const ready = labels.train_groups >= labels.min_train_groups && labels.validation_groups >= labels.min_validation_groups;
   const title = !labels.approved_answers ? "No approved examples yet" : !ready ? "More independent reviewed runs needed" : "Group prerequisites present";
   const model = runtime.status === "observed" ? `Local model last observed ${date(runtime.last_observed_at_ms)}` : runtime.status === "unavailable" ? "Local model runtime unavailable" : "Local model runtime not checked";
-  return `<section class="panel room-readiness"><div class="panel-body"><div class="room-readiness-heading"><div><div class="eyebrow">LEARNING IN ${esc(c.workspace.name)}</div><h2>${title}</h2></div><span class="pill">Workspace evidence</span></div><p>${labels.approved_answers} approved answers · ${labels.train_groups} training groups · ${labels.validation_groups} held-out groups</p><p class="help-copy">${ready ? "Training still checks duplicate inputs, conflicts, lineage and runtime availability." : `Automatic rounds need at least ${labels.min_train_groups} training and ${labels.min_validation_groups} held-out groups after data checks. Review supported decisions from independent runs first.`}</p><div class="actions">${button("Review decisions →", "lab-tab", 'data-tab="review"', "small primary")}${sourceWorkspaceButtons("decisions")}</div><details data-disclosure-key="learning-source"><summary>Source & runtime</summary><p>${esc(model)}. ${runtime.status === "observed" ? "This is a saved observation, not a fresh health check." : esc(runtime.reason || "")}</p><p>Labels and rounds belong to this workspace; switching does not combine datasets.</p><p class="room-path">${esc(learning.source_path)}</p></details></div></section>`;
+  return scope + `<section class="panel room-readiness"><div class="panel-body"><div class="room-readiness-heading"><div><div class="eyebrow">LEARNING IN ${esc(c.workspace.name)}</div><h2>${title}</h2></div><span class="pill">Workspace evidence</span></div><p>${labels.approved_answers} approved answers · ${labels.train_groups} training groups · ${labels.validation_groups} held-out groups</p><p class="help-copy">${ready ? "Training still checks duplicate inputs, conflicts, lineage and runtime availability." : `Automatic rounds need at least ${labels.min_train_groups} training and ${labels.min_validation_groups} held-out groups after data checks. Review supported decisions from independent runs first.`}</p><div class="actions">${button("Review decisions →", "lab-tab", 'data-tab="review"', "small primary")}</div><details data-disclosure-key="learning-source"><summary>Source & runtime</summary><p>${esc(model)}. ${runtime.status === "observed" ? "This is a saved observation, not a fresh health check." : esc(runtime.reason || "")}</p><p class="room-path">${esc(learning.source_path)}</p></details></div></section>`;
 }
 function githubReadiness() {
   const c = state.capabilities, github = c?.github;
@@ -1072,12 +1075,14 @@ function admissionCard(value) {
 }
 function openAdmittedLaunch(options = {}) {
   const provider = state.config.admission;
+  const modes = ["off", "shadow"].filter(mode => mode === "off" || provider.observations?.supported_modes?.includes(mode));
   const requestId = "task-" + crypto.randomUUID();
   modal("Start a TENET task", "TENET saves the task and context; ORC executes the admitted workflow.",
     `<form id="admitted-launch-form"><input type="hidden" name="request_id" value="${requestId}">
       ${!provider.ready ? `<p class="blocker">${esc(provider.error || "The required provider is unavailable.")}</p>` : ""}
       <div class="field"><label for="admitted-task">What should happen?</label><textarea id="admitted-task" name="text" rows="6" required>${esc(options.text || options.spec?.task || "")}</textarea></div>
-      <p class="help-copy">${esc(provider.executor?.model || provider.binding?.executor?.model || "Operator-selected Codex")} · one attempt · up to 10 minutes per worker. Laya is disabled for this dispatch.</p>
+      <p class="help-copy">${esc(provider.executor?.model || provider.binding?.executor?.model || "Operator-selected Codex")} · one attempt · up to 10 minutes per worker.</p>
+      <div class="field"><label for="admitted-laya-mode">Laya observations for this task</label><select id="admitted-laya-mode" name="mode">${modes.map(mode => `<option value="${mode}">${mode === "off" ? "Off · no model observations" : "Shadow · advisory only"}</option>`).join("")}</select><small>${modes.includes("shadow") ? "The operator configured a local runtime; this view has not checked inference. Shadow records observations without changing routing, acceptance, retries or permissions." : "The operator has not enabled a shadow runtime for this workspace."} Active mode is unavailable.</small></div>
       <p class="help-copy">Context to freeze: ${esc(provider.context_paths?.join(", ") || "No context files selected in operator policy")}</p>
       <label class="check-field"><input type="checkbox" name="allow_write"> Allow workspace edits for this task</label>
       <p class="help-copy">Without edits, Codex runs read-only. With edits, it uses workspace-write with approvals disabled and no extra Git metadata write roots. Service permissions are not qualified by this setting.</p>
@@ -1310,7 +1315,7 @@ async function refresh(force = false) {
     if (force || !state.config) {
       state.config = await api("config", undefined, w);
       if (epoch !== state.epoch) return;
-      $("#mode-chip").textContent = "Laya · " + state.config.mode;
+      $("#mode-chip").textContent = "Workspace Laya · " + state.config.mode;
       $("#execution-chip").textContent =
         state.config.admission?.mode === "tenet" ? (state.config.admission.ready ? "TENET admission" : "TENET unavailable") : state.config.execution_mode === "yolo"
           ? "YOLO · full access"
@@ -1674,7 +1679,7 @@ document.addEventListener("submit", async (event) => {
           task: values.text + "\nDo not delegate, publish, or broaden this task. Return evidence and explicit unresolved blockers.",
           acceptance: {required_handoff: writes ? ["summary", "tests"] : ["summary"]}}], acceptance: {required_nodes: ["work"]},
       };
-      await launch({action: "workflow", request_id: values.request_id, text: values.text, spec, allow_write: writes, mode: "off"});
+      await launch({action: "workflow", request_id: values.request_id, text: values.text, spec, allow_write: writes, mode: values.mode || "off"});
     } else if (form.id === "launch-form") {
       const kind = values.kind;
       await launch({
