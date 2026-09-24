@@ -213,7 +213,9 @@ NONE_ANSWERS = {"none", "n/a", "na", "nil", "nothing", "-", "—"}
 def parse_handoff(text: str) -> dict[str, Any]:
     """Extract the small handoff contract from a worker's final message."""
     blocks: dict[str, list[str]] = {}
-    label_pattern = re.compile(r"^(STATUS|SUMMARY|CHANGED|TESTS|BLOCKERS):\s*(.*)$", re.I)
+    # Models decorate labels: **STATUS:** success, **STATUS**: success, ## STATUS: success.
+    label_pattern = re.compile(
+        r"^(?:#{1,6}\s+)?([*_]{0,3})(STATUS|SUMMARY|CHANGED|TESTS|BLOCKERS)\1?\s*:\s*\1?\s*(.*)$", re.I)
     active: str | None = None
     fence: str | None = None
     handoff_fence = False
@@ -249,8 +251,8 @@ def parse_handoff(text: str) -> dict[str, Any]:
             continue
         matched = label_pattern.match(stripped)
         if matched:
-            active = matched[1].upper()
-            blocks[active] = [matched[2]]
+            active = matched[2].upper()
+            blocks[active] = [matched[3]]
         elif active:
             blocks[active].append(line)
     fields = {label: "\n".join(value).strip() for label, value in blocks.items()}
@@ -307,7 +309,7 @@ def parse_handoff(text: str) -> dict[str, Any]:
                 values.extend(part.strip() for part in re.split(r"[,\n]", item) if part.strip())
         return values
 
-    reported_status = fields.get("STATUS", "").split("\n", 1)[0].strip().lower()
+    reported_status = fields.get("STATUS", "").split("\n", 1)[0].strip().strip("*_`").strip().lower()
     if reported_status not in {"success", "partial", "blocked", "error"}:
         reported_status = ""
     return {

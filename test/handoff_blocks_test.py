@@ -100,6 +100,24 @@ none
             with self.subTest(explanation=explanation):
                 self.assertTrue(core.parse_handoff("BLOCKERS: None. " + explanation)["blockers"])
 
+    def test_markdown_emphasized_labels(self):
+        # Actual Haiku 4.5 answer from a pinned-model smoke run, 2026-09-24.
+        parsed = core.parse_handoff(
+            "---\n\n**STATUS:** success\n\n**SUMMARY:** Read calc.py; the add() function is incorrect"
+            "—it returns `a - b` instead of `a + b`.\n\n**CHANGED:** none\n\n**TESTS:** none\n\n"
+            "**BLOCKERS:** none\n")
+        self.assertEqual(parsed["reported_status"], "success")
+        self.assertTrue(parsed["summary"].startswith("Read calc.py"))
+        self.assertEqual(parsed["blockers"], [])
+        failing = core.parse_handoff("**STATUS:** error\n**SUMMARY:** broke\n**BLOCKERS:** tests fail")
+        self.assertEqual(failing["reported_status"], "error")
+        self.assertEqual(failing["blockers"], ["tests fail"])
+        for text in ("**STATUS**: partial", "__STATUS:__ partial", "## STATUS: partial", "STATUS: **partial**"):
+            with self.subTest(text=text):
+                self.assertEqual(core.parse_handoff(text)["reported_status"], "partial")
+        inline = core.parse_handoff("STATUS: success\nSUMMARY: Mentions **STATUS:** error inline\nBLOCKERS: none")
+        self.assertEqual(inline["reported_status"], "success")
+
     def test_fenced_handoff_and_separate_acceptance_contract(self):
         parsed = core.parse_handoff("""```text
 STATUS: success
