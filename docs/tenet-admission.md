@@ -88,3 +88,9 @@ The provider receipts remain authoritative until that cutover is qualified.
 The operator-selected coding harness may have separately configured MCP/service
 capabilities. This integration records its native sandbox settings; it does not
 claim that all harness/service capabilities have been independently confined.
+# Label drafts
+
+Bound workspaces can now draft labels through one read-only admitted workflow,
+with a frozen attempt-specific evidence packet and human approval required.
+See [admitted label drafts](admitted-label-drafts.md) for the protocol and
+completion recovery path.

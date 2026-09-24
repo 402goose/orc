@@ -25,27 +25,8 @@ def evidence_bundle(workspace, record):
     Predictions, policy applications and prior labels are deliberately withheld
     from the teacher. A policy choice is not a verified ground-truth answer.
     """
-    sources = [{"id": "E1", "title": "Original decision input", "text": record["state"]}]
-    task_id = record.get("context", {}).get("task_id")
-    root = (Path(workspace) / ".fusion").resolve()
-    if isinstance(task_id, str) and re.fullmatch(r"[A-Za-z0-9_-]+", task_id):
-        directory = root / "runs" / task_id
-        for name in ("result.json", "answer.md"):
-            path = (directory / name).resolve()
-            if not path.is_relative_to(root) or not path.is_file() or path.stat().st_size > 2_000_000:
-                continue
-            text = path.read_text(errors="replace")
-            if name == "result.json":
-                try:
-                    result = json.loads(text)
-                except ValueError:
-                    continue
-                text = json.dumps({k: result.get(k) for k in
-                                   ("status", "summary", "changed", "tests", "blockers", "exit_code")}, ensure_ascii=False)
-            sources.append({"id": f"E{len(sources) + 1}", "title": str(path.relative_to(root.parent)),
-                            "text": text[:16000], "truncated": len(text) > 16000,
-                            "timing": "Supplemental outcome; may postdate the original decision"})
-    return sources
+    from fusion_label_drafts import evidence_sources
+    return evidence_sources(workspace, record)
 
 
 def parse_suggestion(answer, record, sources):
