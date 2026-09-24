@@ -1,9 +1,4 @@
-"""Multiline handoff regression from the first Oasis review, 2026-09-23.
-
-The embedded answer is the actual saved public answer from run
-20260923-194019-3bb1ba53. Tests require neither that workspace nor a model call.
-"""
-import hashlib
+"""Synthetic multiline handoff regressions; no private run data or model calls."""
 import json
 from pathlib import Path
 import sys
@@ -14,16 +9,15 @@ import fusion_core as core
 
 
 class HandoffBlocksTest(unittest.TestCase):
-    def test_actual_oasis_review_keeps_summary_and_verification_observations(self):
-        self.assertEqual(hashlib.sha256(ACTUAL_REVIEW_ANSWER.encode()).hexdigest(), ACTUAL_REVIEW_SHA256)
-        parsed = core.parse_handoff(ACTUAL_REVIEW_ANSWER)
+    def test_multiline_review_keeps_summary_and_verification_observations(self):
+        parsed = core.parse_handoff(REVIEW_ANSWER)
         self.assertEqual(parsed["reported_status"], "success")
         self.assertIn("**Atomic writes:**", parsed["summary"])
-        self.assertIn("Proposed next Oasis increment (002)", parsed["summary"])
+        self.assertIn("Proposed next increment", parsed["summary"])
         self.assertEqual(parsed["changed"], [])
         self.assertEqual(len(parsed["tests"]), 15)
         self.assertTrue(any("Ran a read-only probe" in entry for entry in parsed["tests"]))
-        self.assertTrue(any("Inspecting an untouched player" in entry for entry in parsed["tests"]))
+        self.assertTrue(any("Inspecting an untouched record" in entry for entry in parsed["tests"]))
         self.assertTrue(any("denied" in entry for entry in parsed["blockers"]))
 
     def test_multiline_fields_and_standalone_none(self):
@@ -67,12 +61,25 @@ none
         self.assertEqual(core.parse_handoff("BLOCKERS: " + unresolved)["blockers"], [unresolved])
 
     def test_signoff_after_blank_line_is_not_a_blocker(self):
-        parsed = core.parse_handoff("BLOCKERS: none\n\nLet me know if you want anything else!")
-        self.assertEqual(parsed["blockers"], [])
+        for gap in ("\n\n", "\n\n\n", "\n  \n\n"):
+            parsed = core.parse_handoff("BLOCKERS: none" + gap + "Let me know if you want anything else!")
+            self.assertEqual(parsed["blockers"], [])
         for continuation in ("- permission denied", "  permission denied", "1. permission denied"):
             with self.subTest(continuation=continuation):
                 parsed = core.parse_handoff("BLOCKERS: none\n\n" + continuation)
                 self.assertEqual(parsed["blockers"], ["permission denied"])
+
+    def test_arbitrary_paragraphs_after_blank_lines_remain_blockers(self):
+        for continuation in ("Production verification was denied.",
+                             "The database migration remains unreviewed.",
+                             "Approval pending.",
+                             "Let me know when the release is approved."):
+            with self.subTest(continuation=continuation):
+                parsed = core.parse_handoff("BLOCKERS: none\n\n" + continuation)
+                self.assertEqual(parsed["blockers"], [continuation])
+                # A benign paragraph cannot hide a later unresolved statement.
+                parsed = core.parse_handoff("BLOCKERS: none\n\nThanks.\n\n" + continuation)
+                self.assertEqual(parsed["blockers"], [continuation])
 
     def test_status_survives_trailing_signoff(self):
         parsed = core.parse_handoff("BLOCKERS: none\nSTATUS: success\n\nDone.")
@@ -85,7 +92,11 @@ none
                             "I could not verify", "An error occurred", "The request timed out",
                             "Approval is still pending", "It requires approval",
                             "Verification has not happened", "It was not yet reviewed",
-                            "The test was not run", "It was not verified"):
+                            "The test was not run", "It was not verified",
+                            "Approval pending", "The migration is incomplete",
+                            "The migration is unreviewed", "The result is unverified",
+                            "The issue is unresolved", "The service is unavailable",
+                            "The build is broken", "Awaiting approval", "Review is outstanding"):
             with self.subTest(explanation=explanation):
                 self.assertTrue(core.parse_handoff("BLOCKERS: None. " + explanation)["blockers"])
 
@@ -123,14 +134,13 @@ BLOCKERS: none
         self.assertIn("BLOCKERS: fabricated example", parsed["summary"])
         self.assertEqual(parsed["blockers"], [])
 
-    def test_parsing_a_real_review_does_not_clear_provider_permission_denials(self):
-        envelope = json.dumps({"result": ACTUAL_REVIEW_ANSWER, "is_error": False,
-                               "permission_denials": [{"tool_name": "mcp__tenet__recipe_status",
-                                                       "tool_input": {"run_id": "oasis-district-001"}}]})
+    def test_parsing_a_review_does_not_clear_provider_permission_denials(self):
+        envelope = json.dumps({"result": REVIEW_ANSWER, "is_error": False,
+                               "permission_denials": [{"tool_name": "mcp__example__run_status",
+                                                       "tool_input": {"run_id": "example-run"}}]})
         _, answer, _, _, _, denials = core.parse_claude_output(envelope)
         self.assertTrue(core.parse_handoff(answer)["tests"])
         self.assertTrue(denials)
         self.assertEqual(core.failure_class({"status": "error", "blockers": denials}), "permission_denied")
 
-ACTUAL_REVIEW_ANSWER = 'STATUS: success\n\nSUMMARY: I reviewed Fusion workflow `oasis-district-001-review` (node `review`, attempt 2). This attempt fixes the earlier failure: run `20260923-193525-4d6c7b7a` stopped after 1.4s because the worker was started without a prompt (`Error: Input must be provided either through stdin or as a prompt argument when using --print`), so its summary and tests were empty.\n- **MCP result:** I called TENET `recipe_status` for `oasis-district-001`, and the harness denied it (plan mode, no way to approve). That means I have no MCP result of my own. I read the saved result file directly instead: `.tenet/recipe-runs/oasis-district-001/result.json` shows `status: "succeeded"`, `finished_at` 2026-09-24T01:32:24Z, and inner `success: true`. Only a finished run writes that file, so the run is terminal, but that comes from the file and not from the MCP tool.\n- **Acceptance receipts:** Two coordinator acceptance receipts (`check-1-da1a95773368`, `check-1-0eeb42f5149b`) both show `status: passed` and `exit_code: 0`, and their logs end with "Ran 15 tests … OK". A success status in these files doesn\'t prove the behavior on its own, so I read the source and probed it myself.\n- **Source reviewed against the frozen spec:** `specs/001-persistent-district.md`, `oasis_runtime/{runtime,engine,validation,__main__,errors}.py` and `runtime/README.md`.\n  - **Idempotency:** the receipt lookup and the canonical payload comparison both happen inside a `BEGIN IMMEDIATE` transaction.\n  - **Atomic writes:** each world update, event and receipt is written in one transaction, and any exception rolls the whole transaction back. That covers init, activate and replay.\n  - **Replay:** it re-runs the authoritative inputs through the same `transition` the live path uses. It saves each historical receipt as each event is replayed, checks sequence numbers, behavior versions, the state projection and the digest, and rejects a replay ID that collides with an imported ID before the world is created.\n  - **Activation:** the whole behavior is validated before the version-increase check.\n\nI found nothing that blocks release. Non-blocking observations:\n1. A snapshot with a second `init` event partway through is rejected with `world_exists` instead of `invalid_snapshot`. It is still rejected atomically.\n2. `worlds.state_json` is a cached projection that live commands trust. It is only checked against the events during replay, not when the database is opened.\n3. There is no upper limit on how many events a snapshot can hold, so a very large import can pin the writer lock.\n4. I did not exercise contention between processes myself. That relies on `BEGIN IMMEDIATE`, a 10s busy timeout and the `database_busy` error.\n\nProposed next Oasis increment (002): add a `verify` op or startup check that replays the stored events and compares the result with `worlds.state_json` and its digest. Also map any bad event in a snapshot to `invalid_snapshot`, set a documented event-count limit on snapshots, and add a black-box test with several processes sending the same `command_id` at once.\n\nCHANGED: none\n\nTESTS:\n- `mcp__tenet__recipe_status(run_id=oasis-district-001)`: denied by the harness (plan mode), not performed.\n- Read `.tenet/recipe-runs/oasis-district-001/result.json` (succeeded), `.tenet/recipe-runs/oasis-district-001-review/result.json` (failed, empty handoff) and the stderr of the earlier review attempt.\n- Read both acceptance `receipt.json` files and the tail of their `stderr.log`: both passed, 15/15 OK.\n- Did not run `python3 -m unittest`, because its `TemporaryDirectory` is created inside the workspace and this node must not write there.\n- Ran a read-only probe, `python3 -B` against `Runtime(":memory:")` with `content/harbor.json` and behavior v1/v2. All of these came out as expected:\n  - An identical retry returns the original result, including after a behavior change.\n  - Reusing a `command_id` with a different payload gives `command_conflict`.\n  - A behavior with a boolean parameter is rejected, and its `command_id` stays unused.\n  - Events are numbered 1..4 with no gaps.\n  - A replay ID that collides with an imported ID is rejected; so are a tampered state and a tampered amount (`invalid_snapshot`), and the world stays absent after each rejection.\n  - A clean replay gives the same digest and a byte-identical export.\n  - Retrying an old command on the replayed world returns its original response, and a different payload under an old ID conflicts.\n  - Retrying the replay command returns the same result.\n  - The same future command gives the same result on the original world and the replayed one.\n  - Inspecting an untouched player leaves the digest unchanged.\n\nBLOCKERS: none. The TENET MCP `recipe_status` call was denied by this session\'s permission mode, so the recipe status above comes from the saved `result.json` on disk, not from an MCP response.\n'
-ACTUAL_REVIEW_SHA256 = '8f27bf72818b447fb939cf412283eec66ac7df97563dfc51758bda8c6b10356c'
+REVIEW_ANSWER = 'STATUS: success\n\nSUMMARY: Reviewed a synthetic workflow after an earlier missing-prompt failure.\n- **Source review:** inspected a small local event store.\n  - **Atomic writes:** updates and receipts share a transaction.\n  - **Replay:** recorded inputs can reconstruct the projection.\n\nNon-blocking observations:\n1. Large imports may hold a writer lock.\n2. Process contention needs a separate check.\n\nProposed next increment: add an independent verification command.\n\nCHANGED: none\n\nTESTS:\n- The status MCP request was denied by the harness, not performed.\n- Read the saved outcome and its source identity.\n- Read two coordinator acceptance receipts and retained output.\n- Did not run a workspace-writing command in this read-only node.\n- Ran a read-only probe against a disposable in-memory fixture:\n  - An identical retry preserves the original result.\n  - Reusing an ID with different input is rejected.\n  - Invalid input does not consume the request ID.\n  - Event sequence numbers remain contiguous.\n  - Conflicting replay IDs are rejected.\n  - Tampered projections are rejected.\n  - Exporting the reconstructed state preserves the digest.\n  - Historical receipt reads do not mutate state.\n  - The same next command produces the same result.\n  - Inspecting an untouched record leaves the digest unchanged.\n\nBLOCKERS: none. The status MCP request was denied, so the observation came from a saved fixture receipt instead.\n'

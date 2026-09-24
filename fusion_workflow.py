@@ -717,7 +717,12 @@ BLOCKERS: unresolved issues, or none
         Each invocation has its own directory, including resume rechecks. Output
         goes straight to files so a verbose check cannot exhaust coordinator
         memory. The initial receipt survives an interrupted coordinator; only a
-        finalized, successful receipt can pass the gate.
+        finalized, successful receipt can pass the gate. A direct exit is not
+        evidence that an entire process family finished: POSIX checks with a
+        surviving process group fail and that group is terminated. Descendants
+        that escape into another session are not observed or claimed terminated.
+        Final logs are detached prefix snapshots, so inherited output descriptors
+        cannot keep modifying the files referenced by a finalized receipt.
         """
         attempt = int(result.get("attempt") or node.get("attempts") or 0)
         directory = (self._node_dir(node["id"]) / "acceptance" / f"attempt-{attempt}"
@@ -742,6 +747,12 @@ BLOCKERS: unresolved issues, or none
             "exit_code": None,
             "timed_out": False,
             "error": None,
+            "process": {"pid": None, "exit_observed": False, "group_id": None,
+                        "group_survivors_after_exit": None, "group_termination_requested": False,
+                        "group_survivors_after_cleanup": None,
+                        "descendant_scope": "same_posix_process_group_only" if os.name == "posix" else "unobserved",
+                        "escaped_sessions": "unobserved"},
+            "output_scope": "detached_observed_prefix_snapshot",
             "artifacts": {"receipt": str(receipt_path), "stdout": str(stdout_path), "stderr": str(stderr_path)},
         }
 
@@ -761,21 +772,47 @@ BLOCKERS: unresolved issues, or none
                 receipt["timeout_seconds"] = timeout
                 with subprocess.Popen(command, cwd=self.workspace, stdin=subprocess.DEVNULL,
                                       stdout=stdout, stderr=stderr, start_new_session=(os.name == "posix")) as process:
+                    observed = receipt["process"]
+                    observed["pid"] = process.pid
+                    observed["group_id"] = process.pid if os.name == "posix" else None
+
+                    def group_alive() -> bool:
+                        try:
+                            os.killpg(process.pid, 0)
+                            return True
+                        except ProcessLookupError:
+                            return False
+
+                    def terminate_group() -> None:
+                        observed["group_termination_requested"] = True
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
                     try:
                         process.wait(timeout=timeout)
                     except subprocess.TimeoutExpired:
                         receipt["timed_out"] = True
                         receipt["error"] = f"acceptance check timed out after {timeout} seconds"
                         if os.name == "posix":
-                            try:
-                                os.killpg(process.pid, signal.SIGKILL)
-                            except ProcessLookupError:
-                                pass
+                            terminate_group()
                         else:
                             process.kill()
                         process.wait()
+                    observed["exit_observed"] = True
                     receipt["exit_code"] = process.returncode
+                    if os.name == "posix":
+                        observed["group_survivors_after_exit"] = group_alive()
+                        if observed["group_survivors_after_exit"]:
+                            if not receipt["error"]:
+                                receipt["error"] = "acceptance check exited with processes remaining in its process group"
+                            terminate_group()
+                        # This is an observation, not a process-family guarantee:
+                        # killed but unreaped descendants may remain visible.
+                        observed["group_survivors_after_cleanup"] = group_alive()
                 receipt["status"] = ("timed_out" if receipt["timed_out"] else
+                                     "error" if receipt["error"] else
                                      "passed" if receipt["exit_code"] == 0 else "failed")
             except (OSError, ValueError) as exc:
                 receipt["status"] = "error"
@@ -786,11 +823,24 @@ BLOCKERS: unresolved issues, or none
         for name, path in (("stdout", stdout_path), ("stderr", stderr_path)):
             digest = hashlib.sha256()
             size = 0
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            snapshot = path.with_suffix(".snapshot")
+            with path.open("rb") as handle, snapshot.open("xb") as target:
+                observed_size = os.fstat(handle.fileno()).st_size
+                remaining = observed_size
+                # A descendant may still hold the old inode, including one
+                # outside the observed group. Bound the copy to this prefix;
+                # following a growing capture until EOF could run indefinitely.
+                while remaining:
+                    chunk = handle.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise OSError("acceptance output was truncated while snapshotting")
+                    target.write(chunk)
                     digest.update(chunk)
                     size += len(chunk)
-            receipt["outputs"][name] = {"path": str(path), "sha256": digest.hexdigest(), "bytes": size}
+                    remaining -= len(chunk)
+            snapshot.replace(path)
+            receipt["outputs"][name] = {"path": str(path), "sha256": digest.hexdigest(), "bytes": size,
+                                        "capture_bytes_observed": observed_size}
         save()
         self._event("acceptance.check.finished", {"node_id": node["id"], "attempt": attempt,
                                                   "status": receipt["status"], "receipt": str(receipt_path)})

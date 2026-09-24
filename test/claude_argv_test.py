@@ -1,11 +1,7 @@
-"""Claude prompt boundaries; native probes stop at validation, never inference."""
+"""Portable Claude prompt-boundary regressions; no native runtime required."""
 import argparse
-import os
 from pathlib import Path
-import shutil
-import subprocess
 import sys
-import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -35,7 +31,7 @@ class ClaudeArgvTest(unittest.TestCase):
         return parser.parse_args(argv[1:])
 
     def test_fresh_and_resumed_launches_keep_prompt_separate_from_tools(self):
-        tools = ["Read", "Glob", "Grep", "mcp__tenet__recipe_status"]
+        tools = ["Read", "Glob", "Grep", "mcp__example__run_status"]
         task = self.task("/tmp/fixture", allowed_tools=tools, max_budget_usd=2,
                          launcher_args=["--mcp-config", "/tmp/fixture-mcp.json", "--strict-mcp-config"])
         for session in (None, "prior-session"):
@@ -65,34 +61,6 @@ class ClaudeArgvTest(unittest.TestCase):
                         self.assertEqual(argv[-2:], ["--", core.brief_for(task)])
                         if command == "claude":
                             self.assertEqual(self.parse_fixture(argv).prompt, core.brief_for(task))
-
-    @unittest.skipUnless(sys.platform == "darwin" and shutil.which("claude") and shutil.which("sandbox-exec"),
-                         "requires native Claude and macOS network sandbox")
-    def test_native_claude_recognizes_prompt_before_local_validation_gate(self):
-        # No credentials are inherited, --bare disables hooks/keychain/discovery,
-        # config is isolated, and the OS denies networking as an extra backstop.
-        # Invalid stream-json verbosity stops after prompt parsing, before model
-        # initialization. Keeping this gate is essential: never make this a live
-        # inference test just to check CLI parsing.
-        with tempfile.TemporaryDirectory(prefix="orc-claude-argv-") as directory:
-            task = self.task(directory, command=shutil.which("claude"), allowed_tools=["Read", "Glob"],
-                             launcher_args=["--bare", "--strict-mcp-config", "--setting-sources", ""])
-            argv, _, _ = core.agent_command(core.DEFAULTS, task, None)
-            argv[argv.index("--output-format") + 1] = "stream-json"
-            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "CLAUDE_CONFIG_DIR": directory,
-                   "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_TELEMETRY": "1"}
-            prefix = [shutil.which("sandbox-exec"), "-p", "(version 1) (allow default) (deny network*)"]
-            for label, command, expected in (
-                ("regression", [arg for arg in argv if arg != "--"], "Input must be provided"),
-                ("fixed", argv, "--output-format=stream-json requires --verbose"),
-            ):
-                with self.subTest(label=label):
-                    result = subprocess.run([*prefix, *command], cwd=directory, env=env, input="",
-                                            capture_output=True, text=True, timeout=15)
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertEqual(result.stdout, "")
-                    self.assertIn(expected, result.stderr)
-
 
 if __name__ == "__main__":
     unittest.main()

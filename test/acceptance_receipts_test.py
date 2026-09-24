@@ -2,9 +2,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -161,6 +163,84 @@ class AcceptanceReceiptsTest(unittest.TestCase):
         self.assertEqual(receipt["outputs"]["stdout"]["bytes"], 2 * 1024 * 1024)
         self.assertNotEqual(observed[0]["stdout"], subprocess.PIPE)
         self.assertNotEqual(observed[0]["stderr"], subprocess.PIPE)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_successful_parent_with_live_group_is_rejected_and_group_terminated(self):
+        started, release, completed = [self.workspace / name for name in ("started", "release", "completed")]
+        child = ("import pathlib,time;"
+                 f"pathlib.Path({str(started)!r}).write_text('ready');"
+                 f"release=pathlib.Path({str(release)!r}); deadline=time.monotonic()+5;"
+                 "\nwhile not release.exists() and time.monotonic()<deadline: time.sleep(0.01)\n"
+                 "print('late child output',flush=True);"
+                 f"pathlib.Path({str(completed)!r}).write_text('escaped cleanup')")
+        parent = ("import pathlib,subprocess,sys,time;"
+                  f"subprocess.Popen([sys.executable,'-c',{child!r}]);"
+                  f"ready=pathlib.Path({str(started)!r});"
+                  "\nwhile not ready.exists(): time.sleep(0.01)\n"
+                  "print('parent output',flush=True)")
+        runner = self.runner([[sys.executable, "-c", parent]])
+        result = {"status": "success", "summary": "fixture", "attempt": 1}
+        try:
+            accepted, problems = runner._accept_node(runner.nodes["verify"], result)
+        finally:
+            release.touch()
+        self.assertFalse(accepted)
+        self.assertTrue(any("processes remaining" in problem for problem in problems))
+        receipt = result["acceptance_checks"][0]
+        self.assert_receipt(receipt, "error")
+        self.assertEqual(receipt["exit_code"], 0)  # Direct exit remains truthful.
+        self.assertTrue(receipt["process"]["exit_observed"])
+        self.assertTrue(receipt["process"]["group_survivors_after_exit"])
+        self.assertTrue(receipt["process"]["group_termination_requested"])
+        time.sleep(0.85)
+        self.assertFalse(completed.exists())
+        self.assert_receipt(receipt, "error")
+        self.assertEqual(Path(receipt["outputs"]["stdout"]["path"]).read_text(), "parent output\n")
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX session escape")
+    def test_escaped_inherited_descriptors_cannot_mutate_final_snapshots(self):
+        started, release, completed = [self.workspace / name for name in ("started", "release", "completed")]
+        # The escaped child stays idle until after the receipt is finalized, then
+        # demonstrably writes through both inherited FDs before marking done.
+        child = ("import os,pathlib,sys,time;"
+                 f"pathlib.Path({str(started)!r}).write_text(str(os.getpid()));"
+                 f"release=pathlib.Path({str(release)!r}); deadline=time.monotonic()+5;"
+                 "\nwhile not release.exists() and time.monotonic()<deadline: time.sleep(0.01)\n"
+                 "print('late escaped stdout',flush=True);print('late escaped stderr',file=sys.stderr,flush=True);"
+                 f"pathlib.Path({str(completed)!r}).write_text('done')")
+        parent = ("import pathlib,subprocess,sys,time;"
+                  f"subprocess.Popen([sys.executable,'-c',{child!r}],start_new_session=True);"
+                  f"ready=pathlib.Path({str(started)!r});"
+                  "\nwhile not ready.exists(): time.sleep(0.01)\n"
+                  "print('parent stdout',flush=True);print('parent stderr',file=sys.stderr,flush=True)")
+        runner = self.runner([[sys.executable, "-c", parent]])
+        result = {"status": "success", "summary": "fixture", "attempt": 1}
+        try:
+            accepted, problems = runner._accept_node(runner.nodes["verify"], result)
+            self.assertTrue(accepted, problems)
+            receipt = result["acceptance_checks"][0]
+            self.assert_receipt(receipt, "passed")
+            self.assertEqual(receipt["output_scope"], "detached_observed_prefix_snapshot")
+            self.assertFalse(receipt["process"]["group_survivors_after_exit"])
+            self.assertFalse(receipt["process"]["group_termination_requested"])
+            self.assertEqual(receipt["process"]["descendant_scope"], "same_posix_process_group_only")
+            self.assertEqual(receipt["process"]["escaped_sessions"], "unobserved")
+            before = {name: Path(receipt["outputs"][name]["path"]).read_bytes() for name in ("stdout", "stderr")}
+            self.assertEqual(before, {"stdout": b"parent stdout\n", "stderr": b"parent stderr\n"})
+            release.write_text("go")
+            deadline = time.monotonic() + 3
+            while not completed.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(completed.exists(), "escaped child did not exercise inherited output descriptors")
+            self.assert_receipt(receipt, "passed")
+            self.assertEqual(before, {name: Path(receipt["outputs"][name]["path"]).read_bytes() for name in before})
+        finally:
+            release.touch()
+            if started.exists():
+                try:
+                    os.kill(int(started.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 if __name__ == "__main__":
