@@ -163,6 +163,22 @@ class ShadowProviderSupervisorTest(unittest.TestCase):
     def test_real_provider_and_supervisor_preserve_explicit_off(self):
         self.supervisor_mode("off")
 
+    def test_configured_timeout_reaches_frozen_provider_contract_without_clamping(self):
+        self.config["timeout_seconds"] = 1800
+        admitted = admission.admit(self.workspace, "longer-build", self.spec, self.config)
+        frozen = json.loads(Path(admitted["artifacts"]["config"]["path"]).read_text())
+        self.assertEqual(frozen["timeout_seconds"], 1800)
+        self.config["timeout_seconds"] = 3601
+        with self.assertRaisesRegex(ValueError, "timeout_seconds"):
+            admission.admit(self.workspace, "over-policy-bound", self.spec, self.config)
+        self.assertFalse((self.root / "state" / "fixture" / "over-policy-bound").exists())
+
+    def test_teacher_timeout_remains_separately_bounded(self):
+        self.config["timeout_seconds"] = 1800
+        with patch.object(admission, "call", return_value={}) as provider:
+            admission.admit(self.workspace, "teacher", self.spec, self.config, label_draft={})
+        self.assertEqual(provider.call_args.kwargs["intent"]["config"]["timeout_seconds"], 600)
+
     def supervisor_mode(self, mode):
         app = ui.ControlRoom(self.workspace)
         original = subprocess.Popen
