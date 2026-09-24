@@ -87,11 +87,32 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":12,"output_tok
         with self.assertRaisesRegex(ValueError, "explicit model"):
             core.agent_command(self.config, self.task({"model": "", "reasoning_effort": "high"}), None)
         task = self.task(ASTRA)
-        task["agent"] = "claude"
-        with self.assertRaisesRegex(ValueError, "native Codex"):
+        task["agent"] = "agy"
+        with self.assertRaisesRegex(ValueError, "native Codex and Claude Code"):
             core.agent_command(self.config, task, None)
-        with self.assertRaisesRegex(ValueError, "explicit Codex"):
+        with self.assertRaisesRegex(ValueError, "explicit Codex or Claude"):
             validate_spec({"nodes": [{"id": "one", "task": "inspect", "agent": "auto", **ASTRA}]})
+
+    def test_claude_effort_is_passed_and_recorded_but_not_claimed(self):
+        task = self.task({"model": "claude-sonnet-5", "reasoning_effort": "high"})
+        task["agent"] = "claude"
+        argv, _, metadata = core.agent_command(self.config, task, None)
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+        self.assertLess(argv.index("--effort"), argv.index("--"))
+        choice = metadata["execution_choice"]
+        self.assertEqual(choice["requested"], {"model": "claude-sonnet-5", "reasoning_effort": "high"})
+        self.assertEqual((choice["catalog"]["status"], choice["observed"]["status"]), ("unchecked", "unobserved"))
+        for effort in ("ultra", "minimal", "none"):
+            with self.subTest(effort=effort):
+                task = self.task({"model": "claude-sonnet-5", "reasoning_effort": effort})
+                task["agent"] = "claude"
+                with self.assertRaisesRegex(ValueError, "Claude Code accepts"):
+                    core.agent_command(self.config, task, None)
+        plain = self.task({"model": "claude-sonnet-5"})
+        plain["agent"] = "claude"
+        argv, _, metadata = core.agent_command(self.config, plain, None)
+        self.assertNotIn("--effort", argv)
+        self.assertNotIn("execution_choice", metadata)
 
     def test_real_fixture_dispatch_persists_choice_without_claiming_effective_effort(self):
         task = self.task(SOL)

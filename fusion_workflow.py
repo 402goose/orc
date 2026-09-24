@@ -269,8 +269,8 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
         visit(node["id"])
         if "reasoning_effort" in node:
             from fusion_reasoning import EFFORTS
-            if node["agent"] != "codex" or not isinstance(node["reasoning_effort"], str) or node["reasoning_effort"] not in EFFORTS:
-                raise ValueError("workflow reasoning_effort requires an explicit Codex node and a supported effort")
+            if node["agent"] not in {"codex", "claude"} or not isinstance(node["reasoning_effort"], str) or node["reasoning_effort"] not in EFFORTS:
+                raise ValueError("workflow reasoning_effort requires an explicit Codex or Claude node and a supported effort")
         if "allow_native_delegation" in node and (node["agent"] != "codex" or not isinstance(node["allow_native_delegation"], bool)):
             raise ValueError("allow_native_delegation requires an explicit Codex node and boolean")
         if node.get("independent_of") and node["independent_of"] not in node["needs"]:
