@@ -283,7 +283,10 @@ def survey(workspace, config, agent="auto", remote="origin", resume=None, sync_o
                 packet_path = root / f"batch-{len(record['batches']) + 1}.json"
                 save(packet_path, packet)
                 task = truffle.worker_task(workspace, choice, SURVEY_PROMPT.replace("PATH", str(packet_path)),
-                                           ["Read-only issue grading. No edits, implementation, publication or delegation."], record["id"])
+                                           ["Read-only issue grading. No edits, implementation, publication or delegation."], record["id"],
+                                           f"Truffle survey: grade each of {len(batch)} issues in {record['repo']} "
+                                           f"({', '.join('#' + str(r['number']) for r in batch)}) A-D for a scoped Fusion fix, "
+                                           "with checked source quotes for A/B candidates. Read-only.")
                 attempt = {"numbers": [r["number"] for r in batch], "run_id": task["run_id"], "status": "running", "started_at_ms": core.now_ms()}
                 record["batches"].append(attempt)
                 record.update(active_run_id=task["run_id"], message=f"Snout is grading {', '.join('#' + str(r['number']) for r in batch)}")

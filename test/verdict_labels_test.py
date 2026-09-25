@@ -43,12 +43,14 @@ class VerdictLabelsTest(unittest.TestCase):
         path.write_text(json.dumps(value))
         os.environ["FUSION_CONFIG"] = str(path)
 
-    def run_dir(self, run_id="20260924-000000-abcdef12", status="success", task="Add CSV export with tests", **task_fields):
-        run = core.RunStore(self.workspace).runs / run_id
+    def run_dir(self, run_id="20260924-000000-abcdef12", status="success", task="Add CSV export with tests", runs=None,
+                result=None, **task_fields):
+        run = (runs or core.RunStore(self.workspace).runs) / run_id
         run.mkdir(parents=True)
         (run / "task.json").write_text(json.dumps({"run_id": run_id, "task": task, "trace_id": run_id, **task_fields}))
         (run / "result.json").write_text(json.dumps({"status": status, "summary": "Added CSV export", "changed": ["export.py"],
-                                                     "tests": ["pytest -q: 3 passed"], "route": "orc-free", "agent": "claude"}))
+                                                     "tests": ["pytest -q: 3 passed"], "route": "orc-free", "agent": "claude",
+                                                     **(result or {})}))
         return run_id
 
     def events(self, name):
@@ -118,6 +120,82 @@ class VerdictLabelsTest(unittest.TestCase):
         self.assertEqual(label["status"], "skipped")
         self.assertTrue(self.events("decision")[0]["truncated"])
         self.assertEqual(self.events("label"), [])
+
+    def test_a_truffle_scout_sized_verdict_labels_a_marked_summary_excerpt(self):
+        prompt = "You are Truffle pig, scouting tractable GitHub issues. " + "Inspect source and tests. " * 80
+        context = "Truffle scout: shortlist at most 3 independent, tractable open issues in hathbanger/orc with checked source quotes. Read-only."
+        summary = "Shortlisted #46 and #51 with checked quotes; skipped 9 issues with reasons.\n" + "- #%d skipped: needs a product decision.\n" * 200
+        summary = summary % tuple(range(200))
+        self.assertGreater(len(prompt), 2000)
+        self.assertGreater(len(summary), 6500)
+        run_id = self.run_dir(task=prompt, decision_context=context, result={"summary": summary, "changed": [], "tests": []})
+        label = self.verdict(run_id, True)["label"]
+        self.assertEqual(label["status"], "labeled", label)
+        [decision] = self.events("decision")
+        self.assertFalse(decision["truncated"])
+        self.assertLessEqual(len(decision["state"]), 2200)
+        state = json.loads(decision["state"])
+        self.assertEqual(state["task"], context)
+        self.assertTrue(state["summary"].startswith("Shortlisted #46 and #51"))
+        omitted = int(state["summary"].rsplit("[…truncated ", 1)[1].split(" chars]")[0])
+        self.assertEqual(len(state["summary"]) - len(f" […truncated {omitted} chars]") + omitted, len(summary))
+
+    def test_a_workflow_stage_verdict_matches_the_gate_input_and_is_labeled(self):
+        from fusion_policy import accept_node
+        headline = "Fixes https://github.com/hathbanger/orc/issues/46 — Woodland can show the previous survey"
+        request = headline + "\nSelected from Truffle pig hunt.\n" + json.dumps({"evidence": ["quote " * 40] * 30})
+        node_context = {"request": request, "workflow_kind": "debug", "stage": "implement"}
+        node = {"id": "implement", "role": "implementation", "task": "Read the full request and brief. " * 60,
+                "decision_context": node_context}
+        run_context = {"request": node_context, "dependencies": [{"status": "success", "changed": ["x.py"] * 50, "blockers": []}]}
+        result = {"summary": "Minted the survey id before launch and navigated to it. " * 120,
+                  "changed": [f"src/module_{i}.py" for i in range(30)], "tests": ["python3 test/run_python.py: 409 passed"]}
+        self.assertGreater(len(request), 6500)
+        run_id = self.run_dir(task=node["task"] + "\nWork in this dedicated worktree.", role="implementation",
+                              parent_task_id="wf-9", decision_context=run_context, result=result)
+        label = self.verdict(run_id, False, "The fix races the UI job id")["label"]
+        self.assertEqual(label["status"], "labeled", label)
+        verdict_state = self.events("decision")[0]["state"]
+        state = json.loads(verdict_state)
+        self.assertEqual({k: v for k, v in state["task"].items() if k != "request"},
+                         {"workflow_kind": "debug", "stage": "implement", "role": "implementation"})
+        self.assertTrue(state["task"]["request"].startswith(headline + "\nSelected from Truffle"))
+        self.assertIn("[…truncated", state["task"]["request"])
+        self.assertIn("[…truncated", state["summary"])
+        self.assertEqual((len(state["changed"]), state["changed"][-1]), (13, "[…18 more]"))
+        self.assertLessEqual(len(verdict_state), 2200)
+        with patch.object(fusion_decisions, "runtime_for", lambda options: Backend({"plausible": "true"})):
+            _, gate_id = accept_node({"decisions": {"mode": "shadow"}}, self.workspace, "wf-9", node, {**result, "run_id": run_id})
+        self.assertEqual(self.store.get(gate_id)["state"], verdict_state)
+
+    def test_a_criterion_that_cannot_fit_whole_is_not_excerpted(self):
+        run_id = self.run_dir(task="Keep every requirement: " + "must quote commas; " * 110,
+                              result={"summary": "Added CSV export. " * 400})
+        label = self.verdict(run_id, True)["label"]
+        self.assertEqual(label["status"], "skipped")
+        self.assertIn("does not fit", label["reason"])
+        [decision] = self.events("decision")
+        self.assertTrue(decision["truncated"])
+        self.assertEqual(self.events("label"), [])
+
+    def test_a_worktree_run_is_recorded_and_labeled_in_the_parent_workspace(self):
+        worktree = self.workspace / ".fusion" / "worktrees" / "wf-7"
+        run_id = self.run_dir("20260924-180319-c7a5873c", runs=worktree / ".fusion" / "runs", parent_task_id="wf-7")
+        payload = self.verdict(run_id, True)
+        evidence = str(worktree / ".fusion" / "runs" / run_id / "result.json")
+        self.assertEqual((payload["label"]["status"], payload["evidence"], payload["group"]), ("labeled", evidence, run_id))
+        [outcome] = self.events("outcome")
+        self.assertEqual((outcome["task_id"], outcome["accepted"]), (run_id, True))
+        self.assertIn(evidence, self.events("label")[0]["evidence"])
+        self.assertEqual(json.loads(self.events("decision")[0]["state"])["task"], "Add CSV export with tests")
+        self.assertFalse((worktree / ".fusion" / "decisions").exists())
+        with tempfile.TemporaryDirectory() as outside:
+            escaped = self.workspace / ".fusion" / "worktrees" / "wf-8"
+            escaped.mkdir(parents=True)
+            (escaped / ".fusion").symlink_to(outside, target_is_directory=True)
+            self.run_dir("run-outside", runs=Path(outside) / "runs")
+            with self.assertRaisesRegex(ValueError, "no completed Fusion run"):
+                self.verdict("run-outside", True)
 
     def test_a_workflow_gate_decision_is_labeled_in_place(self):
         run_id = self.run_dir(parent_task_id="workflow-2")
