@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1420,7 +1421,8 @@ def agent_command(
             # :free OpenRouter routes the guard trips on phantom cost while real
             # spend is zero; it would only sabotage cheap lanes.
             argv += ["--max-budget-usd", str(max_budget)]
-        allowed = settings.get("allowed_tools") or []
+        allowed = [*(settings.get("allowed_tools") or []),
+                   *(f"Bash({shlex.join(argv)}:*)" for argv in task.get("verification_argv") or [])]
         if allowed and not yolo:
             argv += ["--allowedTools", *allowed]
         if session_id:
