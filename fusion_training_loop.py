@@ -10,16 +10,20 @@ from pathlib import Path
 import uuid
 
 import fusion_core as core
-from fusion_decisions import LABELABLE_STATUSES, DecisionEngine, digest, exceeds_token_budget
+from fusion_decisions import DEFAULTS as DECISION_DEFAULTS, LABELABLE_STATUSES, DecisionEngine, digest, exceeds_token_budget, labeled_splits
 from fusion_garden import locked
 from fusion_learning import decision_rows, read_object
 from fusion_publish import save
-from fusion_quality import dataset_quality, input_key, matched_comparisons
+from fusion_quality import dataset_quality, input_key, matched_comparisons, unbeaten
 
 DEFAULTS = {"enabled": False, "min_new_answers": 10}
 PHASES = ("export", "baseline", "train", "evaluate", "calibrate")
 ACTIONS = {"baseline": "evaluate", **{p:p for p in PHASES if p != "baseline"}}
 ACTIVE = {"queued", "running", "stopping"}
+DEFAULT_SPLIT = DECISION_DEFAULTS['split']
+# A candidate improves only if it beats the source checkpoint and every
+# applicable baseline on the held-out questions by more than this much accuracy.
+IMPROVEMENT_MARGIN = 0.02
 
 
 def root(workspace):
@@ -50,13 +54,17 @@ def changes(before, after):
     return sum(before.get(k) != after.get(k) for k in before.keys() | after.keys())
 
 
-def readiness(rows):
-    groups = defaultdict(set)
-    for row in rows:
-        if row.get('reviewed_answers') and not row.get('excluded') and not row.get('truncated') and row.get('status') in LABELABLE_STATUSES and not exceeds_token_budget(row):
-            group = row.get('context', {}).get('group') or row.get('context', {}).get('task_id') or digest(row['state'])
-            groups['validation' if int(digest(group)[:8],16) % 5 == 0 else 'train'].add(group)
-    return {k:len(groups[k]) for k in ('train','validation')}
+def readiness(rows, method='time'):
+    splits = labeled_splits(rows, method)
+    return {k:sum(v == k for v in splits.values()) for k in ('train','validation')}
+
+
+def split_method(workspace):
+    try:
+        config,_ = core.load_config(workspace)
+        return DecisionEngine(workspace,config).options['split']
+    except (OSError, ValueError, KeyError, TypeError, SystemExit):
+        return DEFAULT_SPLIT
 
 
 def curate(source, destination):
@@ -104,18 +112,71 @@ def proof(round):
         notes.append('Held-out independence could not be established for both models.')
     delta = comparison.get('delta') if not notes else None
     n, groups = comparison.get('validation_questions',0), comparison.get('validation_groups',0)
-    outcome = 'unmeasured' if delta is None else 'gain' if delta > 0 else 'regression' if delta < 0 else 'flat'
     if n < 30 or groups < 10: notes.append('Small held-out sample; this is an early measurement, not established generalization.')
-    control,majority,accuracy = (comparison.get(k) for k in ('control_accuracy','majority_accuracy','accuracy'))
-    if accuracy is not None and control is not None and accuracy <= control:
-        notes.append('The candidate did not beat the shuffled-state control.')
-    if accuracy is not None and majority is not None and accuracy <= majority:
-        notes.append('The candidate did not beat the training-majority baseline.')
+    baselines = comparison.get('baselines')
+    if baselines is None:
+        # An evaluation from before per-question baselines: compare on its whole-benchmark numbers.
+        accuracy = comparison.get('accuracy')
+        baselines = {name: {'n': n, 'accuracy': comparison[key], 'candidate_accuracy': accuracy, 'margin': accuracy - comparison[key]}
+                     for name, key in (('majority','majority_accuracy'),('control','control_accuracy'))
+                     if accuracy is not None and comparison.get(key) is not None}
+    missed = unbeaten(baselines, IMPROVEMENT_MARGIN)
+    labels = {'majority': 'training-majority baseline', 'heuristic': 'deterministic-policy baseline', 'control': 'shuffled-state control'}
+    for name in missed:
+        notes.append(f"The candidate did not beat the {labels.get(name, name)} by more than {IMPROVEMENT_MARGIN:g}.")
+    if delta is None: outcome = 'unmeasured'
+    elif delta < -IMPROVEMENT_MARGIN: outcome = 'regression'
+    elif delta > IMPROVEMENT_MARGIN and not missed: outcome = 'gain'
+    else: outcome = 'flat'
     notes.append('Benchmarks can change between rounds. Compare source and candidate within each round; repeated trials are not independent evidence.')
     calibration = results.get('calibrate',{})
-    return {**comparison,'delta':delta,'outcome':outcome,'notes':notes,
+    return {**comparison,'baselines':baselines,'delta':delta,'outcome':outcome,'margin':IMPROVEMENT_MARGIN,'notes':notes,
+            'questions':question_table(comparison, calibration),
             'qualified_buckets':sum(b.get('qualified') is True for b in calibration.get('buckets',{}).values()),
             'promoted':False}
+
+
+def question_table(comparison, calibration):
+    """Per held-out question: n, candidate vs source and each baseline, and whether it may act.
+
+    Calibration buckets are keyed kind:schema_hash:question; a question asked
+    under more than one schema lists each bucket's gate.
+    """
+    table = {}
+    for name, value in (comparison.get('by_question') or {}).items():
+        before = (comparison.get('baseline_by_question') or {}).get(name, {})
+        table[name] = {'n': value.get('n'), 'groups': value.get('groups'), 'candidate': value.get('accuracy'),
+                       'source': before.get('accuracy'),
+                       **{b: v.get('accuracy') for b, v in (value.get('baselines') or {}).items()}, 'gates': []}
+    for key, bucket in (calibration.get('buckets') or {}).items():
+        kind, question = key.split(':', 1)[0], key.rsplit(':', 1)[-1]
+        risk = bucket.get('risk') or {}
+        gate = {'bucket': key, 'n': bucket.get('validation'), 'qualified': bucket.get('qualified') is True,
+                'threshold': risk.get('threshold'), 'coverage': risk.get('coverage') if risk.get('threshold') is not None else None,
+                'upper_bound': risk.get('upper_bound'), 'alpha': risk.get('alpha'), 'delta': risk.get('delta'),
+                'status': bucket.get('status') or ('qualified' if bucket.get('qualified') else 'not qualified')}
+        table.setdefault(f"{kind}:{question}", {'gates': []})['gates'].append(gate)
+    return table
+
+
+def gate_line(gate):
+    if gate.get('qualified') and gate.get('threshold') is not None:
+        return (f"acts at p>={gate['threshold']:.2f}, coverage {gate['coverage']:.0%} of {gate['n']} held-out; "
+                f"error <= {gate['alpha']:g} with probability {1 - gate['delta']:g} (bound {gate['upper_bound']:.3f})")
+    return gate.get('status') or 'not qualified'
+
+
+def question_lines(table):
+    """The per-question table as short, readable fields for `fusion learn status`."""
+    def score(value):
+        return None if value is None else round(value, 3)
+    lines = {}
+    for name, row in sorted(table.items()):
+        line = {'holdout_n': row.get('n'), 'holdout_groups': row.get('groups')}
+        line.update({key: score(row.get(key)) for key in ('candidate', 'source', 'majority', 'heuristic', 'control') if key in row})
+        line['gate'] = [gate_line(g) for g in row.get('gates', [])] or ['not calibrated']
+        lines[name] = line
+    return lines
 
 
 LIVE_JOB_FIELDS = ('id', 'status', 'started_at_ms', 'progress')
@@ -140,7 +201,7 @@ def status(app, workspace, rows=None):
     rows = decision_rows(workspace) if rows is None else rows
     current = tokens(rows)
     previous = next((r for r in history if r.get('status')=='complete'), {})
-    groups = readiness(rows)
+    groups = readiness(rows, split_method(workspace))
     running = next((r for r in history if r.get('status') in {'running','needs_attention'}), None)
     pending = changes((running or previous).get('tokens',{}),current)
     active_job = None

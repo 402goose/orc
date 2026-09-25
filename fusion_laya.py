@@ -149,7 +149,7 @@ def loss_curve(losses):
 
 def evaluate(args):
     from fusion_decisions import distribution, digest
-    from fusion_quality import dataset_quality, input_key
+    from fusion_quality import baseline_comparison, dataset_quality, input_key
     rows = dataset_rows(args.dataset)
     validation = [row for row in rows if row["split"] == "validation"]
     total_work = len(rows) + (len(validation) if getattr(args, "control", False) and len(validation)>1 else 0)
@@ -160,12 +160,7 @@ def evaluate(args):
     correct = total = 0
     results = []
     by_kind = defaultdict(lambda: {"correct": 0, "questions": 0})
-    train_labels = defaultdict(Counter)
-    for row in rows:
-        if row["split"] == "train":
-            for key, label in row["labels"].items():
-                train_labels[digest(row["questions"][key])][label] += 1
-    majority_correct = majority_total = 0
+    predictions, controls = {}, {}
     for row in rows:
         result = backend.predict({"state": row["state"], "questions": row["questions"],
                                   "model_path": args.model_path, "device": args.device})
@@ -179,10 +174,7 @@ def evaluate(args):
                 metric = by_kind[row["kind"]]
                 metric["questions"] += 1
                 metric["correct"] += max(prediction[key], key=prediction[key].get) == label
-                counts = train_labels[digest(row["questions"][key])]
-                if counts:
-                    majority_total += 1
-                    majority_correct += sorted(counts, key=lambda v: (-counts[v], v))[0] == label
+        predictions[row["id"]] = prediction
         results.append({**row, "prediction": prediction, "model_identity": result["model_identity"]})
         learning_progress(args, "evaluation", done=len(results), total=total_work)
     # Control: score each held-out example against another example's state. A model
@@ -197,6 +189,7 @@ def evaluate(args):
             if result["truncated"]:
                 raise ValueError("shuffled-state control truncates a reviewed example")
             prediction = {key: distribution(result["answers"][key], q) for key, q in row["questions"].items()}
+            controls[row["id"]] = prediction
             for key, label in row["labels"].items():
                 control_total += 1
                 control_correct += max(prediction[key], key=prediction[key].get) == label
@@ -219,10 +212,15 @@ def evaluate(args):
                "overlap_groups": len(overlap_groups), "overlap_inputs": len(overlap_inputs),
                "cross_split_duplicates": len(quality['cross_split_duplicates'])}
     benchmark = [{k: r[k] for k in ('id', 'group', 'state', 'questions', 'labels')} for r in sorted(validation, key=lambda r: r['id'])]
+    comparison = baseline_comparison(rows, predictions, controls)
+    baselines = comparison["baselines"]
     report = {"path": str(output), "validation_questions": total, "accuracy": correct / total if total else None,
               "correct": correct, "by_kind": {k: {**v, "accuracy": v['correct'] / v['questions']} for k, v in by_kind.items()},
-              "majority_accuracy": majority_correct / majority_total if majority_total else None,
-              "majority_questions": majority_total,
+              "majority_accuracy": baselines.get("majority", {}).get("accuracy"),
+              "majority_questions": baselines.get("majority", {}).get("n", 0),
+              "heuristic_accuracy": baselines.get("heuristic", {}).get("accuracy"),
+              "heuristic_questions": baselines.get("heuristic", {}).get("n", 0),
+              "baselines": baselines, "by_question": comparison["by_question"],
               "control_accuracy": control_correct / control_total if control_total else None,
               "control_questions": control_total,
               "validation_groups": len({row['group'] for row in validation}),

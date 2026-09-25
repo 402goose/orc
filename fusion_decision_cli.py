@@ -35,13 +35,15 @@ def add_parser(sub):
     suggest.add_argument("--garden-policy", help="saved garden policy; changes or pausing revoke pending automatic approvals")
     export = commands.add_parser("export", help="export reviewed labels, split by workflow group")
     export.add_argument("output")
+    export.add_argument("--split", choices=["time", "group-hash"],
+                        help="hold out the newest workflow groups (time) or a hash of the group name; default decisions.split")
     export.add_argument("--exclude-source", action="append", default=[], metavar="SOURCE",
                         help="leave out answers approved by this source, for example lead_verdict, structural_gate or user_explicit; repeatable")
     commands.add_parser("routing-report", help="per-lane acceptance from logged routing propensities (IPS, ESS); read-only")
-    calibrate = commands.add_parser("calibrate", help="fit temperature on train and assess held-out groups")
+    calibrate = commands.add_parser("calibrate", help="fit temperature on train; certify an acting threshold on held-out groups (Learn-then-Test)")
     calibrate.add_argument("dataset")
     calibrate.add_argument("output")
-    calibrate.add_argument("--threshold", type=float, default=0.9)
+    calibrate.add_argument("--threshold", type=float, default=0.9, help="reported only when no threshold is certified")
     for command in ["train", "evaluate"]:
         action = commands.add_parser(command, help=f"{command} a local candidate without promoting it")
         action.add_argument("dataset")
@@ -116,8 +118,9 @@ def run(args, workspace, config):
         from fusion_policy import routing_report
         payload = routing_report(read_jsonl(store.path))
     elif command == "export":
-        payload = store.export(args.output, getattr(args, "exclude_source", []))
+        payload = store.export(args.output, getattr(args, "exclude_source", []),
+                               getattr(args, "split", None) or options["split"])
     else:
-        payload = fit_calibration(args.dataset, args.output, args.threshold)
+        payload = fit_calibration(args.dataset, args.output, args.threshold, options["risk"])
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 1 if isinstance(payload, dict) and payload.get("status") == "unavailable" else 0

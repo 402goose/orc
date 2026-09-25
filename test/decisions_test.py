@@ -751,18 +751,19 @@ class DecisionsTest(unittest.TestCase):
         self.assertEqual(len({row["split"] for row in rows}), 1)
         self.assertTrue(all(row["labels"] == {"workflow": "build"} for row in rows))
 
-    def calibration_data(self, repeated_group=False):
+    def calibration_data(self, repeated_group=False, half=20):
         questions = {"action": {"type": "choice", "instructions": "Next?", "criteria": {"repair": "repair", "stop": "stop"}}}
-        rows = [{"schema": "fusion.training.v1", "id": str(i), "group": ("train-group" if i < 20 else "val-group") if repeated_group else str(i),
-                 "split": "train" if i < 20 else "validation", "kind": "recovery", "state": "test failure", "questions": questions,
+        rows = [{"schema": "fusion.training.v1", "id": str(i), "group": ("train-group" if i < half else "val-group") if repeated_group else str(i),
+                 "split": "train" if i < half else "validation", "kind": "recovery", "state": "test failure", "questions": questions,
                  "schema_hash": digest(questions), "labels": {"action": "repair"},
-                 "prediction": {"action": {"repair": .95, "stop": .05}}, "model_identity": "fixture-model"} for i in range(40)]
+                 "prediction": {"action": {"repair": .95, "stop": .05}}, "model_identity": "fixture-model"} for i in range(2 * half)]
         path = self.workspace / "data.jsonl"
         path.write_text("".join(json.dumps(row) + "\n" for row in rows))
         return path, rows
 
     def test_calibration_requires_independent_heldout_groups(self):
-        path, rows = self.calibration_data(repeated_group=True)
+        # 50 error-free held-out answers: enough for Learn-then-Test at alpha .05, delta .1 (needs 45).
+        path, rows = self.calibration_data(repeated_group=True, half=50)
         report = fit_calibration(path, self.workspace / "report.json")
         self.assertFalse(next(iter(report["buckets"].values()))["qualified"])
         for i, row in enumerate(rows):
