@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 from pathlib import Path, PurePosixPath
 import subprocess
@@ -1071,6 +1072,14 @@ BLOCKERS: unresolved issues, or none
             route=route,
             settings_overrides=settings,
         )
+        if node.get("_plan_checks"):
+            # The coordinator runs these after the worker finishes. A worker that
+            # cannot run them reports its own work unverified, so let it run
+            # exactly these vetted commands (fusion_verification) and nothing else.
+            task["verification_argv"] = [list(check) for check in node["_plan_checks"]]
+            task["task"] += ("\nAfter you finish, the coordinator runs these checks: "
+                             + "; ".join(shlex.join(check) for check in task["verification_argv"])
+                             + ". You may run exactly these commands yourself.")
         store = core.RunStore(self.control_workspace)
         task["progress_label"] = node_id
         store.write_json(self._node_dir(node_id) / "active.json", {"run_id": task["run_id"], "attempt": attempt})
