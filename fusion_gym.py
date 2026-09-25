@@ -531,6 +531,20 @@ def _remove_worktree(repo, path):
     git(repo, "worktree", "prune", check=False)
 
 
+def withdraw_untrusted_label(gym, row):
+    """A gate label is only as good as the checks it read. A worker that edited
+    test files graded itself, and a baseline that did not behave as extracted
+    measured something else, so the gate's label is retracted (append-only)."""
+    label = row.get("gate_label") or {}
+    if row.get("verdict") not in {"tampered", "invalid_baseline"} or label.get("status") != "labeled":
+        return label
+    from fusion_decisions import DecisionStore
+    DecisionStore(gym).append("label", id=label["decision_id"], answers={}, verified=True, replace=True,
+                              source="structural_gate",
+                              evidence=f"Retracted by gym: verdict {row['verdict']} on {row['key']}.")
+    return {**label, "status": "retracted", "reason": f"gym verdict {row['verdict']}"}
+
+
 def summarize(task, lane_name, lane, outcome, diff_files, wall_ms):
     node = (outcome.get("nodes") or [{}])[0]
     result = node.get("result") or {}
@@ -626,6 +640,7 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
                 except (OSError, ValueError, subprocess.SubprocessError):
                     pass
                 row = summarize(task, name, lane, outcome, diff_files, wall_ms)
+                row["gate_label"] = withdraw_untrusted_label(gym, row)
                 if outcome.get("error"):
                     row["error"] = outcome["error"]
                 evidence = gym / "results" / task["id"] / _slug(name)

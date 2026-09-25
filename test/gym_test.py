@@ -278,3 +278,19 @@ class GymTest(Isolated):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WithdrawUntrustedLabelTest(unittest.TestCase):
+    def test_tampered_and_invalid_baseline_labels_are_retracted(self):
+        from fusion_decisions import DecisionStore, read_jsonl
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            labeled = {"status": "labeled", "decision_id": "d1", "answers": {"failed_task": "false"}}
+            for verdict in ("tampered", "invalid_baseline"):
+                with self.subTest(verdict=verdict):
+                    out = gym.withdraw_untrusted_label(root, {"verdict": verdict, "key": "t:l", "gate_label": labeled})
+                    self.assertEqual(out["status"], "retracted")
+            kept = gym.withdraw_untrusted_label(root, {"verdict": "solved", "key": "t:l", "gate_label": labeled})
+            self.assertEqual(kept, labeled)
+            retractions = [e for e in read_jsonl(DecisionStore(root).path) if e.get("event") == "label"]
+            self.assertEqual([(e["answers"], e["replace"], e["source"]) for e in retractions], [({}, True, "structural_gate")] * 2)
