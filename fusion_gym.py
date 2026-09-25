@@ -770,7 +770,50 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
                 spent += row["cost_usd"]
                 if not keep_worktrees:
                     _remove_worktree(repo, worktree)
+        audit(gym)
         return {"status": "complete", "mode": mode, "spent_usd": spent, "runs": finished}
+
+
+AUDIT_EVIDENCE = "gym audit: no lane has solved this task from its prompt"
+
+
+def audit(gym):
+    """A negative gym label claims the worker failed a task that could be done.
+    SWE-bench Verified drops tasks whose hidden tests expect something the
+    issue never states; the gym's equivalent evidence is that some lane solved
+    the task from the same prompt. Until one has, a task's failed_task=true
+    gate labels are retracted (append-only) and the task is flagged; once a
+    lane solves it, labels this audit retracted are restored. Positives and
+    labels from any other source are never touched."""
+    from fusion_decisions import DecisionStore, label_provenance, read_jsonl, reviewed_labels
+    store = DecisionStore(gym)
+    latest = {}
+    for row in read_results(gym):
+        if row.get("event") == "finished" and row.get("mode") == "hidden" and row.get("completed"):
+            latest[row["key"]] = row
+    solved = {row["task"] for row in latest.values() if row.get("verdict") == "solved"}
+    events = read_jsonl(store.path)
+    answers, _ = reviewed_labels(events)
+    sources = label_provenance(events)
+    audited = {e["id"] for e in events if e.get("event") == "label" and str(e.get("evidence", "")).startswith(AUDIT_EVIDENCE)}
+    retracted, restored, flagged = [], [], sorted({row["task"] for row in latest.values()} - solved)
+    for row in latest.values():
+        decision = (row.get("gate_label") or {}).get("decision_id") or (row.get("gate_label") or {}).get("id")
+        if not decision:
+            continue
+        current = answers.get(decision, {}).get("failed_task")
+        source = (sources.get(decision, {}).get("failed_task") or {}).get("source")
+        if row["task"] not in solved and current == "true" and source == "structural_gate":
+            store.append("label", id=decision, answers={}, verified=True, replace=True, source="structural_gate",
+                         evidence=f"{AUDIT_EVIDENCE} ({row['key']}); its hidden tests may expect what the prompt never states.")
+            retracted.append(row["key"])
+        elif row["task"] in solved and decision in audited and current is None and row.get("verdict") == "unsolved":
+            store.append("label", id=decision, answers={"failed_task": "true"}, verified=True, replace=False,
+                         source="structural_gate", evidence=f"Restored: a lane solved {row['task']} from the same prompt.")
+            restored.append(row["key"])
+    summary = {"solved_tasks": sorted(solved), "unsolved_tasks": flagged, "retracted": retracted, "restored": restored}
+    (Path(gym) / "audit.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    return summary
 
 
 # ---------------------------------------------------------------- report
@@ -878,6 +921,8 @@ def add_parser(sub):
                          help="old mode: the fix's tests are in the worker's tree (default: hidden, graded by fixtures)")
     report_cmd = commands.add_parser("report", help="per-lane and per-task results of a gym directory")
     report_cmd.add_argument("gym_dir")
+    audit_cmd = commands.add_parser("audit", help="retract negatives from tasks no lane has solved; restore them once one does")
+    audit_cmd.add_argument("gym_dir")
 
 
 def command(args, workspace, as_json=False, out=None):
@@ -895,6 +940,10 @@ def command(args, workspace, as_json=False, out=None):
         print(json.dumps(result, indent=2) if as_json else
               f"{result['status']}: {len(result['runs'])} runs, ${result['spent_usd']:.2f}\n" + table(report(args.gym_workspace)),
               file=out)
+        return 0
+    if args.gym_command == "audit":
+        value = audit(args.gym_dir)
+        print(json.dumps(value, indent=2), file=out)
         return 0
     value = report(args.gym_dir)
     print(json.dumps(value, indent=2) if as_json else table(value), file=out)
