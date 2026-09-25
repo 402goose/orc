@@ -17,7 +17,7 @@ ISSUE = re.compile(r"https://github\.com/([\w.-]+)/([\w.-]+)/issues/(\d+)\b")
 # A sweep fans one read-only worker out per dimension. The cap is the engine's
 # own parallelism ceiling doubled: beyond that a sweep is a queue, not a fan-out.
 MAX_DIMENSIONS = 12
-PLANNING_ONLY = re.compile(r"\b(?:discovery[ /-]+(?:and[ /-]+)?planning[ -]+only|(?:discovery|planning|investigation|research)[ -]+only|do not implement|no implementation|do not (?:write|change|edit) (?:any )?(?:code|files)|read[ -]only)\b", re.I)
+PLANNING_ONLY = re.compile(r"\b(?:discovery[ /-]+(?:and[ /-]+)?planning[ -]+only|(?:discovery|planning|investigation|research)[ -]+only|do not implement|no implementation|do not (?:write|change|edit) (?:any )?(?:code|files)|(?:keep|stay|remain|be) (?:this |it |the (?:work|task|change) )?read[ -]only|read[ -]only (?:investigation|analysis|audit)(?: only)?)\b", re.I)
 
 
 def source_for(idea, workspace):
