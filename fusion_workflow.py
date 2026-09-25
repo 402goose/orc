@@ -280,6 +280,9 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("workflow reasoning_effort requires an explicit Codex, Claude or agy node and a supported effort")
         if "allow_native_delegation" in node and (node["agent"] != "codex" or not isinstance(node["allow_native_delegation"], bool)):
             raise ValueError("allow_native_delegation requires an explicit Codex node and boolean")
+        before = node["acceptance"].get("before") if isinstance(node.get("acceptance"), dict) else None
+        if before is not None and (not isinstance(before, bool) or (before and not node["write"])):
+            raise ValueError(f"workflow node {node['id']} acceptance.before must be a boolean on a write node")
         if node.get("independent_of") and node["independent_of"] not in node["needs"]:
             raise ValueError("independent_of must name a direct dependency")
 
@@ -315,6 +318,15 @@ def load_spec(path: Path) -> dict[str, Any]:
     return validate_spec(value)
 
 
+def _authored_before_checks(node: dict[str, Any]) -> list[list[str]]:
+    """A write node's authored argv checks that opted into a pre-change run."""
+    acceptance = node.get("acceptance") or {}
+    if not node.get("write") or not isinstance(acceptance, dict) or acceptance.get("before") is not True:
+        return []
+    return [command for command in _as_list(acceptance.get("checks"))
+            if isinstance(command, list) and command and all(isinstance(part, str) for part in command)]
+
+
 def _result_cost(result: dict[str, Any]) -> float:
     usage = result.get("usage") or {}
     return core.number(usage.get("cost_usd", usage.get("cost", 0)))
@@ -328,7 +340,11 @@ class WorkflowRunner:
         spec: dict[str, Any],
         run_id: str | None = None,
         resume: bool = False,
+        worktree: dict[str, Any] | None = None,
     ):
+        """`worktree` is a checkout the caller already prepared (`workspace`
+        and `base_sha`), as `fusion gym` does: workers and checks run there,
+        while runs, traces and decisions stay in `workspace`."""
         self.workspace = workspace
         self.control_workspace = workspace
         self.config = config
@@ -347,6 +363,10 @@ class WorkflowRunner:
         elif self.spec.get("publish", {}).get("mode", "off") != "off":
             from fusion_publish import setup_worktree
             self.git_context = setup_worktree(workspace, self.run_id, self.spec.get("task", ""), self.spec["publish"])
+        elif worktree:
+            from fusion_publish import save
+            self.git_context = {**worktree, "mode": "off", "isolated": True}
+            save(self.root / "git.json", self.git_context)
         if self.git_context:
             self.workspace = Path(self.git_context["workspace"])
         self.workflow_baseline = {
@@ -486,6 +506,7 @@ class WorkflowRunner:
             if node["write"]:
                 self._prepare_plan_checks(node)
                 self._baseline_plan_checks(node, run=False)
+                self._baseline_authored_checks(node, run=False)
             accepted, problems = self._accept_node(node, result)
             if result.get("acceptance_checks"):
                 # Resume rechecks have their own receipts; keep node.json and
@@ -902,9 +923,23 @@ BLOCKERS: unresolved issues, or none
         """
         from fusion_verification import OFFLINE_ENV, settings
 
-        checks = node.get("_plan_checks") or []
-        path = self._node_dir(node["id"]) / "acceptance" / "before.json"
-        node["_plan_before"] = {}
+        self._baseline(node, node.get("_plan_checks") or [], "before.json", "_plan_before",
+                       "running the plan's verification on the tree before the change",
+                       env=OFFLINE_ENV, timeout=settings(self.config)["timeout_seconds"], run=run)
+        self._drop_unstartable(node)
+
+    def _baseline_authored_checks(self, node: dict[str, Any], run: bool = True) -> None:
+        """`acceptance.before: true` gives a write node's authored checks the
+        same pre-change run as plan checks, so their vacuity is known and the
+        gate can label them. They run with the same environment and timeout
+        before and after, so only the tree differs between the two runs."""
+        self._baseline(node, _authored_before_checks(node), "before-authored.json", "_authored_before",
+                       "running the acceptance checks on the tree before the change", run=run)
+
+    def _baseline(self, node: dict[str, Any], checks: list[Any], filename: str, key: str, activity: str, *,
+                  env: dict[str, str] | None = None, timeout: int | None = None, run: bool = True) -> None:
+        path = self._node_dir(node["id"]) / "acceptance" / filename
+        node[key] = {}
         if not checks:
             return
         try:
@@ -912,24 +947,21 @@ BLOCKERS: unresolved issues, or none
         except (OSError, ValueError):
             saved = {}
         if isinstance(saved, dict) and saved.get("checks") == checks:
-            node["_plan_before"] = saved
-            self._drop_unstartable(node)
+            node[key] = saved
             return
         if node["attempts"] > 1 or not run:
             return
-        timeout = settings(self.config)["timeout_seconds"]
         receipts = []
-        with progress.activity(node["id"], "running the plan's verification on the tree before the change"):
+        with progress.activity(node["id"], activity):
             for index, command in enumerate(checks):
                 try:
                     receipts.append(self._acceptance_check(node, {"attempt": node["attempts"]}, command, index,
-                                                           phase="before", env=OFFLINE_ENV, timeout=timeout))
+                                                           phase="before", env=env, timeout=timeout))
                 except OSError as exc:
                     receipts.append({"argv": command, "phase": "before", "status": "error", "error": str(exc)})
-        node["_plan_before"] = {"checks": checks, "receipts": receipts}
+        node[key] = {"checks": checks, "receipts": receipts}
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(core.json_text(node["_plan_before"]) + "\n", encoding="utf-8")
-        self._drop_unstartable(node)
+        path.write_text(core.json_text(node[key]) + "\n", encoding="utf-8")
 
     def _drop_unstartable(self, node: dict[str, Any]) -> None:
         """A plan command whose program could not even start before the change
@@ -1009,23 +1041,27 @@ BLOCKERS: unresolved issues, or none
                 problem("required_handoff_empty", f"required handoff field is empty: {field}", field=str(field))
         from fusion_verification import OFFLINE_ENV, counts_as_failure, settings
 
-        before = {json.dumps(receipt.get("argv")): receipt for receipt in (node.get("_plan_before") or {}).get("receipts", [])}
+        before = {origin: {json.dumps(receipt.get("argv")): receipt for receipt in (node.get(key) or {}).get("receipts", [])}
+                  for origin, key in (("plan", "_plan_before"), ("authored", "_authored_before"))}
         authored = [(command, "authored") for command in _as_list(acceptance.get("checks"))]
         planned = [(command, "plan") for command in node.get("_plan_checks") or []]
+        with_before = _authored_before_checks(node)
         if node.get("_plan_checks_rejected"):
             result["verification_rejected"] = node["_plan_checks_rejected"]
         for index, (command, origin) in enumerate(authored + planned):
             extra: dict[str, Any] = {}
             vacuous = None
-            if origin == "plan":
-                baseline = before.get(json.dumps(command))
+            if origin == "plan" or command in with_before:
+                baseline = before[origin].get(json.dumps(command))
                 # Vacuous: it already passed before the change. Known only
                 # when a baseline ran; a baseline that could not run is unknown.
                 vacuous = {"passed": True, "failed": False}.get((baseline or {}).get("status"))
-                extra = {"env": OFFLINE_ENV, "timeout": settings(self.config)["timeout_seconds"], "annotations": {
-                    "origin": "plan", "vacuous": vacuous,
+                extra = {"annotations": {
+                    "origin": origin, "vacuous": vacuous,
                     "before": {"status": baseline.get("status"), "exit_code": baseline.get("exit_code"),
                                "receipt": (baseline.get("artifacts") or {}).get("receipt")} if baseline else None}}
+                if origin == "plan":
+                    extra.update(env=OFFLINE_ENV, timeout=settings(self.config)["timeout_seconds"])
             try:
                 receipt = self._acceptance_check(node, result, command, index, **extra)
             except OSError as exc:
@@ -1062,7 +1098,9 @@ BLOCKERS: unresolved issues, or none
             agent,
             self._prompt(node) + (f"\nWork in this dedicated worktree. The starting Git commit is {self.git_context['base_sha']}. "
                                   "Inspect the full diff against that commit, including newly created files. "
-                                  "Do not commit or push; Fusion publishes the reviewed changes after completion." if self.git_context else ""),
+                                  + ("Do not commit or push; Fusion publishes the reviewed changes after completion."
+                                     if self.git_context.get("mode") in {"manual", "auto"} else "Do not commit or push.")
+                                  if self.git_context else ""),
             node["role"],
             ["complete the assigned node", "return evidence in the required handoff format"],
             ["do not broaden the workflow task", "do not run parallel writers in this workspace"],
@@ -1308,6 +1346,7 @@ BLOCKERS: unresolved issues, or none
                         # so its caches never count as the worker's change.
                         self._prepare_plan_checks(selected)
                         self._baseline_plan_checks(selected)
+                        self._baseline_authored_checks(selected)
                     # A writer that writes nothing did not do the work. Record
                     # the tree so acceptance can check the repository itself
                     # rather than the worker's account of it.
