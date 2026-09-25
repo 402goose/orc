@@ -200,7 +200,7 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":12,"output_tok
             check_pair("claude", {"model": "claude-haiku-4-5-20251001", "reasoning_effort": "low"})
         self.assertEqual(claude_choice({"model": "claude-opus-4-6", "reasoning_effort": "xhigh"})["catalog"]["status"],
                          "requested_may_downgrade")
-        with self.assertRaisesRegex(ValueError, "agy accepts reasoning_effort high, low, medium"):
+        with self.assertRaisesRegex(ValueError, "agy accepts reasoning_effort high, low, max, medium"):
             check_pair("agy", {"model": "gemini-3-pro", "reasoning_effort": "xhigh"})
         config = core.deep_merge(self.config, {"agy": {"command": sys.executable}})
         task = core.make_task(self.workspace, "agy", "Inspect fixture", "inspect", [], [], None, False, False,

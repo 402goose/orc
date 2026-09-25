@@ -10,7 +10,7 @@ from pathlib import Path
 EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 # `claude --effort` accepts exactly these (Claude Code 2.1.x); `agy --effort` low..high.
 CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
-AGY_EFFORTS = frozenset({"low", "medium", "high"})
+AGY_EFFORTS = frozenset({"low", "medium", "high", "max"})
 HARNESS_EFFORTS = {"codex": EFFORTS, "claude": CLAUDE_EFFORTS, "agy": AGY_EFFORTS}
 
 

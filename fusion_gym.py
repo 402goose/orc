@@ -68,6 +68,10 @@ DEFAULT_LANES = {
     "claude": {"agent": "claude"},
     "codex": {"agent": "codex"},
     "agy": {"agent": "agy"},
+    # agy names its thinking level in the model id; its default is
+    # gemini-3.8-flash-high, so these measure the same model at lower levels.
+    "agy-flash-medium": {"agent": "agy", "model": "gemini-3.8-flash-medium"},
+    "agy-flash-low": {"agent": "agy", "model": "gemini-3.8-flash-low"},
     "grok": {"agent": "grok"},
 }
 LANE_KEYS = {"agent", "route", "model", "reasoning_effort"}
