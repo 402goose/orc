@@ -1,1 +1,0 @@
-{"ts":"2026-09-21T19:05:43.407Z","command":"context-hub","action":"defer_background","delay_ms":0,"confidence":0.85,"source":"rules","reason":"CPU at 100% — deferring background tasks","duration_ms":228,"cpu_before":100,"mem_before_mb":16302.78125,"load_before":19.640625,"cpu_after":100,"mem_after_mb":16298.953125,"load_after":19.640625,"thermal":"nominal"}
