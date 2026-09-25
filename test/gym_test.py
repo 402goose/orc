@@ -1,6 +1,8 @@
-"""ORC gym: authored checks with a pre-change run, task extraction from a
-squash-merged fix, and lane runs that label fail->pass and no-change honestly."""
+"""ORC gym: authored checks with a pre-change run, acceptance fixtures, task
+extraction from a squash-merged fix, and lane runs (hidden and visible tests)
+that label fail->pass and no-change honestly."""
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -20,7 +22,10 @@ from fusion_workflow import WorkflowRunner, validate_spec
 from decisions_test import Backend
 
 WORKER = '''import json, pathlib, sys
-sys.stdin.read()
+prompt = sys.stdin.read()
+if SEE:
+    seen = {name: pathlib.Path(name).read_text() if pathlib.Path(name).is_file() else None for name in SEE}
+    pathlib.Path("seen.json").write_text(json.dumps({"prompt": prompt, "files": seen}))
 for name, body in WRITES.items():
     pathlib.Path(name).parent.mkdir(parents=True, exist_ok=True)
     pathlib.Path(name).write_text(body)
@@ -46,6 +51,10 @@ TEST_FIX = TEST_BASE + '''
     def test_add_negative(self):
         self.assertEqual(add(-2, 3), 1)
 '''
+FORGED = TEST_BASE + '''
+    def test_add_negative(self):
+        pass
+'''
 EXISTS = "import pathlib, sys\nsys.exit(0 if pathlib.Path('done.txt').exists() else 1)\n"
 ABSENT = "import pathlib, sys\nsys.exit(1 if pathlib.Path('done.txt').exists() else 0)\n"
 
@@ -69,9 +78,9 @@ class Isolated(unittest.TestCase):
         runtime.start()
         self.addCleanup(runtime.stop)
 
-    def worker(self, name, writes):
+    def worker(self, name, writes, see=()):
         path = self.root / name
-        path.write_text("#!/usr/bin/env python3\n" + f"WRITES = {writes!r}\n" + WORKER)
+        path.write_text("#!/usr/bin/env python3\n" + f"WRITES = {writes!r}\nSEE = {list(see)!r}\n" + WORKER)
         path.chmod(0o755)
         return str(path)
 
@@ -92,11 +101,12 @@ class AuthoredBeforeTest(Isolated):
         run_git(self.workspace, "add", ".")
         run_git(self.workspace, "commit", "-qm", "seed")
 
-    def run_node(self, checks, writes, before=True):
-        config = {"codex": {"command": self.worker("fake-codex", writes)}, "claude": {"command": "missing-claude"},
+    def run_node(self, checks, writes, before=True, fixtures=None, see=()):
+        config = {"codex": {"command": self.worker("fake-codex", writes, see)}, "claude": {"command": "missing-claude"},
                   "agy": {"command": "missing-agy"}, "grok": {"command": "missing-grok"},
                   "timeout_seconds": 30, "decisions": {"mode": "shadow"}}
-        acceptance = {"checks": checks, "required_handoff": ["summary"], **({"before": True} if before else {})}
+        acceptance = {"checks": checks, "required_handoff": ["summary"], **({"before": True} if before else {}),
+                      **({"fixtures": fixtures} if fixtures is not None else {})}
         spec = {"task": "t", "nodes": [{"id": "implement", "role": "implementation", "agent": "codex", "write": True,
                                         "task": "Make it done", "acceptance": acceptance}]}
         outcome = WorkflowRunner(self.workspace, config, spec).run()
@@ -130,6 +140,79 @@ class AuthoredBeforeTest(Isolated):
                 validate_spec({"nodes": [{"id": "n", "agent": "codex", "task": "t", **node}]})
 
 
+class FixtureTest(AuthoredBeforeTest):
+    """acceptance.fixtures: written for every check run, set aside again after."""
+
+    def test_fixtures_run_before_and_after_and_the_worker_never_sees_them(self):
+        (self.root / "hidden-check.py").write_text(EXISTS)
+        fixtures = [{"path": "gate.py", "from_file": str(self.root / "hidden-check.py")},
+                    {"path": "deep/er/note.txt", "content": "fixture\n"}]
+        # The worker writes its own gate.py that always passes: the fixture wins.
+        outcome, result = self.run_node([["python3", "gate.py"]], {"done.txt": "x", "gate.py": "raise SystemExit(0)\n"},
+                                        fixtures=fixtures, see=["gate.py", "deep/er/note.txt"])
+        self.assertEqual(outcome["status"], "success", outcome)
+        seen = json.loads((self.workspace / "seen.json").read_text())
+        self.assertEqual(seen["files"], {"gate.py": None, "deep/er/note.txt": None})
+        self.assertNotIn("gate.py", seen["prompt"])
+        [check] = result["acceptance_checks"]
+        self.assertEqual((check["status"], check["before"]["status"]), ("passed", "failed"))
+        before = json.loads(Path(check["before"]["receipt"]).read_text())
+        digest = hashlib.sha256(EXISTS.encode()).hexdigest()
+        self.assertEqual([(f["path"], f["sha256"], f["found"]["type"]) for f in before["fixtures"]],
+                         [("gate.py", digest, "absent"), ("deep/er/note.txt", hashlib.sha256(b"fixture\n").hexdigest(), "absent")])
+        worker_gate = hashlib.sha256(b"raise SystemExit(0)\n").hexdigest()
+        self.assertEqual(check["fixtures"][0], {"path": "gate.py", "sha256": digest,
+                                                "found": {"type": "file", "sha256": worker_gate}})
+        # Afterwards the worker's own file is back and the fixture directory is gone.
+        self.assertEqual((self.workspace / "gate.py").read_text(), "raise SystemExit(0)\n")
+        self.assertFalse((self.workspace / "deep").exists())
+        self.assertEqual(result["gate_label"]["answers"], {"failed_task": "false"})
+        saved = json.loads((Path(outcome["artifacts"]["root"]) / "nodes/implement/acceptance/before-authored.json").read_text())
+        self.assertEqual([f["path"] for f in saved["fixtures"]], ["gate.py", "deep/er/note.txt"])
+
+    def test_a_worker_edit_at_a_fixture_path_cannot_pass_the_check(self):
+        fixtures = [{"path": "gate.py", "content": EXISTS}]
+        _, result = self.run_node([["python3", "gate.py"]], {"gate.py": "raise SystemExit(0)\n", "other.txt": "x"},
+                                  fixtures=fixtures)
+        [check] = result["acceptance_checks"]
+        self.assertEqual(check["status"], "failed")
+        self.assertEqual(result["gate_label"]["status"], "unlabeled")
+
+    def test_bytecode_of_a_fixture_is_removed(self):
+        (self.workspace / "pkg").mkdir()
+        (self.workspace / "pkg/keep.txt").write_text("k\n")
+        fixtures = [{"path": "pkg/hidden_mod.py", "content": "VALUE = 1\n"}]
+        check = ["python3", "-c", "import sys; sys.path.insert(0, 'pkg'); import hidden_mod"]
+        with patch.dict(os.environ):
+            os.environ.pop("PYTHONDONTWRITEBYTECODE", None)
+            _, result = self.run_node([check], {"done.txt": "x"}, fixtures=fixtures)
+        self.assertEqual(result["acceptance_checks"][0]["status"], "passed")
+        self.assertFalse((self.workspace / "pkg/hidden_mod.py").exists())
+        self.assertEqual(list((self.workspace / "pkg/__pycache__").glob("hidden_mod.*")) if
+                         (self.workspace / "pkg/__pycache__").exists() else [], [])
+
+    def test_fixtures_are_validated(self):
+        for fixtures in ("x", [{"path": "a"}], [{"path": "a", "content": "x", "from_file": "y"}],
+                         [{"path": "../a", "content": "x"}], [{"path": ".git/x", "content": "x"}],
+                         [{"path": "a", "content": "x"}, {"path": "a/b", "content": "y"}],
+                         [{"path": "a", "content": "x"}, {"path": "a", "content": "y"}],
+                         [{"path": "a", "content": 3}], [{"path": "a", "content": "x", "mode": "644"}]):
+            with self.subTest(fixtures=fixtures), self.assertRaises(ValueError):
+                validate_spec({"nodes": [{"id": "n", "agent": "codex", "task": "t", "write": True,
+                                          "acceptance": {"checks": [["true"]], "fixtures": fixtures}}]})
+
+    def test_a_fixture_path_through_a_symlink_out_of_the_tree_is_refused(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (self.workspace / "link").symlink_to(outside, target_is_directory=True)
+        _, result = self.run_node([["python3", "exists.py"]], {"done.txt": "x"},
+                                  fixtures=[{"path": "link/x.py", "content": "x"}])
+        [check] = result["acceptance_checks"]
+        self.assertEqual(check["status"], "error")
+        self.assertIn("outside the workspace", check["error"])
+        self.assertEqual(list(outside.iterdir()), [])
+
+
 class GymTest(Isolated):
     def setUp(self):
         super().setUp()
@@ -157,6 +240,9 @@ class GymTest(Isolated):
                            "fixer": {"agent": "codex", "command": self.worker("fixer", {"calc.py": FIXED})},
                            "idler": {"agent": "codex", "command": self.worker("idler", {"notes.txt": "looked\n"})},
                            "cheater": {"agent": "codex", "command": self.worker("cheater", {"test/calc_test.py": TEST_BASE})},
+                           "forger": {"agent": "codex", "command": self.worker("forger", {"test/calc_test.py": FORGED})},
+                           "observer": {"agent": "codex", "command": self.worker(
+                               "observer", {"calc.py": FIXED}, see=["test/calc_test.py"])},
                        }}
         (self.repo / ".fusion.json").write_text(json.dumps(self.config))
         self.tasks = self.root / "tasks"
@@ -183,6 +269,13 @@ class GymTest(Isolated):
         self.assertEqual(run_git(self.repo, "show", f"{task['task_sha']}:calc.py") + "\n", BUGGY)
         self.assertEqual(run_git(self.repo, "show", f"{task['task_sha']}:test/calc_test.py") + "\n", TEST_FIX)
         self.assertNotIn("7", run_git(self.repo, "log", "-1", "--format=%B", task["task_sha"]))
+        # The hidden form: the worker starts at B; C's test file is a fixture.
+        hidden = task["hidden"]
+        self.assertEqual((hidden["base_ref"], hidden["base_sha"]), ("refs/gym/bases/pr-7", self.base))
+        self.assertEqual(run_git(self.repo, "rev-parse", "refs/gym/bases/pr-7"), self.base)
+        [fixture] = hidden["fixtures"]
+        self.assertEqual(fixture["path"], "test/calc_test.py")
+        self.assertEqual(gym.base64.b64decode(fixture["content_base64"]).decode(), TEST_FIX)
         self.assertEqual(run_git(self.repo, "status", "--porcelain"), status)
         self.assertEqual(rows[8]["skipped"], "no test files changed")
         self.assertIn("no commit for PR #99", rows[99]["skipped"])
@@ -209,7 +302,7 @@ class GymTest(Isolated):
 
     def test_lanes_label_fail_to_pass_and_no_change_and_resume(self):
         self.extract()
-        result = gym.run(self.tasks, ["fixer", "idler", "cheater"], self.gym_dir)
+        result = gym.run(self.tasks, ["fixer", "idler", "cheater"], self.gym_dir, mode="visible")
         self.assertEqual(result["status"], "complete")
         runs = {row["lane"]: row for row in result["runs"]}
         self.assertEqual({lane: row["verdict"] for lane, row in runs.items()},
@@ -231,13 +324,84 @@ class GymTest(Isolated):
         self.assertFalse(gym.succeeds(task_repo, "cat-file", "-e", self.fix + "^{commit}"))
         self.assertEqual(list((self.gym_dir / "tasks/pr-7/lanes").iterdir()), [])
         # Resumable: completed task x lane pairs are skipped.
-        again = gym.run(self.tasks, ["fixer", "idler", "cheater"], self.gym_dir)
+        again = gym.run(self.tasks, ["fixer", "idler", "cheater"], self.gym_dir, mode="visible")
         self.assertEqual(again["runs"], [])
-        value = gym.report(self.gym_dir)
+        value = gym.report(self.gym_dir)["modes"]["visible"]
         self.assertEqual(value["tasks"]["pr-7"]["solved_by"], ["fixer"])
         self.assertEqual((value["lanes"]["fixer"]["f2p_pass_rate"], value["lanes"]["idler"]["f2p_pass_rate"]), (1.0, 0.0))
         self.assertEqual(value["lanes"]["cheater"]["tampered"], 1)
-        self.assertIn("fixer", gym.table(value))
+        self.assertIn("fixer", gym.table(gym.report(self.gym_dir)))
+
+    def test_hidden_tests_grade_a_worker_that_only_sees_the_problem(self):
+        self.extract()
+        result = gym.run(self.tasks, ["fixer", "idler", "cheater", "forger", "observer"], self.gym_dir)
+        self.assertEqual((result["status"], result["mode"]), ("complete", "hidden"))
+        runs = {row["lane"]: row for row in result["runs"]}
+        self.assertEqual({lane: row["verdict"] for lane, row in runs.items()},
+                         {"fixer": "solved", "idler": "unsolved", "cheater": "unsolved", "forger": "unsolved",
+                          "observer": "solved"})
+        self.assertTrue(all(row["mode"] == "hidden" and row["key"].endswith(":hidden") for row in runs.values()))
+        # fail->pass labels the fixer; fail->fail labels nothing.
+        self.assertEqual(runs["fixer"]["gate_label"]["answers"], {"failed_task": "false"})
+        self.assertTrue(runs["fixer"]["baseline_ok"])
+        self.assertEqual(runs["fixer"]["changed"], ["calc.py"])
+        self.assertEqual((runs["idler"]["status"], runs["idler"]["gate_label"]["status"]), ("failed", "unlabeled"))
+        # A worker that rewrites the hidden test file (the forger makes the F2P
+        # test pass trivially) is graded by the fixture anyway: recorded, not
+        # rewarded, and not "tampered". The cheater's write equals B: no change.
+        self.assertEqual((runs["forger"]["touched_fixtures"], runs["forger"]["tampered"]), (["test/calc_test.py"], []))
+        self.assertEqual((runs["cheater"]["touched_fixtures"], runs["cheater"]["changed"]), ([], []))
+        self.assertFalse(runs["forger"]["f2p_passed"] or runs["cheater"]["f2p_passed"])
+        self.assertEqual(runs["forger"]["gate_label"]["status"], "unlabeled")
+        # The worker saw the base test file and a prompt that names no test.
+        patch_text = Path(runs["observer"]["patch"]).read_text()
+        self.assertIn("seen.json", patch_text)
+        self.assertNotIn("test_add_negative", patch_text)
+        self.assertIn("test_add_positive", patch_text)
+        self.assertIn("tests that are not in this repository will grade the change", patch_text)
+        self.assertNotIn("calc_test", patch_text.split("prompt")[1].split("files")[0])
+        # The hidden task repository holds neither the fix nor the task commit.
+        hidden_repo = self.gym_dir / "tasks/pr-7/hidden/repo"
+        task = json.loads((self.tasks / "pr-7.json").read_text())
+        for sha in (self.fix, task["task_sha"]):
+            self.assertFalse(gym.succeeds(hidden_repo, "cat-file", "-e", sha + "^{commit}"))
+        self.assertEqual(list((self.gym_dir / "tasks/pr-7/hidden/lanes").iterdir()), [])
+        value = gym.report(self.gym_dir)
+        self.assertEqual(list(value["modes"]), ["hidden"])
+        self.assertEqual(value["modes"]["hidden"]["tasks"]["pr-7"]["solved_by"], ["fixer", "observer"])
+        self.assertEqual(value["modes"]["hidden"]["lanes"]["forger"]["touched_fixtures"], 1)
+        self.assertIn("hidden tests", gym.table(value))
+
+    def test_resume_keys_keep_hidden_and_visible_apart(self):
+        self.extract()
+        [hidden] = gym.run(self.tasks, ["fixer"], self.gym_dir)["runs"]
+        self.assertEqual(hidden["key"], "pr-7:fixer:hidden")
+        [visible] = gym.run(self.tasks, ["fixer"], self.gym_dir, mode="visible")["runs"]
+        self.assertEqual(visible["key"], "pr-7:fixer:visible")
+        self.assertEqual(gym.run(self.tasks, ["fixer"], self.gym_dir)["runs"], [])
+        self.assertEqual(gym.run(self.tasks, ["fixer"], self.gym_dir, mode="visible")["runs"], [])
+        # A row written before modes existed was a visible run.
+        legacy = {"schema": gym.RESULT_SCHEMA, "event": "finished", "key": "pr-7:idler", "task": "pr-7", "lane": "idler",
+                  "completed": True, "verdict": "unsolved", "f2p_passed": False, "p2p_regressed": False, "tampered": []}
+        with (self.gym_dir / "results.jsonl").open("a") as stream:
+            stream.write(json.dumps(legacy) + "\n")
+        self.assertEqual(gym.run(self.tasks, ["idler"], self.gym_dir, mode="visible")["runs"], [])
+        [row] = gym.run(self.tasks, ["idler"], self.gym_dir)["runs"]
+        self.assertEqual(row["key"], "pr-7:idler:hidden")
+        modes = gym.report(self.gym_dir)["modes"]
+        self.assertEqual({mode: sorted(section["lanes"]) for mode, section in modes.items()},
+                         {"hidden": ["fixer", "idler"], "visible": ["fixer", "idler"]})
+
+    def test_a_task_extracted_before_the_hidden_form_upgrades_in_place(self):
+        self.extract()
+        path = self.tasks / "pr-7.json"
+        task = json.loads(path.read_text())
+        task.pop("hidden")
+        path.write_text(json.dumps(task))
+        run_git(self.repo, "update-ref", "-d", "refs/gym/bases/pr-7")
+        [row] = gym.run(self.tasks, ["fixer"], self.gym_dir)["runs"]
+        self.assertEqual((row["mode"], row["verdict"]), ("hidden", "solved"))
+        self.assertNotIn("hidden", json.loads(path.read_text()))
 
     def test_a_shallow_source_repository_works(self):
         shallow = self.root / "shallow"
@@ -254,7 +418,7 @@ class GymTest(Isolated):
         result = gym.run(self.tasks, ["agy"], self.gym_dir)
         [row] = result["runs"]
         self.assertEqual((row["verdict"], row["completed"]), ("unavailable", False))
-        self.assertEqual(gym.report(self.gym_dir)["incomplete"], ["pr-7:agy"])
+        self.assertEqual(gym.report(self.gym_dir)["incomplete"], ["pr-7:agy:hidden"])
         self.assertEqual(gym.run(self.tasks, ["fixer"], self.gym_dir, budget_usd=0)["status"], "budget_reached")
 
     def test_cli_and_guards(self):
@@ -269,11 +433,20 @@ class GymTest(Isolated):
                                             gym.resolve_lane({}, "claude-sonnet-high"), 2.0))
         node = spec["graph"]["nodes"][0]
         self.assertEqual((node["acceptance"]["before"], node["max_budget_usd"], node["reasoning_effort"]), (True, 2.0, "high"))
+        self.assertNotIn("fixtures", node["acceptance"])
+        task = json.loads((self.tasks / "pr-7.json").read_text())
+        fixtures = [{"path": "test/calc_test.py", "from_file": "/nowhere"}]
+        node = gym.build_spec(task, {"agent": "codex"}, mode="hidden", fixtures=fixtures)["nodes"][0]
+        self.assertEqual(node["acceptance"]["fixtures"], fixtures)
+        for leak in ("calc_test", "test_add_negative", "test/"):
+            self.assertNotIn(leak, node["task"])
+        with self.assertRaises(ValueError):
+            gym.run(self.tasks, ["fixer"], self.gym_dir, mode="secret")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             code = core.main(["--quiet", "gym", "report", str(self.gym_dir)])
         self.assertEqual(code, 0)
-        self.assertIn("lane", out.getvalue())
+        self.assertIn("no completed gym runs", out.getvalue())
 
 
 if __name__ == "__main__":

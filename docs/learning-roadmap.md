@@ -89,7 +89,7 @@ That result was fixed by how labels are gathered, not by the model:
 
 | # | Change | Label it produces |
 |---|---|---|
-| 3a | **ORC gym** (`fusion gym extract/run/report`): merged fix PRs become tasks (B + the PR's tests); each lane runs them with the F2P/P2P tests as `acceptance.before` checks. See [ORC gym](../FUSION_DECISIONS.md#orc-gym-replayed-fixes-as-benchmark-tasks). | `failed_task` from fail→pass / pass→fail / no change, `source: structural_gate`, on real tasks that can fail; per-lane solve rates on the same tasks |
+| 3a | **ORC gym** (`fusion gym extract/run/report`): merged fix PRs become tasks (B + the PR's tests); each lane runs them with the F2P/P2P tests as `acceptance.before` checks, hidden by default (worker starts at B with the problem text; the tests are `acceptance.fixtures`). See [ORC gym](../FUSION_DECISIONS.md#orc-gym-replayed-fixes-as-benchmark-tasks). | `failed_task` from fail→pass / pass→fail / no change, `source: structural_gate`, on real tasks that can fail; per-lane solve rates on the same tasks |
 
 - **Code survival:** `learn tick` mines git history for ORC-built commits that are
   reverted or re-fixed within a window (delayed negatives) or survive it (matured
