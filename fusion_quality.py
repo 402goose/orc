@@ -1,7 +1,7 @@
 """Measured dataset health and evaluation evidence; no model calls or inferred grades."""
 from collections import Counter, defaultdict
 
-from fusion_decisions import digest, labelable_record, labels_for
+from fusion_decisions import digest, labelable_record, labeled_splits, labels_for, record_group
 
 
 def input_key(row):
@@ -45,8 +45,9 @@ def dataset_quality(rows):
             "group_overlap": sorted(groups["train"] & groups["validation"]), "balance": balance}
 
 
-def review_quality(rows):
+def review_quality(rows, split="time"):
     """Inspect current retained labels, with one effective review event per answer."""
+    splits = labeled_splits(rows, split)
     examples, sources, evidence, edits, revisions = [], Counter(), 0, Counter(), 0
     council = Counter()
     for row in rows:
@@ -71,9 +72,8 @@ def review_quality(rows):
         answers = row.get("reviewed_answers", {})
         if not answers:
             continue
-        group = row.get("context", {}).get("group") or row.get("context", {}).get("task_id") or digest(row["state"])
-        split = "validation" if int(digest(group)[:8], 16) % 5 == 0 else "train"
-        examples.append({**row, "labels": answers, "group": group, "split": split})
+        group = record_group(row)
+        examples.append({**row, "labels": answers, "group": group, "split": splits.get(group, "train")})
         for key in answers:
             event = effective.get(key, {})
             evidence += bool(str(event.get("evidence", "")).strip())
@@ -92,6 +92,68 @@ def review_quality(rows):
     quality = dataset_quality(examples)
     return {**quality, "evidence_recorded": evidence, "sources": dict(sources),
             "draft_reviews": dict(edits), "revised_answers": revisions, "council": dict(council)}
+
+
+BASELINES = ("majority", "heuristic", "control")
+
+
+def _selected(probs):
+    return max(probs, key=probs.get)
+
+
+def baseline_comparison(rows, predictions, controls=None):
+    """Held-out accuracy per question beside each baseline that applies to it.
+
+    `predictions` maps a row id to its {question: probabilities}; `controls`
+    maps a validation row id to the same questions answered against another
+    example's state. Baselines, each compared on only the answers it covers:
+    majority -- the most common training label for that exact question;
+    heuristic -- the deterministic policy's answer exported with the row
+      (fusion_decisions.heuristic_answers);
+    control -- the candidate itself, reading a shuffled state.
+    """
+    train_labels = defaultdict(Counter)
+    for row in rows:
+        if row["split"] == "train":
+            for key, label in row["labels"].items():
+                train_labels[digest(row["questions"][key])][label] += 1
+    empty = lambda: {"n": 0, "correct": 0, "baseline_correct": 0}
+    questions = defaultdict(lambda: {"n": 0, "correct": 0, "groups": set(), "baselines": defaultdict(empty)})
+    overall = defaultdict(empty)
+    for row in rows:
+        if row["split"] != "validation":
+            continue
+        for key, label in row["labels"].items():
+            hit = _selected(predictions[row["id"]][key]) == label
+            entry = questions[f"{row['kind']}:{key}"]
+            entry["n"] += 1
+            entry["correct"] += hit
+            entry["groups"].add(row["group"])
+            counts = train_labels[digest(row["questions"][key])]
+            answers = {"majority": sorted(counts, key=lambda v: (-counts[v], v))[0] if counts else None,
+                       "heuristic": (row.get("heuristic") or {}).get(key),
+                       "control": _selected(controls[row["id"]][key]) if controls and row["id"] in controls else None}
+            for name, answer in answers.items():
+                if answer is None:
+                    continue
+                for target in (entry["baselines"][name], overall[name]):
+                    target["n"] += 1
+                    target["correct"] += hit
+                    target["baseline_correct"] += answer == label
+
+    def summary(value):
+        return {"n": value["n"], "accuracy": value["baseline_correct"] / value["n"],
+                "candidate_accuracy": value["correct"] / value["n"],
+                "margin": (value["correct"] - value["baseline_correct"]) / value["n"]}
+    return {"baselines": {name: summary(overall[name]) for name in BASELINES if overall[name]["n"]},
+            "by_question": {name: {"n": value["n"], "groups": len(value["groups"]), "accuracy": value["correct"] / value["n"],
+                                   "baselines": {b: summary(value["baselines"][b]) for b in BASELINES if value["baselines"][b]["n"]}}
+                            for name, value in sorted(questions.items())}}
+
+
+def unbeaten(baselines, margin):
+    """Baselines the candidate does not beat by more than `margin` on the answers each covers."""
+    return [name for name, value in (baselines or {}).items() if not value["margin"] > margin]
 
 
 def matched_comparisons(candidates, evaluations):
@@ -125,5 +187,8 @@ def matched_comparisons(candidates, evaluations):
                                 "by_kind": result.get("by_kind", {}), "baseline_by_kind": before.get("by_kind", {}),
                                 "control_accuracy": result.get("control_accuracy"),
                                 "majority_accuracy": result.get("majority_accuracy"),
+                                "heuristic_accuracy": result.get("heuristic_accuracy"),
+                                "baselines": result.get("baselines"), "by_question": result.get("by_question", {}),
+                                "baseline_by_question": before.get("by_question", {}),
                                 "holdout_status": result.get("holdout", {}).get("status", "unknown"), "notes": reasons})
     return sorted(comparisons, key=lambda r: r.get("time_ms") or 0, reverse=True)
