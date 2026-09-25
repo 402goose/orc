@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import selectors
 import subprocess
 import sys
@@ -58,12 +59,87 @@ ACCEPTANCE_QUESTIONS = {
     "failed_task": {"type": "noul", "instructions": "Did the worker fail to do what the task asked?"},
 }
 ACCEPTANCE_MIN_SUMMARY = 400
-ACCEPTANCE_LIST_LIMITS = {"changed": 12, "tests": 8}
-ACCEPTANCE_ITEM_CHARS = 200
+# `changed` and `tests` entries kept, and characters per entry. Lists shrink
+# to the next level only when the criterion and minimum summary cannot fit
+# beside them.
+ACCEPTANCE_LIST_LEVELS = ({"changed": 12, "tests": 8, "chars": 200}, {"changed": 6, "tests": 4, "chars": 100},
+                          {"changed": 3, "tests": 2, "chars": 60})
 
 
 def state_cap(options):
     return max(200, min(6000, int(options["max_state_chars"])))
+
+
+# Laya's encoder reads at most LAYA_MAX_LEN tokens: the question head (type,
+# instruction, options; at most LAYA_HEAD_MAX_LEN plus three separators), then
+# the state, which gets whatever is left (fusion_laya.truncated). A state is
+# complete only if it fits that remainder, so a character cap cannot decide it:
+# with the checkpoint's byte-level BPE tokenizer, real decision states measured
+# 2.4-4.8 characters per token, hashes and diffs ~1.7, CJK ~1.2.
+# STATE_HEAD_TOKENS is the measured head of a kind's longest question
+# (test/laya_token_budget.py re-measures it); an unmeasured kind is assumed to
+# use the whole head.
+LAYA_MAX_LEN = 512
+LAYA_HEAD_MAX_LEN = 192
+STATE_HEAD_TOKENS = {"acceptance": 40}
+_PIECES = re.compile(r"'(?:s|t|re|ve|m|ll|d)| ?[^\W\d_]+| ?\d+| ?(?:[^\s\w]|_)+|\s+(?!\S)|\s+")
+_CASED = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[A-Za-z]")
+
+
+def state_tokens(kind):
+    return LAYA_MAX_LEN - STATE_HEAD_TOKENS.get(kind, LAYA_HEAD_MAX_LEN + 3)
+
+
+def estimated_tokens(text):
+    """A cheap upper estimate of Laya's token count for `text`, without the tokenizer.
+
+    Splits like the tokenizer's GPT-2 pre-tokenizer, then charges each piece
+    more than BPE usually spends: a cased run of letters one token per 4
+    letters, digits one per 2, each punctuation character, tab or newline
+    one, a run of spaces one, and each non-ASCII character its UTF-8 length
+    less one (four-byte characters, e.g. emoji, their full length). Measured with the
+    tokenizer on 1,596 texts -- this repository's code, docs, JSON and shell
+    in 1,500-character chunks, raw and JSON-encoded; 88 recorded decision
+    states; hashes, UUIDs, digits, accented text, CJK, emoji -- the true count
+    was at most 0.89 of the estimate on JSON-encoded text (decision states
+    are JSON), 0.81 on recorded acceptance states (0.72 on average), and at
+    most 1.0 on raw text and the synthetic hash and whitespace runs. Text
+    built to defeat BPE (random consonant strings, base64, alternating case)
+    can exceed it; the runtime still reports that as truncation.
+    test/laya_token_budget.py re-measures it; test/fixtures/
+    laya_token_counts.json keeps the counts the default suite checks against.
+    """
+    total = 0
+    for piece in _PIECES.findall(text):
+        piece = piece.lstrip(" ") or " "
+        for char in piece:
+            if ord(char) > 127:
+                width = len(char.encode())
+                total += width if width == 4 else max(1, width - 1)
+        plain = "".join(char for char in piece if ord(char) < 128)
+        if not plain:
+            continue
+        if plain.isspace():
+            total += sum(char != " " for char in plain) + (" " in plain)
+        elif plain[0].isalpha():
+            total += sum(-(-len(run) // 4) for run in _CASED.findall(plain))
+        elif plain[0].isdigit():
+            total += -(-len(plain) // 2)
+        else:
+            total += len(plain)
+    return total
+
+
+def exceeds_token_budget(record):
+    """An input recorded without inference (`unscored`) whose estimated size
+    exceeds the model's state budget. The model never checked it, so it counts
+    as truncated: an acceptance input of up to 2200 characters recorded before
+    inputs were bounded by tokens is one."""
+    return record.get("status") == "unscored" and over_token_budget(record.get("kind"), record.get("state"))
+
+
+def over_token_budget(kind, text):
+    return isinstance(text, str) and estimated_tokens(text) > state_tokens(kind)
 
 
 def _encoded(value):
@@ -87,8 +163,8 @@ def excerpt(text, budget):
     return _marked(text, keep)
 
 
-def _listed(items, limit):
-    items = [text if len(text) <= ACCEPTANCE_ITEM_CHARS else _marked(text, ACCEPTANCE_ITEM_CHARS)
+def _listed(items, limit, chars):
+    items = [text if len(text) <= chars else _marked(text, chars)
              for text in (str(item) for item in (items or []))]
     return items if len(items) <= limit else items[:limit] + [f"[…{len(items) - limit} more]"]
 
@@ -118,8 +194,10 @@ def acceptance_task(source):
     return fields, criterion, detail
 
 
-def acceptance_state(source, result, cap):
-    """The input for the ACCEPTANCE questions, bounded to `cap` encoded characters.
+def acceptance_state(source, result, cap, tokens=None):
+    """The input for the ACCEPTANCE questions, bounded to `cap` encoded
+    characters and to `tokens` estimated tokens (default: what Laya leaves the
+    state beside the acceptance questions, `state_tokens("acceptance")`).
 
     Both the workflow gate (fusion_policy.accept_node) and lead verdicts
     (fusion_labeling.verdict_label) build it here, so one run always yields
@@ -131,9 +209,36 @@ def acceptance_state(source, result, cap):
     may be excerpted; each cut carries a visible "[…truncated N chars]"
     marker, as do capped `changed` and `tests` lists. An input with visible
     markers is complete for labeling: it says exactly what the classifier saw.
+
+    The token bound is met by lowering the character cap in proportion to the
+    estimate (estimated_tokens) until the input fits, so the rule above holds
+    unchanged at whatever cap the tokens allow. When even that leaves no room
+    for the criterion and minimum summary, the lists shrink a level
+    (ACCEPTANCE_LIST_LEVELS) and the cap is lowered again from `cap`.
     """
+    tokens = state_tokens("acceptance") if tokens is None else tokens
+    for lists in ACCEPTANCE_LIST_LEVELS:
+        state = _acceptance_within_tokens(source, result, cap, tokens, lists)
+        if not state.get("source_truncated"):
+            return state
+    return state
+
+
+def _acceptance_within_tokens(source, result, cap, tokens, lists):
+    while True:
+        state = _acceptance_within(source, result, cap, lists)
+        used = estimated_tokens(json.dumps(state, ensure_ascii=False, sort_keys=True))
+        if used <= tokens or state.get("source_truncated"):
+            return state
+        smaller = min(cap - 1, cap * tokens // used)
+        if smaller < 200:
+            return {**state, "source_truncated": True}
+        cap = smaller
+
+
+def _acceptance_within(source, result, cap, limits):
     fields, criterion, detail = acceptance_task(source)
-    lists = {key: _listed(result.get(key), limit) for key, limit in ACCEPTANCE_LIST_LIMITS.items()}
+    lists = {key: _listed(result.get(key), limits[key], limits["chars"]) for key in ("changed", "tests")}
     summary = str(result.get("summary") or "")
 
     def build(request, text):
@@ -144,7 +249,7 @@ def acceptance_state(source, result, cap):
         return whole
     spare = cap - _encoded(build(criterion, "")) - (40 if detail else 0)
     size = _encoded(summary) - 2
-    budget = min(size, max(spare * 3 // 5, spare - (_encoded(joined) - 2)))
+    budget = min(size, max(spare * 3 // 5, min(spare, ACCEPTANCE_MIN_SUMMARY), spare - (_encoded(joined) - 2)))
     if budget < min(size, ACCEPTANCE_MIN_SUMMARY):
         return {**whole, "source_truncated": True}
     summary = excerpt(summary, budget)
@@ -174,7 +279,8 @@ def config_for(config):
 
 
 def labelable_record(record):
-    return record.get("status") in LABELABLE_STATUSES and not record.get("truncated")
+    return (record.get("status") in LABELABLE_STATUSES and not record.get("truncated")
+            and not exceeds_token_budget(record))
 
 
 def runtime_python(options):
@@ -391,12 +497,14 @@ class DecisionStore:
         labels, exclusions = reviewed_labels(events)
         provenance = label_provenance(events)
         excluded_sources = set(exclude_sources)
-        rows = []
+        rows, over_budget = [], 0
         records = {e["id"]: e for e in events if e.get("event") == "decision"}
         for record in records.values():
             origin = provenance.get(record["id"], {})
             kept = {key: value for key, value in labels.get(record["id"], {}).items()
                     if origin.get(key, {}).get("source", "human") not in excluded_sources}
+            if kept and not exclusions.get(record["id"]) and not record.get("truncated") and exceeds_token_budget(record):
+                over_budget += 1
             if not kept or exclusions.get(record["id"]) or not labelable_record(record):
                 continue
             group = record.get("context", {}).get("group") or record.get("context", {}).get("task_id") or digest(record["state"])
@@ -414,6 +522,7 @@ class DecisionStore:
         destination.chmod(0o600)
         from fusion_quality import dataset_quality
         return {"examples": len(rows), "splits": dict(Counter(row["split"] for row in rows)), "path": str(destination),
+                "skipped_over_token_budget": over_budget,
                 "data_quality": dataset_quality(rows), "dataset_hash": hashlib.sha256(destination.read_bytes()).hexdigest()}
 
 
@@ -496,12 +605,14 @@ class DecisionEngine:
         """Record a decision input without inference, so a verified answer can be
         attached to it. Same encoding and truncation as decide(), or an already
         encoded complete input; no prediction, no recommendation, and allowed()
-        can never act on it."""
+        can never act on it. No model checks its fit, so an input over the
+        estimated token budget (exceeds_token_budget) is recorded truncated."""
         record = {**self.new_record(kind, questions, context), "status": "unscored", "duration_ms": 0, **extra}
         if encoded is None:
             self.encode(record, state)
         else:
             record.update(state=encoded, truncated=False)
+        record["truncated"] = record["truncated"] or exceeds_token_budget(record)
         self.store.append("decision", **record)
         return record
 

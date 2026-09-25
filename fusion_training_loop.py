@@ -10,7 +10,7 @@ from pathlib import Path
 import uuid
 
 import fusion_core as core
-from fusion_decisions import LABELABLE_STATUSES, DecisionEngine, digest
+from fusion_decisions import LABELABLE_STATUSES, DecisionEngine, digest, exceeds_token_budget
 from fusion_garden import locked
 from fusion_learning import decision_rows, read_object
 from fusion_publish import save
@@ -38,7 +38,7 @@ def tokens(rows):
     """Effective evidence only: repeat approvals and predictions cannot trigger training."""
     result = {}
     for row in rows:
-        if row.get('excluded') or row.get('truncated') or row.get('status', 'ok') not in LABELABLE_STATUSES:
+        if row.get('excluded') or row.get('truncated') or row.get('status', 'ok') not in LABELABLE_STATUSES or exceeds_token_budget(row):
             continue
         group = row.get('group') or row.get('context', {}).get('group') or row.get('context', {}).get('task_id') or digest(row['state'])
         for key, value in row.get('reviewed_answers', row.get('labels', {})).items():
@@ -53,7 +53,7 @@ def changes(before, after):
 def readiness(rows):
     groups = defaultdict(set)
     for row in rows:
-        if row.get('reviewed_answers') and not row.get('excluded') and not row.get('truncated') and row.get('status') in LABELABLE_STATUSES:
+        if row.get('reviewed_answers') and not row.get('excluded') and not row.get('truncated') and row.get('status') in LABELABLE_STATUSES and not exceeds_token_budget(row):
             group = row.get('context', {}).get('group') or row.get('context', {}).get('task_id') or digest(row['state'])
             groups['validation' if int(digest(group)[:8],16) % 5 == 0 else 'train'].add(group)
     return {k:len(groups[k]) for k in ('train','validation')}

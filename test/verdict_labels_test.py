@@ -164,6 +164,7 @@ class VerdictLabelsTest(unittest.TestCase):
         self.assertIn("[…truncated", state["summary"])
         self.assertEqual((len(state["changed"]), state["changed"][-1]), (13, "[…18 more]"))
         self.assertLessEqual(len(verdict_state), 2200)
+        self.assertLessEqual(fusion_decisions.estimated_tokens(verdict_state), fusion_decisions.state_tokens("acceptance"))
         with patch.object(fusion_decisions, "runtime_for", lambda options: Backend({"plausible": "true"})):
             _, gate_id = accept_node({"decisions": {"mode": "shadow"}}, self.workspace, "wf-9", node, {**result, "run_id": run_id})
         self.assertEqual(self.store.get(gate_id)["state"], verdict_state)
