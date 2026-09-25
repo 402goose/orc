@@ -1309,6 +1309,50 @@ sys.exit(1)
         )
         self.assertIsNone(fusion_core.select_orc_model(str(orc), "free"))
 
+    def test_select_orc_model_best_selector_never_resolves_to_free_model(self):
+        orc_free_only = self.write_agent(
+            "orc-free-only",
+            """
+import sys
+argv = sys.argv[1:]
+if argv[:1] == ['models']:
+    if '--fit' in argv:
+        print('providerA/mini-code:free\\tFIT stuff')
+    else:
+        # Free model ranks above untested paid model in tools ranking.
+        print('providerA/mini-code:free\\tstuff')
+        print('providerB/paid-model\\tstuff')
+    sys.exit(0)
+sys.exit(1)
+""",
+        )
+        # When only free models have passed probe --fit, 'best' must return None, not the free model.
+        self.assertIsNone(fusion_core.select_orc_model(str(orc_free_only), "best"))
+        self.assertEqual(fusion_core.fitted_orc_models(str(orc_free_only), "best", 1), [])
+        # 'free' selector is unchanged and still resolves to the fitted free model.
+        self.assertEqual(fusion_core.select_orc_model(str(orc_free_only), "free"), "providerA/mini-code:free")
+
+        orc_with_paid = self.write_agent(
+            "orc-with-paid",
+            """
+import sys
+argv = sys.argv[1:]
+if argv[:1] == ['models']:
+    if '--fit' in argv:
+        print('providerA/mini-code:free\\tFIT stuff')
+        print('providerB/paid-model\\tFIT stuff')
+    else:
+        # Free model still ranks higher in tools ranking.
+        print('providerA/mini-code:free\\tstuff')
+        print('providerB/paid-model\\tstuff')
+    sys.exit(0)
+sys.exit(1)
+""",
+        )
+        # Once a paid model is also fit, 'best' picks the paid model over the higher-ranked free model.
+        self.assertEqual(fusion_core.select_orc_model(str(orc_with_paid), "best"), "providerB/paid-model")
+        self.assertEqual(fusion_core.fitted_orc_models(str(orc_with_paid), "best", 1), ["providerB/paid-model"])
+
     def test_workflow_waits_for_all_dependencies_before_blocking_fanin(self):
         spec = {
             "nodes": [
