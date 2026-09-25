@@ -430,8 +430,8 @@ start-up workspace to that registry.
 `~/Library/LaunchAgents/ai.orc.fusion-learn.plist` and prints it, then loads
 it with `launchctl bootstrap gui/$UID`, replacing any loaded copy. The agent
 runs `learn tick` at load and then every `--interval` seconds (default 300,
-minimum 60). It appends output to `~/.local/share/orc/learn.log`, which is
-not rotated. Details of the plist:
+minimum 60). It appends output to `~/.local/share/orc/learn.log`; the log is
+rotated to `learn.log.1` (replacing any older copy) when it exceeds 5 MB. Details of the plist:
 
 - It pins the Python interpreter and the `fusion` script that ran `install`.
   Run it from the installed `fusion`, and run it again after upgrading Python

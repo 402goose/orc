@@ -115,6 +115,73 @@ class LearnTickTest(unittest.TestCase):
             self.cli('learn', 'tick', '--workspace', str(self.root / 'missing'))
 
 
+class LogRotationTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name).resolve()
+        self.log_dir = self.home / ".local/share/orc"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_path = self.log_dir / "learn.log"
+
+    def test_oversized_log_is_rotated(self):
+        self.log_path.write_text("x" * (6 * 1024 * 1024))
+        rotated_path = self.log_path.with_name("learn.log.1")
+        self.assertTrue(self.log_path.exists())
+        self.assertFalse(rotated_path.exists())
+        learn.rotate_learn_log(self.log_path)
+        self.assertFalse(self.log_path.exists())
+        self.assertTrue(rotated_path.exists())
+        self.assertEqual(rotated_path.stat().st_size, 6 * 1024 * 1024)
+
+    def test_oversized_log_replaces_existing_rotation(self):
+        rotated_path = self.log_path.with_name("learn.log.1")
+        rotated_path.write_text("old" * 100)
+        self.log_path.write_text("y" * (6 * 1024 * 1024))
+        learn.rotate_learn_log(self.log_path)
+        self.assertFalse(self.log_path.exists())
+        self.assertTrue(rotated_path.exists())
+        self.assertEqual(rotated_path.stat().st_size, 6 * 1024 * 1024)
+
+    def test_small_log_is_untouched(self):
+        small_content = "small log"
+        self.log_path.write_text(small_content)
+        rotated_path = self.log_path.with_name("learn.log.1")
+        learn.rotate_learn_log(self.log_path)
+        self.assertTrue(self.log_path.exists())
+        self.assertFalse(rotated_path.exists())
+        self.assertEqual(self.log_path.read_text(), small_content)
+
+    def test_missing_log_is_untouched(self):
+        rotated_path = self.log_path.with_name("learn.log.1")
+        learn.rotate_learn_log(self.log_path)
+        self.assertFalse(self.log_path.exists())
+        self.assertFalse(rotated_path.exists())
+
+    def test_tick_rotates_log(self):
+        self.log_path.write_text("z" * (6 * 1024 * 1024))
+        temp_repo = self.home / "repo"
+        seed_workspace(temp_repo)
+        orc_home = self.home / "orc"
+        env = patch.dict(os.environ, {"ORC_HOME": str(orc_home), "FUSION_DECISIONS_MODE": "off"})
+        env.start()
+        self.addCleanup(env.stop)
+        launch = patch.object(ControlRoom, "launch", autospec=True, side_effect=lambda *a, **k: None)
+        launch.start()
+        self.addCleanup(launch.stop)
+        out = io.StringIO()
+        with patch("fusion_learn_cli.paths") as mock_paths:
+            mock_paths.return_value = (self.home / "Library/LaunchAgents" / "test.plist", self.log_path)
+            learn.run(
+                core.build_parser().parse_args(["learn", "tick", "--workspace", str(temp_repo)]),
+                temp_repo,
+                out=out
+            )
+        rotated_path = self.log_path.with_name("learn.log.1")
+        self.assertFalse(self.log_path.exists())
+        self.assertTrue(rotated_path.exists())
+
+
 class ScheduleTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

@@ -158,6 +158,14 @@ def paths(home=None):
     return home / "Library/LaunchAgents" / (LABEL + ".plist"), home / ".local/share/orc/learn.log"
 
 
+def rotate_learn_log(log_path, max_size_bytes=5 * 1024 * 1024):
+    log_path = Path(log_path)
+    if log_path.exists() and log_path.stat().st_size > max_size_bytes:
+        rotated = log_path.with_name(log_path.name + ".1")
+        rotated.unlink(missing_ok=True)
+        log_path.rename(rotated)
+
+
 def plist(args, workspace, which=shutil.which, home=None):
     _, log = paths(home)
     environment = {"PATH": search_path(which)}
@@ -229,6 +237,9 @@ def run(args, workspace, out=None):
     command = args.learn_command
     if command == "schedule":
         return schedule(args, workspace, out=out)
+    if command == "tick":
+        _, log = paths()
+        rotate_learn_log(log)
     app = room(workspace)
     selected = targets(app, args, workspace)
     if command == "tick":
