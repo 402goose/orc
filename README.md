@@ -906,7 +906,10 @@ keeps provider availability separate from harness regressions.
 tasks from a PR's squash commit (its parent plus the PR's tests, with
 FAIL_TO_PASS and PASS_TO_PASS test ids), `gym run` gives each task to each
 lane in its own worktree and lets the gate label the result, and `gym report`
-compares lanes on the same tasks. `gym run` calls paid models. See
+compares lanes on the same tasks. By default the tests are hidden: the worker
+starts from the parent commit with only the problem text, and the PR's tests
+are written in only while the gate runs them (`--visible-tests` for the old
+mode). `gym run` calls paid models. See
 [ORC gym](FUSION_DECISIONS.md#orc-gym-replayed-fixes-as-benchmark-tasks).
 
 ### Remote telemetry (on by default)
