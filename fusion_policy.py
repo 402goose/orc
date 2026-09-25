@@ -23,6 +23,8 @@ def route_candidates(config, task, store, rejected=None):
         if rejected is not None:
             rejected.setdefault(key, why)
     yolo = core.execution_mode(config) == "yolo"
+    ttl_ms = core.cache_settings(config)["ttl_seconds"] * 1000
+    now = core.now_ms()
     history = defaultdict(list)
     outcomes = {event["task_id"]: event["accepted"] for event in read_jsonl(DecisionStore(task["workspace"]).path)
                 if event.get("event") == "outcome"}
@@ -130,6 +132,16 @@ def route_candidates(config, task, store, rejected=None):
             costs = [core.number(span["usage"].get("cost_usd", span["usage"].get("cost", 0))) for span in spans
                      if "cost_usd" in span.get("usage", {}) or "cost" in span.get("usage", {})]
             mean_cost = sum(costs) / len(costs) if costs else None
+            # Warm and cold split by the span's own session idle time; spans
+            # recorded before it existed have no key and join neither side.
+            split_costs = {True: [], False: []}
+            for span in spans:
+                if "session_idle_s" in span and ("cost_usd" in span.get("usage", {}) or "cost" in span.get("usage", {})):
+                    idle = span["session_idle_s"]
+                    split_costs[idle is not None and idle * 1000 < ttl_ms].append(
+                        core.number(span["usage"].get("cost_usd", span["usage"].get("cost", 0))))
+            last_end = spans[0].get("end_time_ms") if spans else None
+            lane_idle = round(max(0, now - last_end) / 1000, 3) if isinstance(last_end, (int, float)) and last_end > 0 else None
             arm = f"{key}:{model}" if split else key
             if task.get("budget_remaining_usd") is not None and mean_cost is not None and mean_cost > task["budget_remaining_usd"]:
                 drop(arm, f"its average reported cost ${mean_cost:.4f} exceeds the ${task['budget_remaining_usd']:.4f} left in the budget")
@@ -139,6 +151,9 @@ def route_candidates(config, task, store, rejected=None):
                             "runs": len(spans), "reported_success_rate": sum(s.get("status") == "success" for s in spans) / len(spans) if spans else None,
                             "checked_runs": len(verified), "acceptance_rate": sum(verified) / len(verified) if verified else None,
                             "mean_cost_usd": mean_cost,
+                            "mean_cost_usd_warm": sum(split_costs[True]) / len(split_costs[True]) if split_costs[True] else None,
+                            "mean_cost_usd_cold": sum(split_costs[False]) / len(split_costs[False]) if split_costs[False] else None,
+                            "session_idle_s": lane_idle, "warm": lane_idle is not None and lane_idle * 1000 < ttl_ms,
                             "mean_ms": sum(s.get("duration_ms", 0) for s in spans) / len(spans) if spans else None})
             if len(choices) == 8:
                 break
@@ -162,7 +177,7 @@ def no_route_reason(config, task, store):
             "Run `fusion doctor` to see every lane and its command.")
 
 
-def rank_by_outcomes(candidates, minimum=3):
+def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None):
     """Order automatic candidates by verified outcomes, not by worker self-reports.
 
     A candidate with fewer than `minimum` checked runs is tried first, in the
@@ -170,6 +185,11 @@ def rank_by_outcomes(candidates, minimum=3):
     smoothed acceptance rate (accepted + 1) / (checked + 2). Stable: ties keep
     preference order. Only gate and lead outcomes count; `status: success` alone
     is a worker's claim.
+
+    With `warm_epsilon`, prompt-cache warmth breaks ties only: candidates in the
+    same bucket whose smoothed rate is within epsilon of the best rate in their
+    run are one tier, and a warm candidate leads its tier. Warmth never moves a
+    candidate past one whose rate is more than epsilon better.
     """
     def score(item):
         index, candidate = item
@@ -178,7 +198,17 @@ def rank_by_outcomes(candidates, minimum=3):
             return (0, 0.0, index)
         accepted = (candidate.get("acceptance_rate") or 0) * checked
         return (1, -(accepted + 1) / (checked + 2), index)
-    return [candidate for _, candidate in sorted(enumerate(candidates), key=score)]
+    ranked = sorted(enumerate(candidates), key=score)
+    if warm_epsilon is None:
+        return [candidate for _, candidate in ranked]
+    tiers = []
+    for item in ranked:
+        bucket, rate, _ = score(item)
+        if tiers and tiers[-1][0] == bucket and rate - tiers[-1][1] <= warm_epsilon + 1e-9:
+            tiers[-1][2].append(item[1])
+        else:
+            tiers.append((bucket, rate, [item[1]]))
+    return [candidate for _, _, tier in tiers for candidate in sorted(tier, key=lambda c: not c.get("warm"))]
 
 
 def route_task(config, task, store):
@@ -196,17 +226,19 @@ def route_task(config, task, store):
     # Explicit lanes are never silently substituted, even if unhealthy.
     with progress.activity(task.get("progress_label", task["role"]), "checking available workers and model fit" if automatic else "checking selected worker"):
         ranking = config.get("decisions", {}).get("rank_by_outcomes")
+        import fusion_core as core
+        cache = core.cache_settings(config)
+        warm_epsilon = cache["warm_epsilon"] if cache["configured"] else None
         within_route = False
         if automatic:
             candidates = route_candidates(config, task, store)
             if ranking:
-                candidates = rank_by_outcomes(candidates, int(ranking) if not isinstance(ranking, bool) else 3)
+                candidates = rank_by_outcomes(candidates, int(ranking) if not isinstance(ranking, bool) else 3, warm_epsilon)
                 if task.get("prefer_different_agent"):
                     # Independence outranks track record: a review stays with a
                     # different harness than the implementer when one is available.
                     candidates.sort(key=lambda item: item["agent"] == task["prefer_different_agent"])
         else:
-            import fusion_core as core
             from fusion_reasoning import pair_candidates, pair_key
             settings = core.agent_settings(config, task)
             pairs = pair_candidates(config, settings, task.get("write", False)) if task["agent"] == "codex" else []
@@ -215,7 +247,7 @@ def route_task(config, task, store):
             arms = [] if pairs or not task.get("route") or settings.get("model") or int(settings.get("arms", 1)) < 2 else [
                 c for c in route_candidates(config, task, store) if c["route"] == task["route"]]
             if arms and ranking:
-                arms = rank_by_outcomes(arms, int(ranking) if not isinstance(ranking, bool) else 3)
+                arms = rank_by_outcomes(arms, int(ranking) if not isinstance(ranking, bool) else 3, warm_epsilon)
             within_route = len(arms) > 1
             candidates = arms or [{"key": pair_key(pair), "agent": "codex", "route": task.get("route"), **pair} for pair in pairs] or [{
                 "key": task.get("route") or task["agent"], "agent": task["agent"], "route": task.get("route"),

@@ -132,6 +132,64 @@ it. Interactive lead sessions use their own provider controls.
    explicitly enabled council approvals, and lead verdicts on acceptance. Human review, candidate fine-tuning, held-out evaluation and
    calibration are separate steps; no model promotes itself.
 
+## Prompt cache and sessions
+
+Provider prompt caches dominate worker cost (one Claude run read 3.38M
+input tokens from cache against 96 uncached), and they are per
+model/provider and expire after minutes, with provider-specific TTLs.
+Fusion records enough to see this and acts on it only where configured.
+
+**Recorded on every span** in `.fusion/traces.jsonl` (and the run's
+`result.json`):
+
+- `session_key`: the key the run's native session is stored under
+  (`agent:role`, extended for model/effort pins and automatic lanes).
+- `resumed`: whether a stored native session id was passed to the worker.
+- `session_idle_s`: seconds between the end of the previous worker run
+  under the same `session_key` and this run's start; `null` for the first.
+  Last-use times live in `.fusion/session_use.json`; `sessions.json` keeps
+  its `key -> session id` shape, and a session without a use record is
+  treated as unknown age.
+- `cache_read_ratio`: cache-read tokens over all prompt tokens. For
+  Anthropic-style usage that is `cache_read / (input + cache_read +
+  cache_write)`; for OpenAI-style usage, where `cached_input_tokens` is part
+  of `input_tokens`, it is `cached / input`. `null` when no cache counts
+  were reported.
+- `resume_skipped: "cold"` when the policy below started a fresh session.
+
+**Configuration** (all optional):
+
+```json
+"cache": {"ttl_seconds": 300, "cold_resume": "resume", "warm_epsilon": 0.05}
+```
+
+`ttl_seconds` (default 300) is when Fusion considers a session or lane
+cold; set it to your provider's cache lifetime. `cold_resume: "resume"`
+(default) keeps resuming regardless of idle time. `"fresh"` starts a new
+session instead of resuming one idle longer than `ttl_seconds`, so a long
+history is not re-sent at cache-write price; the worker then sees only the
+current brief, not its earlier conversation, so use it where briefs are
+self-contained. A session of unknown age is still resumed.
+
+**Routing.** Each automatic candidate carries `warm` (its lane's most
+recent span, per model for split arms, ended less than `ttl_seconds` ago),
+`session_idle_s` (seconds since that span ended) and
+`mean_cost_usd_warm`/`mean_cost_usd_cold` (mean reported cost of runs
+whose own `session_idle_s` was under/over the TTL; a first run counts as
+cold, spans recorded before these fields existed count in neither).
+Warmth is lane-level, not the exact session a task will resume: a warm
+lane may still hold a cached system prompt and tool prefix.
+
+With a `cache` block present and `rank_by_outcomes` enabled, warmth only
+breaks ties: candidates in the same bucket (exploring, or ranked) whose
+smoothed acceptance is within `warm_epsilon` of the best rate in their
+tier are equal, and the warm one goes first. Warmth never moves a lane
+past one whose smoothed acceptance is more than `warm_epsilon` better,
+and reviews still prefer a different agent from the implementer. Without a
+`cache` block the order is unchanged. Candidates passed to Laya's routing
+decision include `warm` and `session_idle_s` as shadow state; they add no
+authority.
+
 ## Shadow, off and active modes
 
 The default is **shadow**: recommendations are recorded, but deterministic
