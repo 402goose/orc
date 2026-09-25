@@ -1275,6 +1275,8 @@ def fitted_orc_models(command: str, selector: str, limit: int) -> list[str]:
     if selector not in {"free", "best"}:
         return []
     ranked = _orc_model_ids(command, ["--free", "--tools"] if selector == "free" else ["--tools"])
+    if selector == "best":
+        ranked = [candidate for candidate in ranked if not candidate.endswith(":free")]
     fit_ids = set(_orc_model_ids(command, ["--fit"]))
     return [candidate for candidate in ranked if candidate in fit_ids][:max(0, limit)]
 
