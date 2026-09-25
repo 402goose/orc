@@ -1188,6 +1188,23 @@ it:
 Re-extract after new fix PRs merge (existing task shas do not change);
 `gym report` reads receipts only and can run at any time.
 
+### Solvability audit
+
+A negative gym label claims the worker failed a task that could be done. Hidden
+tests sometimes expect a name or interface the issue never states (the problem
+SWE-bench Verified filters out by hand). The gym's evidence that a task *can* be
+done from its prompt is that some lane solved it. `gym audit GYMDIR` (also run
+at the end of every `gym run`):
+
+- retracts, append-only, the `failed_task=true` gate labels of tasks no lane has
+  solved in hidden mode, and lists those tasks as possibly underspecified;
+- restores those labels once a lane solves the task from the same prompt;
+- never touches positives or labels from any other source (human, council,
+  lead). The summary is written to `GYMDIR/audit.json`.
+
+On 2026-09-25 the first 11 hidden tasks left 5 unsolved by Sonnet 5, Opus 5.5,
+Fable 5.1 and agy alike; their negatives are withheld until a lane solves them.
+
 ## Run the loop without the UI
 
 Label drafting (the garden) and training rounds are advanced by a tick. The
