@@ -73,8 +73,20 @@ it. Interactive lead sessions use their own provider controls.
    include task, write permission, routing goal, reported costs/latency,
    reported success, and observed workflow acceptance. Missing metrics stay
    unknown. ORC candidates require passing tool-fit evidence; read-only
-   routes cannot become writers. Recent quota failures exclude equivalent
-   native lanes. Explicit agent/route selections stay pinned, and a lane
+   routes cannot become writers. A lane whose latest run in the last 15
+   minutes hit a quota limit cools down, and equivalent native lanes with
+   it. A permission denial in the current execution mode does the same only
+   when a denied tool is one every task needs: read, edit, write, list or
+   search (`BASELINE_TOOLS` in `fusion_core.py`: `Read`, `Edit`, `Write`,
+   `MultiEdit`, `Glob`, `Grep`, `LS`, agy's `ViewFile`/`ListDir`/...;
+   matched case- and punctuation-insensitively). Denying anything else,
+   such as `Bash` in restricted mode or an MCP tool, is specific to the
+   task: the run still fails as `permission_denied`, but the lane stays a
+   candidate. Each result and span records `denied_tools`, taken from
+   Claude's `permission_denials` or agy's `denied_actions`, else from
+   `permission denied: X` blocker lines. A denial that names no tool,
+   including spans recorded before `denied_tools` existed, keeps the
+   lane-wide cooldown. Explicit agent/route selections stay pinned, and a lane
    with a single candidate records no routing decision: there is nothing
    to choose. Every automatic or within-route choice, single-candidate ones
    included, is still written to the routing log with its propensities; see
