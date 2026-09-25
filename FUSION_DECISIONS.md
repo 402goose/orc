@@ -318,6 +318,15 @@ settings):
     "threshold": 0.9,
     "calibration_file": "",
     "model_path": "",
+    "checkpoints": {},
+    "training": {
+      "objective": "soft_ce+proper_scoring",
+      "unfreeze_encoder": false,
+      "encoder_learning_rate": 2.5e-5,
+      "label_smoothing": 0.0,
+      "class_balance": true,
+      "max_class_weight": 4.0
+    },
     "verdict_labels": true,
     "automatic_labels": true,
     "split": "time",
@@ -356,9 +365,43 @@ Active actions require **all** of:
 
 The SDK's entropy-derived `confidence` is not treated as a probability.
 Fusion uses the selected label's distribution and fitted temperature.
-The upstream typed-decisions checkpoint is not an automatic default for
-Fusion's schemas. `setup --checkpoint typed-decisions` makes it available
-for an explicit `model_path` experiment, subject to the same qualification.
+
+### Checkpoint per decision kind
+
+`checkpoints` maps a decision kind to a published checkpoint name
+(`english`, `typed-decisions`, `multilingual`) or a checkpoint directory
+(relative paths resolve against the workspace):
+
+```json
+{"decisions": {"checkpoints": {"acceptance": "typed-decisions"}}}
+```
+
+A kind's entry wins over `model_path`; a kind without one uses `model_path`,
+else the runtime's default English/multilingual routing. The upstream
+typed-decisions checkpoint (ModernBERT-large, 1,024-token context, 256-token
+question head, tuned on typed workflow decisions) is not a default for
+Fusion's schemas; it is subject to the same qualification as any other
+model. Nothing is downloaded at inference or training: a checkpoint that is
+not cached fails with the command that fetches it,
+`orc fusion decisions setup --checkpoint typed-decisions`.
+
+The state token budget (below) derives from the kind's checkpoint:
+`max_len` minus the question head, read from `fusion_decisions.CHECKPOINTS`
+for a name or from the directory's `rl_agent_config.json`. On
+`typed-decisions` an acceptance input may use 984 estimated tokens instead
+of 472. `max_state_chars` (default 2,200, at most 6,000) still caps the
+characters, so raise it to use the larger budget. The multilingual
+checkpoint's tokenizer was never measured against the estimate, so it keeps
+the English budget. Each recorded decision stores the budget it was built
+under (`state_tokens`), and exports judge unscored inputs by it.
+
+`decisions train --kind acceptance` trains a candidate for one kind from
+that kind's entry. Without `--kind` (as the automatic training loop runs it),
+kinds configured for a different checkpoint are left out of training. The
+loop's evaluation still scores every kind on one model, so an acceptance
+input built for 1,024 tokens stops an automatic round at evaluation
+("candidate truncates a reviewed example"); until evaluation is per kind,
+train and evaluate such a kind by hand.
 
 ## Learn from verified runs
 
@@ -618,9 +661,11 @@ rule remain as they were.
 
 ##### The token budget
 
-Laya's encoder reads 512 tokens: the question head, then the state, which
-gets whatever is left. The longest acceptance question's head takes 40, so
-an acceptance input has 472 tokens (`fusion_decisions.state_tokens`). A
+The English checkpoint's encoder reads 512 tokens: the question head, then
+the state, which gets whatever is left. The longest acceptance question's
+head takes 40, so an acceptance input has 472 tokens
+(`fusion_decisions.state_tokens`; a 1,024-token checkpoint configured for
+acceptance gives 984, see "Checkpoint per decision kind"). A
 character cap cannot decide that: on the checkpoint's tokenizer, recorded
 decision states run 2.4-4.8 characters per token, hashes, UUIDs and diffs
 about 1.7, CJK about 1.2. A 2,200-character acceptance input was 550-750
@@ -702,9 +747,12 @@ orc fusion decisions export .fusion/decisions/reviewed.jsonl
 orc fusion decisions calibrate .fusion/decisions/reviewed.jsonl \
   .fusion/decisions/baseline-calibration.json
 
-# Train a separate candidate; the encoder stays frozen.
+# Train a separate candidate (decisions.training sets the objective).
 orc fusion decisions train .fusion/decisions/reviewed.jsonl \
   .fusion/decisions/candidate --epochs 1
+# Or one kind, starting from that kind's decisions.checkpoints entry.
+orc fusion decisions train .fusion/decisions/reviewed.jsonl \
+  .fusion/decisions/acceptance-candidate --kind acceptance
 orc fusion decisions evaluate .fusion/decisions/reviewed.jsonl \
   .fusion/decisions/candidate-predictions.jsonl \
   --model-path .fusion/decisions/candidate
@@ -712,8 +760,9 @@ orc fusion decisions calibrate .fusion/decisions/candidate-predictions.jsonl \
   .fusion/decisions/candidate-calibration.json
 ```
 
-Training uses only train groups and supervised cross-entropy on the decision
-head. Duplicate examples and train/validation group leakage are rejected.
+Training uses only train groups, with the objective described in
+"Training objective" below. Duplicate examples and train/validation group
+leakage are rejected.
 
 ### Evaluation and gating
 
@@ -849,6 +898,50 @@ before choosing where to spend labeling effort: a kind that ranks the
 clear-cut cases correctly at low confidence is the one calibration can carry
 over the threshold, and a kind that returns the same answer for most states
 will not qualify however many workflows are labeled.
+
+#### Training objective
+
+`train` ports upstream Laya's fine-tuning objective (the typed-decisions
+notebook's training step, scored with `laya.common.proper_reward`):
+
+- **Soft-target cross-entropy**, weight 1.0. A reviewed hard label is a
+  one-hot target, mixed with the uniform distribution by `label_smoothing`
+  (default 0). An exported row may instead carry
+  `targets: {question: {label: probability}}`, for example the mean of
+  several drafting samples, and `weights: {question: w}`, for example
+  council agreement; both are used as given.
+- **Proper-scoring policy term** (`objective: "soft_ce+proper_scoring"`, the
+  default; `"soft_ce"` turns it off): four Gaussian-noised copies of the
+  logits (noise projected to zero mean over the options; standard deviation
+  0.4 in the first epoch falling linearly to 0.1 in the last) are scored
+  against the target by log score plus 0.75 × spherical score, less the
+  ranked probability score on `score` questions. Each sample's advantage over
+  the group mean, normalized, weights its Gaussian log-likelihood.
+- **Class balance** (`class_balance`, default on): per question schema, a
+  class seen n times gets weight min(`max_class_weight`, n_majority / n),
+  where an item's class is its target's argmax. The cap (default 4) follows
+  upstream's advice to weight rare classes ×3–4, and bounds how far a handful
+  of rare examples can pull the head. A class with no examples gets no
+  weight, so an all-positive split (the first round's 22:0) trains
+  unweighted; balancing cannot invent the missing negatives. Item weights
+  (class × row weight) are rescaled to mean 1, so the loss keeps its scale.
+- **Encoder** (`unfreeze_encoder`, default false): frozen, only the decision
+  head trains at `--learning-rate` (default 1e-4). Unfrozen, the encoder
+  trains too at `encoder_learning_rate` (default 2.5e-5, upstream's); this is
+  slow on CPU and needs several GB of memory for ModernBERT-large.
+- **Determinism**: `--seed` seeds Python, torch and the noise generator, and
+  each epoch's example order. AdamW (weight decay 0.01), gradient clipping at
+  1.0. A truncated training example still stops training before any update.
+
+`training.json` records the objective and all of the above: settings,
+upstream constants, per-class weights, the item weight range, learning
+rates, noise by epoch, seed, starting checkpoint and its token limits, and
+the soft cross-entropy by epoch. The loss curve is the soft cross-entropy;
+the policy term is a zero-mean surrogate whose value is not a loss, and is
+reported only as `mean_objective`. `test/laya_training_objective.py` checks
+the objective against a pure-Python reference with the managed runtime and,
+with `--train`, fine-tunes the cached English checkpoint on a small synthetic
+set.
 
 Compare candidate and baseline reports before setting `model_path`,
 `calibration_file`, `mode: active` and selected `auto_actions`. None of those

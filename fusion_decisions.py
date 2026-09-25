@@ -76,24 +76,64 @@ def state_cap(options):
     return max(200, min(6000, int(options["max_state_chars"])))
 
 
-# Laya's encoder reads at most LAYA_MAX_LEN tokens: the question head (type,
-# instruction, options; at most LAYA_HEAD_MAX_LEN plus three separators), then
-# the state, which gets whatever is left (fusion_laya.truncated). A state is
-# complete only if it fits that remainder, so a character cap cannot decide it:
-# with the checkpoint's byte-level BPE tokenizer, real decision states measured
-# 2.4-4.8 characters per token, hashes and diffs ~1.7, CJK ~1.2.
+# Laya's encoder reads at most `max_len` tokens: the question head (type,
+# instruction, options; at most `head_max_len` plus three separators), then
+# the state, which gets whatever is left (fusion_laya.truncated). Both come
+# from the checkpoint's rl_agent_config.json. A state is complete only if it
+# fits that remainder, so a character cap cannot decide it: with the
+# ModernBERT byte-level BPE tokenizer, real decision states measured 2.4-4.8
+# characters per token, hashes and diffs ~1.7, CJK ~1.2.
 # STATE_HEAD_TOKENS is the measured head of a kind's longest question
 # (test/laya_token_budget.py re-measures it); an unmeasured kind is assumed to
 # use the whole head.
 LAYA_MAX_LEN = 512
 LAYA_HEAD_MAX_LEN = 192
 STATE_HEAD_TOKENS = {"acceptance": 40}
+# The published checkpoints' limits (their rl_agent_config.json; the laya
+# README's checkpoint table). test/laya_training_objective.py checks them
+# against any checkpoint cached locally. A directory is read from its own config.
+CHECKPOINTS = {
+    "english": {"encoder": "answerdotai/ModernBERT-large", "max_len": 512, "head_max_len": 192},
+    "typed-decisions": {"encoder": "answerdotai/ModernBERT-large", "max_len": 1024, "head_max_len": 256},
+    "multilingual": {"encoder": "jhu-clsp/mmBERT-base", "max_len": 1024, "head_max_len": 256},
+}
+# estimated_tokens and STATE_HEAD_TOKENS were measured on this tokenizer only.
+MEASURED_ENCODERS = {"answerdotai/ModernBERT-large"}
 _PIECES = re.compile(r"'(?:s|t|re|ve|m|ll|d)| ?[^\W\d_]+| ?\d+| ?(?:[^\s\w]|_)+|\s+(?!\S)|\s+")
 _CASED = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[A-Za-z]")
 
 
-def state_tokens(kind):
-    return LAYA_MAX_LEN - STATE_HEAD_TOKENS.get(kind, LAYA_HEAD_MAX_LEN + 3)
+def checkpoint_limits(spec=None):
+    """{encoder, max_len, head_max_len} of a checkpoint name or directory.
+
+    A directory without a readable rl_agent_config.json gets the English
+    limits, the smaller budget; the runtime cannot load it anyway.
+    """
+    if not spec or spec in CHECKPOINTS:
+        return dict(CHECKPOINTS[spec or "english"])
+    try:
+        config = json.loads((Path(spec).expanduser() / "rl_agent_config.json").read_text())
+        limits = {"encoder": str(config.get("encoder", "")), "max_len": int(config.get("max_len", LAYA_MAX_LEN)),
+                  "head_max_len": int(config.get("head_max_len", LAYA_HEAD_MAX_LEN))}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return dict(CHECKPOINTS["english"])
+    if not 64 <= limits["max_len"] <= 16384 or not 16 <= limits["head_max_len"] < limits["max_len"]:
+        return dict(CHECKPOINTS["english"])
+    return limits
+
+
+def state_tokens(kind, checkpoint=None):
+    """Tokens the state of a `kind` decision may use on `checkpoint` (default English).
+
+    estimated_tokens was measured on the ModernBERT tokenizer only, so a
+    checkpoint with another encoder never gets more than the English budget;
+    its runtime truncation report stays authoritative.
+    """
+    limits = checkpoint_limits(checkpoint)
+    budget = limits["max_len"] - STATE_HEAD_TOKENS.get(kind, limits["head_max_len"] + 3)
+    if limits["encoder"] not in MEASURED_ENCODERS:
+        budget = min(budget, state_tokens(kind))
+    return budget
 
 
 def estimated_tokens(text):
@@ -140,12 +180,16 @@ def exceeds_token_budget(record):
     """An input recorded without inference (`unscored`) whose estimated size
     exceeds the model's state budget. The model never checked it, so it counts
     as truncated: an acceptance input of up to 2200 characters recorded before
-    inputs were bounded by tokens is one."""
-    return record.get("status") == "unscored" and over_token_budget(record.get("kind"), record.get("state"))
+    inputs were bounded by tokens is one. The budget is the one recorded with
+    the input (`state_tokens`, from its kind's checkpoint), else English's."""
+    return record.get("status") == "unscored" and over_token_budget(record.get("kind"), record.get("state"),
+                                                                     record.get("state_tokens"))
 
 
-def over_token_budget(kind, text):
-    return isinstance(text, str) and estimated_tokens(text) > state_tokens(kind)
+def over_token_budget(kind, text, tokens=None):
+    if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens <= 0:
+        tokens = state_tokens(kind)
+    return isinstance(text, str) and estimated_tokens(text) > tokens
 
 
 def _encoded(value):
@@ -286,6 +330,14 @@ def config_for(config):
     if options["split"] not in SPLITS:
         raise ValueError("decisions.split must be time or group-hash")
     options["risk"] = risk_options(options["risk"])
+    checkpoints = options.get("checkpoints") or {}
+    if (not isinstance(checkpoints, dict) or set(checkpoints) - KINDS
+            or any(not isinstance(value, str) or not value.strip() for value in checkpoints.values())):
+        raise ValueError("decisions.checkpoints must map decision kinds to a checkpoint name "
+                         f"({', '.join(CHECKPOINTS)}) or a checkpoint directory")
+    from fusion_laya_objective import training_options
+    options["checkpoints"] = {kind: value.strip() for kind, value in checkpoints.items()}
+    options["training"] = training_options(options.get("training"))
     return options
 
 
@@ -418,7 +470,7 @@ class LayaRuntime:
                     stream.close()
         self.buffer = b""
 
-    def predict(self, state, questions):
+    def predict(self, state, questions, checkpoint=None):
         with self.lock:
             if self.error:
                 raise RuntimeError(self.error)
@@ -433,6 +485,10 @@ class LayaRuntime:
                     )
                 request = {"state": state, "questions": questions, "device": self.options["device"],
                            "model_path": self.options["model_path"]}
+                if checkpoint in CHECKPOINTS:
+                    request.update(checkpoint=checkpoint, model_path="")
+                elif checkpoint:
+                    request["model_path"] = checkpoint
                 self.process.stdin.write((json.dumps(request, ensure_ascii=False) + "\n").encode())
                 self.process.stdin.flush()
                 deadline = time.monotonic() + float(self.options["timeout_seconds"])
@@ -680,8 +736,19 @@ class DecisionEngine:
         if self.options["model_path"]:
             path = Path(self.options["model_path"]).expanduser()
             self.options["model_path"] = str((self.workspace / path).resolve())
+        self.options["checkpoints"] = {kind: value if value in CHECKPOINTS else str((self.workspace / Path(value).expanduser()).resolve())
+                                       for kind, value in self.options["checkpoints"].items()}
         self.store = DecisionStore(workspace)
         self.backend = backend
+
+    def checkpoint(self, kind):
+        """The checkpoint a `kind` decision runs on: its `decisions.checkpoints`
+        entry, else `model_path`, else the English checkpoint (None: the
+        runtime's default routing)."""
+        return self.options["checkpoints"].get(kind) or self.options["model_path"] or None
+
+    def state_tokens(self, kind):
+        return state_tokens(kind, self.checkpoint(kind))
 
     def calibration(self):
         path = self.options.get("calibration_file")
@@ -710,7 +777,7 @@ class DecisionEngine:
             raise ValueError(f"unknown decision kind: {kind}")
         return {"id": uuid.uuid4().hex, "kind": kind, "mode": self.options["mode"],
                 "context": context or {}, "questions": questions, "schema_hash": digest(questions),
-                "status": "off", "recommendations": {}, "prediction": {}}
+                "status": "off", "recommendations": {}, "prediction": {}, "state_tokens": self.state_tokens(kind)}
 
     def encode(self, record, state):
         text = json.dumps(state, ensure_ascii=False, sort_keys=True)
@@ -744,7 +811,9 @@ class DecisionEngine:
                 if question.get("type") == "choice" and len(question.get("criteria") or {}) < 2:
                     raise ValueError(f"choice question {key} needs at least two options")
             with progress.activity("laya", f"{kind}: waiting for local classification ({self.options['mode']})"):
-                prediction = (self.backend or runtime_for(self.options)).predict(record["state"], questions)
+                configured = self.options["checkpoints"].get(kind)
+                prediction = (self.backend or runtime_for(self.options)).predict(
+                    record["state"], questions, **({"checkpoint": configured} if configured else {}))
             answers = prediction.get("answers") or {}
             record["model_identity"] = prediction["model_identity"]
             record["routing"] = prediction.get("routing", {})
