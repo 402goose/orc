@@ -115,7 +115,8 @@ def route_candidates(config, task, store, rejected=None):
                     drop(key, f"no ORC model passed tool-fit for this route ({exc})")
                     continue
             if not models:
-                drop(key, "no ORC model passed tool-fit for this route")
+                drop(key, "no paid ORC model has `orc probe --fit` evidence; run `orc probe --fit <model>`"
+                     if settings.get("model_selector", "best") == "best" else "no ORC model passed tool-fit for this route")
                 continue
         else:
             models = [settings.get("model", "")]
