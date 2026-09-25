@@ -2394,6 +2394,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_parser(sub)
     from fusion_learn_cli import add_parser as learn_parser
     learn_parser(sub)
+    from fusion_gym import add_parser as gym_parser
+    gym_parser(sub)
     sub.add_parser("mcp-serve", help=argparse.SUPPRESS)
     return parser
 
@@ -2426,6 +2428,13 @@ def _main(args, parser) -> int:
         try:
             return run_learn(args, workspace)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            parser.error(str(exc))
+    if args.command == "gym":
+        # Before load_config: `gym run` loads the gym directory's own configuration.
+        from fusion_gym import command as gym_command
+        try:
+            return gym_command(args, workspace, args.json)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             parser.error(str(exc))
     config, config_path = load_config(workspace)
     if args.command == "truffle":

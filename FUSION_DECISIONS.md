@@ -531,8 +531,16 @@ retracted).
   not a test failure and does not label.
 - Laya's veto never enters: the label is computed from the codes alone, so an
   active acceptance head can never label itself.
-- An authored check has no pre-change run, so its baseline is unknown and
-  neither its failure nor its pass labels.
+- An authored check has no pre-change run unless its node opts in, so its
+  baseline is unknown and neither its failure nor its pass labels. A write
+  node with `"acceptance": {"checks": [...], "before": true}` runs its
+  authored checks once on the tree before the first attempt, exactly as plan
+  checks run (receipts under `attempt-1/before-check-*`, summary in
+  `acceptance/before-authored.json`, reused by retries and resumes), and
+  then labels them by the table above. Unlike plan checks they run with the
+  same environment and timeout before and after, and are not filtered by
+  `fusion_verification`: they are authored, not model output. `before` on a
+  read-only node, or a non-boolean, is a spec error.
 
 The node result in `node.json` and the manifest keeps `gate_codes` (one
 structured code beside each gate problem: `worker_status`, `worker_blockers`, `required_file_missing`,
@@ -986,6 +994,127 @@ The loop advances while the control-room server is running, or whenever
 `fusion learn tick` runs (see below); detached steps and saved rounds
 survive restarts. Errors wait for an explicit retry. Automatic rounds do not change
 the configured checkpoint, calibration file, decision mode, or permitted actions.
+
+## ORC gym: replayed fixes as benchmark tasks
+
+`fusion gym` turns ORC's own squash-merged fix PRs into benchmark tasks and
+runs them on several lanes, so the structural gate produces honest labels,
+negatives included, and the same task yields lane-vs-lane evidence. It
+follows SWE-smith (arXiv 2504.21798: tasks from reverted fixes) and grades
+like SWE-bench (FAIL_TO_PASS / PASS_TO_PASS).
+
+```sh
+# 1. Extract tasks (git + unittest only; gh reads PR/issue text).
+orc fusion gym extract --prs 60 63 73 86 87 88 103 104 --ref origin/main \
+  --github-repo hathbanger/orc --out ~/orc-gym/tasks
+# 2. Run each task on each lane (sequential, resumable, budget-capped).
+orc fusion gym run ~/orc-gym/tasks --workspace ~/orc-gym/ws \
+  --lanes claude-sonnet-high claude-opus-high claude-fable-medium agy --budget-usd 10
+# 3. Per-lane and per-task results.
+orc fusion gym report ~/orc-gym/ws
+```
+
+**Extraction.** For PR N's squash commit C (found by `mergeCommit` from gh,
+else by a `(#N)` subject on `--ref`) with parent B, files under `test/` or
+`tests/` or named `test_*.py` / `*_test.py` are tests; everything else is
+source. The task commit is B plus C's test-file changes, written as a commit
+object (fixed author and date, message without the PR number) to
+`refs/gym/tasks/pr-N` in the source repository. That ref is the only thing
+extraction writes there; both trees are materialized with `git archive`.
+Every test in the changed unittest files runs on the task tree and on C.
+FAIL_TO_PASS are the changed or new test methods (a changed class fixture
+or module-level code marks its tests changed) that fail or error on the task
+tree and pass on C; PASS_TO_PASS are the other tests there that pass on both
+(at most `--p2p-limit`, default 200). Each file's ids become one argv
+command, `python3 -m unittest discover -s test -t test -p FILE -k
+'*module.Class.method' ...`; those commands are run again on both trees and
+a task is kept only if its F2P commands fail on the task tree and pass on C.
+A P2P command that is not green on both is dropped. PRs with no test change,
+only test changes, no Python unittest file or no F2P test are skipped with
+a reason. Tasks are JSON (`id`, `base`, `fix`, `task_ref`, `task_sha`,
+`prompt`, `fail_to_pass`, `pass_to_pass`, `checks`, `test_files`,
+`source_files`, `pr_url`) plus `index.json`.
+
+**Prompt.** The linked issue's title and body when the PR closes one
+(sections headed Fix, Solution, Proposed, Plan, Changes are cut). Otherwise
+the PR title without its `fix(scope):` prefix plus the body's paragraphs up
+to the first that describes the change: a bullet list, or a paragraph that
+starts with "This PR", "Now", "New", "Changes", "Validation", a change verb
+("Adds", "Replaces", "Reworks", ...), or says "now" in its first sentence.
+Lines inside kept paragraphs that start with "Fix:" or "Solution:" are
+dropped, as are Markdown headings. Fenced diffs are removed; other code
+blocks (usually the failing input) are kept. `--no-gh` uses the commit
+subject.
+
+**Runs.** The gym directory is its own Fusion workspace: `.fusion` (runs,
+traces, decisions, labels) and a `.fusion.json` copied once from the source
+repository. It must be outside the source repository, which a run only
+reads (`git fetch` of the task ref). Each task gets a repository under
+`tasks/<id>/repo` holding only the task commit and its history, never C,
+and each lane a worktree of it, removed after the run unless
+`--keep-worktrees`. The lane runs one authored write node (`max_attempts:
+1`, `required_handoff: [summary]`) through `WorkflowRunner`, with the
+worktree as the worker's directory and the gym as the control workspace;
+its `acceptance.checks` are the F2P then P2P commands with `before: true`.
+Lanes are `claude-sonnet-high`, `claude-opus-high`, `claude-fable-medium`,
+`claude`, `codex`, `agy`, `grok`, any configured route name, or entries in
+`gym.lanes` (`{"agent", "route", "model", "reasoning_effort"}`) in the gym's
+`.fusion.json`. `--budget-usd` caps one invocation: no run starts once it is
+spent, the workflow budget is what is left, and Claude lanes get it as
+`max_budget_usd`. `--max-tasks N` processes at most N tasks with pending
+lanes.
+
+A task × lane pair is complete once it was dispatched and its checks ran.
+A lane that is unavailable (not on PATH, cooling down), paused on quota or
+budget, or interrupted is recorded but retried by the next `gym run`. Each
+run appends to `results.jsonl` and saves the worktree's diff under
+`results/<task>/<lane>/`.
+
+**What it measures.** Per lane: tasks attempted, `solved` (every F2P
+command passed, no P2P failed, no test file touched), F2P pass rate, P2P
+regressions, test tampering, cost and mean wall time; per task, which lanes
+solved it. `invalid_baseline` (an F2P check that did not fail, or a P2P
+check that did not pass, before the change on this machine) is excluded
+from the rates. This is per-lane evidence on the same tasks, not a
+counterfactual: each lane is observed once per task, with no retries.
+
+**Labels.** Every run is an ordinary workflow (id `gym-<task>-<lane>-…`),
+so the structural gate labels it automatically, as `structural_gate`, in
+the gym workspace's decision store: all F2P passed with the gate passing is
+`failed_task=false`; a P2P test that passed before and fails after is
+`failed_task=true`; no change on the first attempt is `failed_task=true`;
+F2P still failing is unlabeled (fail→fail). The label's `group` is the gym
+workflow id. Laya trains on them with `orc fusion learn tick --workspace
+~/orc-gym/ws`, or export with `decisions export` there.
+
+**Leakage and caveats (v1).**
+
+- The regression tests are in the tree. A worker can read them, and a worker
+  that edits a test file is reported `tampered`; the gate may still have
+  labeled its run, so audit `tampered` rows before training on them.
+- Workers are not told which checks will run; a restricted Claude writer
+  cannot run tests at all. That is the lane as ORC runs it, not its ceiling.
+- Prompts come from issues and PR descriptions written after the fact; the
+  cut is heuristic and can leave a hint of the fix. The PR title often names
+  the desired behavior.
+- The task repository has no C, but the network does: a worker with `gh` or
+  a browser can look up the issue and its linked PR.
+- Earlier lanes' diffs stay under `results/` in the gym directory, readable
+  by a later worker that leaves its worktree.
+- Tests run on the host with no sandbox, as all acceptance checks do. A
+  flaky test can make a pass look like a regression.
+
+**Scheduling.** `gym run` holds a lock on the gym directory, skips
+completed pairs and stops at its budget, so a periodic invocation advances
+it:
+
+```sh
+# crontab: every night at 02:00, at most 3 tasks and $5 per night.
+0 2 * * * cd ~/orc && ./orc fusion --quiet gym run ~/orc-gym/tasks --workspace ~/orc-gym/ws --lanes claude-sonnet-high agy --max-tasks 3 --budget-usd 5 >> ~/orc-gym/gym.log 2>&1
+```
+
+Re-extract after new fix PRs merge (existing task shas do not change);
+`gym report` reads receipts only and can run at any time.
 
 ## Run the loop without the UI
 

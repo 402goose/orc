@@ -902,6 +902,13 @@ The real smoke command returns exit code 2 when the CLI was reached but a
 provider blocked the turn for quota, authentication, or session limits. That
 keeps provider availability separate from harness regressions.
 
+`fusion gym` replays merged fix PRs as benchmark tasks: `gym extract` builds
+tasks from a PR's squash commit (its parent plus the PR's tests, with
+FAIL_TO_PASS and PASS_TO_PASS test ids), `gym run` gives each task to each
+lane in its own worktree and lets the gate label the result, and `gym report`
+compares lanes on the same tasks. `gym run` calls paid models. See
+[ORC gym](FUSION_DECISIONS.md#orc-gym-replayed-fixes-as-benchmark-tasks).
+
 ### Remote telemetry (on by default)
 
 Fusion sends a small, deliberately reduced copy of each span to
