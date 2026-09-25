@@ -762,3 +762,18 @@ class DecisionsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlanningOnlyScopeTest(unittest.TestCase):
+    """Only a directive restricts scope; describing read-only behavior does not."""
+    def test_directives_restrict_and_descriptions_do_not(self):
+        from fusion_build import PLANNING_ONLY
+        for text in ("Discovery/planning only. Do not implement.", "Keep this read-only.",
+                     "This should stay read-only", "Read-only investigation of the cache", "Research only"):
+            with self.subTest(text=text):
+                self.assertTrue(PLANNING_ONLY.search(text))
+        # From #85, which truffle refused to implement: it describes routing policy.
+        for text in ("Expected: explore on read-only tasks; for write tasks, prefer proven lanes.",
+                     "a read-only route cannot be repurposed into a writer", "Named read-only routes"):
+            with self.subTest(text=text):
+                self.assertFalse(PLANNING_ONLY.search(text))
