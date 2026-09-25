@@ -461,13 +461,13 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
             return {"status": "skipped", "reason": f"No label: {skip}"}
         if record is None:
             gate = next((e for e in reversed(decisions) if e.get("state") and not e.get("truncated")
-                         and not over_token_budget("acceptance", e["state"])), None)
+                         and not over_token_budget("acceptance", e["state"], e.get("state_tokens"))), None)
             engine = DecisionEngine(workspace, config)
             if gate:
                 record = engine.record_unscored("acceptance", None, gate["questions"], gate.get("context"),
                                                 encoded=gate["state"], source=VERDICT_SOURCE)
             else:
-                state = acceptance_state(task, result, state_cap(engine.options))
+                state = acceptance_state(task, result, state_cap(engine.options), engine.state_tokens("acceptance"))
                 group = task.get("parent_task_id") or task.get("trace_id") or run_id
                 record = engine.record_unscored("acceptance", state, ACCEPTANCE_QUESTIONS,
                                                 {"task_id": run_id, "group": group}, source=VERDICT_SOURCE)
@@ -515,7 +515,7 @@ def record_gate_input(config, workspace, workflow_id, node, result):
     if result.get("status") != "success" or _automatic_labels_off(config):
         return None
     engine = DecisionEngine(workspace, config)
-    state = acceptance_state(node, result, state_cap(engine.options))
+    state = acceptance_state(node, result, state_cap(engine.options), engine.state_tokens("acceptance"))
     return engine.record_unscored("acceptance", state, ACCEPTANCE_QUESTIONS,
                                   {"task_id": result.get("run_id"), "group": workflow_id}, source=GATE_SOURCE)
 
