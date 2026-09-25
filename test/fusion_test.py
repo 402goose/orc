@@ -267,6 +267,7 @@ import json
 print(json.dumps({'status':'SUCCESS','response':'','denied_actions':[{'action':'command','display_name':'RunCommand'}]}))
 ''')
         config["agy"]["command"] = str(agy)
+        config["agy"]["dangerously_skip_permissions"] = True
         with patch.object(fusion_core, "agy_headless_status", return_value={"automatic_ready": True}):
             first = run_workflow(self.workspace, config, path)
             self.assertEqual(first["status"], "failed")

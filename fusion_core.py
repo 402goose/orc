@@ -593,7 +593,9 @@ def worker_availability(config: dict[str, Any], agent: str) -> dict[str, Any]:
     elif available and agent == "agy" and settings.get("dangerously_skip_permissions") is True:
         state.update(automatic_ready=True, reason="dangerously_skip_permissions: agy runs without its sandbox or permission prompts")
     elif available and agent == "agy":
-        state.update(agy_headless_status(settings))
+        # Sandboxed commands do not cover read tools like ViewFile, which headless
+        # agy auto-denies, so automatic routing needs the explicit opt-out (#100).
+        state.update(automatic_ready=False, reason="Headless agy auto-denies read tools (e.g. ViewFile); set dangerously_skip_permissions on the agy lane for automatic use")
     return state
 
 

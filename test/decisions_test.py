@@ -433,7 +433,7 @@ class DecisionsTest(unittest.TestCase):
             DecisionStore(self.workspace).append("outcome", task_id=f"c{n}", accepted=True)
         self.config["decisions"]["rank_by_outcomes"] = 0
         self.config["codex"] = {"command": "missing-fusion-test-agent"}
-        self.config["agy"] = {"command": sys.executable}
+        self.config["agy"] = {"command": sys.executable, "dangerously_skip_permissions": True}
         engine = self.engine({"route": "claude"})
         review = self.task()
         review["prefer_different_agent"] = "claude"
@@ -477,6 +477,13 @@ class DecisionsTest(unittest.TestCase):
             with patch("fusion_policy.DecisionEngine", return_value=self.engine(mode="off")):
                 route_task(self.config, explicit, core.RunStore(self.workspace))
             self.assertEqual(explicit["agent"], "agy")
+        # A headless-ready sandbox alone does not admit agy to automatic
+        # restricted-mode candidacy: read-only tools like ViewFile still have
+        # no auto-approve setting and get auto-denied (issue #100).
+        with patch.object(core, "agy_headless_status", return_value={"automatic_ready":True}):
+            choices = route_candidates(self.config, self.task(), core.RunStore(self.workspace))
+            self.assertNotIn("agy", [c["agent"] for c in choices])
+        self.config["agy"]["dangerously_skip_permissions"] = True
         with patch.object(core, "agy_headless_status", return_value={"automatic_ready":True}):
             choices = route_candidates(self.config, self.task(), core.RunStore(self.workspace))
             self.assertIn("agy", [c["agent"] for c in choices])

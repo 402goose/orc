@@ -89,8 +89,9 @@ def route_candidates(config, task, store, rejected=None):
         if not core.executable(settings.get("command", agent)):
             drop(key, f"{settings.get('command', agent)} is not on PATH")
             continue
-        if not yolo and agent == "agy" and settings.get("dangerously_skip_permissions") is not True and not core.agy_headless_status(settings)["automatic_ready"]:
-            drop(key, core.agy_headless_status(settings).get("reason", "agy is not ready for headless use"))
+        if not yolo and agent == "agy" and settings.get("dangerously_skip_permissions") is not True:
+            drop(key, "agy requires dangerously_skip_permissions for automatic restricted-mode candidacy; "
+                      "sandboxed command readiness does not cover non-command tools like ViewFile")
             continue
         # Named read-only routes cannot be repurposed into writer routes.
         if not yolo and task.get("write") and (settings.get("sandbox") == "read-only" or settings.get("permission_mode") == "plan" or settings.get("mode") == "plan"):
