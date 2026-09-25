@@ -2215,6 +2215,7 @@ def build_parser() -> argparse.ArgumentParser:
     build = sub.add_parser("build", help="turn a feature idea into an interactive build, with planning and review instructions included")
     build.add_argument("--agent", choices=["claude", "codex"], default="codex", help="lead agent (default: codex)")
     build.add_argument("--kind", choices=["discovery", "build", "debug", "review", "sweep"], help="explicit workflow; planning-only requests remain read-only")
+    build.add_argument("--kind-source", choices=["user", "agent"], default="user", help=argparse.SUPPRESS)
     build.add_argument(
         "--across", action="append", metavar="DIMENSION", default=[],
         help="fan one read-only worker out per dimension, then synthesize their findings; repeat the flag "
@@ -2521,7 +2522,8 @@ def _main(args, parser) -> int:
             except (OSError, ValueError, RuntimeError) as exc:
                 parser.error(str(exc))
             args.idea = idea + (f"\nAdditional user constraints: {args.idea}" if args.idea else "")
-            args.kind = args.kind or "build"
+            if not args.kind:
+                args.kind, args.kind_source = "build", "default"
         elif args.finding is not None or args.from_node:
             parser.error("--finding and --from-node require --from-workflow")
         if not args.idea or not args.idea.strip():
@@ -2529,7 +2531,7 @@ def _main(args, parser) -> int:
         from fusion_build import prepare, run_prepared
         try:
             prepared = prepare(workspace, config, args.idea, args.kind, args.budget_usd, args.max_attempts,
-                               execute=args.execute, across=args.across)
+                               execute=args.execute, across=args.across, kind_source=args.kind_source if args.kind else None)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             parser.error(str(exc))
         if args.plan_only:

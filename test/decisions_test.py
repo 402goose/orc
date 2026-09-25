@@ -669,8 +669,11 @@ class DecisionsTest(unittest.TestCase):
         node = result["nodes"][0]
         self.assertEqual(node["status"], "invalid")
         self.assertNotIn("acceptance", node["result"].get("decisions", {}))
-        kinds = [e["kind"] for e in engine.store.records() if e["context"].get("task_id") == "r2"]
-        self.assertEqual(kinds, ["recovery"])
+        records = [e for e in engine.store.records() if e["context"].get("task_id") == "r2"]
+        self.assertEqual([e["kind"] for e in records if e["status"] != "unscored"], ["recovery"])
+        # The gate's own input is recorded before it decides, never scored.
+        self.assertEqual([(e["kind"], e.get("source")) for e in records if e["status"] == "unscored"],
+                         [("acceptance", "structural_gate")])
 
     def test_retry_costs_survive_budget_pause_and_resume(self):
         config = {**self.config, "decisions": {"mode": "off"}}

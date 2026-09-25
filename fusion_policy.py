@@ -463,7 +463,29 @@ def accept_node(config, workspace, workflow_id, node, result):
     return plausible, record["id"]
 
 
-def recovery(config, workspace, workflow_id, node, result, accepted, max_attempts):
+# Gate codes that come from the worker's own report or its parse, not from an
+# observation of the work. A rejection resting only on these (or on Laya's own
+# veto) is not evidence about the lane.
+REPORT_CODES = frozenset({"worker_blockers", "required_handoff_empty", "repeated_failure"})
+
+
+def outcome_counts(accepted, status, gate_codes=(), laya_veto=False):
+    """Whether a workflow outcome is evidence for route ranking and labeling.
+
+    An acceptance counts, and so does a rejection with any observed cause (a
+    failed or unrunnable check, a missing file, an unchanged tree, a worker
+    that did not report success). A reported success rejected only by Laya's
+    own veto or by blocker/handoff parsing does not: counting it would let an
+    active acceptance head label itself, or turn a parser artifact into a
+    lane's failure.
+    """
+    if accepted or status != "success":
+        return True
+    codes = {code.get("code") if isinstance(code, dict) else code for code in gate_codes or ()}
+    return bool(codes - REPORT_CODES) or not (codes or laya_veto)
+
+
+def recovery(config, workspace, workflow_id, node, result, accepted, max_attempts, gate_codes=None, laya_veto=False):
     import fusion_core as core
     failure = core.failure_class(result)
     if failure == "coordinator_error":
@@ -501,6 +523,12 @@ def recovery(config, workspace, workflow_id, node, result, accepted, max_attempt
                 excluded.append(lane)
     engine.applied(record, actual, applied, "acceptance, permissions and attempt limits enforced")
     if engine.options["mode"] != "off":
-        engine.store.append("outcome", task_id=result.get("run_id"), group=workflow_id, accepted=accepted,
-                            status=result.get("status"), evidence=str(workspace / ".fusion" / "workflows" / workflow_id / "nodes" / node.get("id", "unknown") / "node.json"))
+        # An outcome that is not evidence is written under another event name,
+        # so every reader of "outcome" events (route ranking) skips it.
+        counted = outcome_counts(accepted, result.get("status"), gate_codes, laya_veto)
+        codes = [code.get("code") if isinstance(code, dict) else code for code in gate_codes or ()]
+        engine.store.append("outcome" if counted else "outcome_excluded", task_id=result.get("run_id"), group=workflow_id,
+                            accepted=accepted, status=result.get("status"), laya_veto=bool(laya_veto), gate_codes=codes,
+                            **({} if counted else {"excluded_reason": "rejected only by Laya's veto or by the worker's own report"}),
+                            evidence=str(workspace / ".fusion" / "workflows" / workflow_id / "nodes" / node.get("id", "unknown") / "node.json"))
     return actual, record["id"]

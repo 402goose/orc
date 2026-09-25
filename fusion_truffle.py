@@ -385,7 +385,8 @@ def run_queue(workspace, config, scout_id, numbers, publish, max_attempts=2):
                 record["message"] = f"Implementing #{row['number']}; independent review required"
                 row["status"] = "preparing"
                 save(root / "hunt.json", record)
-                prepared = prepare(workspace, config, implementation_request(record, row), "debug", max_attempts=max_attempts, execute=True)
+                prepared = prepare(workspace, config, implementation_request(record, row), "debug", max_attempts=max_attempts, execute=True,
+                                   kind_source="truffle")
                 if prepared["read_only"]:
                     raise ValueError("Issue contains an investigation-only restriction; resolve its scope before implementing")
                 # Write the identity before creating a worktree or dispatching any writer.
