@@ -93,7 +93,10 @@ among the Claude pairs, never a switch to Codex. Each harness validates its own
 pairs: Codex against the cached native catalog; Claude Code accepts
 `low`–`max` except on Haiku (no effort support), and records `xhigh` on 4.6
 models as `requested_may_downgrade` because they run it as `high`; agy accepts
-`low`, `medium` and `high`. Grok has no effort control here yet.
+`low`, `medium`, `high` and `max`. agy also names a thinking level in its
+model ids (`gemini-3.8-flash-high|medium|low`, `gemini-3.1-pro-high|low`; see
+`agy models`); its default is `gemini-3.8-flash-high`. Grok has no effort
+control here yet.
 
 The explicit pair must be in the list (at most eight pairs). The existing
 `routing` decision asks Laya for one pair; its recommendation and the retained
