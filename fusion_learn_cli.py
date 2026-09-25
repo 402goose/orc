@@ -97,6 +97,14 @@ def report(app, workspace, detail=False):
         return value
     value["garden"]["agent"], value["garden"]["latest_job"] = g["agent"], brief(g["latest_job"])
     value["training"].update(approved_answers=t["approved_answers"], groups=t["groups"], completed_rounds=t["completed_rounds"])
+    measured = next((r for r in t["rounds"] if r.get("proof")), None)
+    if measured:
+        proof = measured["proof"]
+        value["training"]["measured_round"] = {
+            "id": measured.get("id"), "outcome": proof.get("outcome"), "margin": proof.get("margin"),
+            "baselines": {name: {k: v.get(k) for k in ("n", "accuracy", "candidate_accuracy")}
+                          for name, v in (proof.get("baselines") or {}).items()},
+            "questions": training_loop.question_lines(proof.get("questions") or {})}
     try:
         config, _ = core.load_config(workspace)
         summary = learning_summary(workspace, config, rows)
@@ -110,6 +118,8 @@ def report(app, workspace, detail=False):
                           "eligible_questions": summary["eligible_questions"]}
     model = summary["model"]
     value["laya"] = {"mode": model["mode"], "model_path": model["path"], "qualified_buckets": model["qualified_buckets"],
+                     "gates": {name: [training_loop.gate_line(g) for g in row["gates"]]
+                               for name, row in training_loop.question_table({}, {"buckets": model.get("calibration_buckets") or {}}).items()},
                      "agreement": summary["agreement"]}
     return value
 

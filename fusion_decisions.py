@@ -25,8 +25,13 @@ DEFAULTS = {
     "mode": "shadow", "python": "", "device": "cpu", "model_path": "",
     "timeout_seconds": 120, "auto_actions": [], "threshold": 0.90,
     "calibration_file": "", "max_state_chars": 2200, "verdict_labels": True,
-    "automatic_labels": True,
+    "automatic_labels": True, "split": "time",
+    "risk": {"alpha": 0.05, "delta": 0.1, "min_examples": 30, "min_groups": 20},
 }
+SPLITS = {"time", "group-hash"}
+# Share of workflow groups held out, and the fewest groups kept on each side.
+VALIDATION_FRACTION = 0.2
+MIN_SPLIT_GROUPS = 2
 KINDS = {"intake", "routing", "recovery", "review", "acceptance"}
 # "unscored": the input was recorded without running the model, so a verified
 # answer can be attached to it. It has no prediction and never drives an action.
@@ -278,7 +283,104 @@ def config_for(config):
         raise ValueError("decisions.verdict_labels must be true or false")
     if not isinstance(options["automatic_labels"], bool):
         raise ValueError("decisions.automatic_labels must be true or false")
+    if options["split"] not in SPLITS:
+        raise ValueError("decisions.split must be time or group-hash")
+    options["risk"] = risk_options(options["risk"])
     return options
+
+
+def risk_options(value):
+    if not isinstance(value, dict):
+        raise ValueError("decisions.risk must be an object")
+    risk = {**DEFAULTS["risk"], **value}
+    for key in ("alpha", "delta"):
+        if isinstance(risk[key], bool) or not isinstance(risk[key], (int, float)) or not 0 < risk[key] < 1:
+            raise ValueError(f"decisions.risk.{key} must be in (0, 1)")
+    for key in ("min_examples", "min_groups"):
+        if type(risk[key]) is not int or risk[key] < 1:
+            raise ValueError(f"decisions.risk.{key} must be a positive integer")
+    return risk
+
+
+def record_group(record):
+    context = record.get("context") or {}
+    return context.get("group") or context.get("task_id") or digest(record["state"])
+
+
+def hash_split(group):
+    return "validation" if int(digest(group)[:8], 16) % 5 == 0 else "train"
+
+
+def assign_splits(first_seen, method="time"):
+    """{group: "train" | "validation"} for the labeled workflow groups in `first_seen`.
+
+    `first_seen` maps each group to the time of its first decision. "time"
+    holds out the newest groups -- a model is trained on older work and judged
+    on newer work, as it will be deployed -- and never splits a group: about
+    VALIDATION_FRACTION of groups, at least MIN_SPLIT_GROUPS on each side once
+    there are enough. "group-hash" is the earlier assignment by a hash of the
+    group name, kept for comparison with old rounds.
+    """
+    if method == "group-hash":
+        return {group: hash_split(group) for group in first_seen}
+    if method != "time":
+        raise ValueError("split must be time or group-hash")
+    ordered = sorted(first_seen, key=lambda group: (first_seen[group] or 0, str(group)))
+    count = len(ordered)
+    held = 0 if count < 2 else max(1, min(count - MIN_SPLIT_GROUPS, max(MIN_SPLIT_GROUPS, math.ceil(count * VALIDATION_FRACTION))))
+    return {group: "validation" if index >= count - held else "train" for index, group in enumerate(ordered)}
+
+
+def group_first_seen(records):
+    """Time of each workflow group's first recorded decision, labeled or not, so it never moves."""
+    first = {}
+    for record in records:
+        group, time_ms = record_group(record), record.get("time_ms") or 0
+        first[group] = min(first.get(group, time_ms), time_ms)
+    return first
+
+
+def labeled_splits(rows, method="time"):
+    """Splits for decision rows (fusion_learning.decision_rows): every row dates
+    its group, and only groups with an approved, labelable answer are split."""
+    first = group_first_seen(rows)
+    labeled = {record_group(row) for row in rows if row.get("reviewed_answers") and not row.get("excluded")
+               and labelable_record(row)}
+    return assign_splits({group: first[group] for group in labeled}, method)
+
+
+# What the deterministic policy answers for a question without Laya: the
+# baseline a trained head must beat before it may replace it.
+# intake.workflow -- fusion_build._prepare's fallback (planning-only scope,
+#   fix/bug words, a leading "review"), read from the application event, and
+#   skipped when the caller named the kind (that is intent, not a heuristic);
+# intake.needs_clarification -- intake never stops to ask: "false";
+# review.specialty -- fusion_policy.review_task's default focus: "general";
+# review.needs_review -- a requested review always runs: "true";
+# recovery.action -- fusion_policy.recovery's rule (continue / stop on quota,
+#   permission or attempt limit / switch / repair), from the application event;
+# acceptance.plausible / failed_task -- trust the worker's reported success:
+#   "true" / "false". Not the structural gate's result: a gate-sourced label
+#   is that result, so it would be a perfect "baseline" by construction.
+# Routing has no labeled questions: routes are bandit feedback (fusion_policy).
+# An answer the policy took from Laya (applied=true) is not a heuristic answer.
+CONSTANT_HEURISTICS = {("intake", "needs_clarification"): "false", ("review", "specialty"): "general",
+                       ("review", "needs_review"): "true", ("acceptance", "plausible"): "true",
+                       ("acceptance", "failed_task"): "false"}
+APPLIED_HEURISTICS = {("intake", "workflow"), ("recovery", "action")}
+
+
+def heuristic_answers(record, application=None):
+    answers = {}
+    for key, question in (record.get("questions") or {}).items():
+        pair = (record.get("kind"), key)
+        value = CONSTANT_HEURISTICS.get(pair)
+        if (pair in APPLIED_HEURISTICS and application and not application.get("applied")
+                and not application.get("explicit_kind")):
+            value = application.get("actual")
+        if value is not None and value in labels_for(question):
+            answers[key] = value
+    return answers
 
 
 def labelable_record(record):
@@ -495,13 +597,18 @@ class DecisionStore:
             provenance = approval_provenance(self, record, suggestion_id, answers)
         self.append("label", id=decision_id, answers=answers, evidence=evidence, verified=True, replace=replace, **provenance)
 
-    def export(self, destination, exclude_sources=()):
+    def export(self, destination, exclude_sources=(), split="time"):
+        """Labeled examples as fusion.training.v1 rows, split by workflow group
+        (assign_splits). Each row carries the deterministic policy's answers
+        (`heuristic`) so evaluation can report that baseline."""
         events = read_jsonl(self.path)
         labels, exclusions = reviewed_labels(events)
         provenance = label_provenance(events)
         excluded_sources = set(exclude_sources)
         rows, over_budget = [], 0
         records = {e["id"]: e for e in events if e.get("event") == "decision"}
+        applications = {e.get("id"): e for e in events if e.get("event") == "application"}
+        first_seen = group_first_seen(records.values())
         for record in records.values():
             origin = provenance.get(record["id"], {})
             kept = {key: value for key, value in labels.get(record["id"], {}).items()
@@ -510,13 +617,16 @@ class DecisionStore:
                 over_budget += 1
             if not kept or exclusions.get(record["id"]) or not labelable_record(record):
                 continue
-            group = record.get("context", {}).get("group") or record.get("context", {}).get("task_id") or digest(record["state"])
-            split = "validation" if int(digest(group)[:8], 16) % 5 == 0 else "train"
-            rows.append({"schema": "fusion.training.v1", "id": record["id"], "group": group, "split": split,
+            group = record_group(record)
+            rows.append({"schema": "fusion.training.v1", "id": record["id"], "group": group,
+                         "group_first_ms": first_seen.get(group),
                          "kind": record["kind"], "state": record["state"], "questions": record["questions"],
                          "labels": kept, "prediction": record["prediction"],
+                         "heuristic": heuristic_answers(record, applications.get(record["id"])),
                          "label_provenance": {key: origin[key] for key in kept if key in origin},
                          "model_identity": record.get("model_identity"), "schema_hash": record["schema_hash"]})
+        splits = assign_splits({row["group"]: row["group_first_ms"] for row in rows}, split)
+        rows = [{**row, "split": splits[row["group"]]} for row in rows]
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
         with destination.open("x") as handle:
@@ -524,7 +634,8 @@ class DecisionStore:
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
         destination.chmod(0o600)
         from fusion_quality import dataset_quality
-        return {"examples": len(rows), "splits": dict(Counter(row["split"] for row in rows)), "path": str(destination),
+        return {"examples": len(rows), "splits": dict(Counter(row["split"] for row in rows)), "split_method": split,
+                "path": str(destination),
                 "skipped_over_token_budget": over_budget,
                 "data_quality": dataset_quality(rows), "dataset_hash": hashlib.sha256(destination.read_bytes()).hexdigest()}
 
@@ -586,6 +697,9 @@ class DecisionEngine:
             for bucket in report.get("buckets", {}).values():
                 temperature, threshold = float(bucket["temperature"]), float(bucket["threshold"])
                 if not math.isfinite(temperature) or temperature <= 0 or not 0 < threshold <= 1 or not isinstance(bucket.get("qualified"), bool):
+                    return {}
+                certified = (bucket.get("risk") or {}).get("threshold")
+                if certified is not None and not 0 < float(certified) <= 1:
                     return {}
             return report
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
@@ -664,7 +778,11 @@ class DecisionEngine:
         if report.get("model_identity") != record.get("model_identity"):
             return False
         bucket = report.get("buckets", {}).get(f"{record['kind']}:{record['schema_hash']}:{question}", {})
-        threshold = max(float(self.options["threshold"]), float(bucket.get("threshold", 1)))
+        # A Learn-then-Test threshold certified on held-out groups replaces the
+        # fixed decisions.threshold; a report without one keeps the older rule.
+        certified = (bucket.get("risk") or {}).get("threshold")
+        threshold = (float(certified) if certified is not None
+                     else max(float(self.options["threshold"]), float(bucket.get("threshold", 1))))
         # Re-derive the probability from the raw distribution under the
         # calibration being read *now*, rather than trusting the one decide()
         # stored. Those can be different files: the weekly loop rewrites
@@ -688,8 +806,21 @@ class DecisionEngine:
             progress.emit("laya", f"{record['kind']}: action={actual}; {'recommendation applied' if applied else 'advisory only'} ({reason})")
 
 
-def fit_calibration(dataset, output, threshold=0.9):
+def fit_calibration(dataset, output, threshold=0.9, risk=None):
+    """Fit a temperature per question bucket on train groups, then decide on
+    held-out groups whether and above which confidence the bucket may act.
+
+    The acting threshold comes from Learn-then-Test (fusion_risk) on held-out
+    (confidence, correct) pairs, scaled by the train-fitted temperature --
+    fitting it on held-out answers too would reuse them. A bucket qualifies
+    only with a certified threshold, at least `risk.min_examples` held-out
+    answers, and at least `risk.min_groups` train groups and acted held-out
+    groups (answers within one workflow are not independent). `threshold` is
+    only the fallback for reporting when nothing is certified.
+    """
     from fusion_laya import dataset_rows
+    from fusion_risk import learn_then_test
+    risk = risk_options(risk or {})
     rows = dataset_rows(dataset)
     if not 0 < threshold <= 1:
         raise ValueError("threshold must be in (0, 1]")
@@ -719,11 +850,18 @@ def fit_calibration(dataset, output, threshold=0.9):
             bucket[split].append((probs, label, group))
     report = {"schema": "fusion.calibration.v1", "model_identity": next(iter(identities)),
               "dataset_hash": hashlib.sha256(Path(dataset).read_bytes()).hexdigest(), "buckets": {},
-              "unscored_examples": unscored}
+              "unscored_examples": unscored, "risk": risk}
     for key, samples in buckets.items():
         train, validation = samples["train"], samples["validation"]
         candidates = [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8]
         temperature = min(candidates, key=lambda t: sum(-math.log(max(temperature_scale(p, t)[y], 1e-9)) for p, y, _ in train)) if train else 1
+        pairs = []
+        for probs, label, _ in validation:
+            scaled = temperature_scale(probs, temperature)
+            selected = max(scaled, key=scaled.get)
+            pairs.append((scaled[selected], selected == label))
+        gate = learn_then_test(pairs, risk["alpha"], risk["delta"], risk["min_examples"])
+        acting = gate["threshold"] if gate["threshold"] is not None else threshold
         correct = confident = confident_correct = 0
         confident_groups = set()
         brier = 0.0
@@ -743,7 +881,7 @@ def fit_calibration(dataset, output, threshold=0.9):
             for floor in certain_errors:
                 if top >= float(floor) and not hit:
                     certain_errors[floor] += 1
-            if top >= threshold:
+            if top >= acting:
                 confident += 1
                 confident_correct += hit
                 confident_groups.add(group)
@@ -752,15 +890,23 @@ def fit_calibration(dataset, output, threshold=0.9):
         reliability = [{"floor": index / 10, "count": count, "confidence": total / count, "accuracy": hits / count}
                        for index, (count, total, hits) in enumerate(bins) if count]
         ece = sum(item["count"] / len(validation) * abs(item["accuracy"] - item["confidence"]) for item in reliability) if validation else None
+        train_groups = len({group for _, _, group in train})
+        reasons = [gate["reason"]] if gate["threshold"] is None else []
+        if train_groups < risk["min_groups"]:
+            reasons.append(f"not qualified (train groups {train_groups}<{risk['min_groups']})")
+        if gate["threshold"] is not None and len(confident_groups) < risk["min_groups"]:
+            reasons.append(f"not qualified (acted held-out groups {len(confident_groups)}<{risk['min_groups']})")
         report["buckets"][key] = {
-            "temperature": temperature, "threshold": threshold, "train": len(train), "validation": len(validation),
+            "temperature": temperature, "threshold": acting, "train": len(train), "validation": len(validation),
+            "risk": {name: value for name, value in gate.items() if name != "reason"},
+            "status": "; ".join(reasons) or "qualified",
             "accuracy": correct / len(validation) if validation else None,
             "brier": brier / len(validation) if validation else None,
             "ece": ece, "reliability": reliability, "certain_errors": certain_errors,
             "coverage": confident / len(validation) if validation else 0,
             "selective_accuracy": selective_accuracy,
-            "train_groups": len({group for _, _, group in train}), "confident_validation_groups": len(confident_groups),
-            "qualified": len({group for _, _, group in train}) >= 20 and len(confident_groups) >= 20 and selective_accuracy >= 0.95,
+            "train_groups": train_groups, "confident_validation_groups": len(confident_groups),
+            "qualified": not reasons,
         }
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     with Path(output).open("x") as handle:

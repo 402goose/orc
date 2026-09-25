@@ -3,7 +3,8 @@ from collections import Counter, defaultdict
 import json
 from pathlib import Path
 
-from fusion_decisions import DecisionEngine, DecisionStore, digest, labelable_record, read_jsonl, reviewed_labels, label_provenance
+from fusion_decisions import (DecisionEngine, DecisionStore, labelable_record, labeled_splits, read_jsonl, record_group,
+                              reviewed_labels, label_provenance)
 
 
 def read_object(path):
@@ -80,6 +81,8 @@ def learning_artifacts(workspace):
 
 def learning_summary(workspace, config, rows=None):
     rows = decision_rows(workspace) if rows is None else rows
+    engine = DecisionEngine(workspace, config)
+    splits = labeled_splits(rows, engine.options['split'])
     counts = Counter(row['garden_state'] for row in rows)
     kinds, distribution, growth = {}, defaultdict(Counter), Counter()
     groups = {'train': set(), 'validation': set()}
@@ -97,9 +100,8 @@ def learning_summary(workspace, config, rows=None):
         kind['reviewed'] += 1
         kind['labeled'] += len(answers)
         labeled += len(answers)
-        group = row.get('context', {}).get('group') or row.get('context', {}).get('task_id') or digest(row['state'])
-        split = 'validation' if int(digest(group)[:8], 16) % 5 == 0 else 'train'
-        groups[split].add(group)
+        group = record_group(row)
+        groups[splits.get(group, 'train')].add(group)
         for key, value in answers.items():
             distribution[f"{row['kind']} · {key}"][value] += 1
             prediction = row.get('prediction', {}).get(key, {})
@@ -113,7 +115,6 @@ def learning_summary(workspace, config, rows=None):
     candidates = [a for a in artifacts if a['action'] == 'train' and a['status'] == 'success']
     evaluations = [a for a in artifacts if a['action'] == 'evaluate' and a['status'] == 'success']
     exports = [a for a in artifacts if a['action'] == 'export' and a['status'] == 'success']
-    engine = DecisionEngine(workspace, config)
     options = engine.options
     calibration = engine.calibration()
     configured = options.get('model_path', '')
@@ -130,7 +131,10 @@ def learning_summary(workspace, config, rows=None):
                       'last_observed_identity': observed.get('model_identity'),
                       'last_observed_at_ms': observed.get('time_ms'),
                       'qualified_buckets': sum(b.get('qualified') is True for b in calibration.get('buckets', {}).values()),
-                      'calibration_identity': calibration.get('model_identity')},
-            'quality': review_quality(rows), 'comparisons': matched_comparisons(candidates, evaluations),
+                      'calibration_identity': calibration.get('model_identity'),
+                      'calibration_buckets': {key: {**{k: v for k, v in bucket.items() if k not in {'reliability', 'risk'}},
+                                                    'risk': {k: v for k, v in (bucket.get('risk') or {}).items() if k != 'curve'}}
+                                              for key, bucket in calibration.get('buckets', {}).items()}},
+            'quality': review_quality(rows, options['split']), 'comparisons': matched_comparisons(candidates, evaluations),
             'candidates': candidates, 'evaluations': evaluations, 'exports': exports,
             'jobs': artifacts[:10]}

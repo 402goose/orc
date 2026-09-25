@@ -68,9 +68,18 @@ That result was fixed by how labels are gathered, not by the model:
   temperatures on held-out groups only.
 - Choose the checkpoint per decision kind; evaluate `laya-typed-decisions`
   (1024-token context) for acceptance and re-derive the token budget from it.
-- Report per-head majority and heuristic baselines on a time-split holdout.
-- Gate any `auto_actions` on a Learn-then-Test threshold with a published
-  risk/coverage curve.
+- [x] Report per-head majority and heuristic baselines on a time-split holdout.
+  `decisions.split: "time"` (default) holds out the newest workflow groups;
+  `evaluate` reports majority, deterministic-policy and shuffled-state
+  baselines per question, and a round is a gain only if it beats all of
+  them by more than 0.02.
+- [x] Gate any `auto_actions` on a Learn-then-Test threshold with a published
+  risk/coverage curve. Exact binomial tests in fixed sequence
+  (`decisions.risk`, default α 0.05, δ 0.1, at least 30 held-out answers);
+  `allowed()` uses the certified threshold. Temperatures stay fit on train
+  groups, because the threshold is chosen on held-out groups and fitting
+  both there would reuse them. See
+  [Evaluation and gating](../FUSION_DECISIONS.md#evaluation-and-gating).
 
 ## Phase 3: more honest labels
 

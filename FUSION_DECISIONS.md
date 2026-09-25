@@ -319,7 +319,9 @@ settings):
     "calibration_file": "",
     "model_path": "",
     "verdict_labels": true,
-    "automatic_labels": true
+    "automatic_labels": true,
+    "split": "time",
+    "risk": {"alpha": 0.05, "delta": 0.1, "min_examples": 30, "min_groups": 20}
   },
   "verification": {
     "execute": true,
@@ -344,7 +346,10 @@ Active actions require **all** of:
 - `mode: active` and the decision kind listed in `auto_actions`;
 - a qualified calibration bucket for the exact question schema and model
   identity, including weights, tokenizer, configuration and SDK version;
-- probability at least the configured and calibrated thresholds;
+- probability at least the bucket's certified Learn-then-Test threshold
+  (see [Evaluation and gating](#evaluation-and-gating)); a calibration report
+  from before certified thresholds uses the higher of `threshold` and the
+  bucket's threshold instead;
 - complete state, instructions and options within the checkpoint's token
   limits; any detected truncation forces abstention;
 - all deterministic permission, availability, attempt and acceptance gates.
@@ -707,23 +712,136 @@ orc fusion decisions calibrate .fusion/decisions/candidate-predictions.jsonl \
   .fusion/decisions/candidate-calibration.json
 ```
 
-Exports group by workflow/task so related examples stay in the same split;
-approximately 20% of groups are held out. Training uses only train groups
-and supervised cross-entropy on the decision head. Evaluation reports
-held-out accuracy; `evaluate --control` also scores each held-out example
-against a different example's state, and a model that scores about the
-same on that control is answering from the question, not the state,
-whatever its accuracy says. Calibration fits temperature on train and
-reports held-out accuracy, Brier score, expected calibration error with a
-ten-bin reliability table, the count of confident wrong answers at 0.9,
-0.95 and 0.99, coverage and selective accuracy. Duplicate examples and
-train/validation group leakage are rejected.
+Training uses only train groups and supervised cross-entropy on the decision
+head. Duplicate examples and train/validation group leakage are rejected.
 
-A bucket qualifies only with at least 20 independent training groups,
-20 confident validation groups, and at least 95% selective validation
-accuracy. This is a rollout gate, not proof of generalization. Small
-datasets remain unqualified. Calibration currently targets one model
-identity per report; other language checkpoints abstain from active actions.
+### Evaluation and gating
+
+**Time-split holdout.** Exports group examples by workflow (`context.group`,
+else `task_id`) so a workflow is never split. `decisions.split: "time"` (the
+default) dates each group by its first recorded decision, labeled or not, and
+holds out the newest groups: about 20%, and at least two on each side once
+there are four or more labeled groups. The model is trained on older work and
+judged on newer work, as it will be deployed, so drift shows up as a worse
+score instead of being averaged away. `"group-hash"` is the earlier
+assignment by a hash of the group name; use it (or `export --split
+group-hash`) to reproduce a round measured before this change. Each exported
+row carries `group_first_ms`, and the export reports `split_method`.
+
+A group's date never moves, so a newer group can only push an older one from
+validation into training. The reverse can happen once: when an older group is
+labeled late, the held-out count (20% of groups) can grow by one and take the
+next-newest training group. A candidate trained in an earlier round that saw
+that group is caught at evaluation, which compares the candidate's
+`seen_train_groups` with the held-out groups and marks the holdout
+`contaminated`.
+
+**Baselines per question.** `evaluate` reports, for each held-out question
+(`kind:question`), the number of answers and groups, the candidate's
+accuracy, and each baseline that applies to it, each compared on only the
+answers it covers:
+
+| Baseline | Answer |
+|---|---|
+| `majority` | Most common training label for that exact question schema. |
+| `heuristic` | What the deterministic policy answers without Laya, exported with each row as `heuristic`. |
+| `control` | The candidate itself, reading another held-out example's state (`evaluate --control`). A model that scores the same here is answering from the question, not the state. |
+
+The deterministic answers (`fusion_decisions.heuristic_answers`):
+
+| Question | Policy answer | Source |
+|---|---|---|
+| `intake.workflow` | the fallback kind: planning-only scope → `discovery`, fix/bug words → `debug`, a leading "review" → `review`, else `build` | the `application` event's `actual`; skipped when the caller named the kind (intent, not a heuristic) |
+| `intake.needs_clarification` | `false`; intake never stops to ask | constant |
+| `review.specialty` | `general` | constant (`review_task`'s default focus) |
+| `review.needs_review` | `true`; a requested review always runs | constant |
+| `recovery.action` | continue / stop on quota, permission or attempt limit / switch / repair | the `application` event's `actual` |
+| `acceptance.plausible`, `failed_task` | `true`, `false`: trust the worker's reported success | constant |
+
+When Laya's answer was applied (`applied: true`), there is no policy answer
+for that decision. The acceptance baseline is not the structural gate's
+result, because a gate-sourced label is that result and would score 1.0 by
+construction. Routing has no labeled questions: routes are bandit feedback
+(see [Routing log and exploration](#routing-log-and-exploration)).
+
+A round's outcome is **gain** only if the candidate beats the source
+checkpoint *and* every applicable baseline on the held-out answers by more
+than 0.02 accuracy (`IMPROVEMENT_MARGIN`). It is **regression** if it trails
+the source by more than that, and otherwise **flat**; a note names each
+baseline that was not beaten. Evaluations saved before per-question
+baselines compare against their overall majority and control scores.
+
+**Temperature.** Calibration fits one temperature per question bucket
+(`kind:schema_hash:question`) on train groups, so the probabilities shown are
+readable, and reports held-out accuracy, Brier score, expected calibration
+error with a ten-bin reliability table, and the count of confident wrong
+answers at 0.9, 0.95 and 0.99. Temperatures are not fit on held-out groups:
+the acting threshold below is chosen on those, and would reuse them.
+
+**When a head may act: Learn-then-Test.** For each bucket, calibration takes
+the held-out (temperature-scaled top probability, correct) pairs and
+certifies a threshold with Learn-then-Test (Angelopoulos et al., arXiv
+2110.01052; `fusion_risk.py`):
+
+1. Each grid threshold t from 1.00 down to 0.50 is a hypothesis "the error
+   rate of the decisions acted on at t exceeds α".
+2. Its p-value is the exact binomial tail P(Binomial(n_t, α) ≤ errors_t)
+   over the n_t held-out answers at or above t. Rejecting at δ is the same as
+   the one-sided Clopper–Pearson upper bound at 1−δ being at most α.
+3. Thresholds are tested in a fixed sequence, most conservative first, each
+   at level δ, stopping at the first that is not rejected. Fixed-sequence
+   testing controls the family-wise error at δ without a multiplicity
+   correction, so every rejected threshold is certified at once.
+4. The sequence skips thresholds with fewer acted answers than zero errors
+   could ever reject (45 at α = 0.05, δ = 0.1). That depends only on the
+   confidences, never on correctness, so the sequence is still fixed before
+   testing.
+5. The certified coverage is the lowest rejected threshold's. The published
+   threshold is the *highest* certified one that acts on the same held-out
+   answers, so the head does not act on confidences it never showed.
+
+The guarantee: with probability at least 1−δ over the held-out draw, the
+error rate among acted decisions is at most α, assuming future decisions are
+exchangeable with held-out ones. The time split is what tests that
+assumption honestly. The loss is 0/1, so the binomial tail is exact.
+Hoeffding and Hoeffding–Bentkus bounds hold for any bounded loss and are
+looser for a binary one, which at 30–100 held-out answers decides whether a
+bucket qualifies at all.
+
+Each bucket stores `risk`: `threshold`, `alpha`, `delta`, `n`, `coverage`,
+`risk` (empirical), `upper_bound`, `min_acted`, and the risk–coverage
+`curve` (acted count, errors, coverage, empirical risk, upper bound and
+p-value at every grid threshold). The bucket's `threshold` is the certified
+one, or the `--threshold` fallback when nothing is certified, which is shown
+for reporting only. `status` says why a bucket is not qualified.
+
+A bucket **qualifies** only with all of:
+
+- a certified threshold;
+- at least `risk.min_examples` held-out answers (default 30); fewer is
+  `not qualified (n<30)` whatever they show;
+- at least `risk.min_groups` train groups and held-out groups acted on
+  (default 20), because answers within one workflow are not independent.
+
+`DecisionEngine.allowed` then acts only when the probability, rescaled under
+the calibration read at that moment, reaches the certified threshold. The
+fixed `decisions.threshold` no longer applies to such a bucket. Configure
+the gate in `.fusion.json`:
+
+```json
+{"decisions": {"risk": {"alpha": 0.05, "delta": 0.1, "min_examples": 30, "min_groups": 20}}}
+```
+
+`orc fusion decisions calibrate` reads it from the workspace configuration.
+What the defaults cost: with no errors, 45 acted held-out answers are
+needed, and 77 with one error. At α = 0.05 and δ = 0.1, none of today's
+buckets can qualify. That is the intended outcome.
+
+Put reversible decisions in `auto_actions` first: review specialty and
+intake, then recovery, and acceptance last. A wrong review focus costs one
+review. A wrong acceptance ships the wrong work.
+Calibration currently targets one model identity per report; other language
+checkpoints abstain from active actions.
 
 Temperature calibration sharpens a distribution whose ordering is already
 right; it cannot make a wrong answer right. Run `test/laya_benchmark.py`
@@ -818,10 +936,17 @@ an error. `status` prints, per workspace:
 - garden `enabled`, `approval_mode`, `queued` and `latest_job`
 - training `enabled`, `min_new_answers`, `completed_rounds` and `last_round`
   (with `outcome` and held-out `delta` once a round completes)
+- `measured_round`: the newest completed round's `outcome`, `margin`, overall
+  `baselines`, and per question (`kind:question`) the `holdout_n` and
+  `holdout_groups`, the candidate's accuracy beside `source`, `majority`,
+  `heuristic` and `control`, and the candidate calibration's `gate`: either
+  "acts at p>=T, coverage C of N held-out; error <= α with probability 1−δ"
+  or why it is not qualified, e.g. `not qualified (n<30)`
 - decision counts by state, `drafts` awaiting review, and approved decisions
   and answers
-- Laya `mode`, `model_path`, `qualified_buckets` and prediction/label
-  agreement
+- Laya `mode`, `model_path`, `qualified_buckets`, the configured calibration
+  file's `gates` per question (the ones `allowed()` uses now), and
+  prediction/label agreement
 
 `--all` means every workspace in the control room's registry
 (`$ORC_HOME/ui-workspaces.json`, default `~/.config/orc`), plus the current
