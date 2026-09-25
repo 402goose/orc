@@ -85,7 +85,7 @@ def route_candidates(config, task, store, rejected=None):
         if not core.executable(settings.get("command", agent)):
             drop(key, f"{settings.get('command', agent)} is not on PATH")
             continue
-        if not yolo and agent == "agy" and not core.agy_headless_status(settings)["automatic_ready"]:
+        if not yolo and agent == "agy" and settings.get("dangerously_skip_permissions") is not True and not core.agy_headless_status(settings)["automatic_ready"]:
             drop(key, core.agy_headless_status(settings).get("reason", "agy is not ready for headless use"))
             continue
         # Named read-only routes cannot be repurposed into writer routes.
