@@ -297,17 +297,17 @@ done in an unacceptable way, or the brief may have been wrong. So
 No label is written when the verdict has no `--reason` (the outcome is still
 recorded for route ranking), when the run did not report `success` (acceptance
 is only asked of a reported success), when the run's `task.json` is missing,
-or when the input exceeds `max_state_chars` (the record is kept, marked
+or when the task cannot be shown whole (below; the record is kept, marked
 truncated). `mode: off` or `"verdict_labels": false` turn verdict labels off.
 
 The label attaches to the run's acceptance decision. A workflow node that
 already has a complete acceptance decision is labeled in place. Otherwise
 Fusion records an `unscored` acceptance decision, with the same input
-`accept_node` builds (`task`, `summary`, `changed`, `tests`) or the input an
-unavailable workflow gate recorded. Laya does not run, so `fusion outcome`
-stays fast and works without a checkpoint. An `unscored` decision has no
-prediction and can never drive an automatic action. Calibration skips it and
-reports it under `unscored_examples`; score it with `evaluate` first.
+`accept_node` builds or the input an unavailable workflow gate recorded.
+Laya does not run, so `fusion outcome` stays fast and works without a
+checkpoint. An `unscored` decision has no prediction and can never drive an
+automatic action. Calibration skips it and reports it under
+`unscored_examples`; score it with `evaluate` first.
 
 Each label is `verified` with `source: "lead_verdict"`, `reviewers:
 [{"agent": "lead", "run_id": ..., "accepted": ...}]` and evidence holding the
@@ -336,6 +336,68 @@ was the best route. Outcomes rank routes (`rank_by_outcomes`) and nothing
 else. Workflow gate outcomes are not labels either: the acceptance question
 is asked only after structural checks pass, so a gate "accept" repeats the
 policy's own choice.
+
+#### What the classifier sees
+
+The workflow gate and verdicts build the acceptance input in one place
+(`fusion_decisions.acceptance_state`), so one run always yields the same
+input. It is `{"task", "summary", "changed", "tests"}`, at most
+`max_state_chars` characters of JSON:
+
+- `task` is the job the report is judged against, not the worker's prompt.
+  It is the run's `decision_context` when that is a string; Truffle sets one
+  ("Truffle scout: shortlist at most N ... in OWNER/REPO ..." or "Truffle
+  survey: grade each of N issues ..."). A stage of a `fusion build` workflow
+  gets `{"request", "workflow_kind", "stage", "role"}`: the original request
+  without the dependency receipts a run's context also carries. Otherwise it
+  is the task text (a delegation brief, a hand-written node's task).
+- `summary` is the handoff's `SUMMARY` field (the whole answer only when
+  the worker gave no `SUMMARY`).
+- `changed` keeps 12 entries and `tests` 8, each at most 200 characters.
+
+When the whole input does not fit, it is cut by one rule. The acceptance
+question asks whether the reported summary plausibly satisfies the task, so
+the task's criterion is never cut. The criterion is the whole task, except
+for a `fusion build` request, whose first line is the ask; the lines after
+it (for an issue Truffle selected, the scouting assessment and evidence)
+are detail. Only these may be cut, each keeping its start:
+
+- the request detail, which gives up room first;
+- the summary, whose start is where a handoff states what was done: it keeps
+  at least 3/5 of the room left after the criterion and lists, and never
+  under 400 characters with its marker (all of it if shorter);
+- list entries past the caps.
+
+Every cut is visible in the input, as `[…truncated N chars]` or `[…N more]`.
+An input with visible markers is complete for labeling: it says exactly
+what the classifier saw, and a label on it is a label on that input. When
+the criterion plus the minimum summary cannot fit, nothing is excerpted: the
+input is marked `source_truncated`, recorded truncated, and never labeled
+or acted on. At the default cap, a delegation brief of more than roughly
+1,700 characters is such a case (less with long `changed` or `tests`
+lists); raise `max_state_chars` (at most 6000) to label long briefs. A
+cut does not change the question schema, so calibration buckets
+(`kind:schema_hash:question`) are unaffected; inputs recorded before this
+rule remain as they were.
+
+#### Runs in workflow worktrees
+
+A workflow that publishes runs its stages in
+`.fusion/worktrees/<workflow_id>`, whose `.fusion` links back to the
+workspace's. A worker that can write the worktree can also replace that
+link. So workflow runs, traces, sessions, gate spans, and routing, review,
+acceptance and recovery decisions are always written to the workspace that
+started the workflow; the worktree is only the worker's working directory.
+Route ranking in the workspace therefore counts implementer runs and their
+outcomes.
+
+`fusion outcome RUN_ID` looks for the run in `.fusion/runs`, then in
+`.fusion/worktrees/*/.fusion/runs` (runs written before this change, or
+while the link was missing). A path that resolves outside the workspace's
+`.fusion` is not accepted. The outcome and label are recorded in the
+workspace's decision store, with evidence pointing at the run's
+`result.json` in the worktree. Traces written inside a worktree before this
+change are not merged into ranking.
 
 ### Review decisions by hand
 

@@ -384,7 +384,7 @@ class WorkflowRunner:
                                     "node_id": key, "cost_usd": _result_cost(node.get("result") or {})}
                                    for key, node in manifest.get("nodes", {}).items()]
         recorded = {item.get("run_id") for item in self.attempt_ledger}
-        for span in core.RunStore(self.workspace).traces(limit=100000):
+        for span in core.RunStore(self.control_workspace).traces(limit=100000):
             # Recover a receipt written after the last manifest flush (e.g. interrupted coordinator).
             if span.get("trace_id") == self.run_id and span.get("run_id") not in recorded:
                 self.attempt_ledger.append({"run_id": span["run_id"], "cost_usd": _result_cost(span),
@@ -525,7 +525,7 @@ class WorkflowRunner:
         cache_result = {"status": "cache_hit", "usage": {}, "changed": [], "tests": [], "blockers": [], "artifacts": {}}
         metadata = {"model": resolved.get("model")}
         try:
-            core.RunStore(self.workspace).trace_span(self.config, task, cache_result, now, now, metadata)
+            core.RunStore(self.control_workspace).trace_span(self.config, task, cache_result, now, now, metadata)
         except OSError:
             pass  # telemetry is best-effort; never let it break a resume.
 
@@ -625,7 +625,7 @@ class WorkflowRunner:
                 self._set_lane(agent, "blocked", f"{command} is not available on PATH")
         if self.resume:
             return
-        store = core.RunStore(self.workspace)
+        store = core.RunStore(self.control_workspace)
         now = core.now_ms()
         seen: set[str] = set()
         for span in store.traces(limit=50):
@@ -919,7 +919,7 @@ BLOCKERS: unresolved issues, or none
             route=route,
             settings_overrides=settings,
         )
-        store = core.RunStore(self.workspace)
+        store = core.RunStore(self.control_workspace)
         task["progress_label"] = node_id
         store.write_json(self._node_dir(node_id) / "active.json", {"run_id": task["run_id"], "attempt": attempt})
         task["excluded_routes"] = list(node.get("excluded_routes", []))
@@ -985,7 +985,7 @@ BLOCKERS: unresolved issues, or none
         if not run_id:
             return
         now = core.now_ms()
-        core.RunStore(self.workspace).trace_span(
+        core.RunStore(self.control_workspace).trace_span(
             self.config, {**task, "run_id": run_id, "agent": "gate", "route": None},
             {"status": "success" if accepted else "failed", "blockers": list(problems), "usage": {}},
             now, now, {},
@@ -1174,7 +1174,7 @@ BLOCKERS: unresolved issues, or none
                         # A semantic Done-check leg, spent only on a node that already passed
                         # every structural check. It can add a problem; it cannot clear one.
                         from fusion_policy import accept_node
-                        plausible, acceptance_decision_id = accept_node(self.config, self.workspace, self.run_id, node, result)
+                        plausible, acceptance_decision_id = accept_node(self.config, self.control_workspace, self.run_id, node, result)
                         result.setdefault("decisions", {})["acceptance"] = acceptance_decision_id
                         if not plausible:
                             accepted = False
@@ -1196,7 +1196,7 @@ BLOCKERS: unresolved issues, or none
                         result["resolved"] = payload.get("task", {}).get("resolved") or {}
                     node["result"] = result
                     from fusion_policy import recovery
-                    action, decision_id = recovery(self.config, self.workspace, self.run_id, node, result, accepted, self.spec["max_attempts"])
+                    action, decision_id = recovery(self.config, self.control_workspace, self.run_id, node, result, accepted, self.spec["max_attempts"])
                     result.setdefault("decisions", {})["recovery"] = decision_id
                     self._record_gate(payload.get("task") or {}, result, accepted, problems)
                     payload["acceptance"] = {"ok": accepted, "problems": problems,
