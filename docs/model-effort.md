@@ -7,6 +7,10 @@ Claude Code publishes no per-model effort catalog and its JSON result does not
 report the applied effort, so `execution_choice.catalog` is `unchecked` and
 `observed` stays `unobserved`. Observed on `claude-sonnet-5` (2026-09-24, same
 read-only task): `low` used 730 output tokens in 15 s, `high` 1,596 in 26 s.
+On a smaller one-sentence task (2026-09-24), `claude-opus-5-5` used 238 vs 310
+output tokens and `claude-fable-5-1` 291 vs 354 (low vs high); both reported the
+requested model. A trivial task shows the flag is accepted, not that effort
+changes quality; judge that with verdicts on real work.
 Effort sent through an `orc` (OpenRouter) route is passed to Claude Code; whether
 the upstream model honors it is unverified.
 
@@ -74,11 +78,22 @@ when false.
     "mode": "shadow",
     "model_effort_pairs": [
       {"model": "gpt-6-astra", "reasoning_effort": "high"},
-      {"model": "gpt-6-sol", "reasoning_effort": "xhigh"}
+      {"model": "gpt-6-sol", "reasoning_effort": "xhigh"},
+      {"agent": "claude", "model": "claude-opus-5-5", "reasoning_effort": "high"},
+      {"agent": "claude", "model": "claude-fable-5-1", "reasoning_effort": "medium"},
+      {"agent": "agy", "model": "gemini-3-pro", "reasoning_effort": "low"}
     ]
   }
 }
 ```
+
+An entry's `agent` defaults to `codex`. A pinned worker is only offered pairs
+for its own harness: a Claude task pinned to Opus 5.5 / high gets Laya advice
+among the Claude pairs, never a switch to Codex. Each harness validates its own
+pairs: Codex against the cached native catalog; Claude Code accepts
+`low`–`max` except on Haiku (no effort support), and records `xhigh` on 4.6
+models as `requested_may_downgrade` because they run it as `high`; agy accepts
+`low`, `medium` and `high`. Grok has no effort control here yet.
 
 The explicit pair must be in the list (at most eight pairs). The existing
 `routing` decision asks Laya for one pair; its recommendation and the retained
