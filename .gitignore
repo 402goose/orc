@@ -3,3 +3,4 @@ graphify-out/
 .fusion.json
 __pycache__/
 node_modules/
+.tenet/

@@ -63,8 +63,7 @@ does not prove current availability, permissions, quota or runtime application.
 `allow_native_delegation: true` in Codex settings or the node, and currently
 requires `write: false`. Child traces and child cost are not qualified by this
 integration. The capability is authorization, not proof that no children exist
-when false. TENET derives this field from external operator policy; an admitted
-caller cannot grant it to itself.
+when false.
 
 ## Laya advice using the existing router
 
