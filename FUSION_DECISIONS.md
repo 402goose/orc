@@ -299,8 +299,8 @@ done in an unacceptable way, or the brief may have been wrong. So
 No label is written when the verdict has no `--reason` (the outcome is still
 recorded for route ranking), when the run did not report `success` (acceptance
 is only asked of a reported success), when the run's `task.json` is missing,
-or when the task cannot be shown whole (below; the record is kept, marked
-truncated). `mode: off` or `"verdict_labels": false` turn verdict labels off.
+or when the task cannot be shown whole within the token budget (below; the
+record is kept, marked truncated). `mode: off` or `"verdict_labels": false` turn verdict labels off.
 
 The label attaches to the run's acceptance decision. A workflow node that
 already has a complete acceptance decision is labeled in place. Otherwise
@@ -343,8 +343,9 @@ policy's own choice.
 
 The workflow gate and verdicts build the acceptance input in one place
 (`fusion_decisions.acceptance_state`), so one run always yields the same
-input. It is `{"task", "summary", "changed", "tests"}`, at most
-`max_state_chars` characters of JSON:
+input. It is `{"task", "summary", "changed", "tests"}` as JSON, within two
+bounds: at most `max_state_chars` characters, and at most the tokens Laya
+reads beside the acceptance questions (the token budget, below):
 
 - `task` is the job the report is judged against, not the worker's prompt.
   It is the run's `decision_context` when that is a string; Truffle sets one
@@ -355,7 +356,8 @@ input. It is `{"task", "summary", "changed", "tests"}`, at most
   is the task text (a delegation brief, a hand-written node's task).
 - `summary` is the handoff's `SUMMARY` field (the whole answer only when
   the worker gave no `SUMMARY`).
-- `changed` keeps 12 entries and `tests` 8, each at most 200 characters.
+- `changed` keeps 12 entries and `tests` 8, each at most 200 characters;
+  fewer when the token budget requires (below).
 
 When the whole input does not fit, it is cut by one rule. The acceptance
 question asks whether the reported summary plausibly satisfies the task, so
@@ -368,19 +370,72 @@ are detail. Only these may be cut, each keeping its start:
 - the summary, whose start is where a handoff states what was done: it keeps
   at least 3/5 of the room left after the criterion and lists, and never
   under 400 characters with its marker (all of it if shorter);
-- list entries past the caps.
+- list entries past the caps. When the criterion and minimum summary do
+  not fit beside the lists, the lists shrink to 6 `changed` and 4 `tests`
+  entries of at most 100 characters, then to 3 and 2 of at most 60.
 
 Every cut is visible in the input, as `[…truncated N chars]` or `[…N more]`.
 An input with visible markers is complete for labeling: it says exactly
 what the classifier saw, and a label on it is a label on that input. When
 the criterion plus the minimum summary cannot fit, nothing is excerpted: the
 input is marked `source_truncated`, recorded truncated, and never labeled
-or acted on. At the default cap, a delegation brief of more than roughly
-1,700 characters is such a case (less with long `changed` or `tests`
-lists); raise `max_state_chars` (at most 6000) to label long briefs. A
-cut does not change the question schema, so calibration buckets
+or acted on. A delegation brief of more than roughly 1,000 characters of
+prose (about 750 of code, paths or commands) is such a case; the token
+budget, not `max_state_chars`, sets that limit, so raising the cap does not
+help. A cut does not change the question schema, so calibration buckets
 (`kind:schema_hash:question`) are unaffected; inputs recorded before this
 rule remain as they were.
+
+##### The token budget
+
+Laya's encoder reads 512 tokens: the question head, then the state, which
+gets whatever is left. The longest acceptance question's head takes 40, so
+an acceptance input has 472 tokens (`fusion_decisions.state_tokens`). A
+character cap cannot decide that: on the checkpoint's tokenizer, recorded
+decision states run 2.4-4.8 characters per token, hashes, UUIDs and diffs
+about 1.7, CJK about 1.2. A 2,200-character acceptance input was 550-750
+tokens, so the model never saw its end.
+
+The verdict path cannot run the tokenizer (`fusion outcome` never loads the
+model), so the gate and verdicts both bound the input with
+`fusion_decisions.estimated_tokens`, a pure-Python estimate that charges
+more than the tokenizer spends. `acceptance_state` lowers its character cap
+in proportion to the estimate until the input fits 472 estimated tokens.
+Measured with the tokenizer on 1,596 texts (the repository's code, docs,
+JSON and shell, recorded decision states, and synthetic hashes, digits,
+unicode and emoji), the true count was at most 0.89 of the estimate on
+JSON-encoded text and 0.81 on recorded acceptance states (0.72 on average),
+so an input built this way uses about 340 of the 472 tokens and at most
+about 420. The margin is the estimate's own; there is no separate factor.
+The estimate is not a bound for text built to defeat BPE (random consonant
+strings, base64, alternating case). Such an input can still be truncated;
+the gate records the runtime's report, which disables automatic action, and
+`train`/`evaluate` still refuse it.
+
+`test/fixtures/laya_token_counts.json` holds the tokenizer's counts for the
+synthetic texts and for six acceptance inputs built by `acceptance_state`;
+the default suite checks that the estimate is never below them and that the
+fixture inputs are rebuilt exactly and fit. `test/laya_token_budget.py`
+re-measures them with the managed runtime (`--write` rewrites the fixture);
+run it after changing the estimate, the acceptance questions or
+`acceptance_state`. The budget applies to acceptance inputs only;
+`max_state_chars` still bounds every other kind, whose truncation the runtime
+reports at inference.
+
+##### Labels on inputs recorded before the token budget
+
+An `unscored` input was never checked by the model. One whose estimate
+exceeds the budget -- an acceptance input of up to 2,200 characters recorded
+by a verdict before this rule -- counts as truncated
+(`fusion_decisions.exceeds_token_budget`): the lab shows it ineligible,
+exports skip it and report `skipped_over_token_budget`, the training loop
+does not count its answers, and it cannot be labeled again. Nothing on disk
+is rewritten, and a scored decision keeps the runtime's own truncation
+report. To repair a run, record its verdict again (`fusion outcome RUN_ID
+--accepted|--rejected --reason ...`): the verdict labels on the old input are
+retracted and the verdict labels a freshly built, bounded input. Labels a
+human or council attached to an old input are left in place but, like the
+input, are not exported.
 
 #### Runs in workflow worktrees
 
@@ -582,6 +637,7 @@ make test dogfood
 make dogfood-paired
 ~/.local/share/orc/laya/bin/python test/laya_smoke.py --train --acceptance
 ~/.local/share/orc/laya/bin/python test/laya_benchmark.py
+~/.local/share/orc/laya/bin/python test/laya_token_budget.py
 ```
 
 `dogfood-paired` runs the fixture fan-out workflow twice, with decisions off
