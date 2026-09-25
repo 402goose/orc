@@ -280,6 +280,8 @@ def run_job(directory):
     environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "FUSION_PROGRESS": "1"}
     if request.get("mode"):
         environment["FUSION_DECISIONS_MODE"] = request["mode"]
+    if request.get("survey_id"):
+        environment["FUSION_TRUFFLE_SURVEY_ID"] = request["survey_id"]
     try:
         with (directory / "stdout.log").open("wb") as out, (directory / "stderr.log").open("wb") as err:
             proc = subprocess.Popen(request["argv"], cwd=request["workspace"], env=environment,
@@ -584,6 +586,7 @@ class ControlRoom:
             raise ValueError("Invalid Laya mode")
         writes = False
         spec = None
+        survey_id = None
         if action == "build":
             kind = body.get("kind", "discovery")
             if kind not in {"discovery", "review", "build", "debug", "sweep"}:
@@ -624,6 +627,11 @@ class ControlRoom:
                 if saved.get("kind") != "survey":
                     raise ValueError("Choose an issue woodland to resume")
                 argv += ["--resume", saved["id"]]
+            else:
+                # Mint the survey id here rather than letting the caller infer it from the
+                # newest hunt.json afterward: between this process returning and the detached
+                # survey writing its first record, the previous survey would still be "latest".
+                survey_id = "truffle-" + uuid.uuid4().hex[:12]
             for key in ("sync_only", "include_assigned"):
                 if key in body and type(body[key]) is not bool:
                     raise ValueError(f"{key} must be boolean")
@@ -760,10 +768,10 @@ class ControlRoom:
             learning = {"dataset": str(dataset) if action in {"train", "evaluate", "calibrate"} else "",
                         "model_path": body.get("model_path", "")}
             atomic_json(directory / "request.json", {"action": action, "title": title, "argv": argv, "workspace": str(workspace), "mode": mode, "decision_id": decision_id, "garden": garden, "learning": learning,
-                                                      "garden_policy": body.get('garden_policy') if garden else None,
+                                                      "garden_policy": body.get('garden_policy') if garden else None, "survey_id": survey_id,
                                                   "learning_round": body.get("learning_round"), "learning_dispatch": body.get("learning_dispatch")})
             atomic_json(directory / "job.json", {"id": job_id, "action": action, "title": title, "status": "queued", "started_at_ms": core.now_ms(), "decision_id": decision_id, "garden": garden,
-                                                  "garden_policy": body.get('garden_policy') if garden else None,
+                                                  "garden_policy": body.get('garden_policy') if garden else None, "survey_id": survey_id,
                                                   "learning_round": body.get("learning_round"), "learning_dispatch": body.get("learning_dispatch")})
             with (directory / "supervisor.log").open("wb") as log:
                 proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--job", str(directory)],
