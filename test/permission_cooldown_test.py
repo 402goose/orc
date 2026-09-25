@@ -1,0 +1,136 @@
+"""Permission-denial lane cooldown is scoped to baseline tools (issue #99); fixtures only."""
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import fusion_core as core
+from fusion_policy import route_candidates
+
+
+class DeniedToolsParsingTest(unittest.TestCase):
+    def test_claude_permission_denials_in_both_seen_shapes(self):
+        stdout = json.dumps({"result": "ok", "permission_denials": [
+            {"tool_name": "Bash", "reason": "command not in allowlist"},
+            {"tool_name": "mcp__example__run_status", "tool_input": {"run_id": "x"}},
+            {"name": "bash"},
+            {"some_unexpected_field": "value"},
+        ]})
+        self.assertEqual(core.provider_denied_tools("claude", stdout), ["Bash", "mcp__example__run_status"])
+
+    def test_agy_denied_actions_prefer_display_name(self):
+        stdout = json.dumps({"status": "SUCCESS", "response": "", "denied_actions": [
+            {"action": "command", "display_name": "RunCommand"}, {"action": "view_file"}]})
+        self.assertEqual(core.provider_denied_tools("agy", stdout), ["RunCommand", "view_file"])
+
+    def test_non_json_and_other_agents_name_nothing(self):
+        self.assertEqual(core.provider_denied_tools("claude", "plain text"), [])
+        self.assertEqual(core.provider_denied_tools("grok", json.dumps({"permission_denials": [{"tool_name": "Read"}]})), [])
+
+    def test_blocker_fallback(self):
+        blockers = ["permission denied: Write(/etc/hosts)", "agy denied: RunCommand: blocked",
+                    "agy auto-denied tools in headless mode: ViewFile, RunCommand; configure sandboxed commands",
+                    "agy auto-denied tools in headless mode: tool; configure", "permission denied",
+                    'permission denied: {"some_unexpected_field": "value"}']
+        self.assertEqual(core.blocker_denied_tools(blockers), ["Write", "RunCommand", "ViewFile"])
+
+    def test_baseline_rule(self):
+        for denied, blocks in ((["Bash"], False), (["mcp__example__run_status"], False), (["RunCommand"], False),
+                               (["Read"], True), (["read"], True), (["Bash", "Edit"], True), (["ViewFile"], True),
+                               (["view_file"], True), (["Glob"], True), (["LS"], True), ([], True)):
+            with self.subTest(denied=denied):
+                self.assertEqual(core.denial_blocks_lane({"denied_tools": denied}), blocks)
+        self.assertTrue(core.denial_blocks_lane({}))
+
+
+class PermissionCooldownRoutingTest(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.workspace = self.root / "repo"
+        self.workspace.mkdir()
+        env = patch.dict(os.environ, {"ORC_HOME": str(self.root / "orc-home"), "FUSION_TELEMETRY": "0"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.config = core.deep_merge(core.DEFAULTS, {"execution_mode": "yolo", "routes": {}, "decisions": {"mode": "off"}})
+        for agent in ("codex", "claude", "agy", "grok"):
+            self.config[agent]["command"] = sys.executable
+        self.store = core.RunStore(self.workspace)
+
+    def agents(self, span):
+        span = {"agent": "claude", "execution_mode": "yolo", "end_time_ms": core.now_ms(), **span}
+        task = core.make_task(self.workspace, "auto", "Check the fixture", "review", [], [], None, True, False)
+        with patch.object(self.store, "traces", return_value=[span]):
+            return [choice["agent"] for choice in route_candidates(self.config, task, self.store)]
+
+    def test_bash_only_denial_keeps_the_lane(self):
+        self.assertIn("claude", self.agents({"failure_class": "permission_denied", "denied_tools": ["Bash"]}))
+
+    def test_baseline_denial_cools_the_lane_down(self):
+        self.assertNotIn("claude", self.agents({"failure_class": "permission_denied", "denied_tools": ["Read"]}))
+        self.assertNotIn("agy", self.agents({"agent": "agy", "failure_class": "permission_denied", "denied_tools": ["ViewFile"]}))
+
+    def test_quota_cools_the_lane_down(self):
+        self.assertNotIn("claude", self.agents({"failure_class": "quota", "denied_tools": []}))
+
+    def test_legacy_span_without_denied_tools_keeps_the_cooldown(self):
+        self.assertNotIn("claude", self.agents({"failure_class": "permission_denied"}))
+
+
+class DeniedToolsDispatchTest(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.workspace = self.root / "repo"
+        self.workspace.mkdir()
+        env = patch.dict(os.environ, {"ORC_HOME": str(self.root / "orc-home"), "FUSION_TELEMETRY": "0"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.config = core.deep_merge(core.DEFAULTS, {"routes": {}, "decisions": {"mode": "off"}})
+
+    def dispatch(self, agent, payload):
+        worker = self.root / f"{agent}-fixture"
+        worker.write_text(f"#!{sys.executable}\nimport json\nprint(json.dumps({payload!r}))\n")
+        worker.chmod(0o755)
+        self.config[agent]["command"] = str(worker)
+        store = core.RunStore(self.workspace)
+        task = core.make_task(self.workspace, agent, "Check the fixture", "review", [], [], None, True, False)
+        result = core.dispatch(self.config, task, store)
+        return result, store.traces(limit=1)[-1]
+
+    def test_claude_denials_reach_result_and_span(self):
+        result, span = self.dispatch("claude", {
+            "is_error": False, "session_id": "s",
+            "result": "STATUS: success\nSUMMARY: done\nCHANGED: none\nTESTS: none\nBLOCKERS: none",
+            "permission_denials": [{"tool_name": "Bash", "tool_input": {"command": "make"}},
+                                   {"tool_name": "Bash", "reason": "not allowed"}]})
+        self.assertEqual(core.failure_class(result), "permission_denied")
+        self.assertEqual(result["denied_tools"], ["Bash"])
+        self.assertEqual(span["denied_tools"], ["Bash"])
+        self.assertEqual(span["failure_class"], "permission_denied")
+        self.assertFalse(core.denial_blocks_lane(span))
+
+    def test_agy_denials_reach_result_and_span(self):
+        result, span = self.dispatch("agy", {"status": "SUCCESS", "response": "",
+                                             "denied_actions": [{"action": "view_file", "display_name": "ViewFile"}]})
+        self.assertEqual(core.failure_class(result), "permission_denied")
+        self.assertEqual(result["denied_tools"], ["ViewFile"])
+        self.assertEqual(span["denied_tools"], ["ViewFile"])
+        self.assertTrue(core.denial_blocks_lane(span))
+
+    def test_handoff_blocker_fallback_when_no_payload_names_a_tool(self):
+        result, span = self.dispatch("claude", {
+            "is_error": False, "session_id": "s",
+            "result": "STATUS: blocked\nSUMMARY: stuck\nCHANGED: none\nTESTS: none\nBLOCKERS: permission denied: Write(/etc/hosts)"})
+        self.assertEqual(result["denied_tools"], ["Write"])
+        self.assertEqual(span["denied_tools"], ["Write"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -50,7 +50,9 @@ def route_candidates(config, task, store, rejected=None):
         settings = {**config.get(agent, {}), **lane}
         family = (agent, settings.get("command", agent))
         if key not in seen and 0 <= time.time() * 1000 - span.get("end_time_ms", 0) < core.LANE_COOLDOWN_SECONDS * 1000:
-            if span.get("failure_class") == "quota" or (span.get("failure_class") == "permission_denied" and span.get("execution_mode", "restricted") == core.execution_mode(config)):
+            if span.get("failure_class") == "quota" or (span.get("failure_class") == "permission_denied"
+                                                        and span.get("execution_mode", "restricted") == core.execution_mode(config)
+                                                        and core.denial_blocks_lane(span)):
                 unhealthy.add(key)
                 if family not in seen_commands and Path(str(family[1])).name != "orc":
                     unavailable_commands.add(family)

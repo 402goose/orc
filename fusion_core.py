@@ -540,6 +540,67 @@ def quota_failure(result: dict[str, Any]) -> bool:
     return any(marker in text for marker in QUOTA_MARKERS)
 
 
+BASELINE_TOOLS = frozenset({
+    "read", "edit", "write", "multiedit", "glob", "grep", "ls", "notebookread", "notebookedit",
+    "viewfile", "viewfileoutline", "viewcodeitem", "listdir", "findbyname", "grepsearch", "codebasesearch",
+    "writetofile", "replacefilecontent", "multireplacefilecontent",
+    "readfile", "editfile", "writefile", "listfiles", "listdirectory",
+})
+_DENIED_TOOL_BLOCKER = re.compile(r"(?:permission denied|agy denied):\s*([A-Za-z_][\w.-]*)", re.IGNORECASE)
+_AGY_AUTO_DENIED = re.compile(r"agy auto-denied tools in headless mode:\s*([^;]*)", re.IGNORECASE)
+
+
+def _tool_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def normalize_tools(names: Any) -> list[str]:
+    seen: dict[str, str] = {}
+    for name in names or []:
+        name = str(name or "").split("(", 1)[0].strip()
+        if _tool_key(name) and _tool_key(name) not in seen:
+            seen[_tool_key(name)] = name
+    return list(seen.values())
+
+
+def _denial_name(item: Any) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    name = item.get("tool_name") or item.get("name") or item.get("tool") or item.get("display_name") or item.get("action")
+    return str(name) if name else None
+
+
+def provider_denied_tools(agent: str, stdout: str) -> list[str]:
+    if agent not in {"claude", "agy"}:
+        return []
+    try:
+        value = json.loads(stdout)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, dict):
+        return []
+    items = value.get("permission_denials" if agent == "claude" else "denied_actions")
+    return normalize_tools(_denial_name(item) for item in items) if isinstance(items, list) else []
+
+
+def blocker_denied_tools(blockers: Any) -> list[str]:
+    names: list[str] = []
+    for blocker in blockers or []:
+        text = str(blocker)
+        auto = _AGY_AUTO_DENIED.search(text)
+        if auto:
+            names += [part.strip() for part in auto.group(1).split(",")]
+        names += _DENIED_TOOL_BLOCKER.findall(text)
+    return normalize_tools(name for name in names if name.lower() != "tool")
+
+
+def denial_blocks_lane(span: dict[str, Any]) -> bool:
+    denied = span.get("denied_tools")
+    if not denied:
+        return True
+    return any(_tool_key(str(name)) in BASELINE_TOOLS for name in denied)
+
+
 def failure_class(result: dict[str, Any]) -> str | None:
     """Coarse, non-identifying category for a non-success result. Used both
     to make local `fusion usage` slicing easier and as the only failure
@@ -828,6 +889,7 @@ class RunStore:
             "changed": result.get("changed", []),
             "tests": result.get("tests", []),
             "blockers": result.get("blockers", []),
+            "denied_tools": result.get("denied_tools") or [],
             "run_id": task["run_id"],
             "artifacts": result.get("artifacts", {}),
         }
@@ -1019,7 +1081,7 @@ def _denial_note(item: Any) -> str:
     guessing wrong and silently dropping information."""
     if not isinstance(item, dict):
         return str(item)
-    name = item.get("tool_name") or item.get("name") or item.get("tool") or item.get("display_name") or item.get("action")
+    name = _denial_name(item)
     reason = item.get("reason") or item.get("message")
     if name and reason:
         return f"{name}: {reason}"
@@ -1559,6 +1621,7 @@ def dispatch(
     model = metadata.get("model")
     handoff: dict[str, Any] = {}
     evidence_notes: list[str] = []
+    worker_stdout = ""
     exit_code = 1
     label = task.get("progress_label", task["role"])
     scope = "implementation" if task["write"] else "review/investigation only"
@@ -1583,7 +1646,7 @@ def dispatch(
                 stdout_path=stdout_path, stderr_path=stderr_path, label=label,
                 plain_output=task["agent"] == "grok" and metadata.get("output_format") == "plain",
             )
-        exit_code = completed.returncode
+        exit_code, worker_stdout = completed.returncode, completed.stdout
         if metadata.get("execution_choice"):
             metadata["execution_choice"]["dispatch"]["status"] = "returned"
         if task["agent"] == "codex":
@@ -1641,6 +1704,7 @@ def dispatch(
         summary, failure, status, exit_code = "worker interrupted", str(exc), "blocked", 130
     duration_ms = int((time.monotonic() - started) * 1000)
     progress.emit(label, f"worker {status} after {progress.elapsed(duration_ms / 1000)}; exit {exit_code}")
+    blockers = handoff.get("blockers", []) + (evidence_notes if task["agent"] != "codex" else []) + ([failure] if failure else [])
     result = {
         "schema": SCHEMA,
         "run_id": task["run_id"],
@@ -1654,7 +1718,8 @@ def dispatch(
         "summary": compact(str(handoff.get("summary") or summary).strip(), int(config.get("max_result_chars", 12000))),
         "changed": handoff.get("changed", []),
         "tests": handoff.get("tests", []),
-        "blockers": handoff.get("blockers", []) + (evidence_notes if task["agent"] != "codex" else []) + ([failure] if failure else []),
+        "blockers": blockers,
+        "denied_tools": provider_denied_tools(task["agent"], worker_stdout) or blocker_denied_tools(blockers),
         "command_evidence": evidence_notes if task["agent"] == "codex" else [],
         "exit_code": exit_code,
         "duration_ms": duration_ms,
