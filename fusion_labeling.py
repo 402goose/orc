@@ -521,22 +521,25 @@ def record_gate_input(config, workspace, workflow_id, node, result):
 
 
 def gate_answers(codes, receipts):
-    """(answers, reason) from objective gate codes only.
+    """(answers, reason) from objective gate codes only, read like SWE-bench's
+    FAIL_TO_PASS / PASS_TO_PASS.
 
-    failed_task=true: an executed check failed with a test failure and had
-    not already passed before the change (vacuous), or a write node left the
-    tree unchanged. failed_task=false: the gate passed and at least one
-    executed check failed before the change and passed after it. Anything
-    else stays unlabeled. `plausible` is never answered: it asks whether the
-    report plausibly matches the task, which no exit code decides. Blockers
-    and handoff fields are parsed from the worker's report (and are Laya's own
-    inputs), so they never label.
+    failed_task=false: the gate passed and a check failed before the change
+    and passed after it. failed_task=true: a check that passed before the
+    change fails after it (the change broke what the plan said must pass), or
+    a first attempt changed nothing. A check that failed before and still
+    fails is not evidence: a plan command can cover a pre-existing failure
+    unrelated to the task (seen live on 2026-09-24). A later attempt that
+    changed nothing is not evidence either: its tree holds earlier attempts'
+    work. `plausible` is never answered: no exit code decides whether a report
+    plausibly matches the task. Blockers and handoff fields are parsed from
+    the worker's report (Laya's own inputs), so they never label.
     """
     for code in codes:
-        if code.get("code") == "check_failed" and code.get("vacuous") is not True and code.get("test_failure"):
-            return {"failed_task": "true"}, "an executed acceptance check failed"
-        if code.get("code") == "write_no_change":
-            return {"failed_task": "true"}, "the write node finished without changing any file"
+        if code.get("code") == "check_failed" and code.get("vacuous") is True and code.get("test_failure"):
+            return {"failed_task": "true"}, "a check that passed before the change fails after it"
+        if code.get("code") == "write_no_change" and int(code.get("attempt") or 1) == 1:
+            return {"failed_task": "true"}, "the first attempt finished without changing any file"
     if codes:
         names = ", ".join(sorted({str(code.get("code")) for code in codes}))
         return None, f"the gate failed on {names}, which is not objective evidence about the task"
