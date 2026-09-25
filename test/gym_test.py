@@ -490,7 +490,7 @@ class SolvabilityAuditTest(unittest.TestCase):
                 store.append("label", id=d, answers={"failed_task": "true"}, verified=True, replace=False, source="structural_gate")
             store.append("label", id="d4", answers={"failed_task": "true"}, verified=True, replace=True, source="lead_verdict")
             summary = gym.audit(root)
-            self.assertEqual((summary["solved_tasks"], summary["unsolved_tasks"]), (["pr-1"], ["pr-2"]))
+            self.assertEqual(summary["modes"], {"hidden": {"solved_tasks": ["pr-1"], "unsolved_tasks": ["pr-2"]}})
             answers, _ = reviewed_labels(read_jsonl(store.path))
             # Solvable task keeps its negative; an unsolved task's gate negative is withdrawn;
             # a lead's own verdict is never touched.
@@ -505,3 +505,253 @@ class SolvabilityAuditTest(unittest.TestCase):
             self.assertEqual(gym.audit(root)["restored"], ["pr-2:a:hidden"])
             answers, _ = reviewed_labels(read_jsonl(store.path))
             self.assertEqual(answers["d3"], {"failed_task": "true"})
+
+
+class SolvabilityAuditPerModeTest(unittest.TestCase):
+    def test_hinted_and_unhinted_runs_are_separate_evidence(self):
+        from fusion_decisions import DecisionStore, read_jsonl, reviewed_labels
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = DecisionStore(root)
+            def row(mode, lane, verdict, decision):
+                return {"event": "finished", "mode": mode, "completed": True, "key": f"pr-1:{lane}:{mode}",
+                        "task": "pr-1", "lane": lane, "verdict": verdict,
+                        "gate_label": {"status": "labeled", "decision_id": decision}}
+            rows = [row("hidden", "a", "unsolved", "d1"), row("hidden+hints", "a", "solved", "d2"),
+                    row("hidden+hints", "b", "unsolved", "d3")]
+            (root / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+            store.append("label", id="d2", answers={"failed_task": "false"}, verified=True, replace=False, source="structural_gate")
+            for d in ("d1", "d3"):
+                store.append("label", id=d, answers={"failed_task": "true"}, verified=True, replace=False, source="structural_gate")
+            summary = gym.audit(root)
+            self.assertEqual(summary["modes"], {"hidden": {"solved_tasks": [], "unsolved_tasks": ["pr-1"]},
+                                                "hidden+hints": {"solved_tasks": ["pr-1"], "unsolved_tasks": []}})
+            # Solved with hints says nothing about the bare prompt: the unhinted
+            # negative is withheld, the hinted one stands.
+            self.assertEqual(summary["retracted"], ["pr-1:a:hidden"])
+            answers, _ = reviewed_labels(read_jsonl(store.path))
+            self.assertFalse(answers.get("d1"))
+            self.assertEqual(answers["d3"], {"failed_task": "true"})
+
+
+LIB_BASE = '''import argparse
+
+
+def keep(a):
+    return a
+
+
+def change(a, b=1):
+    return a + b
+
+
+class Store:
+    def __init__(self):
+        self.items = {}
+
+    def get(self, key):
+        return self.items.get(key)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--verbose", action="store_true")
+    parser.parse_args(argv)
+    return 0
+'''
+LIB_FIX = '''import argparse
+
+LIMIT = 5
+
+
+def keep(a):
+    return a
+
+
+def change(a, b=1, *, strict=False):
+    if strict and b < 0:
+        raise ValueError("SECRET_BODY_MARKER")
+    return a + b
+
+
+def fresh(values, limit=LIMIT):
+    """SECRET_DOCSTRING_MARKER"""
+    return sorted(values)[:limit]
+
+
+class Store:
+    def __init__(self):
+        self.items = {}
+
+    def get(self, key):
+        return self.items.get(key)
+
+    def put(self, key, value):
+        self.items[key] = value
+
+
+class Ledger(Store):
+    total: int = 0
+
+    def add(self, amount):
+        self.total += amount
+        return self.total
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+    return 3 if args.dry_run else 0
+'''
+SUPPORT_BASE = "from lib import Store\n\n\ndef build_store():\n    return Store()\n"
+SUPPORT_FIX = SUPPORT_BASE + "\n\ndef build_ledger():\n    return build_store()\n"
+LIB_TEST_BASE = '''import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib import keep
+
+
+class LibTest(unittest.TestCase):
+    def test_keep(self):
+        self.assertEqual(keep(1), 1)
+'''
+LIB_TEST_FIX = '''import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import lib
+from lib import keep, change, fresh, Ledger
+from support import build_store, build_ledger
+
+
+class LibTest(unittest.TestCase):
+    def test_keep(self):
+        self.assertEqual(keep(1), 1)
+
+    def test_strict(self):
+        with self.assertRaises(ValueError):
+            change(1, -1, strict=True)
+
+    def test_fresh(self):
+        self.assertEqual(fresh([3, 1, 2], limit=2), [1, 2])
+        self.assertEqual(lib.LIMIT, 5)
+
+    def test_store(self):
+        store = build_store()
+        self.assertIsInstance(store, lib.Store)
+        store.put("a", 1)
+        self.assertEqual(store.get("a"), 1)
+        self.assertEqual(Ledger().add(2), 2)
+        self.assertTrue(build_ledger())
+
+    def test_cli(self):
+        self.assertEqual(lib.main(["--dry-run"]), 3)
+'''
+
+
+class InterfaceHintsTest(Isolated):
+    """A fix that adds a function, a class, a method, a constant and a CLI
+    option, and changes one signature: the hints name exactly those."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.root / "source"
+        (self.repo / "test").mkdir(parents=True)
+        (self.repo / "lib.py").write_text(LIB_BASE)
+        (self.repo / "test/support.py").write_text(SUPPORT_BASE)
+        (self.repo / "test/lib_test.py").write_text(LIB_TEST_BASE)
+        (self.repo / ".gitignore").write_text(".fusion/\n.fusion.json\n__pycache__/\n")
+        run_git(self.repo, "init", "-q")
+        run_git(self.repo, "add", ".")
+        run_git(self.repo, "commit", "-qm", "seed")
+        (self.repo / "lib.py").write_text(LIB_FIX)
+        (self.repo / "test/support.py").write_text(SUPPORT_FIX)
+        (self.repo / "test/lib_test.py").write_text(LIB_TEST_FIX)
+        run_git(self.repo, "commit", "-qam", "fix(lib): strict change, fresh values, ledgers and dry runs (#5)")
+        self.config = {"claude": {"command": "missing-claude"}, "agy": {"command": "missing-agy"},
+                       "grok": {"command": "missing-grok"}, "timeout_seconds": 60, "decisions": {"mode": "shadow"},
+                       "routes": {"observer": {"agent": "codex", "command": self.worker(
+                           "observer", {"lib.py": LIB_FIX}, see=["lib.py"])}}}
+        (self.repo / ".fusion.json").write_text(json.dumps(self.config))
+        self.tasks = self.root / "tasks"
+        self.gym_dir = self.root / "gym"
+        _, [self.task] = gym.extract(self.repo, [5], self.tasks, use_gh=False)
+
+    def seen_prompt(self, row):
+        patch_text = Path(row["patch"]).read_text()
+        section = patch_text.split("+++ b/seen.json", 1)[1]
+        added = "\n".join(line[1:] for line in section.splitlines() if line.startswith("+"))
+        return json.loads(added)["prompt"]
+
+    def test_hints_name_new_and_changed_symbols_only(self):
+        self.assertLessEqual({"lib_test.LibTest.test_cli", "lib_test.LibTest.test_fresh", "lib_test.LibTest.test_store",
+                              "lib_test.LibTest.test_strict"}, set(self.task["fail_to_pass"]))
+        self.assertEqual([(i["kind"], i["status"], i["symbol"], i["signature"]) for i in self.task["interface"]], [
+            ("function", "changed", "lib.change", "(a, b=1, *, strict=False)"),
+            ("function", "new", "lib.fresh", "(values, limit=LIMIT)"),
+            ("class", "new", "lib.Ledger", "(Store)"),
+            ("method", "new", "lib.Ledger.add", "(self, amount)"),
+            ("method", "new", "lib.Store.put", "(self, key, value)"),
+            ("name", "new", "lib.LIMIT", ""),
+            ("cli_option", "new", "--dry-run", ""),
+        ])
+        self.assertTrue(all(i["file"] == "lib.py" for i in self.task["interface"]))
+        self.assertEqual(self.task["interface"][2]["fields"], ["total"])
+        from fusion_gym_interface import render
+        text = render(self.task["interface"])
+        self.assertIn("- changed signature: lib.change(a, b=1, *, strict=False)", text)
+        self.assertIn("- new: lib.fresh(values, limit=LIMIT)", text)
+        self.assertIn("- new command-line option: --dry-run (lib.py)", text)
+        # Unchanged symbols, test helpers, bodies, docstrings and test code never appear.
+        for leak in ("keep", "lib.main", "Store.get", "__init__", "build_", "support", "SECRET_", "return", "sorted",
+                     "test_", "lib_test", "assert"):
+            self.assertNotIn(leak, text)
+        self.assertEqual(render([]), "")
+
+    def test_hinted_prompt_keys_and_report_stay_apart_from_unhinted(self):
+        [hinted] = gym.run(self.tasks, ["observer"], self.gym_dir, mode="hidden+hints")["runs"]
+        self.assertEqual((hinted["key"], hinted["mode"], hinted["hinted"], hinted["interface"], hinted["verdict"]),
+                         ("pr-5:observer:hidden+hints", "hidden+hints", True, 7, "solved"))
+        prompt = self.seen_prompt(hinted)
+        self.assertIn("Interface the change must provide", prompt)
+        self.assertIn("lib.fresh(values, limit=LIMIT)", prompt)
+        self.assertIn("tests that are not in this repository will grade the change", prompt)
+        self.assertLess(prompt.index("Interface the change"), prompt.index("Fix this in the repository"))
+        for leak in ("lib_test", "test_fresh", "test/", "SECRET_"):
+            self.assertNotIn(leak, prompt)
+        [plain] = gym.run(self.tasks, ["observer"], self.gym_dir, mode="hidden")["runs"]
+        self.assertEqual((plain["key"], plain["hinted"]), ("pr-5:observer:hidden", False))
+        self.assertNotIn("interface", plain)
+        self.assertNotIn("Interface the change", self.seen_prompt(plain))
+        self.assertEqual(gym.run(self.tasks, ["observer"], self.gym_dir, mode="hidden+hints")["runs"], [])
+        self.assertIn("hidden-hints", hinted["patch"])
+        modes = gym.report(self.gym_dir)["modes"]
+        self.assertEqual(list(modes), ["hidden", "hidden+hints"])
+        self.assertEqual([m["lanes"]["observer"]["attempted"] for m in modes.values()], [1, 1])
+        self.assertIn("interface hints", gym.table(gym.report(self.gym_dir)))
+        audit = json.loads((self.gym_dir / "audit.json").read_text())
+        self.assertEqual(sorted(audit["modes"]), ["hidden", "hidden+hints"])
+        visible = gym.build_spec(self.task, {"agent": "codex"}, mode="visible")["nodes"][0]
+        self.assertNotIn("Interface the change", visible["task"])
+
+    def test_old_tasks_get_hints_lazily_and_the_cli_flag_turns_them_off(self):
+        path = self.tasks / "pr-5.json"
+        task = json.loads(path.read_text())
+        task.pop("interface")
+        path.write_text(json.dumps(task))
+        out = io.StringIO()
+        base = ["--quiet", "gym", "run", str(self.tasks), "--lanes", "observer", "--workspace", str(self.gym_dir)]
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(core.main(base + ["--no-interface-hints"]), 0)
+            self.assertEqual(core.main(base), 0)
+        rows = {row["mode"]: row for row in gym.read_results(self.gym_dir) if row.get("event") == "finished"}
+        self.assertEqual({mode: row["hinted"] for mode, row in rows.items()}, {"hidden": False, "hidden+hints": True})
+        self.assertEqual(rows["hidden+hints"]["interface"], 7)
+        self.assertNotIn("interface", json.loads(path.read_text()))

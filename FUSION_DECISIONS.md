@@ -1039,8 +1039,11 @@ tests pass", not "fix the issue", and produces no negatives. Hidden mode,
 the default, grades like SWE-bench: the worker starts at B with only the
 problem text, and the fix's test files are written in only while the gate
 runs the F2P and P2P checks. Visible mode (`--visible-tests`) is the old
-setup, kept for comparison. The two measure different things: results are
-keyed and reported per mode and never pooled.
+setup, kept for comparison. The default `gym run` mode is `hidden+hints`:
+hidden tests, with the problem text followed by the names and signatures the
+tests call that the fix added or changed (see Interface hints below).
+`--no-interface-hints` runs plain `hidden`. The modes measure different
+things: results are keyed and reported per mode and never pooled.
 
 **Extraction.** For PR N's squash commit C (found by `mergeCommit` from gh,
 else by a `(#N)` subject on `--ref`) with parent B, files under `test/` or
@@ -1165,6 +1168,11 @@ workflow id. Laya trains on them with `orc fusion learn tick --workspace
   not as tampering.
 - Workers are not told which checks will run; a restricted Claude writer
   cannot run tests at all. That is the lane as ORC runs it, not its ceiling.
+- In `hidden+hints` mode, the interface section names the source file and
+  the signature of each new or changed symbol the tests call. That is
+  deliberate: it tells the worker where the change goes and what it must be
+  called, not how it works. A signature's default expressions are shown
+  as written.
 - Prompts come from issues and PR descriptions written after the fact; the
   cut is heuristic and can leave a hint of the fix. The PR title often names
   the desired behavior, and sometimes the test.
@@ -1200,10 +1208,104 @@ at the end of every `gym run`):
   solved in hidden mode, and lists those tasks as possibly underspecified;
 - restores those labels once a lane solves the task from the same prompt;
 - never touches positives or labels from any other source (human, council,
-  lead). The summary is written to `GYMDIR/audit.json`.
+  lead). The summary is written to `GYMDIR/audit.json`: per hidden mode
+  (`hidden`, `hidden+hints`) the solved and unsolved tasks, plus the keys
+  retracted and restored.
+
+Each hidden mode is its own evidence. A task solved with interface hints says
+nothing about whether its bare prompt was enough, so an unhinted negative stays
+withheld until an unhinted lane solves the task, and the other way round.
 
 On 2026-09-25 the first 11 hidden tasks left 5 unsolved by Sonnet 5, Opus 5.5,
 Fable 5.1 and agy alike; their negatives are withheld until a lane solves them.
+
+### Interface hints
+
+**Why.** In the 16-task hidden run of 2026-09-25, 9 tasks were solved by no
+lane. Some fixes introduce a name the hidden tests call and the issue never
+states. #88's tests call `rank_by_outcomes(candidates, explore=False)`. A
+worker given only the issue text cannot guess that keyword, so the task
+measures guessing. SWE-bench Verified removes such tasks by hand, and
+SWE-Gym-style setups give the worker an interface spec instead. The gym now
+does the second, mechanically.
+
+**What is computed.** `fusion_gym_interface.interface_hints` (stdlib `ast`)
+parses the fix's test files at C, which are the hidden fixtures. It collects
+the source-module symbols they reference: `import m` / `import m as a` then
+`a.name` or `a.Class.method`, `from m import name`, `patch.object(m, "name")`
+/ `getattr(m, "name")`, and dotted strings like `"m.name"` in `patch(...)`.
+Each symbol is resolved in its module at B and at C, following
+`from x import y` re-exports up to three hops. A module resolves from the
+repository root or `src/`. A module whose path is a test path (`test/`,
+`tests/`, `test_*.py`, `*_test.py`) is a test helper and is never resolved.
+One hint is emitted per referenced symbol that is new at C or whose
+signature differs between B and C:
+
+- function: `module.name(signature at C)`, new or changed. The signature
+  is the `def` line's arguments: defaults, `*`, keyword-only arguments,
+  `**kwargs`, annotations, the return annotation, and `async`,
+  `@staticmethod`, `@classmethod` and `@property` markers.
+- class: a new class as `module.Name(bases)`, with its annotated
+  class-level field names (dataclass-style constructors). For a referenced
+  class, new or re-signed methods are listed as `module.Class.method(sig)`,
+  but only methods whose name the test file uses as an attribute, plus
+  `__init__` (the tests construct the class by calling it). Methods of
+  classes the tests reach only through return values are not resolved.
+- module-level name (constant or variable): the name only, never its value,
+  and only when new.
+- CLI: an `add_argument("--flag")` or `add_parser("name")` literal that the
+  fix's source adds (absent in the same file at B) and that a test file also
+  contains as a string (for example `main(["--flag"])`). This works by
+  literal matching, not argparse introspection: options built dynamically,
+  new `choices`, or flags that tests reach only through subprocess argv
+  assembled at run time are not detected.
+
+**What is never included**: function or method bodies, docstrings, default
+values defined elsewhere (a default shows only as the expression written in
+the signature), comments, test names, test file paths, test code, and
+test-helper symbols. Symbols whose signature did not change are omitted
+even when the tests call them. Behaviour changes that keep a signature
+(for example #103's `gate_answers` semantics) produce no hint, so the task
+stays as underspecified as its prompt.
+
+**Where it lives.** `gym extract` stores the list as `interface` in the task
+JSON (`kind`, `status` new|changed, `symbol`, `signature`, `file`, and
+`fields` for classes), and `index.json` counts it. Task JSON from before
+hints existed gets them at run time from the source repository (read-only
+`git cat-file`), in memory only, the same way as `ensure_hidden`.
+
+**Prompt.** In `hidden+hints` mode, when the task has hints, the problem text
+is followed by:
+
+```
+Interface the change must provide (the grading tests use these names; signatures as they must read after the change):
+- changed signature: fusion_policy.rank_by_outcomes(candidates, minimum=3, warm_epsilon=None, explore=True)
+```
+
+and then the unchanged hidden brief. `decision_context` stays the problem
+text alone.
+
+**Modes and keys.** `gym run` defaults to `hidden+hints`.
+`--no-interface-hints` runs plain `hidden`, which reproduces unhinted runs,
+and `--visible-tests` is unchanged. Result keys are
+`<task>:<lane>:hidden+hints` vs `<task>:<lane>:hidden`, so `report`, resume
+and the audit never pool them. Rows carry `hinted` (true only when the
+interface section was actually in the prompt) and, in `hidden+hints`, the
+hint count `interface`. A task with no hints still runs under `hidden+hints`
+with `hinted: false`, so the mode's task set stays complete; its prompt is
+the same as `hidden`. Both hidden modes share the task's B repository.
+Worktrees go to `lanes-hints/` and evidence to
+`results/<task>/hidden-hints/<lane>/`, and workflow ids carry `hh-`.
+
+**Hints on the real tasks (2026-09-25, read-only).** pr-88:
+`rank_by_outcomes(..., explore=True)` changed. The `exploration` helper #88
+added gets no hint because the hidden tests never call it. pr-79: new
+`fusion_learn_cli.rotate_learn_log(log_path, max_size_bytes=5 * 1024 * 1024)`.
+pr-72: new `fusion_truffle_survey.SURVEY_ID_ENV`. pr-89: three new names and
+one changed signature in `fusion_decisions`. pr-105: three new `fusion_core`
+functions. pr-103, pr-87, pr-98, pr-60, pr-71 and pr-81 get none, because
+their tests call only existing, unchanged signatures. Those tasks are
+underspecified in behaviour, not in interface, and hints do not help them.
 
 ## Run the loop without the UI
 

@@ -7,13 +7,16 @@ and pass on C, PASS_TO_PASS the other tests in those files that pass on both.
 The task commit is written to `refs/gym/tasks/pr-N` and B to
 `refs/gym/bases/pr-N` in the source repository; nothing else there changes
 (trees are materialized with `git archive`). The task also carries a hidden
-form: C's test files, as fixtures.
+form: C's test files, as fixtures; and `interface`, the names and signatures
+those tests call that the fix added or changed (fusion_gym_interface).
 
 `run` gives each task to each lane in its own git worktree of a per-task
 repository under the gym directory. In the default hidden mode that
 repository holds only B and its history, the worker gets only the problem
 text, and C's test files are acceptance fixtures the coordinator writes into
-the tree only while the checks run (SWE-bench style). In visible mode
+the tree only while the checks run (SWE-bench style). hidden+hints (the CLI
+default; `--no-interface-hints` for plain hidden) adds the task's interface
+to the prompt, so tests that call a new name are not unguessable. In visible mode
 (`--visible-tests`) it holds the task commit, tests included. Neither holds
 C. The worker runs as an authored single-node workflow whose acceptance
 checks are the F2P and P2P commands with `acceptance.before: true`, so the
@@ -48,7 +51,8 @@ REF_PREFIX = "refs/gym/tasks/"
 BASE_REF_PREFIX = "refs/gym/bases/"
 TASK_REF = "refs/gym/task"
 BASE_REF = "refs/gym/base"
-MODES = ("hidden", "visible")
+MODES = ("hidden", "hidden+hints", "visible")
+HIDDEN_MODES = ("hidden", "hidden+hints")
 DEFAULT_TIMEOUT = 900
 DEFAULT_P2P_LIMIT = 200
 TEST_DIRS = {"test", "tests"}
@@ -372,6 +376,37 @@ def ensure_hidden(task):
     return task["hidden"]
 
 
+def _reader(repo):
+    def read(rev, path):
+        proc = subprocess.run(["git", "-c", "core.fsmonitor=false", "cat-file", "blob", f"{rev}:{path}"], cwd=repo,
+                              capture_output=True, stdin=subprocess.DEVNULL)
+        return None if proc.returncode else proc.stdout.decode("utf-8", "replace")
+    return read
+
+
+def interface_for(repo, base, fix, test_paths, source_paths):
+    """Names and signatures the fix's tests call that are new or changed at C
+    (see fusion_gym_interface); never bodies, docstrings or test code."""
+    from fusion_gym_interface import interface_hints
+    read = _reader(repo)
+    tests = [path for path in test_paths if path.endswith(".py") and read(fix, path) is not None]
+    return interface_hints(read, base, fix, tests, source_paths)
+
+
+def ensure_interface(task):
+    """Tasks extracted before interface hints existed get them from the source
+    repository (read-only), in memory only, like the hidden form."""
+    if isinstance(task.get("interface"), list):
+        return task["interface"]
+    try:
+        task["interface"] = interface_for(Path(task["repo_path"]), task["base"], task["fix"],
+                                          task.get("test_files") or [], task.get("source_files") or [])
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"{task['id']}: cannot derive interface hints from {task['repo_path']} ({exc}); "
+                         "re-extract the task or run with --no-interface-hints") from exc
+    return task["interface"]
+
+
 def extract_one(repo, pr, ref="HEAD", gh_repo=None, use_gh=True, timeout=DEFAULT_TIMEOUT, p2p_limit=DEFAULT_P2P_LIMIT):
     """One task dict, or {"pr": N, "skipped": reason}."""
     repo = Path(repo).resolve()
@@ -424,7 +459,9 @@ def extract_one(repo, pr, ref="HEAD", gh_repo=None, use_gh=True, timeout=DEFAULT
     prompt, source = task_prompt(info, git(repo, "log", "-1", "--format=%s", fix).strip())
     task_id = f"pr-{int(pr)}"
     git(repo, "update-ref", REF_PREFIX + task_id, task_sha)
-    hidden = hidden_form(repo, task_id, base, fix, [path for status, path in tests if not status.startswith("D")])
+    kept_tests = [path for status, path in tests if not status.startswith("D")]
+    hidden = hidden_form(repo, task_id, base, fix, kept_tests)
+    interface = interface_for(repo, base, fix, kept_tests, sources)
     return {
         "schema": TASK_SCHEMA, "id": task_id, "pr": int(pr), "pr_url": info.get("url"),
         "issues": [issue.get("url") for issue in info.get("issues") or []],
@@ -434,6 +471,7 @@ def extract_one(repo, pr, ref="HEAD", gh_repo=None, use_gh=True, timeout=DEFAULT
         "checks": {"fail_to_pass": [argv for argv, _ in f2p_checks], "pass_to_pass": [argv for argv, _ in p2p_checks]},
         **({"pass_to_pass_dropped": dropped} if dropped else {}),
         "test_files": sorted(path for _, path in tests), "source_files": sources, "hidden": hidden,
+        "interface": interface,
         "extracted_at_ms": int(time.time() * 1000),
     }
 
@@ -452,7 +490,8 @@ def extract(repo, prs, out=None, ref="HEAD", gh_repo=None, use_gh=True, timeout=
         rows.append(task)
     summary = {"repo": str(Path(repo).resolve()), "ref": ref, "tasks": [
         {"id": t["id"], "pr": t["pr"], "fail_to_pass": len(t["fail_to_pass"]), "pass_to_pass": len(t["pass_to_pass"]),
-         "prompt_source": t["prompt_source"]} for t in rows if "schema" in t],
+         "prompt_source": t["prompt_source"], "interface": len(t.get("interface") or [])}
+        for t in rows if "schema" in t],
         "skipped": [{"pr": t["pr"], "reason": t["skipped"]} for t in rows if "skipped" in t]}
     if out:
         (Path(out) / "index.json").write_text(json.dumps(summary, indent=2) + "\n")
@@ -500,17 +539,26 @@ HIDDEN_BRIEF = ("\n\nFix this in the repository. Keep the change scoped to the p
 VISIBLE_BRIEF = "\n\nFix this in the repository. Keep the change scoped to the problem above."
 
 
+def interface_section(task, mode):
+    """The prompt's interface section: only in hidden+hints mode, only when
+    the task has hints."""
+    from fusion_gym_interface import render
+    return render(task.get("interface") or []) if mode == "hidden+hints" else ""
+
+
 def build_spec(task, lane, budget_remaining=None, mode="visible", fixtures=None):
-    """One write node. Hidden mode: the brief says hidden tests grade the work
+    """One write node. Hidden modes: the brief says hidden tests grade the work
     but names none; `fixtures` ({path, from_file}) put them in place only
-    while the checks run."""
+    while the checks run. hidden+hints adds the interface the tests call
+    (names and signatures) after the problem text."""
     checks = task["checks"]["fail_to_pass"] + task["checks"]["pass_to_pass"]
     acceptance = {"checks": checks, "before": True, "required_handoff": ["summary"],
                   "fail_to_pass": list(task["checks"]["fail_to_pass"])}
-    if mode == "hidden":
+    hidden = mode in HIDDEN_MODES
+    if hidden:
         acceptance["fixtures"] = fixtures or []
     node = {"id": "implement", "role": "implementation", "agent": lane["agent"], "write": True,
-            "task": task["prompt"] + (HIDDEN_BRIEF if mode == "hidden" else VISIBLE_BRIEF),
+            "task": task["prompt"] + interface_section(task, mode) + (HIDDEN_BRIEF if hidden else VISIBLE_BRIEF),
             "decision_context": task["prompt"], "acceptance": acceptance}
     for key in ("route", "model", "reasoning_effort"):
         if lane.get(key):
@@ -576,15 +624,23 @@ def prepare_gym(gym, source_repo=None):
 
 
 def task_root(gym, task, mode):
+    """Both hidden modes start from B and share its repository."""
     root = Path(gym) / "tasks" / task["id"]
-    return root / "hidden" if mode == "hidden" else root
+    return root / "hidden" if mode in HIDDEN_MODES else root
+
+
+WORKFLOW_TAGS = {"hidden": "h-", "hidden+hints": "hh-"}
+
+
+def mode_dir(mode):
+    return {"hidden": "hidden", "hidden+hints": "hidden-hints"}.get(mode, "")
 
 
 def task_repo(gym, task, mode="visible"):
     """A repository holding only the commit the worker starts from and its
     history: the task commit (visible) or B (hidden), never the fix. Hidden
     runs use their own repository, so the task commit's tests are not in it."""
-    if mode == "hidden":
+    if mode in HIDDEN_MODES:
         source_ref, sha, local = task["hidden"]["base_ref"], task["hidden"]["base_sha"], BASE_REF
     else:
         source_ref, sha, local = task["task_ref"], task["task_sha"], TASK_REF
@@ -649,7 +705,7 @@ def summarize(task, lane_name, lane, outcome, diff_files, wall_ms, mode="visible
     p2p_regressed = any(r.get("status") == "failed" for r in p2p)
     baseline_ok = (all((r.get("before") or {}).get("status") == "failed" for r in f2p)
                    and all((r.get("before") or {}).get("status") == "passed" for r in p2p))
-    if mode == "hidden":
+    if mode in HIDDEN_MODES:
         # The fixtures overwrite the hidden test paths for every check run, so
         # a worker cannot grade itself there; its edits are only recorded.
         hidden_paths = {fixture["path"] for fixture in task["hidden"]["fixtures"]}
@@ -676,10 +732,12 @@ def summarize(task, lane_name, lane, outcome, diff_files, wall_ms, mode="visible
         verdict, completed = "unsolved", True
     return {"schema": RESULT_SCHEMA, "event": "finished", "key": result_key(task["id"], lane_name, mode),
             "task": task["id"], "mode": mode, "lane": lane_name, "lane_spec": lane,
+            "hinted": bool(interface_section(task, mode)),
+            **({"interface": len(task.get("interface") or [])} if mode == "hidden+hints" else {}),
             "workflow_id": outcome.get("workflow_id"), "status": status,
             "verdict": verdict, "completed": completed, "f2p_passed": f2p_passed, "p2p_regressed": p2p_regressed,
             "baseline_ok": baseline_ok, "tampered": tampered, "changed": diff_files,
-            **({"touched_fixtures": touched_fixtures, "worker_tests": worker_tests} if mode == "hidden" else {}),
+            **({"touched_fixtures": touched_fixtures, "worker_tests": worker_tests} if mode in HIDDEN_MODES else {}),
             "worker": {"status": result.get("status"), "agent": result.get("agent"), "route": result.get("route"),
                        "model": result.get("model"), "run_id": result.get("run_id")},
             "gate_label": result.get("gate_label"), "cost_usd": float(outcome.get("spent_usd") or 0),
@@ -715,21 +773,23 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
             if max_tasks is not None and processed >= max_tasks:
                 break
             processed += 1
-            if mode == "hidden":
+            if mode in HIDDEN_MODES:
                 ensure_hidden(task)
-            start_sha = task["hidden"]["base_sha"] if mode == "hidden" else task["task_sha"]
+            if mode == "hidden+hints":
+                ensure_interface(task)
+            start_sha = task["hidden"]["base_sha"] if mode in HIDDEN_MODES else task["task_sha"]
             repo = task_repo(gym, task, mode)
             for name in pending:
                 if budget_usd is not None and spent >= budget_usd:
                     return {"status": "budget_reached", "spent_usd": spent, "runs": finished}
                 lane = resolved[name]
                 key = result_key(task["id"], name, mode)
-                workflow_id = f"gym-{task['id']}-{'h-' if mode == 'hidden' else ''}{_slug(name)}-{uuid.uuid4().hex[:8]}"
-                worktree = task_root(gym, task, mode) / "lanes" / _slug(name)
+                workflow_id = f"gym-{task['id']}-{WORKFLOW_TAGS.get(mode, '')}{_slug(name)}-{uuid.uuid4().hex[:8]}"
+                worktree = task_root(gym, task, mode) / ("lanes-hints" if mode == "hidden+hints" else "lanes") / _slug(name)
                 _remove_worktree(repo, worktree)
                 worktree.parent.mkdir(parents=True, exist_ok=True)
                 git(repo, "worktree", "add", "-q", "--detach", str(worktree), start_sha)
-                if mode != "hidden":
+                if mode not in HIDDEN_MODES:
                     # Hidden runs keep no link: the gym's .fusion holds the manifest
                     # (hidden test ids) and before-run output (test names), and
                     # workflow state already goes to the control workspace (#81).
@@ -737,7 +797,7 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
                 _append(gym, {"schema": RESULT_SCHEMA, "event": "started", "key": key, "mode": mode,
                               "workflow_id": workflow_id, "started_at_ms": int(time.time() * 1000)})
                 # Hidden test files live outside the gym only for this run.
-                fixture_dir = Path(tempfile.mkdtemp(prefix="fusion-gym-fixtures-")) if mode == "hidden" else None
+                fixture_dir = Path(tempfile.mkdtemp(prefix="fusion-gym-fixtures-")) if mode in HIDDEN_MODES else None
                 started = time.monotonic()
                 try:
                     fixtures = write_fixtures(task, fixture_dir) if fixture_dir else None
@@ -761,7 +821,7 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
                 row["gate_label"] = withdraw_untrusted_label(gym, row)
                 if outcome.get("error"):
                     row["error"] = outcome["error"]
-                evidence = gym / "results" / task["id"] / ("hidden" if mode == "hidden" else "") / _slug(name)
+                evidence = gym / "results" / task["id"] / mode_dir(mode) / _slug(name)
                 evidence.mkdir(parents=True, exist_ok=True)
                 (evidence / f"{workflow_id}.patch").write_bytes(patch)
                 row["patch"] = str(evidence / f"{workflow_id}.patch")
@@ -784,34 +844,43 @@ def audit(gym):
     the task from the same prompt. Until one has, a task's failed_task=true
     gate labels are retracted (append-only) and the task is flagged; once a
     lane solves it, labels this audit retracted are restored. Positives and
-    labels from any other source are never touched."""
+    labels from any other source are never touched. Each hidden mode is its
+    own evidence: a task solved with interface hints says nothing about
+    whether its bare prompt was enough, and vice versa."""
     from fusion_decisions import DecisionStore, label_provenance, read_jsonl, reviewed_labels
     store = DecisionStore(gym)
     latest = {}
     for row in read_results(gym):
-        if row.get("event") == "finished" and row.get("mode") == "hidden" and row.get("completed"):
+        if row.get("event") == "finished" and row.get("mode") in HIDDEN_MODES and row.get("completed"):
             latest[row["key"]] = row
-    solved = {row["task"] for row in latest.values() if row.get("verdict") == "solved"}
+    solved = {(row["mode"], row["task"]) for row in latest.values() if row.get("verdict") == "solved"}
     events = read_jsonl(store.path)
     answers, _ = reviewed_labels(events)
     sources = label_provenance(events)
     audited = {e["id"] for e in events if e.get("event") == "label" and str(e.get("evidence", "")).startswith(AUDIT_EVIDENCE)}
-    retracted, restored, flagged = [], [], sorted({row["task"] for row in latest.values()} - solved)
+    retracted, restored = [], []
     for row in latest.values():
         decision = (row.get("gate_label") or {}).get("decision_id") or (row.get("gate_label") or {}).get("id")
         if not decision:
             continue
         current = answers.get(decision, {}).get("failed_task")
         source = (sources.get(decision, {}).get("failed_task") or {}).get("source")
-        if row["task"] not in solved and current == "true" and source == "structural_gate":
+        solvable = (row["mode"], row["task"]) in solved
+        if not solvable and current == "true" and source == "structural_gate":
             store.append("label", id=decision, answers={}, verified=True, replace=True, source="structural_gate",
-                         evidence=f"{AUDIT_EVIDENCE} ({row['key']}); its hidden tests may expect what the prompt never states.")
+                         evidence=f"{AUDIT_EVIDENCE} in mode {row['mode']} ({row['key']}); its hidden tests may expect what the prompt never states.")
             retracted.append(row["key"])
-        elif row["task"] in solved and decision in audited and current is None and row.get("verdict") == "unsolved":
+        elif solvable and decision in audited and current is None and row.get("verdict") == "unsolved":
             store.append("label", id=decision, answers={"failed_task": "true"}, verified=True, replace=False,
-                         source="structural_gate", evidence=f"Restored: a lane solved {row['task']} from the same prompt.")
+                         source="structural_gate", evidence=f"Restored: a lane solved {row['task']} from the same prompt ({row['mode']}).")
             restored.append(row["key"])
-    summary = {"solved_tasks": sorted(solved), "unsolved_tasks": flagged, "retracted": retracted, "restored": restored}
+    modes = {}
+    for mode in HIDDEN_MODES:
+        attempted = {row["task"] for row in latest.values() if row["mode"] == mode}
+        if attempted:
+            done = {task for kind, task in solved if kind == mode}
+            modes[mode] = {"solved_tasks": sorted(done), "unsolved_tasks": sorted(attempted - done)}
+    summary = {"modes": modes, "retracted": retracted, "restored": restored}
     (Path(gym) / "audit.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     return summary
 
@@ -866,6 +935,7 @@ def report(gym):
 
 
 MODE_TITLES = {"hidden": "hidden tests (worker sees only the problem text)",
+               "hidden+hints": "hidden tests + interface hints (problem text plus the names and signatures the tests call)",
                "visible": "visible tests (the fix's tests are in the worker's tree)"}
 
 
@@ -919,6 +989,9 @@ def add_parser(sub):
     run_cmd.add_argument("--keep-worktrees", action="store_true", help="keep each lane's worktree after its run")
     run_cmd.add_argument("--visible-tests", action="store_true",
                          help="old mode: the fix's tests are in the worker's tree (default: hidden, graded by fixtures)")
+    run_cmd.add_argument("--no-interface-hints", action="store_true",
+                         help="hidden mode without the interface section (names and signatures the tests call); "
+                              "results are keyed as mode hidden, hinted runs as hidden+hints")
     report_cmd = commands.add_parser("report", help="per-lane and per-task results of a gym directory")
     report_cmd.add_argument("gym_dir")
     audit_cmd = commands.add_parser("audit", help="retract negatives from tasks no lane has solved; restore them once one does")
@@ -936,7 +1009,7 @@ def command(args, workspace, as_json=False, out=None):
         if args.max_tasks is not None and args.max_tasks < 1:
             raise ValueError("--max-tasks must be at least 1")
         result = run(args.tasks, args.lanes, args.gym_workspace, args.max_tasks, args.budget_usd, args.keep_worktrees,
-                     mode="visible" if args.visible_tests else "hidden")
+                     mode="visible" if args.visible_tests else "hidden" if args.no_interface_hints else "hidden+hints")
         print(json.dumps(result, indent=2) if as_json else
               f"{result['status']}: {len(result['runs'])} runs, ${result['spent_usd']:.2f}\n" + table(report(args.gym_workspace)),
               file=out)
