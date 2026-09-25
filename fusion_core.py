@@ -444,6 +444,37 @@ def normalized_usage(usage: Any) -> dict[str, float]:
     return output
 
 
+def cache_read_ratio(usage: Any) -> float | None:
+    """Share of prompt tokens served from cache. Anthropic-style usage reports
+    cache reads beside input_tokens; OpenAI-style cached_input_tokens is
+    already inside input_tokens."""
+    usage = normalized_usage(usage)
+    write = usage.get("cache_creation_input_tokens", 0.0)
+    if "cache_read_input_tokens" in usage:
+        read = usage["cache_read_input_tokens"]
+        total = usage.get("input_tokens", 0.0) + read + write
+    elif "cached_input_tokens" in usage:
+        read = usage["cached_input_tokens"]
+        total = max(usage.get("input_tokens", 0.0), read + write)
+    else:
+        return None
+    return round(read / total, 4) if total > 0 else None
+
+
+def cache_settings(config: dict[str, Any]) -> dict[str, Any]:
+    cache = config.get("cache") or {}
+    ttl = cache.get("ttl_seconds", 300)
+    if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or ttl <= 0:
+        raise ValueError("cache.ttl_seconds must be a positive number")
+    cold = cache.get("cold_resume", "resume")
+    if cold not in {"resume", "fresh"}:
+        raise ValueError("cache.cold_resume must be resume or fresh")
+    epsilon = cache.get("warm_epsilon", 0.05)
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)) or not 0 <= epsilon < 1:
+        raise ValueError("cache.warm_epsilon must be a number in [0, 1)")
+    return {"configured": "cache" in config, "ttl_seconds": ttl, "cold_resume": cold, "warm_epsilon": epsilon}
+
+
 def usage_summary(spans: list[dict[str, Any]]) -> dict[str, Any]:
     fields = (
         "input_tokens",
@@ -733,6 +764,7 @@ class RunStore:
         self.root = workspace / ".fusion"
         self.runs = self.root / "runs"
         self.sessions_path = self.root / "sessions.json"
+        self.session_use_path = self.root / "session_use.json"
         self.traces_path = self.root / "traces.jsonl"
 
     def create(self, task: dict[str, Any]) -> Path:
@@ -785,6 +817,11 @@ class RunStore:
             "write": task.get("write", False),
             "execution_choice": result.get("execution_choice"),
             "usage": result.get("usage") or {},
+            "session_key": task.get("session_key"),
+            "resumed": bool(result.get("resumed")),
+            "session_idle_s": result.get("session_idle_s"),
+            **({"resume_skipped": result["resume_skipped"]} if result.get("resume_skipped") else {}),
+            "cache_read_ratio": cache_read_ratio(result.get("usage")),
             "changed": result.get("changed", []),
             "tests": result.get("tests", []),
             "blockers": result.get("blockers", []),
@@ -831,17 +868,35 @@ class RunStore:
             return {}
         return value if isinstance(value, dict) else {}
 
-    def set_session(self, key: str, session_id: str) -> None:
+    def _update_json(self, path: Path, key: str, value: Any) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         lock_path = self.root / "sessions.lock"
         with lock_path.open("w", encoding="utf-8") as lock:
             try:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                sessions = self.sessions()
-                sessions[key] = session_id
-                self.write_json(self.sessions_path, sessions)
+                try:
+                    current = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+                except (OSError, json.JSONDecodeError):
+                    current = {}
+                current = current if isinstance(current, dict) else {}
+                current[key] = value
+                self.write_json(path, current)
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def set_session(self, key: str, session_id: str) -> None:
+        self._update_json(self.sessions_path, key, session_id)
+
+    def session_last_used(self, key: str) -> int | None:
+        """End time (ms) of the last worker run under this session key."""
+        try:
+            value = json.loads(self.session_use_path.read_text(encoding="utf-8")).get(key)
+        except (OSError, json.JSONDecodeError, AttributeError):
+            return None
+        return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    def touch_session(self, key: str, ended_at_ms: int) -> None:
+        self._update_json(self.session_use_path, key, ended_at_ms)
 
     def recent(self, limit: int = 20) -> list[dict[str, Any]]:
         if not self.runs.exists():
@@ -1418,9 +1473,17 @@ def dispatch(
     run_dir = run_dir or store.create(task)
     store.event(run_dir, "run.started", {"agent": task["agent"], "write": task["write"]})
     started_at_ms = now_ms()
+    cache = cache_settings(config)
+    last_used = store.session_last_used(task["session_key"])
+    session = {"session_idle_s": round(max(0, started_at_ms - last_used) / 1000, 3) if last_used is not None else None}
     session_id = None
     if task["resume"]:
         session_id = store.sessions().get(task["session_key"])
+        # A resume past the cache TTL re-sends the whole history at write price.
+        if session_id and cache["cold_resume"] == "fresh" and session["session_idle_s"] is not None \
+                and session["session_idle_s"] > cache["ttl_seconds"]:
+            session_id, session["resume_skipped"] = None, "cold"
+    session["resumed"] = bool(session_id)
     argv, env, metadata = agent_command(config, task, session_id)
     metadata["execution_mode"] = execution_mode(config)
     task["resolved"] = metadata
@@ -1443,6 +1506,7 @@ def dispatch(
             "exit_code": 127,
             "duration_ms": 0,
             "usage": {},
+            **session,
             "artifacts": {"run_dir": str(run_dir)},
         }
         store.write_json(run_dir / "result.json", result)
@@ -1472,7 +1536,7 @@ def dispatch(
         with contextlib.ExitStack() as stack:
             with progress.activity(label, "acquiring workspace writer lock" if task["write"] else "preparing read-only worker"):
                 stack.enter_context(writer_lock(Path(task["workspace"]), task["write"]))
-            store.event(run_dir, "worker.started", {"argv": argv, "resumed_session": bool(session_id)})
+            store.event(run_dir, "worker.started", {"argv": argv, "resumed_session": bool(session_id), **session})
             if metadata.get("execution_choice"):
                 metadata["execution_choice"]["dispatch"] = {"status": "attempted", "argv": argv}
                 store.write_json(run_dir / "task.json", task)
@@ -1561,6 +1625,7 @@ def dispatch(
         "exit_code": exit_code,
         "duration_ms": duration_ms,
         "usage": usage,
+        **session,
         "decisions": task.get("decisions", {}),
         "artifacts": {
             "run_dir": str(run_dir),
@@ -1570,9 +1635,11 @@ def dispatch(
             **({"thinking": str(run_dir / "thinking.md")} if (run_dir / "thinking.md").exists() else {}),
         },
     }
+    ended_at_ms = now_ms()
+    store.touch_session(task["session_key"], ended_at_ms)
     store.write_json(run_dir / "result.json", result)
     store.event(run_dir, "run.finished", {"result": result})
-    store.trace_span(config, task, result, started_at_ms, now_ms(), {**metadata, "model": model})
+    store.trace_span(config, task, result, started_at_ms, ended_at_ms, {**metadata, "model": model})
     return result
 
 

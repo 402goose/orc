@@ -569,7 +569,10 @@ in charge of the conversation and the final review, then delegates bounded work
 to Claude Code, Codex, Antigravity or Grok through a shared task contract. Each
 run records its task, JSONL events, stdout, stderr, result, and reusable session
 id under `.fusion/` in the workspace — so every claim in a report has a receipt
-behind it.
+behind it. Trace spans also record the session key, whether the run resumed,
+idle time since that session's last run and the cache-read ratio; an optional
+`cache` config can start fresh instead of cold-resuming and let warm lanes break
+ties in routing (see [Prompt cache and sessions](FUSION_DECISIONS.md#prompt-cache-and-sessions)).
 
 The lead can call the other agent through an MCP server:
 
