@@ -493,10 +493,19 @@ objective codes:
 
 | Gate result | Label |
 | --- | --- |
-| an executed check failed with a test failure and was not `vacuous` | `failed_task=true` |
-| a write node finished without changing the tree (`write_no_change`) | `failed_task=true` |
-| the gate passed and at least one executed check failed before the change and passed after it | `failed_task=false` |
+| the gate passed and a check failed before the change and passed after it (fail→pass) | `failed_task=false` |
+| a check that passed before the change fails after it with a test failure (pass→fail: the change broke what the plan said must pass) | `failed_task=true` |
+| a first attempt finished without changing the tree (`write_no_change`, attempt 1) | `failed_task=true` |
+| a check that failed before and still fails (fail→fail), or whose baseline is unknown | unlabeled |
+| a later attempt that changed nothing (its tree holds earlier attempts' work) | unlabeled |
 | anything else | unlabeled |
+
+This follows SWE-bench's FAIL_TO_PASS / PASS_TO_PASS reading. Fail→fail is
+not evidence because a plan's command can cover a pre-existing failure that
+has nothing to do with the task: on 2026-09-24 a plan checked a whole test
+file with an environment-caused failure, and the earlier rule labeled a
+correct implementation `failed_task=true` twice (those labels were
+retracted).
 
 - `plausible` is never labeled by the gate. It asks whether the *report*
   plausibly matches the task, which no exit code decides.
@@ -510,8 +519,8 @@ objective codes:
   not a test failure and does not label.
 - Laya's veto never enters: the label is computed from the codes alone, so an
   active acceptance head can never label itself.
-- An authored check has no pre-change run, so its failure can label
-  `failed_task=true` but its pass cannot label `false`.
+- An authored check has no pre-change run, so its baseline is unknown and
+  neither its failure nor its pass labels.
 
 The node result in `node.json` and the manifest keeps `gate_codes` (one
 structured code beside each gate problem: `worker_status`, `worker_blockers`, `required_file_missing`,

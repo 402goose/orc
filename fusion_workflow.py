@@ -1043,7 +1043,8 @@ BLOCKERS: unresolved issues, or none
                 else:
                     problem("check_failed", f"acceptance check failed: {label}", **detail)
         if unchanged:
-            problem("write_no_change", "write node finished without changing any file")
+            problem("write_no_change", "write node finished without changing any file",
+                    attempt=int(result.get("attempt") or node.get("attempts") or 1))
         return not problems, problems, codes
 
     def _run_node(self, node_id: str, attempt: int) -> dict[str, Any]:

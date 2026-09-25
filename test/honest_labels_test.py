@@ -116,11 +116,16 @@ class VerificationPolicyTest(unittest.TestCase):
 class GateAnswersTest(unittest.TestCase):
     def test_only_objective_codes_label(self):
         failed = {"code": "check_failed", "vacuous": False, "test_failure": True}
-        self.assertEqual(gate_answers([failed], [])[0], {"failed_task": "true"})
-        self.assertEqual(gate_answers([{**failed, "vacuous": None}], [])[0], {"failed_task": "true"})
-        self.assertIsNone(gate_answers([{**failed, "vacuous": True}], [])[0], "a vacuous check never labels negative")
-        self.assertIsNone(gate_answers([{**failed, "test_failure": False}], [])[0], "a runner error is not a test failure")
+        # Failed before and still fails: possibly a pre-existing failure the plan's
+        # command happens to cover (live, 2026-09-24), so it is no evidence.
+        self.assertIsNone(gate_answers([failed], [])[0])
+        self.assertIsNone(gate_answers([{**failed, "vacuous": None}], [])[0], "unknown baseline is no evidence")
+        # Passed before, fails after: the change broke what the plan said must pass.
+        self.assertEqual(gate_answers([{**failed, "vacuous": True}], [])[0], {"failed_task": "true"})
+        self.assertIsNone(gate_answers([{**failed, "vacuous": True, "test_failure": False}], [])[0], "a runner error is not a test failure")
         self.assertEqual(gate_answers([{"code": "write_no_change"}], [])[0], {"failed_task": "true"})
+        self.assertEqual(gate_answers([{"code": "write_no_change", "attempt": 1}], [])[0], {"failed_task": "true"})
+        self.assertIsNone(gate_answers([{"code": "write_no_change", "attempt": 2}], [])[0], "a retry's tree holds earlier work")
         for code in ("worker_blockers", "required_handoff_empty", "check_error", "required_file_missing"):
             self.assertIsNone(gate_answers([{"code": code}], [{"status": "passed", "vacuous": False}])[0], code)
         self.assertEqual(gate_answers([], [{"status": "passed", "vacuous": False}])[0], {"failed_task": "false"})
@@ -218,27 +223,29 @@ class HonestLabelsTest(unittest.TestCase):
         self.assertEqual(nodes["plan"]["result"]["gate_label"]["status"], "unlabeled")
         self.assertEqual([e["status"] for e in self.events("decision", plan_run) if e["kind"] == "acceptance"], ["unscored", "ok"])
 
-    def test_a_check_still_failing_after_the_change_labels_the_task_failed(self):
+    def test_a_check_failing_before_and_after_the_change_is_no_evidence(self):
         outcome, nodes = self.run_build({"verification": [["python3", "hello_exists.py"]]}, write={"other.py": "x = 1\n"})
         self.assertEqual(outcome["status"], "failed")
         result = nodes["implement"]["result"]
         self.assertIn("acceptance check failed: python3 hello_exists.py", result["blockers"])
         self.assertEqual([code["code"] for code in result["gate_codes"]], ["check_failed"])
-        self.assertEqual(result["gate_label"]["answers"], {"failed_task": "true"})
+        # The gate still rejects, but a check that already failed may cover a
+        # pre-existing failure unrelated to the task, so it labels nothing.
+        self.assertEqual(result["gate_label"]["status"], "unlabeled")
+        self.assertEqual(self.gate_labels(), [])
         [outcome_event] = self.events("outcome", result["run_id"])
         self.assertEqual((outcome_event["accepted"], outcome_event["gate_codes"]), (False, ["check_failed"]))
 
-    def test_a_check_that_already_passed_is_vacuous_and_never_labels(self):
+    def test_a_check_that_already_passed_is_no_positive_but_its_regression_is_negative(self):
         outcome, nodes = self.run_build({"verification": [["python3", "hello_absent.py"]]}, write={"other.py": "x = 1\n"})
         self.assertEqual(outcome["status"], "success", outcome)
         [check] = nodes["implement"]["result"]["acceptance_checks"]
         self.assertTrue(check["vacuous"])
         self.assertEqual(nodes["implement"]["result"]["gate_label"]["status"], "unlabeled")
-        # Passed before, fails after: the gate rejects, but a vacuous check is no negative label.
+        # Passed before, fails after: the change broke what the plan said must pass.
         outcome, nodes = self.run_build({"verification": [["python3", "hello_absent.py"]]}, write={"hello.py": "print(1)\n"})
         self.assertEqual(outcome["status"], "failed")
-        self.assertEqual(nodes["implement"]["result"]["gate_label"]["status"], "unlabeled")
-        self.assertEqual(self.gate_labels(), [])
+        self.assertEqual(nodes["implement"]["result"]["gate_label"]["answers"], {"failed_task": "true"})
 
     def test_a_retry_reuses_the_pre_change_baseline(self):
         outcome, nodes = self.run_build({"verification": [["python3", "hello_exists.py"]]}, attempts=2,
@@ -249,7 +256,8 @@ class HonestLabelsTest(unittest.TestCase):
         self.assertEqual([path.name.split("-")[0] for path in sorted((root / "attempt-1").iterdir())], ["before", "check"])
         self.assertEqual([path.name.split("-")[0] for path in (root / "attempt-2").iterdir()], ["check"])
         answers = [label["answers"] for label in self.gate_labels()]
-        self.assertEqual(answers, [{"failed_task": "true"}, {"failed_task": "false"}])
+        # Attempt 1's check still failed (no evidence); attempt 2 turned it green.
+        self.assertEqual(answers, [{"failed_task": "false"}])
 
     def test_a_write_node_that_changed_nothing_labels_the_task_failed(self):
         outcome, nodes = self.run_build({"verification": []})
