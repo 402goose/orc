@@ -410,8 +410,14 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
     builds (fusion_decisions.acceptance_state) -- without running Laya. The
     run may live in a workflow worktree; `evidence_path` is its result.json. A later verdict replaces an earlier verdict label;
     labels from any other reviewer are preserved.
+
+    An unscored input recorded before acceptance inputs were bounded by
+    tokens may exceed what Laya reads (fusion_decisions.exceeds_token_budget).
+    It is no longer labelable; a new verdict retracts the verdict labels on
+    it and labels a freshly built input instead.
     """
-    from fusion_decisions import ACCEPTANCE_QUESTIONS, DecisionEngine, acceptance_state, config_for, reviewed_labels, state_cap
+    from fusion_decisions import (ACCEPTANCE_QUESTIONS, DecisionEngine, acceptance_state, config_for,
+                                  exceeds_token_budget, over_token_budget, reviewed_labels, state_cap)
     options = config_for(config)
     if not options["verdict_labels"] or options["mode"] == "off":
         return {"status": "disabled", "reason": "decisions.mode is off" if options["verdict_labels"] else "decisions.verdict_labels is false"}
@@ -421,6 +427,13 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
         events = read_jsonl(store.path)
         decisions = [e for e in events if e.get("event") == "decision" and e.get("kind") == "acceptance"
                      and e.get("context", {}).get("task_id") == run_id]
+        for stale in (e for e in decisions if exceeds_token_budget(e)):
+            labels = [e for e in events if e.get("id") == stale["id"] and e.get("event") == "label" and e.get("verified")]
+            if reviewed_labels(labels)[0].get(stale["id"]) and all(e.get("source") == VERDICT_SOURCE for e in labels):
+                store.append("label", id=stale["id"], answers={}, verified=True, replace=True, source=VERDICT_SOURCE,
+                             evidence=f"Retracted: this input of run {run_id} exceeds the tokens Laya reads beside the "
+                                      "acceptance questions; the latest lead verdict labels a bounded input instead.",
+                             reviewers=[{"agent": "lead", "run_id": run_id, "accepted": bool(accepted)}])
         record = next((e for e in reversed(decisions) if labelable_record(e)), None)
         own = [e for e in events if record and e.get("id") == record["id"]]
         if any(e.get("event") == "label" and e.get("verified") and e.get("source") != VERDICT_SOURCE for e in own):
@@ -438,7 +451,8 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
                 return {"status": "retracted", "decision_id": record["id"], "reason": f"Earlier verdict label removed: {skip}"}
             return {"status": "skipped", "reason": f"No label: {skip}"}
         if record is None:
-            gate = next((e for e in reversed(decisions) if e.get("state") and not e.get("truncated")), None)
+            gate = next((e for e in reversed(decisions) if e.get("state") and not e.get("truncated")
+                         and not over_token_budget("acceptance", e["state"])), None)
             engine = DecisionEngine(workspace, config)
             if gate:
                 record = engine.record_unscored("acceptance", None, gate["questions"], gate.get("context"),
@@ -450,8 +464,8 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
                                                 {"task_id": run_id, "group": group}, source=VERDICT_SOURCE)
             if record["truncated"]:
                 return {"status": "skipped", "decision_id": record["id"],
-                        "reason": "No label: the task does not fit the acceptance input whole beside a summary excerpt; "
-                                  "raise decisions.max_state_chars (at most 6000) to label long briefs"}
+                        "reason": "No label: the task does not fit the acceptance input whole beside a summary excerpt "
+                                  "within the tokens Laya reads; long briefs stay unlabeled"}
         answers = {key: value for key, value in verdict_answers(accepted).items() if key in record["questions"]}
         if not answers:
             return {"status": "skipped", "decision_id": record["id"], "reason": "No label: this decision asks none of the questions a verdict answers"}
