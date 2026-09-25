@@ -470,3 +470,38 @@ class WithdrawUntrustedLabelTest(unittest.TestCase):
             self.assertEqual(kept, labeled)
             retractions = [e for e in read_jsonl(DecisionStore(root).path) if e.get("event") == "label"]
             self.assertEqual([(e["answers"], e["replace"], e["source"]) for e in retractions], [({}, True, "structural_gate")] * 2)
+
+
+class SolvabilityAuditTest(unittest.TestCase):
+    def test_negatives_count_only_for_tasks_some_lane_solved(self):
+        from fusion_decisions import DecisionStore, read_jsonl, reviewed_labels
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = DecisionStore(root)
+            def row(task, lane, verdict, decision):
+                return {"event": "finished", "mode": "hidden", "completed": True, "key": f"{task}:{lane}:hidden",
+                        "task": task, "lane": lane, "verdict": verdict,
+                        "gate_label": {"status": "labeled", "decision_id": decision}}
+            rows = [row("pr-1", "a", "solved", "d1"), row("pr-1", "b", "unsolved", "d2"),
+                    row("pr-2", "a", "unsolved", "d3"), row("pr-2", "b", "unsolved", "d4")]
+            (root / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+            store.append("label", id="d1", answers={"failed_task": "false"}, verified=True, replace=False, source="structural_gate")
+            for d in ("d2", "d3", "d4"):
+                store.append("label", id=d, answers={"failed_task": "true"}, verified=True, replace=False, source="structural_gate")
+            store.append("label", id="d4", answers={"failed_task": "true"}, verified=True, replace=True, source="lead_verdict")
+            summary = gym.audit(root)
+            self.assertEqual((summary["solved_tasks"], summary["unsolved_tasks"]), (["pr-1"], ["pr-2"]))
+            answers, _ = reviewed_labels(read_jsonl(store.path))
+            # Solvable task keeps its negative; an unsolved task's gate negative is withdrawn;
+            # a lead's own verdict is never touched.
+            self.assertEqual(answers["d2"], {"failed_task": "true"})
+            self.assertFalse(answers.get("d3"))
+            self.assertEqual(answers["d4"], {"failed_task": "true"})
+            self.assertEqual(summary["retracted"], ["pr-2:a:hidden"])
+            self.assertEqual(gym.audit(root)["retracted"], [], "idempotent")
+            # Once a lane solves pr-2, the audited negative comes back.
+            rows[2:] = [row("pr-2", "a", "unsolved", "d3"), row("pr-2", "c", "solved", "d5")]
+            (root / "results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+            self.assertEqual(gym.audit(root)["restored"], ["pr-2:a:hidden"])
+            answers, _ = reviewed_labels(read_jsonl(store.path))
+            self.assertEqual(answers["d3"], {"failed_task": "true"})
