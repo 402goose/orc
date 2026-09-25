@@ -538,6 +538,11 @@ def gate_answers(codes, receipts):
     for code in codes:
         if code.get("code") == "check_failed" and code.get("vacuous") is True and code.get("test_failure"):
             return {"failed_task": "true"}, "a check that passed before the change fails after it"
+        if (code.get("code") == "check_failed" and code.get("vacuous") is False and code.get("targeted")
+                and code.get("test_failure")):
+            # Declared FAIL_TO_PASS: verified to fail before a reference fix and pass
+            # after it (the gym), so still failing means the task was not done.
+            return {"failed_task": "true"}, "a targeted FAIL_TO_PASS check still fails after the change"
         if code.get("code") == "write_no_change" and int(code.get("attempt") or 1) == 1:
             return {"failed_task": "true"}, "the first attempt finished without changing any file"
     if codes:

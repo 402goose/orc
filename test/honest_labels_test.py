@@ -120,6 +120,9 @@ class GateAnswersTest(unittest.TestCase):
         # command happens to cover (live, 2026-09-24), so it is no evidence.
         self.assertIsNone(gate_answers([failed], [])[0])
         self.assertIsNone(gate_answers([{**failed, "vacuous": None}], [])[0], "unknown baseline is no evidence")
+        # A declared FAIL_TO_PASS check (verified against a reference fix) still failing is.
+        self.assertEqual(gate_answers([{**failed, "targeted": True}], [])[0], {"failed_task": "true"})
+        self.assertIsNone(gate_answers([{**failed, "targeted": True, "vacuous": None}], [])[0])
         # Passed before, fails after: the change broke what the plan said must pass.
         self.assertEqual(gate_answers([{**failed, "vacuous": True}], [])[0], {"failed_task": "true"})
         self.assertIsNone(gate_answers([{**failed, "vacuous": True, "test_failure": False}], [])[0], "a runner error is not a test failure")
