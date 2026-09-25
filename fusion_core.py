@@ -285,7 +285,15 @@ def parse_handoff(text: str) -> dict[str, Any]:
             # provider denials and coordinator checks remain separate evidence.
             # Filename punctuation (none.py, nil-cache.json) is not a boundary.
             lead = re.split(r"[.;:,—-](?:\s+|$)", first, maxsplit=1)[0].strip().lower()
-            explanation = first[len(lead):].lstrip(".;:,—- \t") if lead in NONE_ANSWERS else ""
+            # "none for this node's scope" is still none; the qualifier scopes it.
+            scoped = re.match(r"(none|nothing|n/a|nil)\s+(?:for|in|within|on|at|outside)\b", lead)
+            explanation = first[len(lead):].lstrip(".;:,—- \t") if lead in NONE_ANSWERS or scoped else ""
+            if scoped:
+                lead = scoped[1]
+            # A sentence the worker explicitly marks as not blocking is a note,
+            # even when it mentions failures elsewhere; every other sentence counts.
+            explanation = " ".join(sentence for sentence in re.split(r"(?<=[.!?])\s+", explanation)
+                                   if not re.search(r"\bnot\s+(?:a\s+|an\s+)?block(?:er|ing)\b|\bnon-?blocking\b", sentence, re.I))
             benign_explanation = (
                 not explanation
                 or not re.search(

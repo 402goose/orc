@@ -118,6 +118,20 @@ none
         inline = core.parse_handoff("STATUS: success\nSUMMARY: Mentions **STATUS:** error inline\nBLOCKERS: none")
         self.assertEqual(inline["reported_status"], "success")
 
+    def test_scoped_none_and_explicit_non_blocking_notes(self):
+        # Actual implement handoff from truffle run 20260924-175138-wf-886f4e67
+        # (#46): rejected twice as a blocker, costing a paid retry.
+        observed = ("none for this node's scope. Note (not a blocker): `test/ui_test.py` has pre-existing "
+                    "live-worker-dependent failures in this sandbox unrelated to this fix; worth flagging to a "
+                    "human if CI shows the same.")
+        self.assertEqual(core.parse_handoff("BLOCKERS: " + observed)["blockers"], [])
+        self.assertEqual(core.parse_handoff("BLOCKERS: none for this change")["blockers"], [])
+        for blocker in ("none. The flaky UI test is not a blocker. However the migration still fails.",
+                        "none of the tests pass",
+                        "none for this node. The deploy still requires approval."):
+            with self.subTest(blocker=blocker):
+                self.assertTrue(core.parse_handoff("BLOCKERS: " + blocker)["blockers"])
+
     def test_fenced_handoff_and_separate_acceptance_contract(self):
         parsed = core.parse_handoff("""```text
 STATUS: success
