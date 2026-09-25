@@ -734,6 +734,41 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False,
         self.assertEqual(result["status"], "error")
         self.assertIn("worker returned an empty answer", result["blockers"])
 
+    def test_reasoning_only_answer_is_saved_as_evidence_but_stays_an_error(self):
+        # Observed live: cohere/north-mini-code:free on orc-free put its reply in
+        # a thinking block. A STATUS inside reasoning is a draft, not a report.
+        state = self.workspace / "claude-state"
+        transcript = state / "projects" / "repo" / "reasoner.jsonl"
+        transcript.parent.mkdir(parents=True)
+        turns = [{"message": {"role": "user", "content": "earlier task"}},
+                 {"message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "an older turn"}]}},
+                 {"message": {"role": "user", "content": "do it"}},
+                 {"message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "Plan: read calc.py"},
+                                                                {"type": "tool_use", "id": "t", "name": "Read", "input": {}}]}},
+                 {"message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x"}]}},
+                 {"message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "STATUS: success\nBLOCKERS: none"}]}}]
+        transcript.write_text("\n".join(json.dumps(t) for t in turns) + "\n")
+        claude = self.write_agent(
+            "claude-reasoner",
+            """
+import json
+print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'session_id': 'reasoner', 'result': ''}))
+""",
+        )
+        self.config(claude=claude)
+        output = io.StringIO()
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(state)}), contextlib.redirect_stdout(output):
+            self.assertEqual(fusion_core.main(["--workspace", str(self.workspace), "--json", "delegate",
+                                               "--agent", "claude", "--read-only", "do it"]), 1)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["status"], "error")
+        self.assertIn("thinking.md as evidence, not a handoff", " ".join(result["blockers"]))
+        saved = Path(result["artifacts"]["thinking"]).read_text()
+        self.assertIn("Plan: read calc.py", saved)
+        self.assertIn("STATUS: success", saved)
+        self.assertNotIn("an older turn", saved)
+        self.assertNotIn("answer", result["artifacts"])
+
     def test_claude_permission_denials_fall_back_to_raw_entry_when_unrecognized(self):
         claude = self.write_agent(
             "claude-denied-unknown-shape",

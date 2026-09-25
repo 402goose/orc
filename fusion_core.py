@@ -550,6 +550,8 @@ def worker_availability(config: dict[str, Any], agent: str) -> dict[str, Any]:
              "reason": "Installed; account availability is checked during execution" if available else "Not on PATH"}
     if available and execution_mode(config) == "yolo":
         state.update(automatic_ready=True, reason="YOLO: runtime permission prompts and sandbox disabled")
+    elif available and agent == "agy" and settings.get("dangerously_skip_permissions") is True:
+        state.update(automatic_ready=True, reason="dangerously_skip_permissions: agy runs without its sandbox or permission prompts")
     elif available and agent == "agy":
         state.update(agy_headless_status(settings))
     return state
@@ -1001,6 +1003,41 @@ def parse_codex_events(stdout: str) -> tuple[str | None, str, str | None, dict[s
     return thread_id, text, failure, usage, model, command_evidence
 
 
+def claude_final_thinking(session_id: str) -> str:
+    """Reasoning from a Claude Code session's final assistant turn, as evidence only.
+
+    Some OpenRouter reasoning models put their whole reply in a thinking block
+    and return an empty result. Reasoning is where a model drafts, so a
+    `STATUS: success` in it is a plan, not a report: the caller saves this for
+    inspection and still treats the run as an empty answer. Only this session's
+    own transcript is read, and only turns after the last user message.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", session_id or ""):
+        return ""
+    roots = [Path(os.environ["CLAUDE_CONFIG_DIR"])] if os.environ.get("CLAUDE_CONFIG_DIR") else []
+    roots += [Path(os.environ.get("ORC_HOME") or Path.home() / ".config/orc") / "claude-state", Path.home() / ".claude"]
+    for root in dict.fromkeys(roots):
+        for transcript in (root / "projects").glob(f"*/{session_id}.jsonl"):
+            try:
+                lines = transcript.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            final = []
+            for line in reversed(lines):
+                try:
+                    message = (json.loads(line) or {}).get("message") or {}
+                except (ValueError, AttributeError):
+                    continue
+                if message.get("role") == "user" and not any(
+                        isinstance(part, dict) and part.get("type") == "tool_result" for part in message.get("content") or []):
+                    break
+                if message.get("role") == "assistant":
+                    final[:0] = [part["thinking"] for part in message.get("content") or []
+                                 if isinstance(part, dict) and part.get("type") == "thinking" and part.get("thinking")]
+            return "\n\n".join(final).strip()
+    return ""
+
+
 def parse_claude_output(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None, list[str]]:
     try:
         value = json.loads(stdout)
@@ -1238,7 +1275,9 @@ def agent_command(
         mode_key = str(settings.get("mode") or settings.get("permission_mode") or "")
         mode = "accept-edits" if yolo else (AGY_MODE_ALIASES.get(mode_key) or "accept-edits") if task["write"] else "plan"
         argv = [command, "-p", brief_for(task), "--output-format", "json", "--mode", mode]
-        if yolo:
+        # Headless agy auto-denies tools it would prompt for. This per-lane opt-out
+        # is the only restricted-mode path that drops its sandbox, and says so.
+        if yolo or settings.get("dangerously_skip_permissions") is True:
             argv.append("--dangerously-skip-permissions")
         elif settings.get("sandbox", True) is True:
             argv.append("--sandbox")
@@ -1472,6 +1511,11 @@ def dispatch(
             # models do this; without an acceptance gate it read as success.
             status = "error"
             failure = "worker returned an empty answer"
+            thinking = claude_final_thinking(new_session or "") if task["agent"] == "claude" else ""
+            if thinking:
+                with open(run_dir / "thinking.md", "w", encoding="utf-8", opener=lambda name, flags: os.open(name, flags, 0o600)) as stream:
+                    stream.write(thinking + "\n")
+                failure += "; its final reasoning is saved in thinking.md as evidence, not a handoff"
         elif exit_code == 0:
             status = handoff.get("reported_status") or "success"
         else:
@@ -1515,6 +1559,7 @@ def dispatch(
             "stdout": str(stdout_path),
             "stderr": str(stderr_path),
             **({"answer": str(run_dir / "answer.md")} if (run_dir / "answer.md").exists() else {}),
+            **({"thinking": str(run_dir / "thinking.md")} if (run_dir / "thinking.md").exists() else {}),
         },
     }
     store.write_json(run_dir / "result.json", result)

@@ -715,7 +715,15 @@ with your existing configuration:
 ```
 
 This permits sandboxed commands while preserving explicit permission rules;
-commands outside the sandbox can still require approval. See the
+commands outside the sandbox can still require approval.
+
+Headless `agy -p` cannot show a prompt, so a tool it would ask about is denied.
+To run one agy lane fully unattended without switching the whole workspace to
+YOLO, set `"dangerously_skip_permissions": true` on that route or on `agy`.
+Fusion then passes `--dangerously-skip-permissions`: **agy's sandbox and
+permission prompts are off for that lane**, and it counts as ready for automatic
+routing. Other agents ignore the key; Codex's `approval: "never"` still means
+"do not prompt" with its sandbox intact. See the
 [Antigravity sandbox documentation](https://www.antigravity.google/docs/sandbox?tab=cli).
 If your shell or tools come from Nix and fail with a sandbox-blocked library
 under `/nix/store`, add `read_file(/nix/store)` to the existing
