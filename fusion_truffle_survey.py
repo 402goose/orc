@@ -15,6 +15,7 @@ import fusion_truffle as truffle
 from fusion_publish import git, read, repo_for, save, text
 
 BATCH_SIZE = 8
+SURVEY_ID_ENV = "FUSION_TRUFFLE_SURVEY_ID"
 GRADES = {"A": "Ripe", "B": "Promising", "C": "Needs digging", "D": "Leave for now", "P": "Patch", "U": "Unassessed"}
 ISSUES_QUERY = """query($owner:String!,$name:String!,$cursor:String) {
  repository(owner:$owner,name:$name) {
@@ -232,7 +233,13 @@ def survey(workspace, config, agent="auto", remote="origin", resume=None, sync_o
             settings = {**record["settings"], **choice}
         else:
             settings = {**choice, "remote": remote, "include_assigned": include_assigned}
-            record = dict(id="truffle-" + uuid.uuid4().hex[:12], kind="survey", started_at_ms=core.now_ms(),
+            # A caller that spawns this survey detached cannot otherwise learn the id it
+            # just started until hunt.json exists on disk, and guessing the newest record
+            # races the previous survey still on disk. FUSION_TRUFFLE_SURVEY_ID lets it
+            # name the run up front, mirroring fusion_workflow._run_id's FUSION_WORKFLOW_ID.
+            chosen = os.environ.pop(SURVEY_ID_ENV, "").strip()
+            survey_id = chosen if re.fullmatch(r"truffle-[a-f0-9]{12}", chosen) else "truffle-" + uuid.uuid4().hex[:12]
+            record = dict(id=survey_id, kind="survey", started_at_ms=core.now_ms(),
                           target=0, candidates=[], skipped=[], issues=[], patches=[], batches=[], inventory_complete=False)
         root = truffle.root_for(workspace, record["id"])
         record.update(status="scouting", pid=os.getpid(), settings=settings, message="Mapping the open issue woodland")
