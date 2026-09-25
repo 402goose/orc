@@ -9,12 +9,14 @@ worker is dispatched. This makes fan-out auditable and resumable.
 from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+import contextlib
 import copy
 import hashlib
 import json
 import os
 import re
 import shlex
+import shutil
 import signal
 from pathlib import Path, PurePosixPath
 import subprocess
@@ -77,6 +79,66 @@ def _safe_relative(path: Any, field: str) -> str:
     if candidate.is_absolute() or ".." in candidate.parts:
         raise ValueError(f"{field} must be a workspace-relative path: {value}")
     return value
+
+
+FIXTURE_KEYS = {"path", "content", "from_file"}
+
+
+def _validate_fixtures(node_id: str, value: Any) -> None:
+    """`acceptance.fixtures`: files the coordinator writes into the tree
+    for each acceptance check run and removes again afterwards."""
+    if value is None:
+        return
+    field = f"workflow node {node_id} acceptance.fixtures"
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be an array")
+    paths: list[PurePosixPath] = []
+    for item in value:
+        if (not isinstance(item, dict) or set(item) - FIXTURE_KEYS or ("content" in item) == ("from_file" in item)
+                or not isinstance(item.get("content", item.get("from_file")), str)
+                or ("from_file" in item and not item["from_file"].strip())):
+            raise ValueError(f"{field} entries must be {{path, content | from_file}} with string values")
+        path = PurePosixPath(_safe_relative(item.get("path"), field))
+        if path.parts[0] in {".git", ".fusion"} or str(path) == ".":
+            raise ValueError(f"{field} cannot write {path}")
+        paths.append(path)
+    for path in paths:
+        if sum(other == path or path in other.parents for other in paths) != 1:
+            raise ValueError(f"{field} paths must be distinct and must not contain one another: {path}")
+
+
+def _fixtures(node: dict[str, Any]) -> list[dict[str, Any]]:
+    acceptance = node.get("acceptance")
+    return list((acceptance.get("fixtures") if isinstance(acceptance, dict) else None) or [])
+
+
+def _describe(path: Path) -> dict[str, Any]:
+    """What a worker left at a fixture path, recorded before it is set aside."""
+    if path.is_symlink():
+        return {"type": "symlink"}
+    if path.is_dir():
+        return {"type": "directory"}
+    if path.is_file():
+        return {"type": "file", "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    return {"type": "absent"}
+
+
+def _drop_bytecode(path: Path) -> None:
+    """Checks that import a fixture leave its compiled copy in __pycache__;
+    it would carry the fixture into the tree the worker sees."""
+    cache = path.parent / "__pycache__"
+    if path.suffix != ".py" or not cache.is_dir():
+        return
+    for compiled in cache.iterdir():
+        if compiled.name.startswith(path.stem + ".") and compiled.name.endswith(".pyc"):
+            compiled.unlink(missing_ok=True)
+
+
+def _remove(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.is_symlink() or path.exists():
+        path.unlink()
 
 
 MAX_CONTRACT_FILES = 20
@@ -283,6 +345,8 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
         before = node["acceptance"].get("before") if isinstance(node.get("acceptance"), dict) else None
         if before is not None and (not isinstance(before, bool) or (before and not node["write"])):
             raise ValueError(f"workflow node {node['id']} acceptance.before must be a boolean on a write node")
+        if isinstance(node.get("acceptance"), dict):
+            _validate_fixtures(node["id"], node["acceptance"].get("fixtures"))
         if node.get("independent_of") and node["independent_of"] not in node["needs"]:
             raise ValueError("independent_of must name a direct dependency")
 
@@ -458,6 +522,8 @@ class WorkflowRunner:
         for key in ("independent_of", "decision_context"):
             if key in node:
                 payload[key] = node[key]
+        if _fixtures(node):
+            payload["fixture_digests"] = self._fixture_digests(node)
         if node["agent"] == "codex":
             from fusion_reasoning import validate_pair
             settings = core.agent_settings(self.config, {"agent": "codex", "route": node.get("route"),
@@ -809,9 +875,10 @@ BLOCKERS: unresolved issues, or none
                     raise ValueError("acceptance checks must be argv arrays")
                 timeout = int(timeout or self.config.get("timeout_seconds", 3600))
                 receipt["timeout_seconds"] = timeout
-                with subprocess.Popen(command, cwd=self.workspace, stdin=subprocess.DEVNULL,
-                                      env={**os.environ, **env} if env else None,
-                                      stdout=stdout, stderr=stderr, start_new_session=(os.name == "posix")) as process:
+                with self._fixtures_applied(node, directory, receipt), \
+                        subprocess.Popen(command, cwd=self.workspace, stdin=subprocess.DEVNULL,
+                                         env={**os.environ, **env} if env else None, stdout=stdout, stderr=stderr,
+                                         start_new_session=(os.name == "posix")) as process:
                     observed = receipt["process"]
                     observed["pid"] = process.pid
                     observed["group_id"] = process.pid if os.name == "posix" else None
@@ -886,6 +953,69 @@ BLOCKERS: unresolved issues, or none
                                                   "status": receipt["status"], "receipt": str(receipt_path)})
         return receipt
 
+    def _fixture_bytes(self, item: dict[str, Any]) -> bytes:
+        if "content" in item:
+            return item["content"].encode("utf-8")
+        source = Path(item["from_file"]).expanduser()
+        return (source if source.is_absolute() else self.control_workspace / source).read_bytes()
+
+    def _fixture_digests(self, node: dict[str, Any]) -> list[dict[str, Any]] | None:
+        """Path and content digest of each fixture, or None when one is unreadable."""
+        try:
+            return [{"path": item["path"], "sha256": hashlib.sha256(self._fixture_bytes(item)).hexdigest()}
+                    for item in _fixtures(node)]
+        except OSError:
+            return None
+
+    @contextlib.contextmanager
+    def _fixtures_applied(self, node: dict[str, Any], directory: Path, receipt: dict[str, Any]):
+        """Write `acceptance.fixtures` for one check run, then put the tree back.
+
+        Whatever the worker left at a fixture path is moved aside first and
+        restored afterwards, so the check always runs the fixture's content
+        and the worker never sees it: not before its turn, between attempts,
+        nor in the diff. The receipt records each fixture's digest and what
+        was found at its path.
+        """
+        fixtures = _fixtures(node)
+        if not fixtures:
+            yield
+            return
+        loaded = [(item["path"], self._fixture_bytes(item)) for item in fixtures]
+        root = self.workspace.resolve()
+        applied: list[tuple[Path, Path | None, Path | None]] = []
+        records: list[dict[str, Any]] = []
+        try:
+            for index, (relative, data) in enumerate(loaded):
+                target = self.workspace / relative
+                if not target.parent.resolve().is_relative_to(root):
+                    raise ValueError(f"acceptance fixture {relative} resolves outside the workspace")
+                found = _describe(target)
+                moved = None
+                if found["type"] != "absent":
+                    moved = directory / "fixture-stash" / str(index)
+                    moved.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(target), str(moved))
+                created, probe = None, target.parent
+                while probe != self.workspace and not probe.exists():
+                    created, probe = probe, probe.parent
+                applied.append((target, moved, created))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _drop_bytecode(target)
+                target.write_bytes(data)
+                records.append({"path": relative, "sha256": hashlib.sha256(data).hexdigest(), "found": found})
+            receipt["fixtures"] = records
+            yield
+        finally:
+            for target, moved, created in reversed(applied):
+                _remove(target)
+                _drop_bytecode(target)
+                if created is not None:
+                    shutil.rmtree(created, ignore_errors=True)
+                if moved is not None:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(moved), str(target))
+
     def _plan_verification(self, node: dict[str, Any]) -> list[Any]:
         """Verification commands a dependency's plan declared for this node.
 
@@ -946,7 +1076,8 @@ BLOCKERS: unresolved issues, or none
             saved = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             saved = {}
-        if isinstance(saved, dict) and saved.get("checks") == checks:
+        fixtures = self._fixture_digests(node) if _fixtures(node) else None
+        if isinstance(saved, dict) and saved.get("checks") == checks and saved.get("fixtures") == fixtures:
             node[key] = saved
             return
         if node["attempts"] > 1 or not run:
@@ -959,7 +1090,7 @@ BLOCKERS: unresolved issues, or none
                                                            phase="before", env=env, timeout=timeout))
                 except OSError as exc:
                     receipts.append({"argv": command, "phase": "before", "status": "error", "error": str(exc)})
-        node[key] = {"checks": checks, "receipts": receipts}
+        node[key] = {"checks": checks, "receipts": receipts, **({"fixtures": fixtures} if fixtures else {})}
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(core.json_text(node[key]) + "\n", encoding="utf-8")
 

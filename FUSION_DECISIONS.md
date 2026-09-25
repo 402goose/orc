@@ -541,6 +541,22 @@ retracted).
   same environment and timeout before and after, and are not filtered by
   `fusion_verification`: they are authored, not model output. `before` on a
   read-only node, or a non-boolean, is a spec error.
+- `"acceptance": {"fixtures": [{"path": ..., "content": ... | "from_file":
+  ...}]}` are files the coordinator writes into the tree immediately before
+  every acceptance check run (the pre-change run and each after-run,
+  including resume rechecks) and takes out again right after it. Whatever
+  the worker left at a fixture path is moved aside for the run and put
+  back, and a fixture's newly created directories and its `__pycache__`
+  bytecode are removed, so the worker never sees a fixture: not before its
+  turn, not between attempts, not in its diff. A worker edit at a fixture
+  path cannot change what the check runs. Each check receipt records
+  `fixtures: [{path, sha256, found}]`, `found` being what the worker had
+  there (`absent`, or `file` with its sha256, `directory`, `symlink`);
+  `before-authored.json` keeps the fixture digests and is rerun when they
+  change. `from_file` is absolute or relative to the control workspace.
+  Paths are workspace-relative, distinct, not nested in one another, and
+  not under `.git` or `.fusion`; a path that resolves outside the worktree
+  (a symlinked parent) makes the check an `error`, and nothing is written.
 
 The node result in `node.json` and the manifest keeps `gate_codes` (one
 structured code beside each gate problem: `worker_status`, `worker_blockers`, `required_file_missing`,
@@ -1008,11 +1024,22 @@ like SWE-bench (FAIL_TO_PASS / PASS_TO_PASS).
 orc fusion gym extract --prs 60 63 73 86 87 88 103 104 --ref origin/main \
   --github-repo hathbanger/orc --out ~/orc-gym/tasks
 # 2. Run each task on each lane (sequential, resumable, budget-capped).
+#    Hidden tests by default; --visible-tests puts the fix's tests in the tree.
 orc fusion gym run ~/orc-gym/tasks --workspace ~/orc-gym/ws \
   --lanes claude-sonnet-high claude-opus-high claude-fable-medium agy --budget-usd 10
-# 3. Per-lane and per-task results.
+# 3. Per-mode, per-lane and per-task results.
 orc fusion gym report ~/orc-gym/ws
 ```
+
+**Hidden vs visible.** The first live batch (4 tasks x 4 lanes, visible
+tests) solved 16/16: the worker's tree held the fix PR's tests, so workers
+ran the failing tests and iterated against them. That measures "make these
+tests pass", not "fix the issue", and produces no negatives. Hidden mode,
+the default, grades like SWE-bench: the worker starts at B with only the
+problem text, and the fix's test files are written in only while the gate
+runs the F2P and P2P checks. Visible mode (`--visible-tests`) is the old
+setup, kept for comparison. The two measure different things: results are
+keyed and reported per mode and never pooled.
 
 **Extraction.** For PR N's squash commit C (found by `mergeCommit` from gh,
 else by a `(#N)` subject on `--ref`) with parent B, files under `test/` or
@@ -1033,7 +1060,18 @@ A P2P command that is not green on both is dropped. PRs with no test change,
 only test changes, no Python unittest file or no F2P test are skipped with
 a reason. Tasks are JSON (`id`, `base`, `fix`, `task_ref`, `task_sha`,
 `prompt`, `fail_to_pass`, `pass_to_pass`, `checks`, `test_files`,
-`source_files`, `pr_url`) plus `index.json`.
+`source_files`, `pr_url`, `hidden`) plus `index.json`. `hidden` is the
+hidden form: `base_ref` (`refs/gym/bases/pr-N`, pointing at B, written to
+the source repository beside the task ref), `base_sha`, and `fixtures`, the
+full content at C of every test file the fix added or changed (`path`,
+`sha256`, `content_base64`). Whole files rather than a diff: they apply to
+B without patch fuzz, and the P2P tests in those files run from the same
+content they were extracted from. Test files the fix deleted are not
+fixtures (they stay in B; the checks name only files that exist at C). A
+task JSON from before the hidden form upgrades transparently: `gym run`
+derives it from the source repository (B, C and `test_files` are in the
+task), writes `refs/gym/bases/pr-N` there, and leaves the JSON unchanged;
+re-extract to store it.
 
 **Prompt.** The linked issue's title and body when the PR closes one
 (sections headed Fix, Solution, Proposed, Plan, Changes are cut). Otherwise
@@ -1049,13 +1087,23 @@ subject.
 **Runs.** The gym directory is its own Fusion workspace: `.fusion` (runs,
 traces, decisions, labels) and a `.fusion.json` copied once from the source
 repository. It must be outside the source repository, which a run only
-reads (`git fetch` of the task ref). Each task gets a repository under
-`tasks/<id>/repo` holding only the task commit and its history, never C,
-and each lane a worktree of it, removed after the run unless
-`--keep-worktrees`. The lane runs one authored write node (`max_attempts:
-1`, `required_handoff: [summary]`) through `WorkflowRunner`, with the
-worktree as the worker's directory and the gym as the control workspace;
-its `acceptance.checks` are the F2P then P2P commands with `before: true`.
+reads (`git fetch` of the task or base ref), apart from an old task's
+upgrade writing its base ref. Visible runs use a repository under
+`tasks/<id>/repo` holding only the task commit and its history; hidden runs
+use `tasks/<id>/hidden/repo`, holding only B and its history (neither the
+task commit nor C). Each lane gets a worktree of it (`lanes/<lane>` there),
+removed after the run unless `--keep-worktrees`. The lane runs one authored
+write node (`max_attempts: 1`, `required_handoff: [summary]`) through
+`WorkflowRunner`, with the worktree as the worker's directory and the gym
+as the control workspace; its `acceptance.checks` are the F2P then P2P
+commands with `before: true`. In hidden mode the node's
+`acceptance.fixtures` are the task's hidden test files, copied for the run
+into a temporary directory outside the gym (by index, not by path) and
+deleted after it, and the brief is the problem text plus: "When you finish,
+tests that are not in this repository will grade the change. Add or adjust
+tests of your own as you see fit." It names no test, file or command. The
+pre-change run is B plus the fixtures, which is the task tree, so the
+extraction's F2P/P2P proof carries over.
 Lanes are `claude-sonnet-high`, `claude-opus-high`, `claude-fable-medium`,
 `claude`, `codex`, `agy`, `grok`, any configured route name, or entries in
 `gym.lanes` (`{"agent", "route", "model", "reasoning_effort"}`) in the gym's
@@ -1064,19 +1112,29 @@ spent, the workflow budget is what is left, and Claude lanes get it as
 `max_budget_usd`. `--max-tasks N` processes at most N tasks with pending
 lanes.
 
-A task × lane pair is complete once it was dispatched and its checks ran.
-A lane that is unavailable (not on PATH, cooling down), paused on quota or
-budget, or interrupted is recorded but retried by the next `gym run`. Each
-run appends to `results.jsonl` and saves the worktree's diff under
-`results/<task>/<lane>/`.
+A task × lane × mode triple is complete once it was dispatched and its
+checks ran; result keys are `<task>:<lane>:<mode>`, and rows written before
+modes existed read as `visible`, so a visible result never counts as a
+hidden one. A lane that is unavailable (not on PATH, cooling down), paused
+on quota or budget, or interrupted is recorded but retried by the next `gym
+run`. Each run appends to `results.jsonl` (with `mode`) and saves the
+worktree's diff against its starting commit under `results/<task>/<lane>/`
+(visible) or `results/<task>/hidden/<lane>/`.
 
-**What it measures.** Per lane: tasks attempted, `solved` (every F2P
-command passed, no P2P failed, no test file touched), F2P pass rate, P2P
-regressions, test tampering, cost and mean wall time; per task, which lanes
-solved it. `invalid_baseline` (an F2P check that did not fail, or a P2P
-check that did not pass, before the change on this machine) is excluded
-from the rates. This is per-lane evidence on the same tasks, not a
-counterfactual: each lane is observed once per task, with no retries.
+**What it measures.** Per mode, per lane: tasks attempted, `solved` (every
+F2P command passed, no P2P failed, and in visible mode no test file
+touched), F2P pass rate, P2P regressions, test tampering, cost and mean wall
+time; per task, which lanes solved it. Hidden mode measures fixing the
+problem from its description, against tests the worker never saw; visible
+mode measures making given failing tests pass. `invalid_baseline` (an F2P
+check that did not fail, or a P2P check that did not pass, before the
+change on this machine) is excluded from the rates. In hidden mode there is
+no `tampered` verdict: the fixtures overwrite the hidden test paths for
+every check, so a worker cannot grade itself there. Its edits at those
+paths are recorded as `touched_fixtures` (counted per lane), and test files
+it wrote elsewhere as `worker_tests`; neither changes the verdict. This is
+per-lane evidence on the same tasks, not a counterfactual: each lane is
+observed once per task and mode, with no retries.
 
 **Labels.** Every run is an ordinary workflow (id `gym-<task>-<lane>-…`),
 so the structural gate labels it automatically, as `structural_gate`, in
@@ -1087,18 +1145,31 @@ F2P still failing is unlabeled (fail→fail). The label's `group` is the gym
 workflow id. Laya trains on them with `orc fusion learn tick --workspace
 ~/orc-gym/ws`, or export with `decisions export` there.
 
-**Leakage and caveats (v1).**
+**Leakage and caveats.**
 
-- The regression tests are in the tree. A worker can read them, and a worker
-  that edits a test file is reported `tampered`; the gate may still have
-  labeled its run, so audit `tampered` rows before training on them.
+- Visible mode: the regression tests are in the tree. A worker can read
+  them, and a worker that edits a test file is reported `tampered` and its
+  gate label is retracted.
+- Hidden mode keeps the tests out of the worker's tree, its git history and
+  its brief, but not out of reach of a worker that looks outside its
+  worktree. The worktree's `.fusion` is a symlink to the gym's `.fusion`,
+  which holds this run's manifest (the check argv, which name the hidden
+  test ids and files) and the pre-change run's receipts and stdout/stderr
+  (test names and tracebacks), written before the worker starts. The
+  fixture files themselves sit in a temporary directory named in the
+  manifest while the run lasts. Treat a hidden result as "did not read
+  `.fusion` or the temp directory", and audit transcripts that do.
+- A worker may still edit test files the hidden tests import but that are
+  not fixtures (shared helpers under `test/`). That shows in `worker_tests`,
+  not as tampering.
 - Workers are not told which checks will run; a restricted Claude writer
   cannot run tests at all. That is the lane as ORC runs it, not its ceiling.
 - Prompts come from issues and PR descriptions written after the fact; the
   cut is heuristic and can leave a hint of the fix. The PR title often names
-  the desired behavior.
+  the desired behavior, and sometimes the test.
 - The task repository has no C, but the network does: a worker with `gh` or
-  a browser can look up the issue and its linked PR.
+  a browser can look up the issue and its linked PR, or B's successor on
+  the default branch (the brief names B's sha).
 - Earlier lanes' diffs stay under `results/` in the gym directory, readable
   by a later worker that leaves its worktree.
 - Tests run on the host with no sandbox, as all acceptance checks do. A

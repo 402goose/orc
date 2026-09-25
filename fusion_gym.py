@@ -4,23 +4,30 @@
 SWE-smith / SWE-bench shape: the task tree is B plus C's test-file changes,
 FAIL_TO_PASS are the changed or new unittest tests that fail on the task tree
 and pass on C, PASS_TO_PASS the other tests in those files that pass on both.
-The task commit is written to `refs/gym/tasks/pr-N` in the source repository;
-nothing else there changes (trees are materialized with `git archive`).
+The task commit is written to `refs/gym/tasks/pr-N` and B to
+`refs/gym/bases/pr-N` in the source repository; nothing else there changes
+(trees are materialized with `git archive`). The task also carries a hidden
+form: C's test files, as fixtures.
 
 `run` gives each task to each lane in its own git worktree of a per-task
-repository under the gym directory. That repository holds only the task
-commit and its history, never C, so a worker cannot read the fix from git.
-The worker runs as an authored single-node workflow whose acceptance checks
-are the F2P and P2P commands with `acceptance.before: true`, so the gate
-labels each run from the checks' before/after exit codes.
+repository under the gym directory. In the default hidden mode that
+repository holds only B and its history, the worker gets only the problem
+text, and C's test files are acceptance fixtures the coordinator writes into
+the tree only while the checks run (SWE-bench style). In visible mode
+(`--visible-tests`) it holds the task commit, tests included. Neither holds
+C. The worker runs as an authored single-node workflow whose acceptance
+checks are the F2P and P2P commands with `acceptance.before: true`, so the
+gate labels each run from the checks' before/after exit codes.
 
 `report` reads the gym's results: per lane, per task, from receipts only.
 """
 from __future__ import annotations
 
 import ast
+import base64
 import contextlib
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -38,7 +45,10 @@ from typing import Any
 TASK_SCHEMA = "fusion.gym.task.v1"
 RESULT_SCHEMA = "fusion.gym.result.v1"
 REF_PREFIX = "refs/gym/tasks/"
+BASE_REF_PREFIX = "refs/gym/bases/"
 TASK_REF = "refs/gym/task"
+BASE_REF = "refs/gym/base"
+MODES = ("hidden", "visible")
 DEFAULT_TIMEOUT = 900
 DEFAULT_P2P_LIMIT = 200
 TEST_DIRS = {"test", "tests"}
@@ -330,6 +340,38 @@ def make_task_commit(repo, base, fix, changes):
     return git(repo, "commit-tree", tree, "-p", base, "-m", "gym task: regression tests added", env=identity).strip()
 
 
+def hidden_form(repo, task_id, base, fix, test_paths):
+    """The hidden-test form of a task: the worker's tree is B, and the fix's
+    test files at C (whole files, so P2P tests in them still run) are
+    fixtures written only while the checks run. Files the fix deleted are not
+    fixtures. B is kept reachable as `refs/gym/bases/<id>`."""
+    fixtures = []
+    for path in sorted(test_paths):
+        if not succeeds(repo, "cat-file", "-e", f"{fix}:{path}"):
+            continue
+        data = git(repo, "cat-file", "blob", f"{fix}:{path}", binary=True)
+        fixtures.append({"path": path, "sha256": hashlib.sha256(data).hexdigest(),
+                         "content_base64": base64.b64encode(data).decode("ascii")})
+    git(repo, "update-ref", BASE_REF_PREFIX + task_id, base)
+    return {"base_ref": BASE_REF_PREFIX + task_id, "base_sha": base, "fixtures": fixtures}
+
+
+def ensure_hidden(task):
+    """Tasks extracted before the hidden form existed get it from the source
+    repository (B, C and the test paths are in the task), in memory only."""
+    hidden = task.get("hidden")
+    if isinstance(hidden, dict) and hidden.get("base_sha") and hidden.get("fixtures"):
+        return hidden
+    repo = Path(task["repo_path"])
+    try:
+        task["hidden"] = hidden_form(repo, task["id"], task["base"], task["fix"], task.get("test_files") or [])
+    except (ValueError, OSError) as exc:
+        raise ValueError(f"{task['id']}: cannot derive the hidden form from {repo} ({exc}); re-extract the task") from exc
+    if not task["hidden"]["fixtures"]:
+        raise ValueError(f"{task['id']}: the fix left no test files to hide; re-extract the task")
+    return task["hidden"]
+
+
 def extract_one(repo, pr, ref="HEAD", gh_repo=None, use_gh=True, timeout=DEFAULT_TIMEOUT, p2p_limit=DEFAULT_P2P_LIMIT):
     """One task dict, or {"pr": N, "skipped": reason}."""
     repo = Path(repo).resolve()
@@ -382,6 +424,7 @@ def extract_one(repo, pr, ref="HEAD", gh_repo=None, use_gh=True, timeout=DEFAULT
     prompt, source = task_prompt(info, git(repo, "log", "-1", "--format=%s", fix).strip())
     task_id = f"pr-{int(pr)}"
     git(repo, "update-ref", REF_PREFIX + task_id, task_sha)
+    hidden = hidden_form(repo, task_id, base, fix, [path for status, path in tests if not status.startswith("D")])
     return {
         "schema": TASK_SCHEMA, "id": task_id, "pr": int(pr), "pr_url": info.get("url"),
         "issues": [issue.get("url") for issue in info.get("issues") or []],
@@ -390,7 +433,7 @@ def extract_one(repo, pr, ref="HEAD", gh_repo=None, use_gh=True, timeout=DEFAULT
         "fail_to_pass": f2p, "pass_to_pass": sorted(test for _, ids in p2p_checks for test in ids),
         "checks": {"fail_to_pass": [argv for argv, _ in f2p_checks], "pass_to_pass": [argv for argv, _ in p2p_checks]},
         **({"pass_to_pass_dropped": dropped} if dropped else {}),
-        "test_files": sorted(path for _, path in tests), "source_files": sources,
+        "test_files": sorted(path for _, path in tests), "source_files": sources, "hidden": hidden,
         "extracted_at_ms": int(time.time() * 1000),
     }
 
@@ -451,12 +494,23 @@ def _slug(value):
     return re.sub(r"[^A-Za-z0-9_-]+", "-", value).strip("-")[:24] or "lane"
 
 
-def build_spec(task, lane, budget_remaining=None):
+HIDDEN_BRIEF = ("\n\nFix this in the repository. Keep the change scoped to the problem above. "
+                "When you finish, tests that are not in this repository will grade the change. "
+                "Add or adjust tests of your own as you see fit.")
+VISIBLE_BRIEF = "\n\nFix this in the repository. Keep the change scoped to the problem above."
+
+
+def build_spec(task, lane, budget_remaining=None, mode="visible", fixtures=None):
+    """One write node. Hidden mode: the brief says hidden tests grade the work
+    but names none; `fixtures` ({path, from_file}) put them in place only
+    while the checks run."""
     checks = task["checks"]["fail_to_pass"] + task["checks"]["pass_to_pass"]
+    acceptance = {"checks": checks, "before": True, "required_handoff": ["summary"]}
+    if mode == "hidden":
+        acceptance["fixtures"] = fixtures or []
     node = {"id": "implement", "role": "implementation", "agent": lane["agent"], "write": True,
-            "task": task["prompt"] + "\n\nFix this in the repository. Keep the change scoped to the problem above.",
-            "decision_context": task["prompt"],
-            "acceptance": {"checks": checks, "before": True, "required_handoff": ["summary"]}}
+            "task": task["prompt"] + (HIDDEN_BRIEF if mode == "hidden" else VISIBLE_BRIEF),
+            "decision_context": task["prompt"], "acceptance": acceptance}
     for key in ("route", "model", "reasoning_effort"):
         if lane.get(key):
             node[key] = lane[key]
@@ -466,15 +520,26 @@ def build_spec(task, lane, budget_remaining=None):
             "budget_usd": max(budget_remaining, 0.01) if budget_remaining is not None else 0, "nodes": [node]}
 
 
+def result_key(task_id, lane, mode):
+    return f"{task_id}:{lane}:{mode}"
+
+
 def read_results(gym):
+    """Rows written before modes existed ran with the tests in the tree:
+    they read as visible, so they never count as hidden results."""
     path = Path(gym) / "results.jsonl"
     rows = []
     if path.is_file():
         for line in path.read_text().splitlines():
             try:
-                rows.append(json.loads(line))
+                row = json.loads(line)
             except ValueError:
                 continue
+            if isinstance(row, dict) and "mode" not in row:
+                row["mode"] = "visible"
+                if row.get("key"):
+                    row["key"] += ":visible"
+            rows.append(row)
     return rows
 
 
@@ -509,18 +574,42 @@ def prepare_gym(gym, source_repo=None):
     return gym
 
 
-def task_repo(gym, task):
-    """A repository holding only the task commit and its history (never the fix)."""
-    root = gym / "tasks" / task["id"]
-    repo = root / "repo"
+def task_root(gym, task, mode):
+    root = Path(gym) / "tasks" / task["id"]
+    return root / "hidden" if mode == "hidden" else root
+
+
+def task_repo(gym, task, mode="visible"):
+    """A repository holding only the commit the worker starts from and its
+    history: the task commit (visible) or B (hidden), never the fix. Hidden
+    runs use their own repository, so the task commit's tests are not in it."""
+    if mode == "hidden":
+        source_ref, sha, local = task["hidden"]["base_ref"], task["hidden"]["base_sha"], BASE_REF
+    else:
+        source_ref, sha, local = task["task_ref"], task["task_sha"], TASK_REF
+    repo = task_root(gym, task, mode) / "repo"
     if not (repo / ".git").exists():
         repo.mkdir(parents=True, exist_ok=True)
         git(repo, "init", "-q")
-    if git(repo, "rev-parse", "-q", "--verify", TASK_REF, check=False).strip() != task["task_sha"]:
-        git(repo, "fetch", "-q", "--no-tags", "--update-shallow", task["repo_path"], f"+{task['task_ref']}:{TASK_REF}")
-        if git(repo, "rev-parse", "-q", "--verify", TASK_REF, check=False).strip() != task["task_sha"]:
-            raise ValueError(f"{task['task_ref']} in {task['repo_path']} is not {task['task_sha']}; re-extract the task")
+    if git(repo, "rev-parse", "-q", "--verify", local, check=False).strip() != sha:
+        git(repo, "fetch", "-q", "--no-tags", "--update-shallow", task["repo_path"], f"+{source_ref}:{local}")
+        if git(repo, "rev-parse", "-q", "--verify", local, check=False).strip() != sha:
+            raise ValueError(f"{source_ref} in {task['repo_path']} is not {sha}; re-extract the task")
     return repo
+
+
+def write_fixtures(task, directory):
+    """[{path, from_file}] for the task's hidden test files, written under
+    `directory` by index (not by path) and checked against their digests."""
+    specs = []
+    for index, fixture in enumerate(task["hidden"]["fixtures"]):
+        data = base64.b64decode(fixture["content_base64"])
+        if hashlib.sha256(data).hexdigest() != fixture["sha256"]:
+            raise ValueError(f"{task['id']}: hidden fixture {fixture['path']} does not match its digest")
+        source = Path(directory) / str(index)
+        source.write_bytes(data)
+        specs.append({"path": fixture["path"], "from_file": str(source)})
+    return specs
 
 
 def _remove_worktree(repo, path):
@@ -545,7 +634,7 @@ def withdraw_untrusted_label(gym, row):
     return {**label, "status": "retracted", "reason": f"gym verdict {row['verdict']}"}
 
 
-def summarize(task, lane_name, lane, outcome, diff_files, wall_ms):
+def summarize(task, lane_name, lane, outcome, diff_files, wall_ms, mode="visible"):
     node = (outcome.get("nodes") or [{}])[0]
     result = node.get("result") or {}
     receipts = result.get("acceptance_checks") or []
@@ -559,7 +648,15 @@ def summarize(task, lane_name, lane, outcome, diff_files, wall_ms):
     p2p_regressed = any(r.get("status") == "failed" for r in p2p)
     baseline_ok = (all((r.get("before") or {}).get("status") == "failed" for r in f2p)
                    and all((r.get("before") or {}).get("status") == "passed" for r in p2p))
-    tampered = sorted(path for path in diff_files if is_test_path(path))
+    if mode == "hidden":
+        # The fixtures overwrite the hidden test paths for every check run, so
+        # a worker cannot grade itself there; its edits are only recorded.
+        hidden_paths = {fixture["path"] for fixture in task["hidden"]["fixtures"]}
+        touched_fixtures = sorted(path for path in diff_files if path in hidden_paths)
+        worker_tests = sorted(path for path in diff_files if is_test_path(path) and path not in hidden_paths)
+        tampered = []
+    else:
+        tampered = sorted(path for path in diff_files if is_test_path(path))
     dispatched = bool(result.get("run_id"))
     status = outcome.get("status")
     if not dispatched or status in {"paused_quota", "paused_budget", "interrupted"}:
@@ -576,21 +673,27 @@ def summarize(task, lane_name, lane, outcome, diff_files, wall_ms):
         verdict, completed = "regressed", True
     else:
         verdict, completed = "unsolved", True
-    return {"schema": RESULT_SCHEMA, "event": "finished", "key": f"{task['id']}:{lane_name}", "task": task["id"],
-            "lane": lane_name, "lane_spec": lane, "workflow_id": outcome.get("workflow_id"), "status": status,
+    return {"schema": RESULT_SCHEMA, "event": "finished", "key": result_key(task["id"], lane_name, mode),
+            "task": task["id"], "mode": mode, "lane": lane_name, "lane_spec": lane,
+            "workflow_id": outcome.get("workflow_id"), "status": status,
             "verdict": verdict, "completed": completed, "f2p_passed": f2p_passed, "p2p_regressed": p2p_regressed,
             "baseline_ok": baseline_ok, "tampered": tampered, "changed": diff_files,
+            **({"touched_fixtures": touched_fixtures, "worker_tests": worker_tests} if mode == "hidden" else {}),
             "worker": {"status": result.get("status"), "agent": result.get("agent"), "route": result.get("route"),
                        "model": result.get("model"), "run_id": result.get("run_id")},
             "gate_label": result.get("gate_label"), "cost_usd": float(outcome.get("spent_usd") or 0),
             "duration_ms": wall_ms, "finished_at_ms": int(time.time() * 1000)}
 
 
-def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=False, runner=None):
-    """Sequential task x lane runs; resumable (completed pairs are skipped)."""
+def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=False, runner=None, mode="hidden"):
+    """Sequential task x lane runs; resumable (completed pairs are skipped).
+    Results are keyed by task, lane and mode, so a visible run never stands
+    in for a hidden one."""
     import fusion_core as core
     from fusion_publish import snapshot
     from fusion_workflow import WorkflowRunner
+    if mode not in MODES:
+        raise ValueError(f"gym mode must be one of {', '.join(MODES)}")
     runner = runner or WorkflowRunner
     tasks = load_tasks(tasks_path)
     gym = Path(gym).resolve()
@@ -605,45 +708,55 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
         done = {row["key"] for row in read_results(gym) if row.get("event") == "finished" and row.get("completed")}
         spent, processed, finished = 0.0, 0, []
         for task in tasks:
-            pending = [name for name in lanes if f"{task['id']}:{name}" not in done]
+            pending = [name for name in lanes if result_key(task["id"], name, mode) not in done]
             if not pending:
                 continue
             if max_tasks is not None and processed >= max_tasks:
                 break
             processed += 1
-            repo = task_repo(gym, task)
+            if mode == "hidden":
+                ensure_hidden(task)
+            start_sha = task["hidden"]["base_sha"] if mode == "hidden" else task["task_sha"]
+            repo = task_repo(gym, task, mode)
             for name in pending:
                 if budget_usd is not None and spent >= budget_usd:
                     return {"status": "budget_reached", "spent_usd": spent, "runs": finished}
                 lane = resolved[name]
-                workflow_id = f"gym-{task['id']}-{_slug(name)}-{uuid.uuid4().hex[:8]}"
-                worktree = gym / "tasks" / task["id"] / "lanes" / _slug(name)
+                key = result_key(task["id"], name, mode)
+                workflow_id = f"gym-{task['id']}-{'h-' if mode == 'hidden' else ''}{_slug(name)}-{uuid.uuid4().hex[:8]}"
+                worktree = task_root(gym, task, mode) / "lanes" / _slug(name)
                 _remove_worktree(repo, worktree)
                 worktree.parent.mkdir(parents=True, exist_ok=True)
-                git(repo, "worktree", "add", "-q", "--detach", str(worktree), TASK_REF)
+                git(repo, "worktree", "add", "-q", "--detach", str(worktree), start_sha)
                 (worktree / ".fusion").symlink_to(gym / ".fusion", target_is_directory=True)
-                _append(gym, {"schema": RESULT_SCHEMA, "event": "started", "key": f"{task['id']}:{name}",
+                _append(gym, {"schema": RESULT_SCHEMA, "event": "started", "key": key, "mode": mode,
                               "workflow_id": workflow_id, "started_at_ms": int(time.time() * 1000)})
-                spec = build_spec(task, lane, None if budget_usd is None else budget_usd - spent)
+                # Hidden test files live outside the gym only for this run.
+                fixture_dir = Path(tempfile.mkdtemp(prefix="fusion-gym-fixtures-")) if mode == "hidden" else None
                 started = time.monotonic()
                 try:
+                    fixtures = write_fixtures(task, fixture_dir) if fixture_dir else None
+                    spec = build_spec(task, lane, None if budget_usd is None else budget_usd - spent, mode, fixtures)
                     outcome = runner(gym, config, spec, run_id=workflow_id,
-                                     worktree={"workspace": str(worktree), "base_sha": task["task_sha"]}).run()
+                                     worktree={"workspace": str(worktree), "base_sha": start_sha}).run()
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
                     outcome = {"workflow_id": workflow_id, "status": "error", "error": str(exc), "nodes": []}
+                finally:
+                    if fixture_dir:
+                        shutil.rmtree(fixture_dir, ignore_errors=True)
                 wall_ms = round((time.monotonic() - started) * 1000)
                 diff_files, patch = [], b""
                 try:
                     tree = snapshot(worktree)
-                    diff_files = [p for p in git(repo, "diff", "--name-only", "-z", task["task_sha"], tree).split("\0") if p]
-                    patch = git(repo, "diff", "--binary", task["task_sha"], tree, binary=True)
+                    diff_files = [p for p in git(repo, "diff", "--name-only", "-z", start_sha, tree).split("\0") if p]
+                    patch = git(repo, "diff", "--binary", start_sha, tree, binary=True)
                 except (OSError, ValueError, subprocess.SubprocessError):
                     pass
-                row = summarize(task, name, lane, outcome, diff_files, wall_ms)
+                row = summarize(task, name, lane, outcome, diff_files, wall_ms, mode)
                 row["gate_label"] = withdraw_untrusted_label(gym, row)
                 if outcome.get("error"):
                     row["error"] = outcome["error"]
-                evidence = gym / "results" / task["id"] / _slug(name)
+                evidence = gym / "results" / task["id"] / ("hidden" if mode == "hidden" else "") / _slug(name)
                 evidence.mkdir(parents=True, exist_ok=True)
                 (evidence / f"{workflow_id}.patch").write_bytes(patch)
                 row["patch"] = str(evidence / f"{workflow_id}.patch")
@@ -652,23 +765,26 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
                 spent += row["cost_usd"]
                 if not keep_worktrees:
                     _remove_worktree(repo, worktree)
-        return {"status": "complete", "spent_usd": spent, "runs": finished}
+        return {"status": "complete", "mode": mode, "spent_usd": spent, "runs": finished}
 
 
 # ---------------------------------------------------------------- report
 
 def report(gym):
+    """Per mode (hidden, visible): per-lane rates and per-task solvers. The
+    modes measure different things and are never pooled."""
     latest = {}
     for row in read_results(gym):
         if row.get("event") == "finished":
             latest[row["key"]] = row
-    lanes, tasks = {}, {}
+    modes = {}
     for row in latest.values():
         if not row.get("completed"):
             continue
-        lane = lanes.setdefault(row["lane"], {"attempted": 0, "solved": 0, "f2p_passed": 0, "p2p_regressions": 0,
-                                              "tampered": 0, "invalid_baseline": 0, "cost_usd": 0.0, "duration_ms": 0,
-                                              "gate_labels": {}})
+        section = modes.setdefault(row["mode"], {"lanes": {}, "tasks": {}})
+        lane = section["lanes"].setdefault(row["lane"], {
+            "attempted": 0, "solved": 0, "f2p_passed": 0, "p2p_regressions": 0, "tampered": 0, "touched_fixtures": 0,
+            "invalid_baseline": 0, "cost_usd": 0.0, "duration_ms": 0, "gate_labels": {}})
         valid = row["verdict"] != "invalid_baseline"
         lane["attempted"] += valid
         lane["invalid_baseline"] += not valid
@@ -676,40 +792,52 @@ def report(gym):
         lane["f2p_passed"] += bool(valid and row["f2p_passed"] and not row["tampered"])
         lane["p2p_regressions"] += bool(valid and row["p2p_regressed"])
         lane["tampered"] += bool(row["tampered"])
+        lane["touched_fixtures"] += bool(row.get("touched_fixtures"))
         lane["cost_usd"] += row.get("cost_usd") or 0
         lane["duration_ms"] += row.get("duration_ms") or 0
         answer = json.dumps(((row.get("gate_label") or {}).get("answers")) or None)
         lane["gate_labels"][answer] = lane["gate_labels"].get(answer, 0) + 1
-        task = tasks.setdefault(row["task"], {"solved_by": [], "attempted_by": []})
+        task = section["tasks"].setdefault(row["task"], {"solved_by": [], "attempted_by": []})
         task["attempted_by"].append(row["lane"])
         if row["verdict"] == "solved":
             task["solved_by"].append(row["lane"])
-    for lane in lanes.values():
-        n = lane["attempted"]
-        lane["f2p_pass_rate"] = round(lane["f2p_passed"] / n, 3) if n else None
-        lane["mean_duration_s"] = round(lane["duration_ms"] / n / 1000, 1) if n else None
-        lane["cost_usd"] = round(lane["cost_usd"], 4)
-    for task in tasks.values():
-        task["solved_by"].sort()
-        task["attempted_by"].sort()
+    for section in modes.values():
+        for lane in section["lanes"].values():
+            n = lane["attempted"]
+            lane["f2p_pass_rate"] = round(lane["f2p_passed"] / n, 3) if n else None
+            lane["mean_duration_s"] = round(lane["duration_ms"] / n / 1000, 1) if n else None
+            lane["cost_usd"] = round(lane["cost_usd"], 4)
+        for task in section["tasks"].values():
+            task["solved_by"].sort()
+            task["attempted_by"].sort()
+        section["lanes"] = dict(sorted(section["lanes"].items()))
+        section["tasks"] = dict(sorted(section["tasks"].items()))
     pending = sorted(key for key, row in latest.items() if not row.get("completed"))
-    return {"gym": str(Path(gym).resolve()), "lanes": dict(sorted(lanes.items())), "tasks": dict(sorted(tasks.items())),
+    return {"gym": str(Path(gym).resolve()), "modes": {mode: modes[mode] for mode in MODES if mode in modes},
             "incomplete": pending}
 
 
+MODE_TITLES = {"hidden": "hidden tests (worker sees only the problem text)",
+               "visible": "visible tests (the fix's tests are in the worker's tree)"}
+
+
 def table(value):
-    lines = [f"{'lane':<22} {'tasks':>5} {'solved':>6} {'f2p%':>6} {'p2p-reg':>7} {'tamper':>6} {'cost$':>8} {'mean s':>7}"]
-    for name, lane in value["lanes"].items():
-        rate = "-" if lane["f2p_pass_rate"] is None else f"{lane['f2p_pass_rate'] * 100:.0f}"
-        lines.append(f"{name:<22} {lane['attempted']:>5} {lane['solved']:>6} {rate:>6} {lane['p2p_regressions']:>7} "
-                     f"{lane['tampered']:>6} {lane['cost_usd']:>8.2f} {lane['mean_duration_s'] or 0:>7.1f}")
-    lines.append("")
-    for task_id, task in value["tasks"].items():
-        lines.append(f"{task_id:<12} solved by: {', '.join(task['solved_by']) or 'none'}"
-                     f"  (of {', '.join(task['attempted_by'])})")
+    lines = []
+    for mode, section in value["modes"].items():
+        lines += [f"== {MODE_TITLES[mode]}",
+                  f"{'lane':<22} {'tasks':>5} {'solved':>6} {'f2p%':>6} {'p2p-reg':>7} {'tamper':>6} {'cost$':>8} {'mean s':>7}"]
+        for name, lane in section["lanes"].items():
+            rate = "-" if lane["f2p_pass_rate"] is None else f"{lane['f2p_pass_rate'] * 100:.0f}"
+            lines.append(f"{name:<22} {lane['attempted']:>5} {lane['solved']:>6} {rate:>6} {lane['p2p_regressions']:>7} "
+                         f"{lane['tampered']:>6} {lane['cost_usd']:>8.2f} {lane['mean_duration_s'] or 0:>7.1f}")
+        lines.append("")
+        for task_id, task in section["tasks"].items():
+            lines.append(f"{task_id:<12} solved by: {', '.join(task['solved_by']) or 'none'}"
+                         f"  (of {', '.join(task['attempted_by'])})")
+        lines.append("")
     if value["incomplete"]:
         lines.append("incomplete (rerun `gym run` to retry): " + ", ".join(value["incomplete"]))
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip() or "no completed gym runs"
 
 
 def extract_table(summary):
@@ -741,6 +869,8 @@ def add_parser(sub):
     run_cmd.add_argument("--max-tasks", type=int, help="at most N tasks with pending lanes in this invocation")
     run_cmd.add_argument("--budget-usd", type=float, help="stop starting runs once this invocation spent this much")
     run_cmd.add_argument("--keep-worktrees", action="store_true", help="keep each lane's worktree after its run")
+    run_cmd.add_argument("--visible-tests", action="store_true",
+                         help="old mode: the fix's tests are in the worker's tree (default: hidden, graded by fixtures)")
     report_cmd = commands.add_parser("report", help="per-lane and per-task results of a gym directory")
     report_cmd.add_argument("gym_dir")
 
@@ -755,7 +885,8 @@ def command(args, workspace, as_json=False, out=None):
     if args.gym_command == "run":
         if args.max_tasks is not None and args.max_tasks < 1:
             raise ValueError("--max-tasks must be at least 1")
-        result = run(args.tasks, args.lanes, args.gym_workspace, args.max_tasks, args.budget_usd, args.keep_worktrees)
+        result = run(args.tasks, args.lanes, args.gym_workspace, args.max_tasks, args.budget_usd, args.keep_worktrees,
+                     mode="visible" if args.visible_tests else "hidden")
         print(json.dumps(result, indent=2) if as_json else
               f"{result['status']}: {len(result['runs'])} runs, ${result['spent_usd']:.2f}\n" + table(report(args.gym_workspace)),
               file=out)
