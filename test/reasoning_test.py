@@ -87,10 +87,10 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":12,"output_tok
         with self.assertRaisesRegex(ValueError, "explicit model"):
             core.agent_command(self.config, self.task({"model": "", "reasoning_effort": "high"}), None)
         task = self.task(ASTRA)
-        task["agent"] = "agy"
-        with self.assertRaisesRegex(ValueError, "native Codex and Claude Code"):
+        task["agent"] = "grok"
+        with self.assertRaisesRegex(ValueError, "native Codex, Claude Code and agy"):
             core.agent_command(self.config, task, None)
-        with self.assertRaisesRegex(ValueError, "explicit Codex or Claude"):
+        with self.assertRaisesRegex(ValueError, "explicit Codex, Claude or agy"):
             validate_spec({"nodes": [{"id": "one", "task": "inspect", "agent": "auto", **ASTRA}]})
 
     def test_claude_effort_is_passed_and_recorded_but_not_claimed(self):
@@ -168,6 +168,46 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":12,"output_tok
             route_task(config, task, core.RunStore(self.workspace))
         self.assertEqual(task["settings_overrides"], ASTRA)
         self.assertFalse(read_jsonl(engine.store.path)[-1]["applied"])
+
+    def test_laya_advises_among_claude_pairs_and_keeps_the_pin(self):
+        opus = {"agent": "claude", "model": "claude-opus-5-5", "reasoning_effort": "high"}
+        fable = {"agent": "claude", "model": "claude-fable-5-1", "reasoning_effort": "medium"}
+        config = core.deep_merge(self.config, {"claude": {"command": sys.executable},
+                                               "decisions": {"mode": "shadow", "model_effort_pairs": [ASTRA, opus, fable]}})
+        engine = DecisionEngine(self.workspace, config, Advice())
+        task = core.make_task(self.workspace, "claude", "Inspect fixture", "inspect", [], [], None, False, False,
+                              settings_overrides={"model": opus["model"], "reasoning_effort": "high"})
+        with patch("fusion_policy.DecisionEngine", return_value=engine):
+            route_task(config, task, core.RunStore(self.workspace))
+        decision = next(e for e in read_jsonl(engine.store.path) if e.get("event") == "decision")
+        criteria = decision["questions"]["route"]["criteria"]
+        self.assertEqual(len(criteria), 2)
+        self.assertTrue(all(text.startswith("claude ") for text in criteria.values()))
+        self.assertEqual(task["settings_overrides"], {"model": opus["model"], "reasoning_effort": "high"})
+        self.assertFalse(read_jsonl(engine.store.path)[-1]["applied"])
+        # Pairs for another harness are not candidates, and no claude pairs means no question.
+        codex_only = core.deep_merge(self.config, {"claude": {"command": sys.executable},
+                                                   "decisions": {"mode": "shadow", "model_effort_pairs": [ASTRA, SOL]}})
+        task = core.make_task(self.workspace, "claude", "Inspect fixture", "inspect", [], [], None, False, False,
+                              settings_overrides={"model": opus["model"], "reasoning_effort": "high"})
+        with patch("fusion_policy.DecisionEngine", return_value=DecisionEngine(self.workspace, codex_only, Advice())):
+            route_task(codex_only, task, core.RunStore(self.workspace))
+        self.assertEqual(task["settings_overrides"], {"model": opus["model"], "reasoning_effort": "high"})
+
+    def test_harness_specific_effort_rules(self):
+        from fusion_reasoning import check_pair, claude_choice
+        with self.assertRaisesRegex(ValueError, "does not support reasoning effort"):
+            check_pair("claude", {"model": "claude-haiku-4-5-20251001", "reasoning_effort": "low"})
+        self.assertEqual(claude_choice({"model": "claude-opus-4-6", "reasoning_effort": "xhigh"})["catalog"]["status"],
+                         "requested_may_downgrade")
+        with self.assertRaisesRegex(ValueError, "agy accepts reasoning_effort high, low, medium"):
+            check_pair("agy", {"model": "gemini-3-pro", "reasoning_effort": "xhigh"})
+        config = core.deep_merge(self.config, {"agy": {"command": sys.executable}})
+        task = core.make_task(self.workspace, "agy", "Inspect fixture", "inspect", [], [], None, False, False,
+                              settings_overrides={"model": "gemini-3-pro", "reasoning_effort": "medium"})
+        argv, _, metadata = core.agent_command(config, task, None)
+        self.assertEqual(argv[argv.index("--effort") + 1], "medium")
+        self.assertEqual(metadata["execution_choice"]["observed"]["status"], "unobserved")
 
     def test_named_route_keeps_model_and_effort_together(self):
         config = core.deep_merge(self.config, {"decisions": {"mode": "active"}, "routes": {

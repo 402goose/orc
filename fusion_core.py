@@ -1310,8 +1310,8 @@ def agent_command(
 ) -> tuple[list[str], dict[str, str], dict[str, Any]]:
     agent = task["agent"]
     settings = agent_settings(config, task)
-    if settings.get("reasoning_effort") is not None and agent not in {"codex", "claude"}:
-        raise ValueError("reasoning_effort is currently supported only for native Codex and Claude Code")
+    if settings.get("reasoning_effort") is not None and agent not in {"codex", "claude", "agy"}:
+        raise ValueError("reasoning_effort is currently supported only for native Codex, Claude Code and agy")
     yolo = execution_mode(config) == "yolo"
     env = os.environ.copy()
     if agent == "codex":
@@ -1347,12 +1347,18 @@ def agent_command(
         selected_model = str(settings.get("model", ""))
         if selected_model:
             argv += ["--model", selected_model]
+        choice = None
+        if settings.get("reasoning_effort") is not None:
+            from fusion_reasoning import check_pair, recorded_choice
+            choice = recorded_choice(check_pair("agy", settings), {"status": "unchecked", "reason": "agy publishes no per-model effort catalog"})
+            argv += ["--effort", settings["reasoning_effort"]]
         print_timeout = settings.get("print_timeout")
         if print_timeout:
             argv += ["--print-timeout", str(print_timeout)]
         if session_id:
             argv += ["--conversation", session_id]
-        return argv, os.environ.copy(), {"command": command, "model": selected_model}
+        return argv, os.environ.copy(), {"command": command, "model": selected_model,
+                                         **({"execution_choice": choice} if choice else {})}
     if agent == "grok":
         command = settings.get("command", "grok")
         mode = "bypassPermissions" if yolo else settings.get("permission_mode", "plan") if task["write"] else "plan"
@@ -1485,7 +1491,7 @@ def dispatch(
     route_task(config, task, store)
     # Pinned choices do not resume a session created for a different pair.
     # Keep legacy session keys unchanged when effort is inherited.
-    if task["agent"] in {"codex", "claude"}:
+    if task["agent"] in {"codex", "claude", "agy"}:
         settings = agent_settings(config, task)
         if settings.get("reasoning_effort") is not None:
             from fusion_reasoning import pair_key, validate_pair

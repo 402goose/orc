@@ -71,11 +71,11 @@ def route_candidates(config, task, store, rejected=None):
         if settings.get("reasoning_effort") is not None:
             from fusion_reasoning import native_capability, validate_pair
             try:
-                if agent not in {"codex", "claude"}:
-                    raise ValueError("reasoning effort requires native Codex or Claude Code")
-                if agent == "claude":
-                    from fusion_reasoning import claude_choice
-                    claude_choice(settings)
+                if agent not in {"codex", "claude", "agy"}:
+                    raise ValueError("reasoning effort requires native Codex, Claude Code or agy")
+                if agent in {"claude", "agy"}:
+                    from fusion_reasoning import check_pair
+                    check_pair(agent, settings)
                 if settings["reasoning_effort"] == "ultra" and (task.get("write") or settings.get("allow_native_delegation") is not True):
                     raise ValueError("ultra requires read-only scope and explicit native delegation")
                 native_capability(validate_pair(settings.get("model"), settings["reasoning_effort"]))
@@ -245,7 +245,7 @@ def route_task(config, task, store):
         else:
             from fusion_reasoning import pair_candidates, pair_key
             settings = core.agent_settings(config, task)
-            pairs = pair_candidates(config, settings, task.get("write", False)) if task["agent"] == "codex" else []
+            pairs = pair_candidates(config, settings, task.get("write", False), task["agent"]) if task["agent"] in {"codex", "claude", "agy"} and settings.get("reasoning_effort") is not None else []
             # A named route with several arms still chooses a model inside that
             # route; the lane itself is never substituted.
             arms = [] if pairs or not task.get("route") or settings.get("model") or int(settings.get("arms", 1)) < 2 else [
@@ -253,7 +253,7 @@ def route_task(config, task, store):
             if arms and ranking:
                 arms = rank_by_outcomes(arms, int(ranking) if not isinstance(ranking, bool) else 3, warm_epsilon)
             within_route = len(arms) > 1
-            candidates = arms or [{"key": pair_key(pair), "agent": "codex", "route": task.get("route"), **pair} for pair in pairs] or [{
+            candidates = arms or [{"key": pair_key(pair), "agent": task["agent"], "route": task.get("route"), **pair} for pair in pairs] or [{
                 "key": task.get("route") or task["agent"], "agent": task["agent"], "route": task.get("route"),
                 "model": settings.get("model", ""),
                 **({"reasoning_effort": settings["reasoning_effort"]} if settings.get("reasoning_effort") is not None else {}),
