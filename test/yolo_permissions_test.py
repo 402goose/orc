@@ -123,3 +123,39 @@ print(json.dumps({'status':'SUCCESS','response':'STATUS: success\\nSUMMARY: chec
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AgySkipPermissionsTest(unittest.TestCase):
+    """Restricted mode: only an explicit agy opt-out drops agy's sandbox."""
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        env = patch.dict(os.environ, {"ORC_HOME": str(self.root / "orc-home"), "FUSION_TELEMETRY": "0", "HOME": str(self.root)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.config = core.deep_merge(core.DEFAULTS, {"routes": {}, "decisions": {"mode": "off"},
+                                                      "agy": {"command": sys.executable}, "codex": {"command": sys.executable}})
+
+    def argv(self, agent, overrides):
+        task = core.make_task(self.root, agent, "Check the fixture", "review", [], [], None, False, True, settings_overrides=overrides)
+        return core.agent_command(self.config, task, None)[0]
+
+    def test_only_the_explicit_agy_flag_skips_its_sandbox(self):
+        self.assertIn("--sandbox", self.argv("agy", {}))
+        self.assertNotIn("--dangerously-skip-permissions", self.argv("agy", {"approval": "never"}))
+        argv = self.argv("agy", {"dangerously_skip_permissions": True})
+        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertNotIn("--sandbox", argv)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", self.argv("codex", {"approval": "never"}))
+
+    def test_availability_and_routing_follow_the_flag_for_agy_only(self):
+        self.assertFalse(core.worker_availability(self.config, "agy")["automatic_ready"])
+        self.config["agy"]["dangerously_skip_permissions"] = True
+        state = core.worker_availability(self.config, "agy")
+        self.assertTrue(state["automatic_ready"])
+        self.assertIn("without its sandbox", state["reason"])
+        task = core.make_task(self.root, "auto", "Check the fixture", "review", [], [], None, False, False)
+        self.assertIn("agy", [c["agent"] for c in route_candidates(self.config, task, core.RunStore(self.root))])
+        self.config["codex"]["approval"] = "never"
+        self.assertNotIn("sandbox", core.worker_availability(self.config, "codex")["reason"])
