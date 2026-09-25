@@ -767,41 +767,49 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
         done = {row["key"] for row in read_results(gym) if row.get("event") == "finished" and row.get("completed")}
         spent, processed, finished = 0.0, 0, []
         for task in tasks:
-            pending = [name for name in lanes if result_key(task["id"], name, mode) not in done]
+            # Without hints, hidden+hints sends the same prompt as hidden: reuse
+            # those results instead of paying for identical runs again.
+            task_mode = mode
+            if mode == "hidden+hints":
+                ensure_hidden(task)
+                ensure_interface(task)
+                if not task.get("interface"):
+                    task_mode = "hidden"
+            pending = [name for name in lanes if result_key(task["id"], name, task_mode) not in done]
             if not pending:
                 continue
             if max_tasks is not None and processed >= max_tasks:
                 break
             processed += 1
-            if mode in HIDDEN_MODES:
+            if task_mode in HIDDEN_MODES:
                 ensure_hidden(task)
-            if mode == "hidden+hints":
+            if task_mode == "hidden+hints":
                 ensure_interface(task)
-            start_sha = task["hidden"]["base_sha"] if mode in HIDDEN_MODES else task["task_sha"]
-            repo = task_repo(gym, task, mode)
+            start_sha = task["hidden"]["base_sha"] if task_mode in HIDDEN_MODES else task["task_sha"]
+            repo = task_repo(gym, task, task_mode)
             for name in pending:
                 if budget_usd is not None and spent >= budget_usd:
                     return {"status": "budget_reached", "spent_usd": spent, "runs": finished}
                 lane = resolved[name]
-                key = result_key(task["id"], name, mode)
-                workflow_id = f"gym-{task['id']}-{WORKFLOW_TAGS.get(mode, '')}{_slug(name)}-{uuid.uuid4().hex[:8]}"
-                worktree = task_root(gym, task, mode) / ("lanes-hints" if mode == "hidden+hints" else "lanes") / _slug(name)
+                key = result_key(task["id"], name, task_mode)
+                workflow_id = f"gym-{task['id']}-{WORKFLOW_TAGS.get(task_mode, '')}{_slug(name)}-{uuid.uuid4().hex[:8]}"
+                worktree = task_root(gym, task, task_mode) / ("lanes-hints" if task_mode == "hidden+hints" else "lanes") / _slug(name)
                 _remove_worktree(repo, worktree)
                 worktree.parent.mkdir(parents=True, exist_ok=True)
                 git(repo, "worktree", "add", "-q", "--detach", str(worktree), start_sha)
-                if mode not in HIDDEN_MODES:
+                if task_mode not in HIDDEN_MODES:
                     # Hidden runs keep no link: the gym's .fusion holds the manifest
                     # (hidden test ids) and before-run output (test names), and
                     # workflow state already goes to the control workspace (#81).
                     (worktree / ".fusion").symlink_to(gym / ".fusion", target_is_directory=True)
-                _append(gym, {"schema": RESULT_SCHEMA, "event": "started", "key": key, "mode": mode,
+                _append(gym, {"schema": RESULT_SCHEMA, "event": "started", "key": key, "task_mode": task_mode,
                               "workflow_id": workflow_id, "started_at_ms": int(time.time() * 1000)})
                 # Hidden test files live outside the gym only for this run.
-                fixture_dir = Path(tempfile.mkdtemp(prefix="fusion-gym-fixtures-")) if mode in HIDDEN_MODES else None
+                fixture_dir = Path(tempfile.mkdtemp(prefix="fusion-gym-fixtures-")) if task_mode in HIDDEN_MODES else None
                 started = time.monotonic()
                 try:
                     fixtures = write_fixtures(task, fixture_dir) if fixture_dir else None
-                    spec = build_spec(task, lane, None if budget_usd is None else budget_usd - spent, mode, fixtures)
+                    spec = build_spec(task, lane, None if budget_usd is None else budget_usd - spent, task_mode, fixtures)
                     outcome = runner(gym, config, spec, run_id=workflow_id,
                                      worktree={"workspace": str(worktree), "base_sha": start_sha}).run()
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
@@ -817,11 +825,11 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
                     patch = git(repo, "diff", "--binary", start_sha, tree, binary=True)
                 except (OSError, ValueError, subprocess.SubprocessError):
                     pass
-                row = summarize(task, name, lane, outcome, diff_files, wall_ms, mode)
+                row = summarize(task, name, lane, outcome, diff_files, wall_ms, task_mode)
                 row["gate_label"] = withdraw_untrusted_label(gym, row)
                 if outcome.get("error"):
                     row["error"] = outcome["error"]
-                evidence = gym / "results" / task["id"] / mode_dir(mode) / _slug(name)
+                evidence = gym / "results" / task["id"] / mode_dir(task_mode) / _slug(name)
                 evidence.mkdir(parents=True, exist_ok=True)
                 (evidence / f"{workflow_id}.patch").write_bytes(patch)
                 row["patch"] = str(evidence / f"{workflow_id}.patch")

@@ -334,6 +334,14 @@ class GymTest(Isolated):
         self.assertEqual(value["lanes"]["cheater"]["tampered"], 1)
         self.assertIn("fixer", gym.table(gym.report(self.gym_dir)))
 
+    def test_a_task_without_hints_reuses_its_hidden_results(self):
+        self.extract()
+        [first] = gym.run(self.tasks, ["fixer"], self.gym_dir, mode="hidden")["runs"]
+        again = gym.run(self.tasks, ["fixer"], self.gym_dir, mode="hidden+hints")
+        # The fixture task's tests call nothing new, so hidden+hints would send the
+        # same prompt: the hidden result stands and nothing runs again.
+        self.assertEqual((first["key"].endswith(":hidden"), again["runs"]), (True, []))
+
     def test_hidden_tests_grade_a_worker_that_only_sees_the_problem(self):
         self.extract()
         result = gym.run(self.tasks, ["fixer", "idler", "cheater", "forger", "observer"], self.gym_dir)

@@ -1045,6 +1045,15 @@ tests call that the fix added or changed (see Interface hints below).
 `--no-interface-hints` runs plain `hidden`. The modes measure different
 things: results are keyed and reported per mode and never pooled.
 
+A task whose tests call nothing new gets no hint section; its hidden+hints
+prompt equals the hidden one, so `gym run` keys it as `hidden` and reuses
+existing hidden results rather than paying for identical runs. Only tasks with
+hints get separate `hidden+hints` runs. Of the first 18 tasks, 5 have hints
+(pr-72, pr-79, pr-88, pr-89, pr-105); six tasks no lane solved (pr-60, 71, 81,
+87, 98, 103) call only unchanged interfaces and are underspecified in
+behavior, which hints cannot fix; the solvability audit keeps their negatives
+out of training.
+
 **Extraction.** For PR N's squash commit C (found by `mergeCommit` from gh,
 else by a `(#N)` subject on `--ref`) with parent B, files under `test/` or
 `tests/` or named `test_*.py` / `*_test.py` are tests; everything else is
