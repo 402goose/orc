@@ -139,6 +139,8 @@ class GymTest(Isolated):
         (self.repo / "test/calc_test.py").write_text(TEST_BASE)
         (self.repo / ".gitignore").write_text(".fusion/\n.fusion.json\n__pycache__/\n")
         run_git(self.repo, "init", "-q")
+        run_git(self.repo, "add", ".gitignore")
+        run_git(self.repo, "commit", "-qm", "init")
         run_git(self.repo, "add", ".")
         run_git(self.repo, "commit", "-qm", "seed")
         self.base = run_git(self.repo, "rev-parse", "HEAD")
@@ -236,6 +238,16 @@ class GymTest(Isolated):
         self.assertEqual((value["lanes"]["fixer"]["f2p_pass_rate"], value["lanes"]["idler"]["f2p_pass_rate"]), (1.0, 0.0))
         self.assertEqual(value["lanes"]["cheater"]["tampered"], 1)
         self.assertIn("fixer", gym.table(value))
+
+    def test_a_shallow_source_repository_works(self):
+        shallow = self.root / "shallow"
+        run_git(self.root, "clone", "-q", "--depth", "3", self.repo.as_uri(), str(shallow))
+        self.assertEqual(run_git(shallow, "rev-parse", "--is-shallow-repository"), "true")
+        (shallow / ".fusion.json").write_text(json.dumps(self.config))
+        _, [task] = gym.extract(shallow, [7], self.tasks, use_gh=False)
+        self.assertEqual(task["fail_to_pass"], ["calc_test.CalcTest.test_add_negative"])
+        [row] = gym.run(self.tasks, ["fixer"], self.gym_dir)["runs"]
+        self.assertEqual(row["verdict"], "solved")
 
     def test_an_unavailable_lane_and_budget_are_not_completed_runs(self):
         self.extract()

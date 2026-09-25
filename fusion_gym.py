@@ -517,8 +517,8 @@ def task_repo(gym, task):
         repo.mkdir(parents=True, exist_ok=True)
         git(repo, "init", "-q")
     if git(repo, "rev-parse", "-q", "--verify", TASK_REF, check=False).strip() != task["task_sha"]:
-        git(repo, "fetch", "-q", "--no-tags", task["repo_path"], f"+{task['task_ref']}:{TASK_REF}")
-        if git(repo, "rev-parse", TASK_REF).strip() != task["task_sha"]:
+        git(repo, "fetch", "-q", "--no-tags", "--update-shallow", task["repo_path"], f"+{task['task_ref']}:{TASK_REF}")
+        if git(repo, "rev-parse", "-q", "--verify", TASK_REF, check=False).strip() != task["task_sha"]:
             raise ValueError(f"{task['task_ref']} in {task['repo_path']} is not {task['task_sha']}; re-extract the task")
     return repo
 
