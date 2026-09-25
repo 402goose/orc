@@ -347,6 +347,10 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"workflow node {node['id']} acceptance.before must be a boolean on a write node")
         if isinstance(node.get("acceptance"), dict):
             _validate_fixtures(node["id"], node["acceptance"].get("fixtures"))
+            targeted = node["acceptance"].get("fail_to_pass")
+            if targeted is not None and (before is not True or not isinstance(targeted, list)
+                                         or any(check not in (node["acceptance"].get("checks") or []) for check in targeted)):
+                raise ValueError(f"workflow node {node['id']} acceptance.fail_to_pass must list some of its checks and needs acceptance.before")
         if node.get("independent_of") and node["independent_of"] not in node["needs"]:
             raise ValueError("independent_of must name a direct dependency")
 
@@ -1203,6 +1207,7 @@ BLOCKERS: unresolved issues, or none
                 label = " ".join(command) if isinstance(command, list) and all(isinstance(part, str) for part in command) else str(command)
                 detail = {"origin": origin, "check_index": index, "status": receipt["status"], "vacuous": vacuous,
                           "exit_code": receipt.get("exit_code"),
+                          "targeted": origin == "authored" and command in (((node.get("acceptance") or {}).get("fail_to_pass")) or []),
                           "test_failure": receipt["status"] == "failed" and isinstance(command, list)
                           and counts_as_failure(command, receipt.get("exit_code"))}
                 if receipt["error"]:

@@ -508,7 +508,8 @@ objective codes:
 | the gate passed and a check failed before the change and passed after it (fail→pass) | `failed_task=false` |
 | a check that passed before the change fails after it with a test failure (pass→fail: the change broke what the plan said must pass) | `failed_task=true` |
 | a first attempt finished without changing the tree (`write_no_change`, attempt 1) | `failed_task=true` |
-| a check that failed before and still fails (fail→fail), or whose baseline is unknown | unlabeled |
+| a check declared in `acceptance.fail_to_pass` (verified to fail before and pass after a reference fix, as the gym's are) that failed before and still fails | `failed_task=true` |
+| any other check that failed before and still fails (fail→fail), or whose baseline is unknown | unlabeled |
 | a later attempt that changed nothing (its tree holds earlier attempts' work) | unlabeled |
 | anything else | unlabeled |
 
