@@ -179,14 +179,28 @@ def no_route_reason(config, task, store):
             "Run `fusion doctor` to see every lane and its command.")
 
 
-def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None):
+def exploration(ranking, task, candidates):
+    """(minimum, explore) for rank_by_outcomes. Unproven lanes earn evidence on
+    ordinary read-only work, not on work that ships or gates: a writer or a
+    review goes to a lane with verified evidence once any lane has it."""
+    minimum = int(ranking) if not isinstance(ranking, bool) else 3
+    gating = task.get("write") or "review" in str(task.get("role", "")).lower()
+    return minimum, not gating or not any((c.get("checked_runs") or 0) >= minimum for c in candidates)
+
+
+def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None, explore=True):
     """Order automatic candidates by verified outcomes, not by worker self-reports.
 
-    A candidate with fewer than `minimum` checked runs is tried first, in the
-    configured preference order, so every arm earns evidence. The rest follow by
-    smoothed acceptance rate (accepted + 1) / (checked + 2). Stable: ties keep
-    preference order. Only gate and lead outcomes count; `status: success` alone
-    is a worker's claim.
+    With `explore` (the default), a candidate with fewer than `minimum` checked
+    runs is tried first, in the configured preference order, so every arm earns
+    evidence. The rest follow by smoothed acceptance rate
+    (accepted + 1) / (checked + 2). Stable: ties keep preference order. Only
+    gate and lead outcomes count; `status: success` alone is a worker's claim.
+
+    With `explore=False`, the tier-0 short-circuit is skipped and every
+    candidate is scored by smoothed acceptance rate, so an unproven lane never
+    outranks one with verified evidence -- callers pass this once a lane has
+    already earned enough evidence to trust.
 
     With `warm_epsilon`, prompt-cache warmth breaks ties only: candidates in the
     same bucket whose smoothed rate is within epsilon of the best rate in their
@@ -196,7 +210,7 @@ def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None):
     def score(item):
         index, candidate = item
         checked = candidate.get("checked_runs") or 0
-        if checked < minimum:
+        if explore and checked < minimum:
             return (0, 0.0, index)
         accepted = (candidate.get("acceptance_rate") or 0) * checked
         return (1, -(accepted + 1) / (checked + 2), index)
@@ -238,7 +252,8 @@ def route_task(config, task, store):
         if automatic:
             candidates = route_candidates(config, task, store)
             if ranking:
-                candidates = rank_by_outcomes(candidates, int(ranking) if not isinstance(ranking, bool) else 3, warm_epsilon)
+                minimum, explore = exploration(ranking, task, candidates)
+                candidates = rank_by_outcomes(candidates, minimum, warm_epsilon, explore)
                 if task.get("prefer_different_agent"):
                     # Independence outranks track record: a review stays with a
                     # different harness than the implementer when one is available.
@@ -252,7 +267,8 @@ def route_task(config, task, store):
             arms = [] if pairs or not task.get("route") or settings.get("model") or int(settings.get("arms", 1)) < 2 else [
                 c for c in route_candidates(config, task, store) if c["route"] == task["route"]]
             if arms and ranking:
-                arms = rank_by_outcomes(arms, int(ranking) if not isinstance(ranking, bool) else 3, warm_epsilon)
+                minimum, explore = exploration(ranking, task, arms)
+                arms = rank_by_outcomes(arms, minimum, warm_epsilon, explore)
             within_route = len(arms) > 1
             candidates = arms or [{"key": pair_key(pair), "agent": task["agent"], "route": task.get("route"), **pair} for pair in pairs] or [{
                 "key": task.get("route") or task["agent"], "agent": task["agent"], "route": task.get("route"),
