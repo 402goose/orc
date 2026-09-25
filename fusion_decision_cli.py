@@ -5,7 +5,7 @@ import shutil
 import subprocess
 
 from fusion_decisions import (DecisionEngine, DecisionStore, ACCEPTANCE_QUESTIONS, INTAKE_QUESTIONS, RECOVERY_QUESTIONS,
-                              REVIEW_QUESTIONS, fit_calibration, runtime_python)
+                              REVIEW_QUESTIONS, fit_calibration, read_jsonl, runtime_python)
 
 
 def add_parser(sub):
@@ -37,6 +37,7 @@ def add_parser(sub):
     export.add_argument("output")
     export.add_argument("--exclude-source", action="append", default=[], metavar="SOURCE",
                         help="leave out answers approved by this source, for example lead_verdict; repeatable")
+    commands.add_parser("routing-report", help="per-lane acceptance from logged routing propensities (IPS, ESS); read-only")
     calibrate = commands.add_parser("calibrate", help="fit temperature on train and assess held-out groups")
     calibrate.add_argument("dataset")
     calibrate.add_argument("output")
@@ -111,6 +112,9 @@ def run(args, workspace, config):
             raise ValueError("answers must be question=value pairs")
         store.label(args.id, dict(answer.split("=", 1) for answer in args.answers), args.evidence)
         payload = {"id": args.id, "labeled": True}
+    elif command == "routing-report":
+        from fusion_policy import routing_report
+        payload = routing_report(read_jsonl(store.path))
     elif command == "export":
         payload = store.export(args.output, getattr(args, "exclude_source", []))
     else:

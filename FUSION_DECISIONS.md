@@ -73,7 +73,9 @@ it. Interactive lead sessions use their own provider controls.
    routes cannot become writers. Recent quota failures exclude equivalent
    native lanes. Explicit agent/route selections stay pinned, and a lane
    with a single candidate records no routing decision: there is nothing
-   to choose.
+   to choose. Every automatic or within-route choice, single-candidate ones
+   included, is still written to the routing log with its propensities; see
+   [Routing log and exploration](#routing-log-and-exploration).
 
    Without a qualified classifier, automatic lanes follow the configured
    preference order. `"decisions": {"rank_by_outcomes": true}` orders them
@@ -191,6 +193,60 @@ and reviews still prefer a different agent from the implementer. Without a
 `cache` block the order is unchanged. Candidates passed to Laya's routing
 decision include `warm` and `session_idle_s` as shadow state; they add no
 authority.
+
+## Routing log and exploration
+
+Only the chosen lane's outcome is ever observed, so comparing a different
+router against past runs needs the probability with which each lane was
+picked. Every automatic choice and every model choice inside a named route
+with arms appends a `routing_log` event to `.fusion/decisions/events.jsonl`,
+including single-candidate choices (those do not ask Laya). Explicit lanes
+and pairs are not logged: nothing was chosen. With decisions `mode: off`
+nothing is logged and nothing explores.
+
+```json
+{"event": "routing_log", "task_id": "RUN_ID", "group": "...", "decision_id": "... or null",
+ "scope": "automatic | route_arms", "write": false, "role": "implementation",
+ "policy": {"rank_by_outcomes": 3, "explore": true, "warm_epsilon": null,
+            "epsilon": 0.1, "routing_epsilon": 0.1, "laya_applied": false},
+ "candidates": [{"key": "codex", "checked_runs": 4, "acceptance_rate": 0.75, "...": "...", "propensity": 0.95},
+                {"key": "claude", "checked_runs": 0, "...": "...", "propensity": 0.05}],
+ "chosen": "codex", "explored": false}
+```
+
+`candidates` is the final ranked order with the same evidence fields Laya's
+routing decision sees. `policy.rank_by_outcomes` is the minimum checked
+runs (`null` when ranking is off), `explore` whether unproven lanes led the
+ranking, `epsilon` the exploration rate actually applied to this choice and
+`routing_epsilon` the configured one. `propensity` is the probability this
+policy picks each candidate in this state: 1.0 for the chosen lane and 0 for
+the others when the pick is deterministic, including when a qualified Laya
+recommendation is applied.
+
+**Exploration.** `"decisions": {"routing_epsilon": 0.1}` (default 0, the
+deterministic behaviour) picks uniformly among the candidates with
+probability epsilon, so with k candidates the ranked top has propensity
+`(1 - epsilon) + epsilon / k` and each other `epsilon / k`. It applies to
+ordinary read-only work only: never to a writer, a review, a task that must
+use a different agent than the implementer, a pinned lane, or a choice where
+a qualified Laya recommendation was applied. Candidates are the lanes that
+already passed every safety filter, so exploration can never pick a lane
+those filters dropped. The application record's reason says when
+exploration picked the lane.
+
+**Report.** `orc fusion decisions routing-report` (read-only) joins each run's
+latest `routing_log` to its latest outcome by run id -- gate outcomes and
+lead verdicts; outcomes marked `laya_veto` are skipped -- and reports per
+lane, over the logged choices where it was a candidate: `available`,
+`chosen`, `accepted`, `observed_acceptance` (on-policy, biased by the
+ranking), `ips_acceptance` (sum of accepted/propensity over the lane's
+picks, divided by `available`), `snips_acceptance` (the same, normalised by
+the summed weights), and `ess`, the effective sample size
+`(sum w)^2 / sum w^2`. A lane that had propensity 0 anywhere it was
+available, or was never chosen, is marked `insufficient overlap` and gets
+no estimate: deterministic logs cannot say how an unchosen lane would have
+done. Runs logged before this existed have no `routing_log` and are not
+counted.
 
 ## Shadow, off and active modes
 
