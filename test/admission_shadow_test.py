@@ -79,7 +79,7 @@ class ShadowPolicyTest(unittest.TestCase):
     def test_shadow_cannot_veto_or_switch_and_records_linked_advice(self):
         result, events = self.run_workflow(Prediction(plausible=False))
         self.assertEqual(result["status"], "success")
-        records = [e for e in events if e["event"] == "decision"]
+        records = [e for e in events if e["event"] == "decision" and e.get("status") != "unscored"]
         self.assertEqual([r["kind"] for r in records], ["acceptance", "recovery"])
         for record in records:
             self.assertEqual(record["context"], {"task_id": "native-attempt-fixture", "group": "admitted-fixture"})
@@ -94,8 +94,9 @@ class ShadowPolicyTest(unittest.TestCase):
         result, events = self.run_workflow(backend, failed=True)
         self.assertEqual(result["status"], "failed")
         self.assertEqual(backend.calls, 1)  # Recovery only; structural failure skips semantic acceptance.
-        self.assertFalse(any(e.get("kind") == "acceptance" for e in events))
-        self.assertFalse(next(e for e in events if e["event"] == "outcome")["accepted"])
+        self.assertFalse(any(e.get("kind") == "acceptance" and e.get("status") != "unscored" for e in events if e["event"] == "decision"))
+        # A non-objective structural failure is kept out of route ranking (#93).
+        self.assertFalse(next(e for e in events if e["event"] in {"outcome", "outcome_excluded"})["accepted"])
         application = next(e for e in events if e["event"] == "application")
         self.assertEqual(application["actual"], "stop")
         self.assertFalse(application["applied"])
@@ -103,7 +104,7 @@ class ShadowPolicyTest(unittest.TestCase):
     def test_unavailable_shadow_preserves_structural_acceptance(self):
         result, events = self.run_workflow(Prediction(unavailable=True))
         self.assertEqual(result["status"], "success")
-        self.assertTrue(all(e["status"] == "unavailable" for e in events if e["event"] == "decision"))
+        self.assertTrue(all(e["status"] == "unavailable" for e in events if e["event"] == "decision" and e.get("status") != "unscored"))
         self.assertTrue(all(not e["applied"] for e in events if e["event"] == "application"))
 
     def test_active_countercontrol_really_can_veto(self):
