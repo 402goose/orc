@@ -78,7 +78,9 @@ it. Interactive lead sessions use their own provider controls.
    Without a qualified classifier, automatic lanes follow the configured
    preference order. `"decisions": {"rank_by_outcomes": true}` orders them
    by verified outcomes instead: a lane with fewer than 3 checked runs (or
-   the integer you set) is tried first so it earns evidence, then lanes
+   the integer you set) is tried first so it earns evidence -- on ordinary
+   read-only work only: a writer or a review goes to a lane with verified
+   evidence once any lane has reached that minimum -- then lanes
    follow smoothed acceptance `(accepted + 1) / (checked + 2)`. Workflow
    gate outcomes and lead verdicts count, and so does an observed error
    (not quota or permission, which are lane health); a worker's

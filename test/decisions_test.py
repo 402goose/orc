@@ -323,6 +323,46 @@ class DecisionsTest(unittest.TestCase):
         self.assertEqual([c["key"] for c in rank_by_outcomes(candidates, 1)], ["new", "claimed", "strong", "weak"])
         self.assertEqual([c["key"] for c in rank_by_outcomes(candidates, 0)], ["claimed", "strong", "new", "weak"])
 
+    def test_rank_by_outcomes_explore_false_never_lets_untested_lead_a_verified_one(self):
+        candidates = [{"key": "weak", "checked_runs": 5, "acceptance_rate": .2},
+                      {"key": "strong", "checked_runs": 5, "acceptance_rate": .8},
+                      {"key": "new", "checked_runs": 0, "acceptance_rate": None},
+                      {"key": "claimed", "checked_runs": 2, "acceptance_rate": 1.0, "reported_success_rate": 1.0}]
+        # explore=False skips the tier-0 short-circuit: "new" no longer jumps ahead just for being untested.
+        self.assertEqual([c["key"] for c in rank_by_outcomes(candidates, explore=False)], ["claimed", "strong", "new", "weak"])
+        self.assertEqual([c["key"] for c in rank_by_outcomes(candidates, 1, explore=False)], ["claimed", "strong", "new", "weak"])
+
+    def test_route_task_prefers_verified_arm_over_untested_once_a_lane_qualifies_on_write(self):
+        self.config["routes"] = {"orc-free": {"agent": "claude", "command": "orc", "model_selector": "free", "arms": 3}}
+        self.config["decisions"]["rank_by_outcomes"] = 1
+        ranked = {("--free", "--tools"): ["free/untested", "free/top", "free/next"], ("--fit",): ["free/untested", "free/top", "free/next"]}
+        store = core.RunStore(self.workspace)
+        spans = [{"agent": "claude", "route": "orc-free", "model": "free/top", "run_id": "t1", "status": "success"}]
+        DecisionStore(self.workspace).append("outcome", task_id="t1", accepted=True)
+        write_task = core.make_task(self.workspace, "claude", "Scout issues", "discovery", [], [], None, False, True, route="orc-free")
+        with patch.object(core, "executable", return_value="/fixture/agent"), \
+                patch.object(core, "_orc_model_ids", side_effect=lambda command, args: ranked[tuple(args)]), \
+                patch.object(store, "traces", return_value=spans):
+            route_task(self.config, write_task, store)
+        # free/top has reached the minimum with a verified acceptance, so a write task
+        # prefers it over the untested free/untested lane that would otherwise sort first.
+        self.assertEqual(write_task["settings_overrides"]["model"], "free/top")
+        read_task = core.make_task(self.workspace, "claude", "Scout issues", "discovery", [], [], None, False, False, route="orc-free")
+        with patch.object(core, "executable", return_value="/fixture/agent"), \
+                patch.object(core, "_orc_model_ids", side_effect=lambda command, args: ranked[tuple(args)]), \
+                patch.object(store, "traces", return_value=spans):
+            route_task(self.config, read_task, store)
+        # Read-only tasks keep exploring under-tested lanes first, unchanged from today.
+        self.assertEqual(read_task["settings_overrides"]["model"], "free/untested")
+        # A review gates acceptance, so it also goes to verified evidence (seen live:
+        # an unproven free model returned empty reviews twice on 2026-09-24).
+        review_task = core.make_task(self.workspace, "claude", "Review the diff", "review", [], [], None, False, False, route="orc-free")
+        with patch.object(core, "executable", return_value="/fixture/agent"), \
+                patch.object(core, "_orc_model_ids", side_effect=lambda command, args: ranked[tuple(args)]), \
+                patch.object(store, "traces", return_value=spans):
+            route_task(self.config, review_task, store)
+        self.assertEqual(review_task["settings_overrides"]["model"], "free/top")
+
     def test_shadow_automatic_routing_follows_verified_outcomes_when_enabled(self):
         store = core.RunStore(self.workspace)
         spans = [{"agent": agent, "run_id": f"{agent}-{n}", "status": "success"} for agent in ("codex", "claude") for n in range(3)]
