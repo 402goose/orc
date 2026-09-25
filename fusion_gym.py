@@ -728,7 +728,11 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
                 _remove_worktree(repo, worktree)
                 worktree.parent.mkdir(parents=True, exist_ok=True)
                 git(repo, "worktree", "add", "-q", "--detach", str(worktree), start_sha)
-                (worktree / ".fusion").symlink_to(gym / ".fusion", target_is_directory=True)
+                if mode != "hidden":
+                    # Hidden runs keep no link: the gym's .fusion holds the manifest
+                    # (hidden test ids) and before-run output (test names), and
+                    # workflow state already goes to the control workspace (#81).
+                    (worktree / ".fusion").symlink_to(gym / ".fusion", target_is_directory=True)
                 _append(gym, {"schema": RESULT_SCHEMA, "event": "started", "key": key, "mode": mode,
                               "workflow_id": workflow_id, "started_at_ms": int(time.time() * 1000)})
                 # Hidden test files live outside the gym only for this run.
