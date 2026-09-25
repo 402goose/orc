@@ -64,8 +64,9 @@ That result was fixed by how labels are gathered, not by the model:
 
 ## Phase 2: learning quality
 
-- Train with soft cross-entropy plus upstream's proper-scoring objective; fit
-  temperatures on held-out groups only.
+- Train with soft cross-entropy plus upstream's proper-scoring objective.
+  Temperatures are fit on train groups: held-out groups choose the action
+  threshold, and fitting both on them would reuse the same evidence.
 - Choose the checkpoint per decision kind; evaluate `laya-typed-decisions`
   (1024-token context) for acceptance and re-derive the token budget from it.
 - [x] Report per-head majority and heuristic baselines on a time-split holdout.
