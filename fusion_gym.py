@@ -505,7 +505,8 @@ def build_spec(task, lane, budget_remaining=None, mode="visible", fixtures=None)
     but names none; `fixtures` ({path, from_file}) put them in place only
     while the checks run."""
     checks = task["checks"]["fail_to_pass"] + task["checks"]["pass_to_pass"]
-    acceptance = {"checks": checks, "before": True, "required_handoff": ["summary"]}
+    acceptance = {"checks": checks, "before": True, "required_handoff": ["summary"],
+                  "fail_to_pass": list(task["checks"]["fail_to_pass"])}
     if mode == "hidden":
         acceptance["fixtures"] = fixtures or []
     node = {"id": "implement", "role": "implementation", "agent": lane["agent"], "write": True,

@@ -310,13 +310,15 @@ class GymTest(Isolated):
         self.assertEqual(runs["fixer"]["gate_label"]["answers"], {"failed_task": "false"})
         self.assertEqual(runs["fixer"]["changed"], ["calc.py"])
         self.assertIn("return a + b", Path(runs["fixer"]["patch"]).read_text())
-        # Fail before, fail after: the gate rejects, and labels nothing.
-        self.assertEqual((runs["idler"]["status"], runs["idler"]["gate_label"]["status"]), ("failed", "unlabeled"))
+        # Fail before, fail after on a declared FAIL_TO_PASS check: the task was not done.
+        self.assertEqual((runs["idler"]["status"], runs["idler"]["gate_label"]["answers"]), ("failed", {"failed_task": "true"}))
         self.assertTrue(runs["idler"]["baseline_ok"])
         self.assertEqual(runs["cheater"]["tampered"], ["test/calc_test.py"])
         # Labels, runs and workflows accumulate in the gym workspace only.
         labels = self.gate_labels(self.gym_dir)
-        self.assertEqual([label["answers"] for label in labels], [{"failed_task": "false"}])
+        # Fixer done, idler failed; the cheater's label is appended then retracted ({}).
+        self.assertEqual([label["answers"] for label in labels],
+                         [{"failed_task": "false"}, {"failed_task": "true"}, {"failed_task": "true"}, {}])
         self.assertFalse((self.repo / ".fusion").exists())
         self.assertTrue(all(row["workflow_id"].startswith("gym-pr-7-") for row in runs.values()))
         # The per-task repository never holds the fix; lane worktrees are removed.
@@ -341,18 +343,19 @@ class GymTest(Isolated):
                          {"fixer": "solved", "idler": "unsolved", "cheater": "unsolved", "forger": "unsolved",
                           "observer": "solved"})
         self.assertTrue(all(row["mode"] == "hidden" and row["key"].endswith(":hidden") for row in runs.values()))
-        # fail->pass labels the fixer; fail->fail labels nothing.
+        # fail->pass labels the fixer done; fail->fail on its FAIL_TO_PASS check labels the idler failed.
         self.assertEqual(runs["fixer"]["gate_label"]["answers"], {"failed_task": "false"})
         self.assertTrue(runs["fixer"]["baseline_ok"])
         self.assertEqual(runs["fixer"]["changed"], ["calc.py"])
-        self.assertEqual((runs["idler"]["status"], runs["idler"]["gate_label"]["status"]), ("failed", "unlabeled"))
+        self.assertEqual((runs["idler"]["status"], runs["idler"]["gate_label"]["answers"]), ("failed", {"failed_task": "true"}))
         # A worker that rewrites the hidden test file (the forger makes the F2P
         # test pass trivially) is graded by the fixture anyway: recorded, not
         # rewarded, and not "tampered". The cheater's write equals B: no change.
         self.assertEqual((runs["forger"]["touched_fixtures"], runs["forger"]["tampered"]), (["test/calc_test.py"], []))
         self.assertEqual((runs["cheater"]["touched_fixtures"], runs["cheater"]["changed"]), ([], []))
         self.assertFalse(runs["forger"]["f2p_passed"] or runs["cheater"]["f2p_passed"])
-        self.assertEqual(runs["forger"]["gate_label"]["status"], "unlabeled")
+        # The fixture graded the forger's untouched code: the task was not done.
+        self.assertEqual(runs["forger"]["gate_label"]["answers"], {"failed_task": "true"})
         # The worker saw the base test file and a prompt that names no test.
         patch_text = Path(runs["observer"]["patch"]).read_text()
         self.assertIn("seen.json", patch_text)
