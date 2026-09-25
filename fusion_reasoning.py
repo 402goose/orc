@@ -8,19 +8,31 @@ from pathlib import Path
 
 
 EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
-# `claude --effort` accepts exactly these (Claude Code 2.1.x).
+# `claude --effort` accepts exactly these (Claude Code 2.1.x); `agy --effort` low..high.
 CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+AGY_EFFORTS = frozenset({"low", "medium", "high"})
+HARNESS_EFFORTS = {"codex": EFFORTS, "claude": CLAUDE_EFFORTS, "agy": AGY_EFFORTS}
 
 
 def claude_choice(settings):
-    """Claude Code publishes no per-model effort catalog and its JSON result does
-    not report the applied effort, so the request is recorded and the rest stays
-    unobserved rather than assumed."""
+    """Claude Code's JSON result does not report the applied effort, so the
+    request is recorded and the rest stays unobserved rather than assumed.
+    Claude Code's model docs: Haiku takes no effort; 4.6 models lack xhigh and
+    fall back to the highest supported level below it."""
     pair = validate_pair(settings.get("model"), settings.get("reasoning_effort"))
     if pair["reasoning_effort"] not in CLAUDE_EFFORTS:
         raise ValueError("Claude Code accepts reasoning_effort " + ", ".join(sorted(CLAUDE_EFFORTS)))
+    if "haiku" in pair["model"].lower():
+        raise ValueError(f"{pair['model']} does not support reasoning effort in Claude Code")
+    downgrade = pair["reasoning_effort"] == "xhigh" and "4-6" in pair["model"]
+    return recorded_choice(pair, {"status": "requested_may_downgrade", "reason": "4.6 models run xhigh as high"} if downgrade else
+                                 {"status": "unchecked", "reason": "Claude Code publishes no per-model effort catalog"})
+
+
+def recorded_choice(pair, catalog):
+    """A requested pair a harness cannot report back: recorded, never claimed."""
     return {"schema": "fusion.execution-choice.v1", "requested": pair, "dispatch": {"status": "prepared"},
-            "catalog": {"status": "unchecked", "reason": "Claude Code publishes no per-model effort catalog"},
+            "catalog": catalog,
             "observed": {"model": None, "reasoning_effort": None, "status": "unobserved"},
             "native_delegation": {"allowed": False, "child_trace_visibility": "unobserved"},
             "granularity": "worker_invocation"}
@@ -83,20 +95,38 @@ def execution_choice(settings):
             "granularity": "worker_invocation"}
 
 
-def pair_candidates(config, settings, write=False):
-    """Explicit alternatives for the existing router's advisory question."""
+def check_pair(agent, settings, write=False):
+    """Refuse a pair the harness cannot run; the harness decides what it accepts."""
+    pair = validate_pair(settings.get("model"), settings.get("reasoning_effort"))
+    if agent not in HARNESS_EFFORTS:
+        raise ValueError("reasoning_effort is supported for native Codex, Claude Code and agy")
+    if pair["reasoning_effort"] not in HARNESS_EFFORTS[agent]:
+        raise ValueError(f"{agent} accepts reasoning_effort " + ", ".join(sorted(HARNESS_EFFORTS[agent])))
+    if agent == "codex":
+        native_capability(pair)
+    elif agent == "claude":
+        claude_choice(settings)
+    return pair
+
+
+def pair_candidates(config, settings, write=False, agent="codex"):
+    """Explicit alternatives for the existing router's advisory question.
+
+    Entries may name their harness with "agent" (default codex); only pairs for
+    the task's own harness are candidates, since the lane itself is pinned."""
     values = (config.get("decisions") or {}).get("model_effort_pairs") or []
     if not isinstance(values, list) or len(values) > 8:
         raise ValueError("decisions.model_effort_pairs must be a list of at most eight pairs")
+    for value in values:
+        if not isinstance(value, dict) or not {"model", "reasoning_effort"} <= set(value) <= {"model", "reasoning_effort", "agent"}:
+            raise ValueError("model_effort_pairs entries require model and reasoning_effort, and optionally agent")
+    values = [value for value in values if value.get("agent", "codex") == agent]
     if not values:
         return []
     selected = validate_pair(settings.get("model"), settings.get("reasoning_effort"))
     pairs = []
     for value in values:
-        if not isinstance(value, dict) or set(value) != {"model", "reasoning_effort"}:
-            raise ValueError("model_effort_pairs entries require exactly model and reasoning_effort")
-        pair = validate_pair(value["model"], value["reasoning_effort"])
-        native_capability(pair)
+        pair = check_pair(agent, value, write)
         if pair["reasoning_effort"] == "ultra" and (write or settings.get("allow_native_delegation") is not True):
             continue
         if pair not in pairs:
