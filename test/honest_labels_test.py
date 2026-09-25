@@ -389,3 +389,25 @@ class HonestLabelsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WriterMayRunVerificationTest(unittest.TestCase):
+    """Live 2026-09-24: a restricted Claude writer fixed the bug, was denied Bash
+    when it tried the plan's test, reported the work unverified, and the node
+    failed although the coordinator's own check went from failing to passing."""
+    def task(self, argv=None, write=True):
+        task = core.make_task(Path(tempfile.gettempdir()), "claude", "Fix add()", "implementation", [], [], None, False, write)
+        if argv is not None:
+            task["verification_argv"] = argv
+        return task
+
+    def test_claude_writer_may_run_exactly_the_vetted_checks(self):
+        config = core.deep_merge(core.DEFAULTS, {"claude": {"command": sys.executable}})
+        argv, _, _ = core.agent_command(config, self.task([["python3", "-m", "unittest", "test_calc"]]), None)
+        allowed = argv[argv.index("--allowedTools") + 1:argv.index("--")]
+        self.assertEqual(allowed, ["Bash(python3 -m unittest test_calc:*)"])
+        plain, _, _ = core.agent_command(config, self.task(), None)
+        self.assertNotIn("--allowedTools", plain)
+        yolo = core.deep_merge(config, {"execution_mode": "yolo"})
+        full, _, _ = core.agent_command(yolo, self.task([["python3", "-m", "unittest"]]), None)
+        self.assertNotIn("--allowedTools", full)
