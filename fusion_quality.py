@@ -77,7 +77,9 @@ def review_quality(rows):
         for key in answers:
             event = effective.get(key, {})
             evidence += bool(str(event.get("evidence", "")).strip())
-            source = "council_auto" if event.get("source") == "council_approved_suggestion" else event.get("suggested_by", {}).get("agent") or "human"
+            source = ("council_auto" if event.get("source") == "council_approved_suggestion" else
+                      event["source"] if event.get("source") in {"structural_gate", "user_explicit"} else
+                      event.get("suggested_by", {}).get("agent") or "human")
             sources[source] += 1
         # Count the latest retained review of each suggestion once, not per answer.
         seen = set()

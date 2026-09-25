@@ -80,6 +80,16 @@ class CouncilApprovalTest(unittest.TestCase):
         self.assertEqual(len(self.labels()), 2)
         self.assertIn('Human-reviewed', self.app.label_runs(self.workspace)[0]['approval']['reason'])
 
+    def test_council_supersedes_a_structural_gate_label_but_not_a_lead_verdict(self):
+        self.store.append('label', id='decision', answers={'needs_review': 'false'}, evidence='gate', verified=True,
+                          replace=False, source='structural_gate')
+        result = self.run_council()
+        self.assertEqual(result['approval']['status'], 'approved')
+        self.assertEqual(decision_rows(self.workspace)[0]['reviewed_answers'], {'specialty': 'payments', 'needs_review': 'true'})
+        self.store.append('label', id='decision', answers={'needs_review': 'false'}, evidence='lead', verified=True,
+                          replace=False, source='lead_verdict')
+        self.assertEqual(self.run_council()['approval']['status'], 'needs_review')
+
     def test_disagreement_abstention_or_failed_member_does_not_approve(self):
         for members in ([self.member('codex',review=None),self.member('claude',specialty='general',review=None)],
                         [self.member('codex'), {'status':'error','requested_agent':'claude','error':'Quota exhausted'}]):

@@ -323,7 +323,8 @@ def approve_council(workspace, decision_id, suggestion_id, garden_policy=None):
             return {"status": "needs_review", "answers": {}, "reason": "Example was excluded; no approval saved"}
         labels = [e for e in own if e.get('event') == 'label' and e.get('verified')]
         existing = next((e for e in labels if e.get('suggestion_id') == suggestion_id and e.get('source') == 'council_approved_suggestion'), None)
-        if any(e.get('source') != 'council_approved_suggestion' for e in labels):
+        # Council answers supersede structural gate labels per question; every other source is kept.
+        if any(e.get('source') not in {'council_approved_suggestion', GATE_SOURCE} for e in labels):
             return {"status": "needs_review", "answers": {}, "reason": "Human-reviewed labels were preserved"}
         if existing:
             pending = sorted(set(record['questions']) - set(existing['answers']))
@@ -409,7 +410,8 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
     recorded -- the input a workflow gate saw, or the bounded state accept_node
     builds (fusion_decisions.acceptance_state) -- without running Laya. The
     run may live in a workflow worktree; `evidence_path` is its result.json. A later verdict replaces an earlier verdict label;
-    labels from any other reviewer are preserved.
+    labels from any other reviewer are preserved, except that a verdict supersedes structural_gate answers to the
+    questions it answers (LABEL_PRECEDENCE); the gate's other answers are restored under their own source.
 
     An unscored input recorded before acceptance inputs were bounded by
     tokens may exceed what Laya reads (fusion_decisions.exceeds_token_budget).
@@ -434,9 +436,14 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
                              evidence=f"Retracted: this input of run {run_id} exceeds the tokens Laya reads beside the "
                                       "acceptance questions; the latest lead verdict labels a bounded input instead.",
                              reviewers=[{"agent": "lead", "run_id": run_id, "accepted": bool(accepted)}])
-        record = next((e for e in reversed(decisions) if labelable_record(e)), None)
+        # The input the gate labeled is the one the verdict labels too, so one
+        # run is one example; otherwise the latest complete input.
+        gated = {e.get("id") for e in events if e.get("event") == "label" and e.get("source") == GATE_SOURCE}
+        record = (next((e for e in reversed(decisions) if labelable_record(e) and e["id"] in gated), None)
+                  or next((e for e in reversed(decisions) if labelable_record(e)), None))
         own = [e for e in events if record and e.get("id") == record["id"]]
-        if any(e.get("event") == "label" and e.get("verified") and e.get("source") != VERDICT_SOURCE for e in own):
+        if any(e.get("event") == "label" and e.get("verified") and e.get("source") not in {VERDICT_SOURCE, GATE_SOURCE}
+               for e in own):
             return {"status": "preserved", "decision_id": record["id"], "reason": "Another reviewer's labels on this decision were kept"}
         task = read_run_task(Path(evidence_path).parent)
         skip = ("the verdict has no --reason" if not reason else
@@ -444,10 +451,12 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
                 if result.get("status") != "success" else
                 "the run's task.json is missing" if record is None and not task.get("task") else None)
         if skip:
-            if record and reviewed_labels(own)[0].get(record["id"]):
+            if record and any(e.get("event") == "label" and e.get("source") == VERDICT_SOURCE for e in own) \
+                    and reviewed_labels(own)[0].get(record["id"]):
                 store.append("label", id=record["id"], answers={}, verified=True, replace=True, source=VERDICT_SOURCE,
                              evidence=f"Retracted: the latest lead verdict on run {run_id} records no label because {skip}.",
                              reviewers=[{"agent": "lead", "run_id": run_id, "accepted": bool(accepted)}])
+                restore_gate_labels(store, record["id"], own, set())
                 return {"status": "retracted", "decision_id": record["id"], "reason": f"Earlier verdict label removed: {skip}"}
             return {"status": "skipped", "reason": f"No label: {skip}"}
         if record is None:
@@ -472,5 +481,124 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
         store.append("label", id=record["id"], answers=answers, verified=True, replace=True, source=VERDICT_SOURCE,
                      evidence=f"Lead {'accepted' if accepted else 'rejected'} run {run_id}: {reason} [{evidence_path}]",
                      reviewers=[{"agent": "lead", "run_id": run_id, "accepted": bool(accepted)}])
+        restore_gate_labels(store, record["id"], own, set(answers))
         return {"status": "labeled", "decision_id": record["id"], "answers": answers, "source": VERDICT_SOURCE,
                 "unlabeled": sorted(set(record["questions"]) - set(answers))}
+
+
+GATE_SOURCE = "structural_gate"
+INTAKE_SOURCE = "user_explicit"
+# Who may overwrite whom, per answered question. A source never overwrites a
+# label from a higher one; a higher source supersedes a lower one only for the
+# questions it answers. user_explicit answers intake only and ranks with a
+# human, because it is the user's own statement of intent.
+LABEL_PRECEDENCE = {"human": 4, "human_approved_suggestion": 4, INTAKE_SOURCE: 4,
+                    "council_approved_suggestion": 3, VERDICT_SOURCE: 2, GATE_SOURCE: 1}
+
+
+def _automatic_labels_off(config):
+    from fusion_decisions import config_for
+    options = config_for(config)
+    if options["mode"] == "off":
+        return "decisions.mode is off"
+    if not options["automatic_labels"]:
+        return "decisions.automatic_labels is false"
+    return None
+
+
+def record_gate_input(config, workspace, workflow_id, node, result):
+    """Record the acceptance input of a reported success before the structural
+    gate decides it, without running Laya. It is the input accept_node builds,
+    so a gate label and a classifier prediction describe the same input.
+    None when the worker did not report success or automatic labels are off."""
+    from fusion_decisions import ACCEPTANCE_QUESTIONS, DecisionEngine, acceptance_state, state_cap
+    if result.get("status") != "success" or _automatic_labels_off(config):
+        return None
+    engine = DecisionEngine(workspace, config)
+    state = acceptance_state(node, result, state_cap(engine.options))
+    return engine.record_unscored("acceptance", state, ACCEPTANCE_QUESTIONS,
+                                  {"task_id": result.get("run_id"), "group": workflow_id}, source=GATE_SOURCE)
+
+
+def gate_answers(codes, receipts):
+    """(answers, reason) from objective gate codes only.
+
+    failed_task=true: an executed check failed with a test failure and had
+    not already passed before the change (vacuous), or a write node left the
+    tree unchanged. failed_task=false: the gate passed and at least one
+    executed check failed before the change and passed after it. Anything
+    else stays unlabeled. `plausible` is never answered: it asks whether the
+    report plausibly matches the task, which no exit code decides. Blockers
+    and handoff fields are parsed from the worker's report (and are Laya's own
+    inputs), so they never label.
+    """
+    for code in codes:
+        if code.get("code") == "check_failed" and code.get("vacuous") is not True and code.get("test_failure"):
+            return {"failed_task": "true"}, "an executed acceptance check failed"
+        if code.get("code") == "write_no_change":
+            return {"failed_task": "true"}, "the write node finished without changing any file"
+    if codes:
+        names = ", ".join(sorted({str(code.get("code")) for code in codes}))
+        return None, f"the gate failed on {names}, which is not objective evidence about the task"
+    if any(receipt.get("status") == "passed" and receipt.get("vacuous") is False for receipt in receipts):
+        return {"failed_task": "false"}, "a check that failed before the change passed after it"
+    return None, "no executed check failed before the change and passed after it"
+
+
+def gate_label(config, workspace, record, codes, receipts):
+    """Attach the objective gate label to the input record_gate_input saved."""
+    answers, reason = gate_answers(codes, receipts)
+    if record.get("truncated"):
+        return {"status": "skipped", "decision_id": record["id"], "reason": "input truncated; long briefs stay unlabeled"}
+    if not answers:
+        return {"status": "unlabeled", "decision_id": record["id"], "reason": reason}
+    store = DecisionStore(workspace)
+    run_id = record.get("context", {}).get("task_id")
+    with store.review_lock():
+        if any(e.get("id") == record["id"] and e.get("event") == "label" and e.get("verified") for e in read_jsonl(store.path)):
+            return {"status": "preserved", "decision_id": record["id"], "reason": "an existing label on this input was kept"}
+        cited = [f"{' '.join(r['argv']) if isinstance(r.get('argv'), list) else r.get('argv')}: {r.get('status')}"
+                 f" (exit {r.get('exit_code')}; before the change: {(r.get('before') or {}).get('status', 'not run')})"
+                 f" [{(r.get('artifacts') or {}).get('receipt')}]" for r in receipts]
+        store.append("label", id=record["id"], answers=answers, verified=True, replace=False, source=GATE_SOURCE,
+                     evidence=f"Structural gate on run {run_id}: {reason}." + ("\n" + "\n".join(cited) if cited else ""),
+                     reviewers=[{"agent": "gate", "run_id": run_id, "codes": [code.get("code") for code in codes]}])
+    return {"status": "labeled", "decision_id": record["id"], "answers": answers, "source": GATE_SOURCE, "reason": reason}
+
+
+def restore_gate_labels(store, record_id, events, answered):
+    """After a lead verdict replaces its labels on an input, put back the gate's
+    answers for questions the verdict did not answer, still as structural_gate."""
+    gate = [e for e in events if e.get("id") == record_id and e.get("event") == "label"
+            and e.get("verified") and e.get("source") == GATE_SOURCE and e.get("answers")]
+    if not gate:
+        return
+    answers = {key: value for key, value in gate[-1]["answers"].items() if key not in answered}
+    if answers:
+        store.append("label", id=record_id, answers=answers, evidence=gate[-1].get("evidence", ""), verified=True,
+                     replace=False, source=GATE_SOURCE, reviewers=gate[-1].get("reviewers", []))
+
+
+def intake_label(workspace, config, record, state, kind, context, build_id):
+    """An explicit `--kind` typed by the user is their own statement of which
+    workflow they asked for, so it labels intake `workflow` (source
+    user_explicit). The fallback regex, Laya and programmatic callers never
+    label. The decision intake recorded is labeled in place; when Laya did not
+    score it, an unscored input with the same state is recorded instead."""
+    from fusion_decisions import INTAKE_QUESTIONS, DecisionEngine
+    disabled = _automatic_labels_off(config)
+    if disabled:
+        return {"status": "disabled", "reason": disabled}
+    if kind not in INTAKE_QUESTIONS["workflow"]["criteria"]:
+        return {"status": "skipped", "reason": f"{kind} is not an intake answer"}
+    store = DecisionStore(workspace)
+    with store.review_lock():
+        if not labelable_record(record):
+            record = DecisionEngine(workspace, config).record_unscored("intake", state, INTAKE_QUESTIONS, context,
+                                                                       source=INTAKE_SOURCE)
+        if record["truncated"]:
+            return {"status": "skipped", "decision_id": record["id"], "reason": "input truncated"}
+        store.append("label", id=record["id"], answers={"workflow": kind}, verified=True, replace=False,
+                     source=INTAKE_SOURCE, evidence=f"The user ran fusion build --kind {kind} ({build_id}).",
+                     reviewers=[{"agent": "user", "build_id": build_id}])
+    return {"status": "labeled", "decision_id": record["id"], "answers": {"workflow": kind}, "source": INTAKE_SOURCE}

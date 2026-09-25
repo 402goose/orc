@@ -69,7 +69,8 @@ def status(app, workspace, rows=None):
         if row.get('time_ms', 0) < max(value['since_ms'], value['approval_since_ms'] if automatic else 0):
             continue
         if automatic:
-            human_reviewed = any(e.get('verified') and e.get('source') != 'council_approved_suggestion' for e in row.get('labels', []))
+            human_reviewed = any(e.get('verified') and e.get('source') not in {'council_approved_suggestion', 'structural_gate'}
+                                 for e in row.get('labels', []))
             eligible = row['garden_state'] in {'needs_draft', 'needs_review', 'needs_evidence', 'needs_attention'} and not human_reviewed
             if eligible and row['id'] not in attempted_policy:
                 queue.append(row)
