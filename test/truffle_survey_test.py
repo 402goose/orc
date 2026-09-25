@@ -1,7 +1,9 @@
 """Complete inventories and resumable source-backed grading, without model calls."""
 import copy
 import json
+import os
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -239,6 +241,34 @@ class SurveyTest(unittest.TestCase):
         self.assertIn('--include-assigned',args)
         with patch.object(app,'jobs',return_value=[dict(status='running',action='truffle-survey')]), self.assertRaises(ValueError):
             app.launch(self.workspace,dict(action='truffle-hunt'))
+
+    def test_api_launch_mints_a_survey_id_the_caller_can_navigate_to(self):
+        """launch() must not make the frontend guess the new survey's id from the
+        filesystem: between this call returning and the detached CLI writing its
+        first hunt.json, the previous survey is still "latest" on disk."""
+        app=ControlRoom(self.workspace,self.root/'registry.json')
+        with patch('fusion_ui.subprocess.Popen'):
+            first=app.launch(self.workspace,dict(action='truffle-survey',agent='codex',sync_only=True))
+            second=app.launch(self.workspace,dict(action='truffle-survey',agent='codex',sync_only=True))
+        for job in (first, second):
+            self.assertRegex(job['survey_id'], r'\Atruffle-[a-f0-9]{12}\Z')
+            request = pub.read(self.workspace / '.fusion/ui/jobs' / job['id'] / 'request.json')
+            self.assertEqual(request['survey_id'], job['survey_id'])
+        self.assertNotEqual(first['survey_id'], second['survey_id'])
+
+    def test_survey_adopts_the_id_minted_by_its_caller(self):
+        """fusion_ui.launch's minted id must round-trip through the environment
+        into survey()'s own record id, the way FUSION_WORKFLOW_ID already does
+        for workflow ids (fusion_workflow._run_id)."""
+        chosen = 'truffle-' + 'ab' * 6
+        with patch.dict(os.environ, {survey.SURVEY_ID_ENV: chosen}), patch.object(core, 'dispatch', side_effect=AssertionError('No worker for sync')):
+            result = survey.survey(self.workspace, self.config, sync_only=True)
+        self.assertEqual(result['id'], chosen)
+        self.assertNotIn(survey.SURVEY_ID_ENV, os.environ)
+        with patch.dict(os.environ, {survey.SURVEY_ID_ENV: 'not-a-valid-id'}), patch.object(core, 'dispatch', side_effect=AssertionError('No worker for sync')):
+            fallback = survey.survey(self.workspace, self.config, sync_only=True)
+        self.assertNotEqual(fallback['id'], 'not-a-valid-id')
+        self.assertRegex(fallback['id'], r'\Atruffle-[a-f0-9]{12}\Z')
 
 
 if __name__ == '__main__': unittest.main()

@@ -1529,8 +1529,8 @@ document.addEventListener("submit", async (event) => {
       closeModal();
       toast("Reconnected. Your other tabs can use this connection too.");
     } else if (form.id === "truffle-survey-form") {
-      await api("launch", {...values, action:"truffle-survey", sync_only:!values.resume && !values.grade_now, include_assigned:!!values.include_assigned});
-      closeModal(); forestRoute(); await navigate("truffle", values.resume || null);
+      const job = await api("launch", {...values, action:"truffle-survey", sync_only:!values.resume && !values.grade_now, include_assigned:!!values.include_assigned});
+      closeModal(); forestRoute(); await navigate("truffle", values.resume || job.survey_id || null);
       toast("Expedition started. The map updates live; you can leave this tab.");
     } else if (form.id === "truffle-hunt-form") {
       await launch({...values, action: "truffle-hunt", include_assigned: !!values.include_assigned});
