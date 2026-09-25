@@ -4,8 +4,8 @@ from pathlib import Path
 import shutil
 import subprocess
 
-from fusion_decisions import (DecisionEngine, DecisionStore, ACCEPTANCE_QUESTIONS, INTAKE_QUESTIONS, RECOVERY_QUESTIONS,
-                              REVIEW_QUESTIONS, fit_calibration, read_jsonl, runtime_python)
+from fusion_decisions import (CHECKPOINTS, KINDS, DecisionEngine, DecisionStore, ACCEPTANCE_QUESTIONS, INTAKE_QUESTIONS,
+                              RECOVERY_QUESTIONS, REVIEW_QUESTIONS, fit_calibration, read_jsonl, runtime_python)
 
 
 def add_parser(sub):
@@ -54,8 +54,47 @@ def add_parser(sub):
             action.add_argument("--epochs", type=int, default=1)
             action.add_argument("--learning-rate", type=float, default=0.0001)
             action.add_argument("--seed", type=int, default=42)
+            action.add_argument("--kind", choices=sorted(KINDS),
+                                help="train only this kind's examples, from its decisions.checkpoints entry")
+            action.add_argument("--checkpoint", choices=sorted(CHECKPOINTS),
+                                help="published checkpoint to start from when no --model-path is given")
         else:
             action.add_argument("--control", action="store_true", help="also score held-out examples against a different example's state")
+
+
+def training_source(args, options, model_path):
+    """(model path, extra runtime arguments) for `decisions train`.
+
+    The starting checkpoint is --model-path, else --checkpoint, else the
+    --kind's decisions.checkpoints entry, else decisions.model_path, else
+    English. Without --kind, kinds whose decisions.checkpoints entry names a
+    different checkpoint are left out. decisions.training settings become
+    explicit arguments, so the runtime records exactly what it trained with.
+    """
+    extra = []
+    configured = options["checkpoints"].get(args.kind) if getattr(args, "kind", None) else None
+    source = None if args.model_path else getattr(args, "checkpoint", None) or configured
+    if source in CHECKPOINTS:
+        model_path, extra = "", ["--checkpoint", source]
+    elif source:
+        model_path = source
+    starting = model_path or source or "english"
+    if getattr(args, "kind", None):
+        extra += ["--kinds", args.kind]
+    elif any(value != starting for value in options["checkpoints"].values()):
+        # A kind configured to run on another checkpoint is not trained into this one.
+        kinds = sorted(kind for kind in KINDS if options["checkpoints"].get(kind, starting) == starting)
+        if not kinds:
+            raise ValueError("every decision kind runs on another checkpoint; train one with --kind")
+        extra += ["--kinds", ",".join(kinds)]
+    training = options["training"]
+    extra += ["--objective", training["objective"], "--encoder-learning-rate", str(training["encoder_learning_rate"]),
+              "--label-smoothing", str(training["label_smoothing"]), "--max-class-weight", str(training["max_class_weight"])]
+    if training["unfreeze_encoder"]:
+        extra.append("--unfreeze-encoder")
+    if not training["class_balance"]:
+        extra.append("--no-class-balance")
+    return model_path, extra
 
 
 def run(args, workspace, config):
@@ -74,9 +113,12 @@ def run(args, workspace, config):
         subprocess.run([uv, "pip", "install", "--python", python, "laya==0.3.4", "transformers>=4.45,<5"], check=True)
         return subprocess.run([python, script, "warmup", "--checkpoint", args.checkpoint, "--device", args.device], check=False).returncode
     if command in {"train", "evaluate"}:
+        model_path = str(Path(args.model_path).expanduser().resolve()) if args.model_path else options["model_path"]
+        extra = []
+        if command == "train":
+            model_path, extra = training_source(args, options, model_path)
         argv = [runtime_python(options), script, command, "--dataset", str(Path(args.dataset).resolve()),
-                "--output", str(Path(args.output).resolve()), "--device", args.device,
-                "--model-path", str(Path(args.model_path).expanduser().resolve()) if args.model_path else options["model_path"]]
+                "--output", str(Path(args.output).resolve()), "--device", args.device, "--model-path", model_path, *extra]
         if command == "train":
             argv += ["--epochs", str(args.epochs), "--learning-rate", str(args.learning_rate), "--seed", str(args.seed)]
         elif getattr(args, "control", False):

@@ -44,8 +44,8 @@ That result was fixed by how labels are gathered, not by the model:
   router (Dudík et al., 1103.4601; BaRP, 2510.07429). Laya does not train routing
   labels.
 - **Soft targets and proper scoring, as upstream trains.** Laya upstream trains on
-  averaged teacher distributions with a proper-scoring objective; ORC trains hard
-  cross-entropy on a frozen encoder.
+  averaged teacher distributions with a proper-scoring objective; ORC trained hard
+  cross-entropy on a frozen encoder until Phase 2.
 - **No Jev-derived labels.** TypeSafe's terms (MCA §2.3(b)) prohibit using Jev
   output to train or distill a model.
 - **Act only behind a risk bound.** Temperature scaling for readable
@@ -64,11 +64,14 @@ That result was fixed by how labels are gathered, not by the model:
 
 ## Phase 2: learning quality
 
-- Train with soft cross-entropy plus upstream's proper-scoring objective.
-  Temperatures are fit on train groups: held-out groups choose the action
-  threshold, and fitting both on them would reuse the same evidence.
-- Choose the checkpoint per decision kind; evaluate `laya-typed-decisions`
-  (1024-token context) for acceptance and re-derive the token budget from it.
+- [x] Train with soft cross-entropy plus upstream's proper-scoring objective,
+  class-balanced weights and an optional unfrozen encoder
+  (`decisions.training`; see FUSION_DECISIONS.md, "Training objective").
+- [x] Choose the checkpoint per decision kind (`decisions.checkpoints`); the
+  token budget derives from that checkpoint's limits, so
+  `laya-typed-decisions` (1024 tokens) gives acceptance 984 state tokens.
+- [ ] Evaluate `laya-typed-decisions` for acceptance on the held-out set. This
+  needs per-kind evaluation: `evaluate` still scores every kind on one model.
 - [x] Report per-head majority and heuristic baselines on a time-split holdout.
   `decisions.split: "time"` (default) holds out the newest workflow groups;
   `evaluate` reports majority, deterministic-policy and shuffled-state

@@ -13,13 +13,28 @@ import sys
 import time
 
 
+def missing_checkpoint(name):
+    return (f"the {name!r} Laya checkpoint is not cached locally; fetch it once with "
+            f"`orc fusion decisions setup --checkpoint {name}` (downloads public files; inference and training stay offline)")
+
+
 def checkpoint(name="english", online=False):
     from huggingface_hub import snapshot_download
     from laya.router import DEFAULT_MODELS
+    if name not in DEFAULT_MODELS:
+        raise ValueError(f"unknown Laya checkpoint {name!r}; choose one of {', '.join(DEFAULT_MODELS)} or a checkpoint directory")
     repo, folder = DEFAULT_MODELS[name]
     patterns = [f"{folder}/*"] if folder else ["rl_agent_config.json", "model.safetensors", "encoder/*", "tokenizer/*"]
-    root = Path(snapshot_download(repo, allow_patterns=patterns, local_files_only=not online))
-    return root / folder if folder else root
+    try:
+        root = Path(snapshot_download(repo, allow_patterns=patterns, local_files_only=not online))
+    except Exception as error:
+        if online:
+            raise
+        raise ValueError(missing_checkpoint(name)) from error
+    path = root / folder if folder else root
+    if not online and not (path / "rl_agent_config.json").is_file():
+        raise ValueError(missing_checkpoint(name))
+    return path
 
 
 def identity(path):
@@ -70,6 +85,8 @@ class Backend:
             if len(self.loaded) >= 2:
                 self.loaded.popitem(last=False)
             path = Path(model_path).expanduser().resolve() if model_path else checkpoint(name, self.online)
+            if model_path and not (path / "rl_agent_config.json").is_file():
+                raise ValueError(f"{path} is not a Laya checkpoint directory (no rl_agent_config.json)")
             agent = laya.load(str(path), device=device)
             self.loaded[key] = (agent, identity(path), path)
         self.loaded.move_to_end(key)
@@ -80,7 +97,10 @@ class Backend:
         if self.router is None:
             self.router = Router(auto_task_detection=False)
         state, questions = request["state"], request["questions"]
-        route = dict(self.router.route(state, questions))
+        if request.get("checkpoint") and not request.get("model_path"):
+            route = {"model": request["checkpoint"], "reason": "configured for this decision kind"}
+        else:
+            route = dict(self.router.route(state, questions))
         agent, model_id, _ = self.load(route["model"], request.get("device", "cpu"), request.get("model_path", ""))
         result = agent.predict(state, questions)
         return {"answers": result["answers"], "model_identity": model_id,
@@ -232,59 +252,143 @@ def evaluate(args):
     return report
 
 
+def objective(logits, mask, target, qtype, weights, sigma, generator, proper=True):
+    """Soft-target cross-entropy plus upstream's proper-scoring policy term.
+
+    A port of the RLCD step in NandhaKishorM/laya's typed-decisions
+    fine-tuning notebook (training cell), scoring with laya.common.proper_reward:
+    sample Gaussian-noised logits (projected to zero mean over the options),
+    reward each sample by log + spherical score (minus the ranked probability
+    score on `score` questions) against the target distribution, subtract the
+    group mean, and push the logits toward better samples; plus soft
+    cross-entropy at weight 1.0. `weights` (mean 1 over the training set)
+    scale each item's loss. Returns (loss, per-item cross-entropy, mean reward).
+    """
+    import torch
+    from laya.common import proper_reward
+    from fusion_laya_objective import PROPER_SCORING
+    weights = weights.to(logits.dtype)
+    masked = logits.masked_fill(~mask, -1e4)
+    cross_entropy = -(target * torch.log_softmax(masked, -1)).sum(-1)
+    loss = PROPER_SCORING["ce_weight"] * (weights * cross_entropy).mean()
+    reward = torch.zeros((), device=logits.device)
+    if proper:
+        k = mask.sum(-1, keepdim=True).float()
+        noise = torch.randn((PROPER_SCORING["group_size"],) + tuple(logits.shape), generator=generator,
+                            device=generator.device).to(logits.device) * sigma * mask
+        noise = (noise - noise.sum(-1, keepdim=True) / k) * mask
+        z = logits.detach().unsqueeze(0) + noise
+        q = torch.softmax(z.masked_fill(~mask, -1e4), -1)
+        with torch.no_grad():
+            reward = proper_reward(q, target.unsqueeze(0), qtype, mask, w_sph=PROPER_SCORING["w_sph"],
+                                   w_rps=PROPER_SCORING["w_rps"], log_floor=PROPER_SCORING["log_floor"])
+            advantage = reward - reward.mean(0, keepdim=True)
+            advantage = advantage / (advantage.std() + 1e-6)
+        log_prob = -(((z - logits.unsqueeze(0)) ** 2) * mask).sum(-1) / (2 * sigma ** 2)
+        loss = loss + (weights * -(advantage * log_prob)).mean()
+        reward = reward.mean()
+    return loss, cross_entropy.detach(), reward.detach()
+
+
 def train(args):
     """Supervised decision-head adaptation; holdout groups never enter optimization."""
     learning_progress(args, 'loading', message='Loading local checkpoint for training')
+    import random
     import torch
     from laya.common import QTYPES, build_sequence, collate_items
     from safetensors.torch import save_file
     from fusion_decisions import labels_for, digest
+    from fusion_laya_objective import (PROPER_SCORING, example_weight, item_weights, sigma as noise_at,
+                                       target_distribution, training_options)
     from fusion_quality import dataset_quality, input_key
+    options = training_options({key: getattr(args, key) for key in ("objective", "unfreeze_encoder", "encoder_learning_rate",
+                                                                      "label_smoothing", "class_balance", "max_class_weight")
+                                if getattr(args, key, None) is not None})
     rows = dataset_rows(args.dataset)
+    kinds = set(filter(None, (getattr(args, "kinds", "") or "").split(",")))
+    if kinds:
+        rows = [row for row in rows if row["kind"] in kinds]
     train_rows = [row for row in rows if row["split"] == "train"]
     if not train_rows or not any(row["split"] == "validation" for row in rows):
-        raise ValueError("training requires both train and held-out validation groups")
+        raise ValueError("training requires both train and held-out validation groups"
+                         + (f" of kind {', '.join(sorted(kinds))}" if kinds else ""))
     if not 1 <= args.epochs <= 20 or not 0 < args.learning_rate <= 0.01:
         raise ValueError("epochs must be 1..20 and learning rate in (0, .01]")
     output = Path(args.output)
     if output.exists():
         raise ValueError("candidate output already exists")
+    random.seed(args.seed)
     torch.manual_seed(args.seed)
-    agent, source_id, _ = Backend().load("english", args.device, args.model_path)
+    generator = torch.Generator().manual_seed(args.seed)
+    source = getattr(args, "checkpoint", None) or "english"
+    agent, source_id, source_path = Backend().load(source, args.device, args.model_path)
+    max_len, head_len = agent.cfg.get("max_len", 512), agent.cfg.get("head_max_len", 192)
+    # Build every example first: a truncated one stops training before any
+    # update, and class weights need the whole training split.
+    examples, flat, row_weights = [], [], []
+    for row in train_rows:
+        questions = {key: row["questions"][key] for key in row["labels"]}
+        if truncated(agent, row["state"], questions):
+            raise ValueError("training example is truncated; shorten and re-review it")
+        items = []
+        for key, q in questions.items():
+            internal = agent._to_internal(q)
+            ids, markers = build_sequence(agent.tok, row["state"], internal, max_len, head_len)
+            target = target_distribution(row, key, labels_for(q), options["label_smoothing"])
+            items.append({"ids": ids, "markers": markers, "qtype": QTYPES[internal["t"]], "target": target})
+            flat.append((digest(q), target))
+            row_weights.append(example_weight(row, key))
+        examples.append(items)
+    weights, per_class = item_weights(flat, row_weights, options["max_class_weight"], options["class_balance"])
+    position = 0
+    for items in examples:
+        for item in items:
+            item["weight"], position = weights[position], position + 1
+    unfreeze = options["unfreeze_encoder"]
+    head, encoder = [], []
     for name, parameter in agent.model.named_parameters():
-        parameter.requires_grad_(not name.startswith(("encoder.", "act_head.")))
-    optimizer = torch.optim.AdamW([p for p in agent.model.parameters() if p.requires_grad], lr=args.learning_rate)
-    steps, losses = 0, []
-    for _ in range(args.epochs):
-        for row in train_rows:
-            questions = {key: row["questions"][key] for key in row["labels"]}
-            if truncated(agent, row["state"], questions):
-                raise ValueError("training example is truncated; shorten and re-review it")
-            items, targets = [], []
-            for key, q in questions.items():
-                internal = agent._to_internal(q)
-                ids, markers = build_sequence(agent.tok, row["state"], internal,
-                                              agent.cfg.get("max_len", 512), agent.cfg.get("head_max_len", 192))
-                items.append({"ids": ids, "markers": markers, "qtype": QTYPES[internal["t"]]})
-                targets.append(labels_for(q).index(row["labels"][key]))
+        trainable = not name.startswith("act_head.") and (unfreeze or not name.startswith("encoder."))
+        parameter.requires_grad_(trainable)
+        if trainable:
+            (encoder if name.startswith("encoder.") else head).append(parameter)
+    groups = [{"params": head, "lr": args.learning_rate}]
+    if encoder:
+        groups.append({"params": encoder, "lr": options["encoder_learning_rate"]})
+    optimizer = torch.optim.AdamW(groups, weight_decay=0.01)
+    proper = options["objective"] == "soft_ce+proper_scoring"
+    # `losses` is the soft cross-entropy, the curve the UI shows. The policy
+    # term is a zero-mean surrogate, so the full objective can go negative
+    # and is recorded only as `mean_objective`.
+    steps, losses, objectives, rewards = 0, [], [], []
+    total_steps = args.epochs * len(examples)
+    for epoch in range(args.epochs):
+        noise = noise_at(epoch, args.epochs)
+        order = list(range(len(examples)))
+        random.Random(args.seed + epoch).shuffle(order)
+        for index in order:
+            items = examples[index]
             collated = collate_items([items], agent.tok.pad_token_id)
             batch = {key: collated[key].to(agent.device) for key in ["input_ids", "attention_mask", "marker_pos", "marker_mask", "qtype"]}
             agent.model.train()
-            agent.model.encoder.eval()
+            if not unfreeze:
+                agent.model.encoder.eval()
             optimizer.zero_grad()
-            logits, _ = agent.model(**batch, detach_encoder=True)
-            loss = torch.nn.functional.cross_entropy(logits, torch.tensor(targets, device=agent.device))
+            logits, _ = agent.model(**batch, detach_encoder=not unfreeze)
+            item_weight = torch.tensor([item["weight"] for item in items], device=agent.device)
+            loss, cross_entropy, reward = objective(logits, batch["marker_mask"], collated["target"].to(agent.device),
+                                                    batch["qtype"], item_weight, noise, generator, proper)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(agent.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_([p for group in groups for p in group["params"]], 1.0)
             optimizer.step()
-            losses.append(float(loss.detach().cpu()))
+            objectives.append(float(loss.detach().cpu()))
+            losses.append(float(cross_entropy.mean().cpu()))
+            rewards.append(float(reward.cpu()))
             steps += 1
             # The curve is downsampled to 200 points, so a new point only
             # appears every `stride` steps. Emitting every step rewrote the
             # progress file and rebuilt the whole curve each time -- O(steps^2)
             # work, and a write+rename per step, for a display that could not
             # show the difference.
-            total_steps = args.epochs * len(train_rows)
             if emits_progress(steps, total_steps):
                 learning_progress(args, 'training', done=steps, total=total_steps,
                                   loss=losses[-1], loss_curve=loss_curve(losses))
@@ -297,10 +401,23 @@ def train(args):
     parent = {}
     if args.model_path and (Path(args.model_path) / 'training.json').is_file():
         parent = json.loads((Path(args.model_path) / 'training.json').read_text())
-    report = {"method": "supervised decision-head fine-tuning", "source_identity": source_id,
-              "model_identity": identity(output),
+    per_epoch = len(examples)
+    report = {"method": f"supervised {'decision head and encoder' if encoder else 'decision head'} fine-tuning ({options['objective']})",
+              "source_identity": source_id, "model_identity": identity(output),
+              "checkpoint": str(source_path) if args.model_path else source,
+              "limits": {"max_len": max_len, "head_max_len": head_len}, "kinds": sorted(kinds) or None,
+              "objective": {**options, "proper_scoring": PROPER_SCORING if proper else None,
+                            "sigma_by_epoch": [noise_at(epoch, args.epochs) for epoch in range(args.epochs)] if proper else None,
+                            "learning_rates": {"head": args.learning_rate, "encoder": options["encoder_learning_rate"] if encoder else None},
+                            "weight_decay": 0.01, "gradient_clip": 1.0,
+                            "class_weights": [{"question": schema, "class": cls, "weight": weight}
+                                              for (schema, cls), weight in sorted(per_class.items())],
+                            "item_weight_range": [min(weights), max(weights)]},
               "dataset_hash": hashlib.sha256(Path(args.dataset).read_bytes()).hexdigest(),
               "seed": args.seed, "epochs": args.epochs, "steps": steps, "mean_loss": sum(losses) / steps, "loss_curve": loss_curve(losses),
+              "loss": "soft cross-entropy", "mean_objective": sum(objectives) / steps,
+              "cross_entropy_by_epoch": [sum(losses[e * per_epoch:(e + 1) * per_epoch]) / per_epoch for e in range(args.epochs)],
+              "mean_reward": sum(rewards) / steps if proper else None,
               "data_quality": dataset_quality(train_rows),
               "seen_train_groups": sorted(set(parent.get('seen_train_groups', [])) | {digest(r['group']) for r in train_rows}),
               "seen_train_inputs": sorted(set(parent.get('seen_train_inputs', [])) | {input_key(r) for r in train_rows}),
@@ -322,6 +439,13 @@ def main():
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=0.0001)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--kinds", default="", help="train: only these decision kinds (comma-separated)")
+    parser.add_argument("--objective", choices=["soft_ce", "soft_ce+proper_scoring"])
+    parser.add_argument("--unfreeze-encoder", dest="unfreeze_encoder", action="store_true", default=None)
+    parser.add_argument("--encoder-learning-rate", dest="encoder_learning_rate", type=float)
+    parser.add_argument("--label-smoothing", dest="label_smoothing", type=float)
+    parser.add_argument("--no-class-balance", dest="class_balance", action="store_false", default=None)
+    parser.add_argument("--max-class-weight", dest="max_class_weight", type=float)
     parser.add_argument("--control", action="store_true", help="evaluate: also score held-out examples against a different example's state")
     args = parser.parse_args()
     if args.command != "warmup":

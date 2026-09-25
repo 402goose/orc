@@ -453,7 +453,7 @@ def accept_node(config, workspace, workflow_id, node, result):
     it can never accept on its own; a structural failure is decided before
     this is ever called, and this function has no path back to True from one."""
     engine = DecisionEngine(workspace, config)
-    record = engine.decide("acceptance", acceptance_state(node, result, state_cap(engine.options)),
+    record = engine.decide("acceptance", acceptance_state(node, result, state_cap(engine.options), engine.state_tokens("acceptance")),
                            ACCEPTANCE_QUESTIONS, {"task_id": result.get("run_id"), "group": workflow_id})
     plausible, applied = True, False
     if engine.allowed(record, "plausible") and record["recommendations"]["plausible"]["value"] == "false":
