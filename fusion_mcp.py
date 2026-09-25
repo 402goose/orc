@@ -408,6 +408,8 @@ def start_run(
         "build",
         "--kind",
         kind,
+        "--kind-source",
+        "agent",
         "--execute",
         request,
     ]

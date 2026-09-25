@@ -51,9 +51,12 @@ Use the interactive lead for an open-ended review/fix conversation. Saved
 workflows can be edited and resumed using `fusion workflow resume ID --spec
 PATH`; valid accepted nodes remain cached. Custom acceptance checks use argv
 arrays and remain authoritative. Generated workflows require verification
-handoffs and an independent review; the lead/reviewer determines the actual
-project-specific checks. A successful model handoff alone does not prove
-product correctness.
+handoffs and an independent review. The plan's `verification` commands that
+pass the safety rules run as the implementation's acceptance checks, before
+and after the change (see
+[Executed plan verification](#executed-plan-verification)); the reviewer still
+reruns the project-specific checks. A successful model handoff alone does
+not prove product correctness.
 
 `--budget-usd` controls the persisted workflow, including all retry costs.
 It stops new dispatches when **reported** spend reaches the limit and passes
@@ -86,7 +89,11 @@ it. Interactive lead sessions use their own provider controls.
    follow smoothed acceptance `(accepted + 1) / (checked + 2)`. Workflow
    gate outcomes and lead verdicts count, and so does an observed error
    (not quota or permission, which are lane health); a worker's
-   `STATUS: success` is its own claim until a gate or lead checks it. A qualified classifier still
+   `STATUS: success` is its own claim until a gate or lead checks it. A
+   reported success rejected only by Laya's own veto or by what was parsed
+   from the worker's report (blockers, empty handoff fields) is recorded as
+   `outcome_excluded` and does not count: otherwise an active acceptance
+   head would rank lanes by its own answers. A qualified classifier still
    overrides the order. An ORC route with `"arms": 3` offers orc's top three
    tool-fit models as separate candidates (`orc-free:<model id>`), each with
    its own history; the default of one arm keeps the route's key and stats.
@@ -121,7 +128,8 @@ it. Interactive lead sessions use their own provider controls.
    review uses a fresh context on an available worker.
 5. **Acceptance:** a semantic Done-check on workflow nodes. It runs only
    after every structural check has already passed (required files exist and
-   changed, handoff fields present, acceptance commands exited 0) and asks
+   changed, handoff fields present, acceptance commands and executed plan
+   verification exited 0, a write node changed the tree) and asks
    two `noul` questions: does the reported success plausibly satisfy the
    task, and did the worker fail to do what was asked? Only a qualified
    "not plausible" rejects; the second answer is recorded for calibration
@@ -133,7 +141,10 @@ it. Interactive lead sessions use their own provider controls.
    failure is decided before it is called, and there is no path back.
 6. **Learning:** local decisions and acceptance outcomes are logged. Only
    verified labels with evidence enter training exports: human reviews,
-   explicitly enabled council approvals, and lead verdicts on acceptance. Human review, candidate fine-tuning, held-out evaluation and
+   explicitly enabled council approvals, lead verdicts on acceptance,
+   objective workflow-gate results on acceptance (`structural_gate`) and a
+   user's explicit `--kind` on intake (`user_explicit`); see
+   [Labels recorded automatically](#labels-recorded-automatically). Human review, candidate fine-tuning, held-out evaluation and
    calibration are separate steps; no model promotes itself.
 
 ## Prompt cache and sessions
@@ -307,10 +318,21 @@ settings):
     "threshold": 0.9,
     "calibration_file": "",
     "model_path": "",
-    "verdict_labels": true
+    "verdict_labels": true,
+    "automatic_labels": true
+  },
+  "verification": {
+    "execute": true,
+    "runners": ["python3", "python", "pytest", "npm", "pnpm", "yarn", "bun", "node", "deno",
+                "go", "cargo", "make", "uv", "ruby", "rspec", "bundle", "mvn", "gradle"],
+    "timeout_seconds": 900
   }
 }
 ```
+
+`automatic_labels: false` stops gate and `--kind` labels (verdict labels
+have their own switch). `verification` governs plan commands only; authored
+`acceptance.checks` are unaffected by it.
 
 `python` or `FUSION_LAYA_PYTHON` can select a different runtime interpreter.
 `FUSION_DECISIONS_MODE=off` disables classification and decision logging.
@@ -359,7 +381,9 @@ or when the task cannot be shown whole within the token budget (below; the
 record is kept, marked truncated). `mode: off` or `"verdict_labels": false` turn verdict labels off.
 
 The label attaches to the run's acceptance decision. A workflow node that
-already has a complete acceptance decision is labeled in place. Otherwise
+already has a complete acceptance decision is labeled in place: the input
+the structural gate labeled when there is one (so a run stays one example),
+else the latest complete one. Otherwise
 Fusion records an `unscored` acceptance decision, with the same input
 `accept_node` builds or the input an unavailable workflow gate recorded.
 Laya does not run, so `fusion outcome` stays fast and works without a
@@ -373,7 +397,9 @@ reason and the run's `result.json` path. Its context is `task_id` = run id and
 `group` = the run's workflow or trace, so repeats stay in one split. A later
 verdict on the same run replaces the earlier verdict's answers; a later
 verdict that cannot label retracts them. Labels from a human or council on
-that decision are never overwritten.
+that decision are never overwritten. A verdict supersedes a
+`structural_gate` answer only for the questions it answers; the gate's
+other answers stay, still tagged `structural_gate`.
 
 Verdict labels count as approved in the Laya lab, the training loop's
 new-answer count and readiness, and exports. Every exported answer carries
@@ -391,9 +417,152 @@ accumulate if you want them out of automatic rounds.
 
 Verdicts never create routing labels. A worker succeeding does not prove it
 was the best route. Outcomes rank routes (`rank_by_outcomes`) and nothing
-else. Workflow gate outcomes are not labels either: the acceptance question
-is asked only after structural checks pass, so a gate "accept" repeats the
-policy's own choice.
+else. A gate's accept/reject is not a label either; only the objective codes
+behind it are (below).
+
+### Labels recorded automatically
+
+Three sources label without a click. Each is `verified`, carries evidence,
+and every exported answer names its source in `label_provenance`:
+
+| Source | Decision | Answers | Written when |
+| --- | --- | --- | --- |
+| `lead_verdict` | acceptance | `plausible`, `failed_task` (above) | `fusion outcome` with a reason |
+| `structural_gate` | acceptance | `failed_task` only | a workflow node reported success and the gate's objective codes decide it |
+| `user_explicit` | intake | `workflow` | a user typed `fusion build --kind discovery\|build\|debug\|review` |
+
+`mode: off` turns all of them off; `"automatic_labels": false` turns off
+`structural_gate` and `user_explicit`.
+
+#### Structural gate labels
+
+For every workflow node whose worker reported `success`, Fusion records an
+`unscored` acceptance decision (`source: "structural_gate"`) **before** the
+structural gate runs, with the same input `accept_node` builds. A failed
+gate therefore leaves a labelable example too, not only the successes that
+reach the classifier. After the gate, the input is labeled only from these
+objective codes:
+
+| Gate result | Label |
+| --- | --- |
+| an executed check failed with a test failure and was not `vacuous` | `failed_task=true` |
+| a write node finished without changing the tree (`write_no_change`) | `failed_task=true` |
+| the gate passed and at least one executed check failed before the change and passed after it | `failed_task=false` |
+| anything else | unlabeled |
+
+- `plausible` is never labeled by the gate. It asks whether the *report*
+  plausibly matches the task, which no exit code decides.
+- Blockers and `required_handoff` fields never label. They are parsed from
+  the worker's report and are Laya's own inputs; a gate failing on them is a
+  parser or reporting fact, not evidence about the work. A missing or
+  unchanged required file blocks a positive label but is not a negative
+  one: the plan, a model, named the file.
+- A check whose runner could not run it (`error`, `timed_out`, or pytest exit
+  codes 2-5: interrupted, internal error, usage error, no tests collected) is
+  not a test failure and does not label.
+- Laya's veto never enters: the label is computed from the codes alone, so an
+  active acceptance head can never label itself.
+- An authored check has no pre-change run, so its failure can label
+  `failed_task=true` but its pass cannot label `false`.
+
+The node result in `node.json` and the manifest keeps `gate_codes` (one
+structured code beside each gate problem: `worker_status`, `worker_blockers`, `required_file_missing`,
+`required_file_unchanged`, `required_handoff_empty`, `check_failed`,
+`check_error`, `check_unpersisted`, `write_no_change`, `coordinator_error`,
+`repeated_failure`) and `gate_label` (what was written, or why nothing was).
+
+#### Precedence
+
+A source never overwrites a label from a higher one; a higher source
+supersedes a lower one only for the questions it answers:
+
+`human` = `human_approved_suggestion` = `user_explicit` >
+`council_approved_suggestion` > `lead_verdict` > `structural_gate`
+
+A gate labels only the fresh input it recorded, so it never overwrites
+anything. A lead verdict replaces its own earlier answers and the gate's
+answers to the questions it answers, and keeps the rest. A council approval
+is not blocked by gate labels (it is by any other source's). Every label
+event stays in `events.jsonl`, so a disagreement between a gate and a later
+verdict remains auditable.
+
+```sh
+orc fusion decisions export .fusion/decisions/no-gate.jsonl --exclude-source structural_gate
+orc fusion decisions export .fusion/decisions/judged.jsonl --exclude-source structural_gate --exclude-source user_explicit
+```
+
+#### Outcomes are not labels, and Laya's veto is not an outcome
+
+Workflow outcome events carry `laya_veto` and `gate_codes`. A reported
+success rejected only by Laya's veto, or only by `worker_blockers`,
+`required_handoff_empty` or `repeated_failure`, is written as
+`outcome_excluded` with an `excluded_reason`, so route ranking never reads
+it (`fusion_policy.outcome_counts`). No label is derived from outcomes.
+
+#### Intake intent
+
+`fusion build --kind K` records `explicit_kind` and `kind_source` in the
+intake application event. When the user typed it (`kind_source: "user"`),
+the intake decision is labeled `workflow=K` with `source: "user_explicit"`:
+it is the user's own statement of which work they asked for. The fallback
+regex, Laya, an MCP lead (`fusion_run_start`, `kind_source: "agent"`),
+Truffle (`"truffle"`) and `--from-workflow`'s default (`"default"`) never
+label. No label is written when the request's own scope overrides the kind
+(a planning-only request becomes `discovery`), for `sweep` (not an intake
+answer), or when the input is truncated. `needs_clarification` stays
+unlabeled.
+
+#### Executed plan verification
+
+The plan node of a generated `build`/`debug` workflow (Truffle queues use
+`debug`) declares `verification` commands in its acceptance contract. The
+implementation node opts in with `acceptance.plan_verification`, and the
+commands that pass the rules below run as its acceptance checks, with the
+same receipts, timeouts and process-group cleanup as authored checks. They
+run twice: once on the tree before the first attempt (receipts under
+`nodes/implement/acceptance/attempt-1/before-check-*`, summary in
+`acceptance/before.json`, reused by retries and resumes), and after every
+attempt. A check that already passed before the change is `vacuous`: it
+cannot tell whether the work was done, and it never produces a negative
+label. The after-receipt records `origin: "plan"`, `vacuous` and `before`.
+
+The commands are model output and run unsandboxed with your privileges, so
+`fusion_verification` admits only:
+
+1. **argv, no shell.** An argv array is used as is. A string is split with
+   `shlex` only when it has no shell syntax: operators, pipes, redirection,
+   `$`/backtick expansion, globs or brackets, braces, `~`, `!`, `#`,
+   backslashes, newlines or a leading `VAR=` assignment (so a parametrized
+   pytest id such as `test_x[a]` must be an argv array). Anything else is dropped, never run through a shell: a
+   command a shell would have rewritten would fail without one for reasons
+   unrelated to the work and become a false negative label.
+2. **An allowlisted runner.** `argv[0]` must be a bare program name (no
+   path: a path could be a script the plan or implementer wrote) listed in
+   `verification.runners`. The default covers the test runners and the build
+   tools that invoke them across common ecosystems: `python3`, `python`,
+   `pytest`, `npm`, `pnpm`, `yarn`, `bun`, `node`, `deno`, `go`, `cargo`,
+   `make`, `uv`, `ruby`, `rspec`, `bundle`, `mvn`, `gradle`. Wrappers such as
+   `./gradlew` are paths and are refused; add a runner name to opt in.
+3. **No installs, publishing or inline code.** Package managers are held to
+   test/run subcommands (`npm test|run`, `go test|vet|build`, `cargo
+   test|check|build|clippy|fmt`, `uv run`, `bundle exec`, ...); `install`,
+   `add`, `ci`, `update`, `publish`, `deploy`, `pip`, `dlx`/`npx`, `uv run
+   --with` and similar are refused. So are `python -c`, `python -m pip`,
+   `node -e/-p`, `ruby -e` and `deno eval`.
+4. **Offline by request.** Checks run with `PYTHONDONTWRITEBYTECODE=1`,
+   `PIP_NO_INDEX=1`, `UV_OFFLINE=1`, `npm_config_offline=true`,
+   `YARN_ENABLE_NETWORK=0`, `GOPROXY=off` and `CARGO_NET_OFFLINE=true`. That
+   asks tools not to fetch; it is not a network sandbox.
+5. **Bounded.** At most 8 commands, 64 arguments and 400 characters each,
+   `verification.timeout_seconds` (default 900) per run.
+
+Refused commands are listed in the node result's `verification_rejected`
+with a reason and stay in the plan for the reviewer. This is not a sandbox:
+an allowed runner executes repository code (tests, `conftest.py`,
+`package.json` scripts, Makefiles) exactly as the worker was already told
+to. The rules bound which tools a plan can invoke, not what repository code
+does. `"verification": {"execute": false}` records the commands without
+running them. Authored workflows run only their own `acceptance.checks`.
 
 #### What the classifier sees
 

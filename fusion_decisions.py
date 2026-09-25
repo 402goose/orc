@@ -25,6 +25,7 @@ DEFAULTS = {
     "mode": "shadow", "python": "", "device": "cpu", "model_path": "",
     "timeout_seconds": 120, "auto_actions": [], "threshold": 0.90,
     "calibration_file": "", "max_state_chars": 2200, "verdict_labels": True,
+    "automatic_labels": True,
 }
 KINDS = {"intake", "routing", "recovery", "review", "acceptance"}
 # "unscored": the input was recorded without running the model, so a verified
@@ -275,6 +276,8 @@ def config_for(config):
         raise ValueError("decisions.threshold must be in (0, 1]")
     if not isinstance(options["verdict_labels"], bool):
         raise ValueError("decisions.verdict_labels must be true or false")
+    if not isinstance(options["automatic_labels"], bool):
+        raise ValueError("decisions.automatic_labels must be true or false")
     return options
 
 
@@ -679,9 +682,9 @@ class DecisionEngine:
             return False
         return bool(bucket.get("qualified") and max(scaled.values()) >= threshold)
 
-    def applied(self, record, actual, applied=False, reason="shadow mode or unqualified recommendation"):
+    def applied(self, record, actual, applied=False, reason="shadow mode or unqualified recommendation", **extra):
         if record.get("status") != "off":
-            self.store.append("application", id=record["id"], kind=record["kind"], actual=actual, applied=applied, reason=reason)
+            self.store.append("application", id=record["id"], kind=record["kind"], actual=actual, applied=applied, reason=reason, **extra)
             progress.emit("laya", f"{record['kind']}: action={actual}; {'recommendation applied' if applied else 'advisory only'} ({reason})")
 
 

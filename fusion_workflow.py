@@ -93,10 +93,13 @@ def parse_acceptance_contract(answer: str) -> dict[str, Any]:
     not take down the run -- the node's other gates still apply -- but it also
     cannot widen what is enforced by writing nonsense.
 
-    `verification` is recorded and passed on for the reviewer to rerun. It is
-    deliberately NOT executed by the coordinator: acceptance checks run
-    unsandboxed with the user's privileges, and these commands are model
-    output. Authored specs may still supply executable `acceptance.checks`.
+    `verification` is recorded as written (argv arrays or plain strings) and
+    passed on for the reviewer to rerun. It is executed only for an
+    implementation node that opts in with `acceptance.plan_verification`
+    (generated builds do), and only what fusion_verification.plan_checks
+    admits: these commands are model output and acceptance checks run
+    unsandboxed with the user's privileges. Authored specs may still supply
+    executable `acceptance.checks`.
     """
     blocks = re.findall(r"```acceptance-contract\s*\n(.*?)\n```", answer or "", re.S)
     if len(blocks) != 1:
@@ -121,10 +124,13 @@ def parse_acceptance_contract(answer: str) -> dict[str, Any]:
             continue
         files.append(candidate)
 
-    verification = [
-        str(item)[:400] for item in _as_list(value.get("verification"))[:MAX_CONTRACT_FILES]
-        if isinstance(item, str) and item.strip()
-    ]
+    verification: list[Any] = []
+    for item in _as_list(value.get("verification"))[:MAX_CONTRACT_FILES]:
+        if isinstance(item, str) and item.strip():
+            verification.append(item[:400])
+        elif (isinstance(item, list) and item and all(isinstance(part, str) for part in item)
+              and sum(len(part) for part in item) <= 400):
+            verification.append(list(item))
     contract: dict[str, Any] = {}
     if files:
         contract["required_files"] = sorted(dict.fromkeys(files))
@@ -476,6 +482,9 @@ class WorkflowRunner:
             if node["status"] != "success":
                 continue
             result = node.get("result") or {}
+            if node["write"]:
+                self._prepare_plan_checks(node)
+                self._baseline_plan_checks(node, run=False)
             accepted, problems = self._accept_node(node, result)
             if result.get("acceptance_checks"):
                 # Resume rechecks have their own receipts; keep node.json and
@@ -502,6 +511,8 @@ class WorkflowRunner:
                 self._event("node.stale", {"node_id": node_id, "reason": "definition or dependency evidence changed"})
                 continue
             current_digest[node_id] = expected
+            # A reused plan still declares what its dependents must produce and run.
+            node["_contract"] = self._contract_from(result)
             self._event("node.reused", {"node_id": node_id})
             self._emit_cache_hit_telemetry(node_id, node)
 
@@ -707,7 +718,9 @@ BLOCKERS: unresolved issues, or none
             return None
 
     def _acceptance_check(self, node: dict[str, Any], result: dict[str, Any],
-                          command: Any, index: int) -> dict[str, Any]:
+                          command: Any, index: int, *, phase: str = "after",
+                          env: dict[str, str] | None = None, timeout: int | None = None,
+                          annotations: dict[str, Any] | None = None) -> dict[str, Any]:
         """Record coordinator observations independently of a worker's handoff.
 
         Each invocation has its own directory, including resume rechecks. Output
@@ -719,10 +732,15 @@ BLOCKERS: unresolved issues, or none
         that escape into another session are not observed or claimed terminated.
         Final logs are detached prefix snapshots, so inherited output descriptors
         cannot keep modifying the files referenced by a finalized receipt.
+
+        `phase="before"` runs a plan's verification on the tree before the
+        implementation starts (its receipt is the vacuity baseline); `env`
+        adds variables to the inherited environment and only their names are
+        recorded; `annotations` are saved in the receipt (origin, vacuity).
         """
         attempt = int(result.get("attempt") or node.get("attempts") or 0)
         directory = (self._node_dir(node["id"]) / "acceptance" / f"attempt-{attempt}"
-                     / f"check-{index + 1}-{uuid.uuid4().hex[:12]}")
+                     / f"{'before-' if phase == 'before' else ''}check-{index + 1}-{uuid.uuid4().hex[:12]}")
         directory.mkdir(parents=True)
         receipt_path = directory / "receipt.json"
         stdout_path, stderr_path = directory / "stdout.log", directory / "stderr.log"
@@ -734,6 +752,9 @@ BLOCKERS: unresolved issues, or none
             "run_id": result.get("run_id"),
             "attempt": attempt,
             "check_index": index,
+            **({"phase": phase} if phase != "after" else {}),
+            **({"env_overrides": sorted(env)} if env else {}),
+            **(annotations or {}),
             "argv": command,
             "cwd": str(self.workspace.resolve()),
             "started_at_ms": core.now_ms(),
@@ -764,9 +785,10 @@ BLOCKERS: unresolved issues, or none
             try:
                 if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
                     raise ValueError("acceptance checks must be argv arrays")
-                timeout = int(self.config.get("timeout_seconds", 3600))
+                timeout = int(timeout or self.config.get("timeout_seconds", 3600))
                 receipt["timeout_seconds"] = timeout
                 with subprocess.Popen(command, cwd=self.workspace, stdin=subprocess.DEVNULL,
+                                      env={**os.environ, **env} if env else None,
                                       stdout=stdout, stderr=stderr, start_new_session=(os.name == "posix")) as process:
                     observed = receipt["process"]
                     observed["pid"] = process.pid
@@ -842,56 +864,186 @@ BLOCKERS: unresolved issues, or none
                                                   "status": receipt["status"], "receipt": str(receipt_path)})
         return receipt
 
+    def _plan_verification(self, node: dict[str, Any]) -> list[Any]:
+        """Verification commands a dependency's plan declared for this node.
+
+        Only a write node that opts in with `acceptance.plan_verification`
+        (generated builds) inherits them, so authored workflows keep running
+        exactly the `acceptance.checks` they wrote.
+        """
+        acceptance = node.get("acceptance") or {}
+        if not node.get("write") or not isinstance(acceptance, dict) or not acceptance.get("plan_verification"):
+            return []
+        items: list[Any] = []
+        for dependency in node.get("needs") or []:
+            contract = (self.nodes.get(dependency) or {}).get("_contract") or {}
+            items.extend(contract.get("verification") or [])
+        return items
+
+    def _prepare_plan_checks(self, node: dict[str, Any]) -> None:
+        from fusion_verification import plan_checks
+
+        items = self._plan_verification(node)
+        checks, rejected = plan_checks(items, self.config) if items else ([], [])
+        node["_plan_checks"], node["_plan_checks_rejected"] = checks, rejected
+        if rejected:
+            self._event("acceptance.plan_checks.rejected", {"node_id": node["id"], "rejected": rejected})
+
+    def _baseline_plan_checks(self, node: dict[str, Any], run: bool = True) -> None:
+        """Run the plan's checks once, on the tree before the first attempt.
+
+        A check that already passes there cannot tell whether the work was
+        done: its later pass is recorded `vacuous` and never labels the node.
+        The baseline is saved beside the node and reused by retries and
+        resumes, whose tree already holds an earlier attempt's changes; a
+        later attempt without a saved baseline runs none and leaves vacuity
+        unknown.
+        """
+        from fusion_verification import OFFLINE_ENV, settings
+
+        checks = node.get("_plan_checks") or []
+        path = self._node_dir(node["id"]) / "acceptance" / "before.json"
+        node["_plan_before"] = {}
+        if not checks:
+            return
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            saved = {}
+        if isinstance(saved, dict) and saved.get("checks") == checks:
+            node["_plan_before"] = saved
+            self._drop_unstartable(node)
+            return
+        if node["attempts"] > 1 or not run:
+            return
+        timeout = settings(self.config)["timeout_seconds"]
+        receipts = []
+        with progress.activity(node["id"], "running the plan's verification on the tree before the change"):
+            for index, command in enumerate(checks):
+                try:
+                    receipts.append(self._acceptance_check(node, {"attempt": node["attempts"]}, command, index,
+                                                           phase="before", env=OFFLINE_ENV, timeout=timeout))
+                except OSError as exc:
+                    receipts.append({"argv": command, "phase": "before", "status": "error", "error": str(exc)})
+        node["_plan_before"] = {"checks": checks, "receipts": receipts}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(core.json_text(node["_plan_before"]) + "\n", encoding="utf-8")
+        self._drop_unstartable(node)
+
+    def _drop_unstartable(self, node: dict[str, Any]) -> None:
+        """A plan command whose program could not even start before the change
+        (not installed, not executable) says nothing about the implementation
+        and would only fail its gate: it is moved to the rejected list."""
+        receipts = (node.get("_plan_before") or {}).get("receipts") or []
+        if not receipts:
+            return
+        started = []
+        for receipt in receipts:
+            command = receipt.get("argv")
+            if receipt.get("status") == "error" and not (receipt.get("process") or {}).get("pid"):
+                node["_plan_checks_rejected"] = [*(node.get("_plan_checks_rejected") or []), {
+                    "command": command, "reason": f"could not start before the change: {receipt.get('error')}"}]
+            else:
+                started.append(command)
+        node["_plan_checks"] = [command for command in node.get("_plan_checks") or [] if command in started]
+
     def _accept_node(self, node: dict[str, Any], result: dict[str, Any]) -> tuple[bool, list[str]]:
+        accepted, problems, _ = self._gate(node, result)
+        return accepted, problems
+
+    def _gate(self, node: dict[str, Any], result: dict[str, Any]) -> tuple[bool, list[str], list[dict[str, Any]]]:
+        """Structural acceptance: (accepted, problems, codes).
+
+        Each problem string has one structured code beside it
+        ({"code": ..., plus details}), also saved as result["gate_codes"], so
+        labeling and outcomes can tell objective evidence (a check's exit,
+        an unchanged tree, a missing file) from what came out of parsing the
+        worker's handoff (blockers, empty handoff fields).
+        """
         # Worker-provided fields cannot masquerade as coordinator evidence.
         # Older/rechecked receipts remain on disk in their unique directories.
         result["acceptance_checks"] = []
+        result["gate_codes"] = []
         if core.failure_class(result) == "coordinator_error":
             # The coordinator failed to establish the review evidence. Worker
             # handoff checks cannot repair this and only obscure the real error.
-            return False, []
+            result["gate_codes"] = [{"code": "coordinator_error"}]
+            return False, [], result["gate_codes"]
         problems: list[str] = []
+        codes: list[dict[str, Any]] = result["gate_codes"]
+
+        def problem(code: str, text: str, **detail: Any) -> None:
+            problems.append(text)
+            codes.append({"code": code, **detail})
+
         if result.get("status") not in TERMINAL_SUCCESS:
-            problems.append(f"worker status is {result.get('status', 'unknown')}")
+            problem("worker_status", f"worker status is {result.get('status', 'unknown')}", status=result.get("status"))
         if result.get("blockers"):
-            problems.append("worker reported unresolved blockers")
+            problem("worker_blockers", "worker reported unresolved blockers")
         for relative in node.get("required_files", []):
             path = self.workspace / relative
             if not path.is_file():
-                problems.append(f"required artifact is missing: {relative}")
+                problem("required_file_missing", f"required artifact is missing: {relative}", path=relative)
             else:
                 baseline = (node.get("_artifact_baseline") or {}).get(relative)
                 if baseline and _fingerprint(path) == baseline:
-                    problems.append(f"required artifact did not change during node: {relative}")
+                    problem("required_file_unchanged", f"required artifact did not change during node: {relative}", path=relative)
         acceptance = node.get("acceptance") or {}
-        if isinstance(acceptance, dict):
-            for field in _as_list(acceptance.get("required_handoff")):
-                if not result.get(str(field)):
-                    problems.append(f"required handoff field is empty: {field}")
-            for index, command in enumerate(_as_list(acceptance.get("checks"))):
-                try:
-                    receipt = self._acceptance_check(node, result, command, index)
-                except OSError as exc:
-                    problems.append(f"acceptance check evidence could not be persisted: {exc}")
-                    continue
-                result["acceptance_checks"].append(receipt)
-                if receipt["status"] != "passed":
-                    label = " ".join(command) if isinstance(command, list) and all(isinstance(part, str) for part in command) else str(command)
-                    if receipt["error"]:
-                        problems.append(f"acceptance check could not run: {label} ({receipt['error']})")
-                    else:
-                        problems.append(f"acceptance check failed: {label}")
+        if not isinstance(acceptance, dict):
+            acceptance = {}
+        # Compare the tree before any check runs: a check's own caches would
+        # otherwise make an untouched tree look changed.
+        unchanged = False
         if node.get("write") and not acceptance.get("allow_no_changes"):
             # required_handoff only asks whether a field is non-empty, so a
             # worker reporting "TESTS: not run" satisfies it. Generated builds
-            # declare no required_files and no checks, which left the primary
-            # path unable to notice that an implementation node implemented
-            # nothing. Compare the repository against its own pre-dispatch
-            # tree: a worker cannot misreport that the way it can CHANGED.
+            # declare no required_files, which left the primary path unable to
+            # notice that an implementation node implemented nothing. Compare
+            # the repository against its own pre-dispatch tree: a worker
+            # cannot misreport that the way it can CHANGED.
             baseline = node.get("_tree_baseline")
-            if baseline and self._tree() == baseline:
-                problems.append("write node finished without changing any file")
-        return not problems, problems
+            unchanged = bool(baseline) and self._tree() == baseline
+        for field in _as_list(acceptance.get("required_handoff")):
+            if not result.get(str(field)):
+                problem("required_handoff_empty", f"required handoff field is empty: {field}", field=str(field))
+        from fusion_verification import OFFLINE_ENV, counts_as_failure, settings
+
+        before = {json.dumps(receipt.get("argv")): receipt for receipt in (node.get("_plan_before") or {}).get("receipts", [])}
+        authored = [(command, "authored") for command in _as_list(acceptance.get("checks"))]
+        planned = [(command, "plan") for command in node.get("_plan_checks") or []]
+        if node.get("_plan_checks_rejected"):
+            result["verification_rejected"] = node["_plan_checks_rejected"]
+        for index, (command, origin) in enumerate(authored + planned):
+            extra: dict[str, Any] = {}
+            vacuous = None
+            if origin == "plan":
+                baseline = before.get(json.dumps(command))
+                # Vacuous: it already passed before the change. Known only
+                # when a baseline ran; a baseline that could not run is unknown.
+                vacuous = {"passed": True, "failed": False}.get((baseline or {}).get("status"))
+                extra = {"env": OFFLINE_ENV, "timeout": settings(self.config)["timeout_seconds"], "annotations": {
+                    "origin": "plan", "vacuous": vacuous,
+                    "before": {"status": baseline.get("status"), "exit_code": baseline.get("exit_code"),
+                               "receipt": (baseline.get("artifacts") or {}).get("receipt")} if baseline else None}}
+            try:
+                receipt = self._acceptance_check(node, result, command, index, **extra)
+            except OSError as exc:
+                problem("check_unpersisted", f"acceptance check evidence could not be persisted: {exc}", origin=origin)
+                continue
+            result["acceptance_checks"].append(receipt)
+            if receipt["status"] != "passed":
+                label = " ".join(command) if isinstance(command, list) and all(isinstance(part, str) for part in command) else str(command)
+                detail = {"origin": origin, "check_index": index, "status": receipt["status"], "vacuous": vacuous,
+                          "exit_code": receipt.get("exit_code"),
+                          "test_failure": receipt["status"] == "failed" and isinstance(command, list)
+                          and counts_as_failure(command, receipt.get("exit_code"))}
+                if receipt["error"]:
+                    problem("check_error", f"acceptance check could not run: {label} ({receipt['error']})", **detail)
+                else:
+                    problem("check_failed", f"acceptance check failed: {label}", **detail)
+        if unchanged:
+            problem("write_no_change", "write node finished without changing any file")
+        return not problems, problems, codes
 
     def _run_node(self, node_id: str, attempt: int) -> dict[str, Any]:
         node = self.nodes[node_id]
@@ -1140,6 +1292,12 @@ BLOCKERS: unresolved issues, or none
                         relative: _fingerprint(self.workspace / relative)
                         for relative in selected.get("required_files", [])
                     }
+                    if selected["write"]:
+                        # The plan's verification becomes this node's checks;
+                        # their pre-change run must precede the tree baseline
+                        # so its caches never count as the worker's change.
+                        self._prepare_plan_checks(selected)
+                        self._baseline_plan_checks(selected)
                     # A writer that writes nothing did not do the work. Record
                     # the tree so acceptance can check the repository itself
                     # rather than the worker's account of it.
@@ -1168,8 +1326,14 @@ BLOCKERS: unresolved issues, or none
                     self.attempt_ledger.append({"run_id": result.get("run_id"), "node_id": node_id,
                                                 "attempt": node["attempts"], "cost_usd": _result_cost(result),
                                                 "usage": result.get("usage", {})})
+                    from fusion_labeling import gate_label, record_gate_input
+                    # The input is recorded before the gate decides, for every
+                    # reported success, so a failed gate leaves a labelable example
+                    # too; only a passed one reaches the classifier.
+                    gate_input = record_gate_input(self.config, self.control_workspace, self.run_id, node, result)
                     with progress.activity(node_id, "checking handoff and acceptance criteria"):
-                        accepted, problems = self._accept_node(node, result)
+                        accepted, problems, codes = self._gate(node, result)
+                    laya_veto = False
                     if accepted:
                         # A semantic Done-check leg, spent only on a node that already passed
                         # every structural check. It can add a problem; it cannot clear one.
@@ -1177,8 +1341,12 @@ BLOCKERS: unresolved issues, or none
                         plausible, acceptance_decision_id = accept_node(self.config, self.control_workspace, self.run_id, node, result)
                         result.setdefault("decisions", {})["acceptance"] = acceptance_decision_id
                         if not plausible:
-                            accepted = False
+                            accepted, laya_veto = False, True
                             problems = problems + ["Laya acceptance check: reported success does not plausibly match the task"]
+                    if gate_input:
+                        # Only objective gate codes label; the veto above never does.
+                        result["gate_label"] = gate_label(self.config, self.control_workspace, gate_input, codes,
+                                                          result.get("acceptance_checks", []))
                     if problems:
                         result.setdefault("blockers", []).extend(problems)
                     previous = node.get("result") or {}
@@ -1189,6 +1357,7 @@ BLOCKERS: unresolved issues, or none
                         node["repeated_failure"] = True
                         problems = problems + ["attempt repeated the previous attempt's blockers exactly; stopping instead of retrying"]
                         result["blockers"].append(problems[-1])
+                        codes.append({"code": "repeated_failure"})
                     if accepted:
                         node["_contract"] = self._contract_from(result)
                         dependency_digests = {dep: (self.nodes[dep].get("result") or {}).get("digest") for dep in node["needs"]}
@@ -1196,7 +1365,8 @@ BLOCKERS: unresolved issues, or none
                         result["resolved"] = payload.get("task", {}).get("resolved") or {}
                     node["result"] = result
                     from fusion_policy import recovery
-                    action, decision_id = recovery(self.config, self.control_workspace, self.run_id, node, result, accepted, self.spec["max_attempts"])
+                    action, decision_id = recovery(self.config, self.control_workspace, self.run_id, node, result, accepted,
+                                                   self.spec["max_attempts"], gate_codes=codes, laya_veto=laya_veto)
                     result.setdefault("decisions", {})["recovery"] = decision_id
                     self._record_gate(payload.get("task") or {}, result, accepted, problems)
                     payload["acceptance"] = {"ok": accepted, "problems": problems,

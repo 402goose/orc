@@ -126,15 +126,20 @@ In a generated `build`, the planning node declares what the implementation must
 produce, as one fenced `acceptance-contract` block:
 
 ```acceptance-contract
-{"required_files": ["src/export.py", "tests/test_export.py"], "verification": ["pytest tests/test_export.py"]}
+{"required_files": ["src/export.py", "tests/test_export.py"], "verification": [["python3", "-m", "pytest", "tests/test_export.py"]]}
 ```
 
 Those files become `required_files` on the implementing node, so it is gated on
 producing them. Paths are workspace-relative and validated — absolute paths,
 `~`, and `..` are refused — and a malformed contract is ignored rather than
-widening what is enforced. `verification` is recorded for the reviewer to rerun
-and is **not** executed by the orchestrator: acceptance `checks` run unsandboxed
-with your privileges, so only an authored workflow may supply them.
+widening what is enforced. `verification` is recorded for the reviewer to rerun,
+and the commands that pass a conservative policy also run as the implementing
+node's acceptance checks: argv only (no shell), an allowlisted test runner by
+bare name, no installs, publishing or inline code, offline where the tool
+allows. Each runs on the tree before the change and again after it; a check
+that already passed before is `vacuous` and proves nothing. They run
+unsandboxed with your privileges, like the tests the worker runs. See
+[executed plan verification](FUSION_DECISIONS.md#executed-plan-verification).
 
 Start here, from the repository you want worked on:
 

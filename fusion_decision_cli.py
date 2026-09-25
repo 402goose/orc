@@ -36,7 +36,7 @@ def add_parser(sub):
     export = commands.add_parser("export", help="export reviewed labels, split by workflow group")
     export.add_argument("output")
     export.add_argument("--exclude-source", action="append", default=[], metavar="SOURCE",
-                        help="leave out answers approved by this source, for example lead_verdict; repeatable")
+                        help="leave out answers approved by this source, for example lead_verdict, structural_gate or user_explicit; repeatable")
     commands.add_parser("routing-report", help="per-lane acceptance from logged routing propensities (IPS, ESS); read-only")
     calibrate = commands.add_parser("calibrate", help="fit temperature on train and assess held-out groups")
     calibrate.add_argument("dataset")

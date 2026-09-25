@@ -59,11 +59,17 @@ workspace-relative files the implementation must create or change, and the
 commands that verify it. The orchestrator gates the implementation node on
 those files existing and changing, so name only files the work must actually
 produce, and leave required_files empty when the request needs no file change.
-Verification commands are recorded for the reviewer to rerun; they are not
-executed by the orchestrator.
+The orchestrator runs each verification command before the implementation
+starts and again after it, from the repository root, without a shell and
+offline; the implementation is rejected if one fails afterwards. Write each as
+an argv array for an installed test runner (pytest, python3 -m pytest, npm
+test, go test, cargo test, make ...), with no pipes, redirection, `cd`,
+environment assignments, globs, installs or inline code; anything else is
+recorded for the reviewer and not run. Prefer a focused test that fails
+before the change and passes after it.
 
 ```acceptance-contract
-{"required_files": ["path/one.py", "tests/test_one.py"], "verification": ["pytest tests/test_one.py"]}
+{"required_files": ["path/one.py", "tests/test_one.py"], "verification": [["python3", "-m", "pytest", "tests/test_one.py"]]}
 ```
 """
 
@@ -77,12 +83,22 @@ def dimensions(across):
     return items
 
 
-def prepare(workspace, config, idea, kind=None, budget_usd=0, max_attempts=2, *, execute=False, across=()):
+KIND_SOURCES = {"user", "agent", "truffle", "default"}
+
+
+def prepare(workspace, config, idea, kind=None, budget_usd=0, max_attempts=2, *, execute=False, across=(), kind_source=None):
+    """`kind_source` says who chose an explicit `kind`: "user" (typed --kind),
+    "agent" (an MCP lead), "truffle" or "default" (a caller's fallback). Only a
+    user's choice becomes an intake label."""
     if not idea.strip():
         raise ValueError("feature idea must not be empty")
     if budget_usd < 0 or not 1 <= max_attempts <= 5:
         raise ValueError("budget must be nonnegative and max attempts must be 1..5")
     across = dimensions(across)
+    if kind_source is not None and kind_source not in KIND_SOURCES:
+        raise ValueError(f"kind_source must be one of {', '.join(sorted(KIND_SOURCES))}")
+    if kind_source and not kind:
+        raise ValueError("kind_source requires an explicit kind")
     if kind == "sweep" and not across:
         raise ValueError("a sweep needs at least one --across dimension")
     if across and kind and kind != "sweep":
@@ -95,7 +111,7 @@ def prepare(workspace, config, idea, kind=None, budget_usd=0, max_attempts=2, *,
                    coordinator_pid=os.getpid(), execution=execute)
     progress.emit("intake", f"build {build_id} registered; watch with: orc 'fusion' workflow watch {build_id}")
     try:
-        prepared = _prepare(workspace, config, idea, kind, budget_usd, max_attempts, build_id, root, across)
+        prepared = _prepare(workspace, config, idea, kind, budget_usd, max_attempts, build_id, root, across, kind_source)
         _update_status(root, status="running" if execute else "prepared", phase="starting" if execute else "prepared",
                        message="brief saved; starting workflow" if execute else "brief and workflow saved")
         return prepared
@@ -104,13 +120,14 @@ def prepare(workspace, config, idea, kind=None, budget_usd=0, max_attempts=2, *,
         raise
 
 
-def _prepare(workspace, config, idea, kind, budget_usd, max_attempts, build_id, root, across=()):
+def _prepare(workspace, config, idea, kind, budget_usd, max_attempts, build_id, root, across=(), kind_source=None):
     source = source_for(idea, workspace)
     read_only = bool(PLANNING_ONLY.search(source["text"]))
     fallback = "discovery" if read_only else "debug" if re.search(r"\b(fix|bug|broken|regression)\b", idea, re.I) else "review" if re.match(r"\s*review\b", idea, re.I) else "build"
     engine = DecisionEngine(workspace, config)
     _update_status(root, phase="classification", message="waiting for Laya intake classification; first checkpoint load can take tens of seconds")
-    record = engine.decide("intake", {"request": source["text"], "planning_only": read_only}, INTAKE_QUESTIONS, {"group": build_id})
+    intake_state = {"request": source["text"], "planning_only": read_only}
+    record = engine.decide("intake", intake_state, INTAKE_QUESTIONS, {"group": build_id})
     selected = kind or fallback
     applied = not kind and engine.allowed(record, "workflow")
     if applied:
@@ -123,7 +140,15 @@ def _prepare(workspace, config, idea, kind, budget_usd, max_attempts, build_id, 
         selected, applied = "sweep", False
     read_only = selected in {"discovery", "review", "sweep"}
     progress.emit("intake", f"{selected} workflow; {'read-only' if read_only else 'implementation permitted'}")
-    engine.applied(record, selected, applied, "explicit planning restrictions and workflow selection take priority")
+    engine.applied(record, selected, applied, "explicit planning restrictions and workflow selection take priority",
+                   explicit_kind=kind or None, kind_source=(kind_source or "caller") if kind else None)
+    intake_label = None
+    if kind and kind_source == "user":
+        if selected == kind:
+            from fusion_labeling import intake_label as label_intake
+            intake_label = label_intake(workspace, config, record, intake_state, kind, {"group": build_id}, build_id)
+        else:
+            intake_label = {"status": "skipped", "reason": f"--kind {kind} was overridden by the request's own scope ({selected})"}
     _update_status(root, phase="preparing", message=f"saving the {selected} brief and workflow")
     request_path, brief_path = root / "request.json", root / "brief.md"
     request_path.write_text(json.dumps(source, indent=2, ensure_ascii=False))
@@ -164,7 +189,7 @@ def _prepare(workspace, config, idea, kind, budget_usd, max_attempts, build_id, 
             nodes.extend([
                 {"id": "implement", "agent": "auto", "write": True, "role": "implementation", "needs": ["plan"],
                  "task": shared + "Implement the plan, reproduce the defect first when debugging, and run meaningful verification. Do not delegate further.",
-                 "acceptance": {"required_handoff": ["summary", "tests"]}},
+                 "acceptance": {"required_handoff": ["summary", "tests"], "plan_verification": True}},
                 {"id": "review", "agent": "auto", "write": False, "role": "review", "needs": ["implement"], "independent_of": "implement",
                  "task": shared + "Independently inspect the actual diff and rerun relevant checks against acceptance criteria. Return blocked for unresolved findings. Do not delegate further.",
                  "acceptance": {"required_handoff": ["summary", "tests"]}},
@@ -191,6 +216,7 @@ def _prepare(workspace, config, idea, kind, budget_usd, max_attempts, build_id, 
         file.chmod(0o600)
     progress.emit("intake", f"brief and workflow saved: {root}")
     return {"build_id": build_id, "kind": selected, "read_only": read_only, "across": across, "decision_id": record["id"],
+            **({"intake_label": intake_label} if intake_label else {}),
             "brief": str(brief_path), "request": str(request_path), "workflow": str(path)}
 
 
