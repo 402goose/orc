@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from pathlib import Path
+import random
 import time
 
 from fusion_decisions import (DecisionEngine, DecisionStore, ACCEPTANCE_QUESTIONS, RECOVERY_QUESTIONS, REVIEW_QUESTIONS,
@@ -179,13 +180,37 @@ def no_route_reason(config, task, store):
             "Run `fusion doctor` to see every lane and its command.")
 
 
+def gating(task):
+    """Work that ships or gates: a writer or a review."""
+    return bool(task.get("write") or "review" in str(task.get("role", "")).lower())
+
+
 def exploration(ranking, task, candidates):
     """(minimum, explore) for rank_by_outcomes. Unproven lanes earn evidence on
     ordinary read-only work, not on work that ships or gates: a writer or a
     review goes to a lane with verified evidence once any lane has it."""
     minimum = int(ranking) if not isinstance(ranking, bool) else 3
-    gating = task.get("write") or "review" in str(task.get("role", "")).lower()
-    return minimum, not gating or not any((c.get("checked_runs") or 0) >= minimum for c in candidates)
+    return minimum, not gating(task) or not any((c.get("checked_runs") or 0) >= minimum for c in candidates)
+
+
+ROUTING_RNG = random.Random()
+
+
+def routing_epsilon(config):
+    value = (config.get("decisions") or {}).get("routing_epsilon", 0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+        raise ValueError("decisions.routing_epsilon must be a number in [0, 1]")
+    return float(value)
+
+
+def propensities(keys, chosen, epsilon):
+    """Probability the logging policy picks each key: the ranked top with
+    (1 - epsilon) + epsilon / k, every candidate with epsilon / k. A
+    deterministic pick (epsilon 0) is 1.0 for `chosen`, 0.0 for the rest."""
+    if not epsilon:
+        return {key: float(key == chosen) for key in keys}
+    share = epsilon / len(keys)
+    return {key: share + (1 - epsilon if index == 0 else 0) for index, key in enumerate(keys)}
 
 
 def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None, explore=True):
@@ -227,12 +252,13 @@ def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None, explore=True):
     return [candidate for _, _, tier in tiers for candidate in sorted(tier, key=lambda c: not c.get("warm"))]
 
 
-def route_task(config, task, store):
+def route_task(config, task, store, rng=None):
     """Record advice for explicit routing, apply only to a genuinely automatic lane.
 
     Decisions and outcomes live beside `store`, which is the control workspace
     even when the worker runs in a workflow's worktree."""
     engine = DecisionEngine(store.workspace, config)
+    epsilon = routing_epsilon(config)
     automatic = task["agent"] == "auto" and not task.get("route")
     if task["agent"] == "auto" and task.get("route"):
         task["agent"] = config.get("routes", {}).get(task["route"], {}).get("agent")
@@ -249,6 +275,7 @@ def route_task(config, task, store):
         cache = core.cache_settings(config)
         warm_epsilon = cache["warm_epsilon"] if cache["configured"] else None
         within_route = False
+        minimum = explore = None
         if automatic:
             candidates = route_candidates(config, task, store)
             if ranking:
@@ -292,6 +319,15 @@ def route_task(config, task, store):
             value = record["recommendations"]["route"]["value"]
             selected = next(c for c in candidates if c["key"] == value)
             applied = True
+    # Epsilon exploration: ordinary read-only work only, among lanes that
+    # already passed every filter, never over a qualified recommendation or a
+    # pinned lane, and only when the routing log that makes it useful is kept.
+    scope = "automatic" if automatic else "route_arms" if within_route else None
+    effective = (epsilon if scope and not applied and not gating(task) and not task.get("prefer_different_agent")
+                 and engine.options["mode"] != "off" and len(candidates) > 1 else 0.0)
+    explored = bool(effective) and (rng or ROUTING_RNG).random() < effective
+    if explored:
+        selected = candidates[(rng or ROUTING_RNG).randrange(len(candidates))]
     if within_route:
         task.setdefault("settings_overrides", {})["model"] = selected["model"]
         task["session_key"] += ":" + selected["key"]
@@ -312,7 +348,80 @@ def route_task(config, task, store):
                   "explicit route or pair retained; advice does not change dispatch" if not automatic else
                   "ranked by verified outcomes; advice does not change dispatch" if config.get("decisions", {}).get("rank_by_outcomes") else
                   "configured preference order; advice does not change dispatch")
-        engine.applied(record, selected["key"], applied, reason)
+        engine.applied(record, selected["key"], applied, reason + ("; epsilon exploration picked this lane" if explored else ""))
+    if scope and engine.options["mode"] != "off":
+        keys = [c["key"] for c in candidates]
+        chances = propensities(keys, selected["key"], 0.0 if applied else effective)
+        engine.store.append("routing_log", **context(task), decision_id=record["id"] if record else None, scope=scope,
+                            write=bool(task.get("write")), role=task.get("role"),
+                            policy={"rank_by_outcomes": minimum, "explore": explore, "warm_epsilon": warm_epsilon if ranking else None,
+                                    "epsilon": effective, "routing_epsilon": epsilon, "laya_applied": applied},
+                            candidates=[{**c, "propensity": chances[c["key"]]} for c in candidates],
+                            chosen=selected["key"], explored=explored)
+
+
+def routing_report(events):
+    """Per-lane acceptance from logged routing choices, inverse-propensity weighted.
+
+    Joins each run's latest `routing_log` to its latest outcome (gate or lead)
+    by run id; outcomes marked `laya_veto` are skipped, since the model would
+    be grading itself. For each lane, over the logged choices where it was a
+    candidate: `ips_acceptance` is sum(accepted / propensity for choices of the
+    lane) / available, `snips_acceptance` normalises by the summed weights, and
+    `ess` is (sum w)^2 / sum w^2. A lane given propensity 0 in any of those
+    choices has no overlap there, so neither estimate is reported for it."""
+    logs, outcomes, vetoed, sources = {}, {}, 0, {}
+    for event in events:
+        if event.get("event") == "routing_log" and event.get("task_id"):
+            logs[event["task_id"]] = event
+        elif event.get("event") == "outcome" and event.get("task_id"):
+            outcomes[event["task_id"]] = event
+    lanes = {}
+    joined = 0
+    for task_id, log in logs.items():
+        outcome = outcomes.get(task_id)
+        if outcome is None:
+            continue
+        if outcome.get("laya_veto"):
+            vetoed += 1
+            continue
+        joined += 1
+        source = outcome.get("source") or "gate"
+        sources[source] = sources.get(source, 0) + 1
+        reward = 1.0 if outcome.get("accepted") else 0.0
+        for candidate in log.get("candidates") or []:
+            lane = lanes.setdefault(candidate["key"], {"key": candidate["key"], "available": 0, "chosen": 0, "accepted": 0,
+                                                       "zero_propensity": 0, "_w": 0.0, "_w2": 0.0, "_wr": 0.0})
+            propensity = float(candidate.get("propensity") or 0)
+            lane["available"] += 1
+            if propensity <= 0:
+                lane["zero_propensity"] += 1
+            if log.get("chosen") == candidate["key"] and propensity > 0:
+                weight = 1 / propensity
+                lane["chosen"] += 1
+                lane["accepted"] += int(reward)
+                lane["_w"] += weight
+                lane["_w2"] += weight * weight
+                lane["_wr"] += weight * reward
+    rows = []
+    for lane in sorted(lanes.values(), key=lambda item: (-item["available"], item["key"])):
+        weight, square, weighted = lane.pop("_w"), lane.pop("_w2"), lane.pop("_wr")
+        overlap = lane["zero_propensity"] == 0 and lane["chosen"] > 0
+        lane.update(observed_acceptance=lane["accepted"] / lane["chosen"] if lane["chosen"] else None,
+                    ips_acceptance=weighted / lane["available"] if overlap else None,
+                    snips_acceptance=weighted / weight if overlap else None,
+                    ess=round(weight * weight / square, 3) if square else 0.0,
+                    overlap="ok" if overlap else "insufficient overlap")
+        rows.append(lane)
+    warnings = []
+    if any(lane["overlap"] != "ok" for lane in rows):
+        warnings.append("insufficient overlap: some lanes had propensity 0 where they were available or were never chosen; "
+                        "their counterfactual acceptance is not identified. Set decisions.routing_epsilon above 0 to explore.")
+    if len(logs) - joined - vetoed:
+        warnings.append(f"{len(logs) - joined - vetoed} logged routing choices have no outcome yet")
+    return {"schema": "fusion.routing_report.v1", "logged_choices": len(logs), "with_outcome": joined,
+            "vetoed_outcomes_skipped": vetoed, "outcome_sources": sources,
+            "explored": sum(bool(log.get("explored")) for log in logs.values()), "lanes": rows, "warnings": warnings}
 
 
 def review_task(config, task, store=None):
