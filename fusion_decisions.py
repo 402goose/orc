@@ -57,6 +57,101 @@ ACCEPTANCE_QUESTIONS = {
     "plausible": {"type": "noul", "instructions": "Does the worker's reported summary and evidence plausibly satisfy the task?"},
     "failed_task": {"type": "noul", "instructions": "Did the worker fail to do what the task asked?"},
 }
+ACCEPTANCE_MIN_SUMMARY = 400
+ACCEPTANCE_LIST_LIMITS = {"changed": 12, "tests": 8}
+ACCEPTANCE_ITEM_CHARS = 200
+
+
+def state_cap(options):
+    return max(200, min(6000, int(options["max_state_chars"])))
+
+
+def _encoded(value):
+    return len(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+def _marked(text, keep):
+    return text[:keep] + f" […truncated {len(text) - keep} chars]"
+
+
+def excerpt(text, budget):
+    """`text` if its JSON-escaped form fits `budget` characters, else a head
+    excerpt that says how much was cut. Never silently shortened."""
+    def size(value):
+        return _encoded(value) - 2
+    if size(text) <= budget:
+        return text
+    keep = max(0, budget - 40)
+    while keep and size(_marked(text, keep)) > budget:
+        keep = max(0, keep - max(1, size(_marked(text, keep)) - budget))
+    return _marked(text, keep)
+
+
+def _listed(items, limit):
+    items = [text if len(text) <= ACCEPTANCE_ITEM_CHARS else _marked(text, ACCEPTANCE_ITEM_CHARS)
+             for text in (str(item) for item in (items or []))]
+    return items if len(items) <= limit else items[:limit] + [f"[…{len(items) - limit} more]"]
+
+
+def acceptance_task(source):
+    """What the acceptance question is judged against, as (fields, criterion, detail).
+
+    `source` is a workflow node or a run's task.json. Its decision_context is
+    unwrapped through nested `request`s (a workflow run wraps its node's
+    context and adds dependency receipts, which the node's own acceptance does
+    not depend on). A Fusion-built request carries its workflow kind and stage;
+    its first line is the ask and the rest is supporting detail. Anything else
+    -- a short decision_context string, a hand-written node task, a delegation
+    brief -- is the criterion as a whole.
+    """
+    context = source.get("decision_context", source.get("task"))
+    fields = {}
+    while isinstance(context, dict) and "request" in context:
+        fields.update({key: context[key] for key in ("workflow_kind", "stage") if isinstance(context.get(key), str)})
+        context = context["request"]
+    text = context if isinstance(context, str) else json.dumps(context, ensure_ascii=False, sort_keys=True)
+    if not fields:
+        return None, text, ""
+    if isinstance(source.get("role"), str):
+        fields["role"] = source["role"]
+    criterion, _, detail = text.strip().partition("\n")
+    return fields, criterion, detail
+
+
+def acceptance_state(source, result, cap):
+    """The input for the ACCEPTANCE questions, bounded to `cap` encoded characters.
+
+    Both the workflow gate (fusion_policy.accept_node) and lead verdicts
+    (fusion_labeling.verdict_label) build it here, so one run always yields
+    the same input. What is asked is whether the reported summary plausibly
+    satisfies the task, so the criterion is never cut: a task that does not
+    fit whole beside a minimal summary is marked `source_truncated` and stays
+    unlabeled. The summary is kept from its start -- where a handoff states
+    what was done -- and a request's supporting detail after its first line
+    may be excerpted; each cut carries a visible "[…truncated N chars]"
+    marker, as do capped `changed` and `tests` lists. An input with visible
+    markers is complete for labeling: it says exactly what the classifier saw.
+    """
+    fields, criterion, detail = acceptance_task(source)
+    lists = {key: _listed(result.get(key), limit) for key, limit in ACCEPTANCE_LIST_LIMITS.items()}
+    summary = str(result.get("summary") or "")
+
+    def build(request, text):
+        return {"task": request if fields is None else {**fields, "request": request}, "summary": text, **lists}
+    joined = "\n" + detail if detail else ""
+    whole = build(criterion + joined, summary)
+    if _encoded(whole) <= cap:
+        return whole
+    spare = cap - _encoded(build(criterion, "")) - (40 if detail else 0)
+    size = _encoded(summary) - 2
+    budget = min(size, max(spare * 3 // 5, spare - (_encoded(joined) - 2)))
+    if budget < min(size, ACCEPTANCE_MIN_SUMMARY):
+        return {**whole, "source_truncated": True}
+    summary = excerpt(summary, budget)
+    if detail:
+        joined = excerpt(joined, cap - _encoded(build(criterion, summary)))
+    state = build(criterion + joined, summary)
+    return state if _encoded(state) <= cap else {**state, "source_truncated": True}
 
 
 def digest(value):
@@ -393,7 +488,7 @@ class DecisionEngine:
 
     def encode(self, record, state):
         text = json.dumps(state, ensure_ascii=False, sort_keys=True)
-        cap = max(200, min(6000, int(self.options["max_state_chars"])))
+        cap = state_cap(self.options)
         record["state"] = text[:cap]
         record["truncated"] = len(text) > cap or bool(isinstance(state, dict) and state.get("source_truncated"))
 

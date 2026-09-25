@@ -1425,6 +1425,26 @@ def agent_command(
     raise ValueError(f"unsupported agent: {agent}")
 
 
+def run_directory(workspace: Path, run_id: str) -> Path | None:
+    """The directory of a completed run of this workspace, or None.
+
+    Workflow worktrees link `.fusion` back to the workspace, but a worker that
+    can write its worktree can also replace that link, and older runs then
+    landed in `<worktree>/.fusion/runs`. Those are still this workspace's
+    runs, so they are found there after the main runs directory. Only paths
+    that resolve inside this workspace's `.fusion` are accepted.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id or ""):
+        return None
+    root = (Path(workspace) / ".fusion").resolve()
+    for directory in [RunStore(workspace).runs / run_id,
+                      *sorted((Path(workspace) / ".fusion" / "worktrees").glob(f"*/.fusion/runs/{run_id}"))]:
+        result = directory / "result.json"
+        if result.is_file() and result.resolve().is_relative_to(root):
+            return directory
+    return None
+
+
 def record_outcome(workspace: Path, run_id: str, accepted: bool, reason: str = "") -> dict[str, Any]:
     """The lead's verdict on a delegation, after inspecting its diff and tests.
 
@@ -1432,11 +1452,13 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool, reason: str = "
     the worker's own claim. Outcomes feed decisions.rank_by_outcomes; the
     latest verdict for a run wins. A verdict with a reason on a reported
     success also becomes an acceptance label (fusion_labeling.verdict_label).
+    A run found in a workflow worktree is recorded here, in this workspace's
+    decision store, with evidence pointing at its worktree path.
     """
     from fusion_decisions import DecisionStore
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id or ""):
         raise ValueError("run_id must be a Fusion run id")
-    result_path = RunStore(workspace).runs / run_id / "result.json"
+    result_path = (run_directory(workspace, run_id) or RunStore(workspace).runs / run_id) / "result.json"
     try:
         result = json.loads(result_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -1469,7 +1491,7 @@ def dispatch(
             from fusion_reasoning import pair_key, validate_pair
             task["session_key"] += ":" + pair_key(validate_pair(settings.get("model"), settings["reasoning_effort"])) + ":delegation=" + str(settings.get("allow_native_delegation", False)).lower()
     if "review" in task["role"].lower() and not task["write"]:
-        review_task(config, task)
+        review_task(config, task, store)
     run_dir = run_dir or store.create(task)
     store.event(run_dir, "run.started", {"agent": task["agent"], "write": task["write"]})
     started_at_ms = now_ms()

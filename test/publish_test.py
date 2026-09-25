@@ -281,6 +281,42 @@ class PublicationTest(unittest.TestCase):
         with patch.object(core, "dispatch", side_effect=AssertionError("Do not rerun workers")):
             self.assertEqual(pub.publish(self.workspace, runner.run_id, config, {})["url"], state["url"])
 
+    def test_worktree_runs_land_in_the_parent_even_when_a_writer_replaces_the_fusion_link(self):
+        from fusion_policy import route_candidates
+        config = core.deep_merge(self.config, {"codex": {"command": sys.executable}})
+        spec = {"task": "Fix routing", "publish": self.config["publish"], "nodes": [
+            {"id": "implement", "agent": "codex", "role": "implementation", "write": True, "task": "Implement"},
+            {"id": "review", "agent": "codex", "role": "review", "needs": ["implement"], "task": "Review"}]}
+        runs = {}
+        def worker(config, task, store):
+            worktree = Path(task["workspace"])
+            if task["write"]:
+                (worktree / ".fusion").unlink()
+                (worktree / ".fusion").mkdir()
+                (worktree / "app.txt").write_text("fixed\n")
+            self.assertEqual(store.workspace, self.workspace)
+            run_dir = store.create(task)
+            result = {"run_id": task["run_id"], "status": "success", "agent": "codex", "exit_code": 0, "summary": "Verified",
+                      "changed": ["app.txt"] if task["write"] else [], "tests": ["fixture check"], "blockers": []}
+            store.write_json(run_dir / "result.json", result)
+            store.trace_span(config, task, result, core.now_ms(), core.now_ms(), {})
+            runs[task["role"]] = task["run_id"]
+            return result
+        with patch.object(core, "dispatch", side_effect=worker):
+            runner = WorkflowRunner(self.workspace, config, spec)
+            self.assertEqual(runner.run()["status"], "success")
+        self.assertNotEqual(runner.workspace, self.workspace)
+        self.assertEqual(list((runner.workspace / ".fusion").iterdir()), [])
+        implement = runs["implementation"]
+        spans = [s for s in core.RunStore(self.workspace).traces(limit=50) if s.get("run_id") == implement]
+        self.assertEqual({s["agent"] for s in spans}, {"codex", "gate"})
+        task = {"workspace": str(self.workspace), "write": True}
+        def codex():
+            return next(c for c in route_candidates(config, task, core.RunStore(self.workspace)) if c["key"] == "codex")
+        self.assertEqual((codex()["runs"], codex()["checked_runs"]), (2, 0))
+        self.assertTrue(core.record_outcome(self.workspace, implement, True, "Read the diff")["recorded"])
+        self.assertEqual((codex()["runs"], codex()["checked_runs"], codex()["acceptance_rate"]), (2, 1, 1.0))
+
     def test_reviewed_worktree_cannot_be_published_after_later_edits(self):
         context = pub.setup_worktree(self.workspace, "wf-isolated", "Fix routing", self.config["publish"])
         worktree = Path(context["workspace"])

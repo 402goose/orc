@@ -5,7 +5,8 @@ from collections import defaultdict
 from pathlib import Path
 import time
 
-from fusion_decisions import DecisionEngine, DecisionStore, ACCEPTANCE_QUESTIONS, RECOVERY_QUESTIONS, REVIEW_QUESTIONS, read_jsonl
+from fusion_decisions import (DecisionEngine, DecisionStore, ACCEPTANCE_QUESTIONS, RECOVERY_QUESTIONS, REVIEW_QUESTIONS,
+                              acceptance_state, read_jsonl, state_cap)
 import fusion_progress as progress
 
 
@@ -26,7 +27,7 @@ def route_candidates(config, task, store, rejected=None):
     ttl_ms = core.cache_settings(config)["ttl_seconds"] * 1000
     now = core.now_ms()
     history = defaultdict(list)
-    outcomes = {event["task_id"]: event["accepted"] for event in read_jsonl(DecisionStore(task["workspace"]).path)
+    outcomes = {event["task_id"]: event["accepted"] for event in read_jsonl(DecisionStore(store.workspace).path)
                 if event.get("event") == "outcome"}
     unhealthy = set(task.get("excluded_routes", []))
     unavailable_commands = set()
@@ -212,8 +213,11 @@ def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None):
 
 
 def route_task(config, task, store):
-    """Record advice for explicit routing, apply only to a genuinely automatic lane."""
-    engine = DecisionEngine(task["workspace"], config)
+    """Record advice for explicit routing, apply only to a genuinely automatic lane.
+
+    Decisions and outcomes live beside `store`, which is the control workspace
+    even when the worker runs in a workflow's worktree."""
+    engine = DecisionEngine(store.workspace, config)
     automatic = task["agent"] == "auto" and not task.get("route")
     if task["agent"] == "auto" and task.get("route"):
         task["agent"] = config.get("routes", {}).get(task["route"], {}).get("agent")
@@ -294,8 +298,8 @@ def route_task(config, task, store):
         engine.applied(record, selected["key"], applied, reason)
 
 
-def review_task(config, task):
-    engine = DecisionEngine(task["workspace"], config)
+def review_task(config, task, store=None):
+    engine = DecisionEngine(store.workspace if store else task["workspace"], config)
     record = engine.decide("review", {"task": task.get("decision_context", task["task"]), "role": task["role"], "write": task["write"]}, REVIEW_QUESTIONS, context(task))
     selected = "general"
     applied = engine.allowed(record, "specialty")
@@ -323,9 +327,7 @@ def accept_node(config, workspace, workflow_id, node, result):
     it can never accept on its own; a structural failure is decided before
     this is ever called, and this function has no path back to True from one."""
     engine = DecisionEngine(workspace, config)
-    record = engine.decide("acceptance", {"task": node.get("decision_context", node["task"]),
-                                         "summary": result.get("summary"), "changed": result.get("changed", []),
-                                         "tests": result.get("tests", [])},
+    record = engine.decide("acceptance", acceptance_state(node, result, state_cap(engine.options)),
                            ACCEPTANCE_QUESTIONS, {"task_id": result.get("run_id"), "group": workflow_id})
     plausible, applied = True, False
     if engine.allowed(record, "plausible") and record["recommendations"]["plausible"]["value"] == "false":

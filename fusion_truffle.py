@@ -62,10 +62,13 @@ def worker_choice(agent="auto", route=None, model=None):
     return {"agent": agent, "route": route or None, "model": model or None}
 
 
-def worker_task(workspace, choice, prompt, constraints, session_key):
+def worker_task(workspace, choice, prompt, constraints, session_key, decision_context):
+    """`decision_context` is the short, stable statement of the job that
+    routing and acceptance judge, instead of the long scouting prompt."""
     task = core.make_task(workspace, choice["agent"], prompt, "discovery", [], constraints, session_key, False, False,
                           route=choice.get("route"), settings_overrides=core.choice_overrides(choice.get("model"), None))
     task["progress_label"] = "truffle"
+    task["decision_context"] = decision_context
     return task
 
 
@@ -289,7 +292,10 @@ def hunt(workspace, config, **settings):
             save(root / "hunt.json", record)
             if eligible:
                 prompt = SCOUT_PROMPT.replace("PATH", str(root / "issues.json")).replace("TARGET", str(settings["count"]))
-                task = worker_task(workspace, settings, prompt, ["Investigate only; no edits, publication or delegation."], scout_id)
+                task = worker_task(workspace, settings, prompt, ["Investigate only; no edits, publication or delegation."], scout_id,
+                                   f"Truffle scout: shortlist at most {settings['count']} independent, tractable open issues in {repo} "
+                                   "from the saved issue packet, each with checked source quotes and a verification plan; "
+                                   "explain every skipped issue. Read-only.")
                 result = core.dispatch(config, task, core.RunStore(workspace))
                 record["worker"] = {k: result.get(k) for k in ("agent", "model", "run_id", "usage")}
                 if result.get("status") != "success" or result.get("exit_code") != 0:

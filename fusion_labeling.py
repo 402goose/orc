@@ -29,7 +29,8 @@ def evidence_bundle(workspace, record):
     task_id = record.get("context", {}).get("task_id")
     root = (Path(workspace) / ".fusion").resolve()
     if isinstance(task_id, str) and re.fullmatch(r"[A-Za-z0-9_-]+", task_id):
-        directory = root / "runs" / task_id
+        from fusion_core import run_directory
+        directory = run_directory(workspace, task_id) or root / "runs" / task_id
         for name in ("result.json", "answer.md"):
             path = (directory / name).resolve()
             if not path.is_relative_to(root) or not path.is_file() or path.stat().st_size > 2_000_000:
@@ -391,9 +392,9 @@ def verdict_answers(accepted):
     return {"plausible": "true", "failed_task": "false"} if accepted else {"plausible": "false"}
 
 
-def read_run_task(workspace, run_id):
+def read_run_task(directory):
     try:
-        task = json.loads((Path(workspace) / ".fusion" / "runs" / run_id / "task.json").read_text(encoding="utf-8"))
+        task = json.loads((Path(directory) / "task.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     return task if isinstance(task, dict) else {}
@@ -405,11 +406,12 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
     Never a routing label: a worker succeeding does not prove it was the best
     route. The label attaches to the run's complete acceptance decision when a
     workflow recorded one. Otherwise an unscored acceptance decision is
-    recorded -- the input a workflow gate saw, or the state accept_node builds
-    -- without running Laya. A later verdict replaces an earlier verdict label;
+    recorded -- the input a workflow gate saw, or the bounded state accept_node
+    builds (fusion_decisions.acceptance_state) -- without running Laya. The
+    run may live in a workflow worktree; `evidence_path` is its result.json. A later verdict replaces an earlier verdict label;
     labels from any other reviewer are preserved.
     """
-    from fusion_decisions import ACCEPTANCE_QUESTIONS, DecisionEngine, config_for, reviewed_labels
+    from fusion_decisions import ACCEPTANCE_QUESTIONS, DecisionEngine, acceptance_state, config_for, reviewed_labels, state_cap
     options = config_for(config)
     if not options["verdict_labels"] or options["mode"] == "off":
         return {"status": "disabled", "reason": "decisions.mode is off" if options["verdict_labels"] else "decisions.verdict_labels is false"}
@@ -423,7 +425,7 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
         own = [e for e in events if record and e.get("id") == record["id"]]
         if any(e.get("event") == "label" and e.get("verified") and e.get("source") != VERDICT_SOURCE for e in own):
             return {"status": "preserved", "decision_id": record["id"], "reason": "Another reviewer's labels on this decision were kept"}
-        task = read_run_task(workspace, run_id)
+        task = read_run_task(Path(evidence_path).parent)
         skip = ("the verdict has no --reason" if not reason else
                 f"the run ended with status {result.get('status')!r}; acceptance is only asked of a reported success"
                 if result.get("status") != "success" else
@@ -442,14 +444,14 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
                 record = engine.record_unscored("acceptance", None, gate["questions"], gate.get("context"),
                                                 encoded=gate["state"], source=VERDICT_SOURCE)
             else:
-                state = {"task": task.get("decision_context", task["task"]), "summary": result.get("summary"),
-                         "changed": result.get("changed", []), "tests": result.get("tests", [])}
+                state = acceptance_state(task, result, state_cap(engine.options))
                 group = task.get("parent_task_id") or task.get("trace_id") or run_id
                 record = engine.record_unscored("acceptance", state, ACCEPTANCE_QUESTIONS,
                                                 {"task_id": run_id, "group": group}, source=VERDICT_SOURCE)
             if record["truncated"]:
                 return {"status": "skipped", "decision_id": record["id"],
-                        "reason": "No label: the acceptance input was truncated; raise decisions.max_state_chars to label long briefs"}
+                        "reason": "No label: the task does not fit the acceptance input whole beside a summary excerpt; "
+                                  "raise decisions.max_state_chars (at most 6000) to label long briefs"}
         answers = {key: value for key, value in verdict_answers(accepted).items() if key in record["questions"]}
         if not answers:
             return {"status": "skipped", "decision_id": record["id"], "reason": "No label: this decision asks none of the questions a verdict answers"}
