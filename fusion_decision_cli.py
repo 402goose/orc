@@ -38,7 +38,7 @@ def add_parser(sub):
     export.add_argument("--split", choices=["time", "group-hash"],
                         help="hold out the newest workflow groups (time) or a hash of the group name; default decisions.split")
     export.add_argument("--exclude-source", action="append", default=[], metavar="SOURCE",
-                        help="leave out answers approved by this source, for example lead_verdict, structural_gate or user_explicit; repeatable")
+                        help="leave out answers approved by this source, for example lead_verdict, structural_gate, gym_grade or user_explicit; repeatable")
     commands.add_parser("routing-report", help="per-lane acceptance from logged routing propensities (IPS, ESS); read-only")
     calibrate = commands.add_parser("calibrate", help="fit temperature on train; certify an acting threshold on held-out groups (Learn-then-Test)")
     calibrate.add_argument("dataset")

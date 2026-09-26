@@ -22,7 +22,12 @@ C. The worker runs as an authored single-node workflow whose acceptance
 checks are the F2P and P2P commands with `acceptance.before: true`, so the
 gate labels each run from the checks' before/after exit codes.
 
-`report` reads the gym's results: per lane, per task, from receipts only.
+`run --kind localize` is the read-only kind: the worker gets the problem
+text and B, names the files and symbols the fix must change, and the gym
+grades that against the fix's diff (fusion_gym_localize); no checks run.
+
+`report` reads the gym's results: per kind, mode, lane and task, from
+receipts only.
 """
 from __future__ import annotations
 
@@ -52,6 +57,8 @@ BASE_REF_PREFIX = "refs/gym/bases/"
 TASK_REF = "refs/gym/task"
 BASE_REF = "refs/gym/base"
 MODES = ("hidden", "hidden+hints", "visible")
+KINDS = ("fix", "localize")
+GRADE_SOURCE = "gym_grade"
 HIDDEN_MODES = ("hidden", "hidden+hints")
 DEFAULT_TIMEOUT = 900
 DEFAULT_P2P_LIMIT = 200
@@ -411,6 +418,29 @@ def ensure_interface(task):
     return task["interface"]
 
 
+def localization_for(repo, base, fix):
+    """Ground truth of a localization task: the fix's changed source files
+    and the functions, classes and methods its hunks touch (read-only git)."""
+    from fusion_gym_localize import ground_truth
+    listing = git(repo, "diff", "--no-renames", "--name-status", "-z", base, fix).split("\0")
+    changes = [(listing[i], listing[i + 1]) for i in range(0, len(listing) - 1, 2) if not is_test_path(listing[i + 1])]
+    return ground_truth(_reader(repo), base, fix, changes,
+                        lambda path: git(repo, "diff", "--no-renames", "-U0", base, fix, "--", path))
+
+
+def ensure_localization(task):
+    """Tasks extracted before localization existed get it from the source
+    repository (read-only), in memory only, like the hidden form."""
+    if isinstance(task.get("localization"), dict):
+        return task["localization"]
+    try:
+        task["localization"] = localization_for(Path(task["repo_path"]), task["base"], task["fix"])
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"{task['id']}: cannot derive localization ground truth from {task['repo_path']} ({exc}); "
+                         "re-extract the task") from exc
+    return task["localization"]
+
+
 def extract_one(repo, pr, ref="HEAD", gh_repo=None, use_gh=True, timeout=DEFAULT_TIMEOUT, p2p_limit=DEFAULT_P2P_LIMIT):
     """One task dict, or {"pr": N, "skipped": reason}."""
     repo = Path(repo).resolve()
@@ -466,6 +496,7 @@ def extract_one(repo, pr, ref="HEAD", gh_repo=None, use_gh=True, timeout=DEFAULT
     kept_tests = [path for status, path in tests if not status.startswith("D")]
     hidden = hidden_form(repo, task_id, base, fix, kept_tests)
     interface = interface_for(repo, base, fix, kept_tests, sources)
+    localization = localization_for(repo, base, fix)
     return {
         "schema": TASK_SCHEMA, "id": task_id, "pr": int(pr), "pr_url": info.get("url"),
         "issues": [issue.get("url") for issue in info.get("issues") or []],
@@ -475,7 +506,7 @@ def extract_one(repo, pr, ref="HEAD", gh_repo=None, use_gh=True, timeout=DEFAULT
         "checks": {"fail_to_pass": [argv for argv, _ in f2p_checks], "pass_to_pass": [argv for argv, _ in p2p_checks]},
         **({"pass_to_pass_dropped": dropped} if dropped else {}),
         "test_files": sorted(path for _, path in tests), "source_files": sources, "hidden": hidden,
-        "interface": interface,
+        "interface": interface, "localization": localization,
         "extracted_at_ms": int(time.time() * 1000),
     }
 
@@ -573,8 +604,28 @@ def build_spec(task, lane, budget_remaining=None, mode="visible", fixtures=None)
             "budget_usd": max(budget_remaining, 0.01) if budget_remaining is not None else 0, "nodes": [node]}
 
 
-def result_key(task_id, lane, mode):
-    return f"{task_id}:{lane}:{mode}"
+def build_localize_spec(task, lane, budget_remaining=None):
+    """One read-only node: the problem text (never interface hints: they name
+    the symbols the answer is graded on) and the localization brief. No
+    checks run; the gym grades the answer after the run."""
+    from fusion_gym_localize import BRIEF
+    node = {"id": "localize", "role": "localization", "agent": lane["agent"], "write": False,
+            "task": task["prompt"] + BRIEF, "decision_context": task["prompt"],
+            "acceptance": {"required_handoff": ["summary"]}}
+    for key in ("route", "model", "reasoning_effort"):
+        if lane.get(key):
+            node[key] = lane[key]
+    if budget_remaining is not None and lane["agent"] == "claude":
+        node["max_budget_usd"] = round(max(budget_remaining, 0.01), 2)
+    return {"task": f"gym localize {task['id']}: {task['prompt'].splitlines()[0][:200]}", "max_attempts": 1,
+            "max_parallel_writers": 0,
+            "budget_usd": max(budget_remaining, 0.01) if budget_remaining is not None else 0, "nodes": [node]}
+
+
+def result_key(task_id, lane, mode, kind="fix"):
+    """Fix keys keep their original form; other kinds append the kind, so a
+    localization result never stands in for a fix result."""
+    return f"{task_id}:{lane}:{mode}" + ("" if kind == "fix" else f":{kind}")
 
 
 def read_results(gym):
@@ -592,6 +643,8 @@ def read_results(gym):
                 row["mode"] = "visible"
                 if row.get("key"):
                     row["key"] += ":visible"
+            if isinstance(row, dict):
+                row.setdefault("kind", "fix")
             rows.append(row)
     return rows
 
@@ -636,8 +689,14 @@ def task_root(gym, task, mode):
 WORKFLOW_TAGS = {"hidden": "h-", "hidden+hints": "hh-"}
 
 
-def mode_dir(mode):
+def mode_dir(mode, kind="fix"):
+    if kind == "localize":
+        return "localize"
     return {"hidden": "hidden", "hidden+hints": "hidden-hints"}.get(mode, "")
+
+
+def lanes_dir(mode, kind="fix"):
+    return "lanes-localize" if kind == "localize" else "lanes-hints" if mode == "hidden+hints" else "lanes"
 
 
 def task_repo(gym, task, mode="visible"):
@@ -735,7 +794,7 @@ def summarize(task, lane_name, lane, outcome, diff_files, wall_ms, mode="visible
     else:
         verdict, completed = "unsolved", True
     return {"schema": RESULT_SCHEMA, "event": "finished", "key": result_key(task["id"], lane_name, mode),
-            "task": task["id"], "mode": mode, "lane": lane_name, "lane_spec": lane,
+            "task": task["id"], "kind": "fix", "mode": mode, "lane": lane_name, "lane_spec": lane,
             "hinted": bool(interface_section(task, mode)),
             **({"interface": len(task.get("interface") or [])} if mode == "hidden+hints" else {}),
             "workflow_id": outcome.get("workflow_id"), "status": status,
@@ -748,15 +807,94 @@ def summarize(task, lane_name, lane, outcome, diff_files, wall_ms, mode="visible
             "duration_ms": wall_ms, "finished_at_ms": int(time.time() * 1000)}
 
 
-def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=False, runner=None, mode="hidden"):
+def _read_answer(result):
+    path = (result.get("artifacts") or {}).get("answer")
+    try:
+        return Path(path).read_text(encoding="utf-8") if path else ""
+    except OSError:
+        return ""
+
+
+def summarize_localize(task, lane_name, lane, outcome, diff_files, wall_ms):
+    """A localization row: the worker's answer (from answer.md, its whole
+    final message) graded against the task's ground truth. A dispatched run
+    is complete whether or not it answered; no answer is `invalid_answer`."""
+    from fusion_gym_localize import ZERO, gradeable, grade, parse_answer
+    node = (outcome.get("nodes") or [{}])[0]
+    result = node.get("result") or {}
+    status = outcome.get("status")
+    files, symbols = gradeable(task["localization"])
+    row = {"schema": RESULT_SCHEMA, "event": "finished", "key": result_key(task["id"], lane_name, "hidden", "localize"),
+           "task": task["id"], "kind": "localize", "mode": "hidden", "lane": lane_name, "lane_spec": lane,
+           "hinted": False, "workflow_id": outcome.get("workflow_id"), "status": status,
+           "truth": {"files": files, "symbols": symbols}, "changed": diff_files,
+           "worker": {"status": result.get("status"), "agent": result.get("agent"), "route": result.get("route"),
+                      "model": result.get("model"), "run_id": result.get("run_id")},
+           "gate_label": result.get("gate_label"), "cost_usd": float(outcome.get("spent_usd") or 0),
+           "duration_ms": wall_ms, "finished_at_ms": int(time.time() * 1000)}
+    if not result.get("run_id") or status in {"paused_quota", "paused_budget", "interrupted"}:
+        return {**row, "verdict": "unavailable" if outcome.get("lanes") else status or "not_run", "completed": False}
+    answer, error = parse_answer(_read_answer(result))
+    if error:
+        return {**row, "verdict": "invalid_answer", "completed": True, "answer_error": error, "scores": dict(ZERO)}
+    scores = grade(answer, task["localization"])
+    return {**row, "verdict": scores.pop("verdict"), "completed": True, "answer": answer, "scores": scores}
+
+
+GRADE_LABELS = {"localized": {"failed_task": "false"}, "missed": {"failed_task": "true"}}
+
+
+def grade_label(gym, row):
+    """The gym's grade as an acceptance label (source gym_grade) on the input
+    the workflow recorded for the node's reported success. localized ->
+    failed_task=false; missed (no changed file in the top 3) ->
+    failed_task=true; partial and invalid answers stay unlabeled, as does a
+    read-only run that changed files or any input someone already labeled."""
+    decision = (row.get("gate_label") or {}).get("decision_id")
+    answers = GRADE_LABELS.get(row.get("verdict"))
+    if (row.get("worker") or {}).get("status") != "success":
+        return {"status": "skipped", "reason": "the worker did not report success"}
+    if not decision:
+        return {"status": "skipped", "reason": "no acceptance input was recorded (automatic labels off?)"}
+    if row.get("changed"):
+        return {"status": "skipped", "decision_id": decision, "reason": "the read-only worker changed files"}
+    if not answers:
+        return {"status": "unlabeled", "decision_id": decision, "reason": f"verdict {row.get('verdict')} is not evidence"}
+    from fusion_decisions import DecisionStore, read_jsonl
+    store = DecisionStore(gym)
+    with store.review_lock():
+        if any(e.get("id") == decision and e.get("event") == "label" and e.get("verified") for e in read_jsonl(store.path)):
+            return {"status": "preserved", "decision_id": decision, "reason": "an existing label on this input was kept"}
+        scores = row.get("scores") or {}
+        store.append("label", id=decision, answers=answers, verified=True, replace=False, source=GRADE_SOURCE,
+                     evidence=(f"Gym grade on {row['key']}: {row['verdict']} (files {row['truth']['files']}; answer top 3 "
+                               f"{(row.get('answer') or {}).get('files', [])[:3]}; recall@3 {scores.get('file_recall_at_3')})."),
+                     reviewers=[{"agent": "gym", "run_id": (row.get("worker") or {}).get("run_id"), "key": row["key"]}])
+    return {"status": "labeled", "decision_id": decision, "answers": answers, "source": GRADE_SOURCE}
+
+
+def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=False, runner=None, mode="hidden",
+        kind="fix"):
     """Sequential task x lane runs; resumable (completed pairs are skipped).
-    Results are keyed by task, lane and mode, so a visible run never stands
-    in for a hidden one."""
+    Results are keyed by task, lane, mode and kind, so a visible run never
+    stands in for a hidden one, nor a localization for a fix.
+
+    kind "localize" runs the read-only localization task on B in mode
+    hidden only: interface hints name the symbols the answer is graded on,
+    and visible tests point at the files. Tasks whose fix changed no source
+    file that exists in B cannot be localized from B and are skipped."""
     import fusion_core as core
+    from fusion_gym_localize import gradeable
     from fusion_publish import snapshot
     from fusion_workflow import WorkflowRunner
     if mode not in MODES:
         raise ValueError(f"gym mode must be one of {', '.join(MODES)}")
+    if kind not in KINDS:
+        raise ValueError(f"gym kind must be one of {', '.join(KINDS)}")
+    localize = kind == "localize"
+    if localize and mode != "hidden":
+        raise ValueError("localize runs start from B with the problem text only (mode hidden): interface hints "
+                         "name the symbols the answer is graded on, and visible tests point at the files")
     runner = runner or WorkflowRunner
     tasks = load_tasks(tasks_path)
     gym = Path(gym).resolve()
@@ -769,7 +907,7 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
     resolved = {name: resolve_lane(config, name) for name in lanes}
     with _locked(gym):
         done = {row["key"] for row in read_results(gym) if row.get("event") == "finished" and row.get("completed")}
-        spent, processed, finished = 0.0, 0, []
+        spent, processed, finished, skipped = 0.0, 0, [], []
         for task in tasks:
             # Without hints, hidden+hints sends the same prompt as hidden: reuse
             # those results instead of paying for identical runs again.
@@ -779,8 +917,11 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
                 ensure_interface(task)
                 if not task.get("interface"):
                     task_mode = "hidden"
-            pending = [name for name in lanes if result_key(task["id"], name, task_mode) not in done]
+            pending = [name for name in lanes if result_key(task["id"], name, task_mode, kind) not in done]
             if not pending:
+                continue
+            if localize and not gradeable(ensure_localization(task))[0]:
+                skipped.append({"task": task["id"], "reason": "the fix changed no source file that exists in B"})
                 continue
             if max_tasks is not None and processed >= max_tasks:
                 break
@@ -793,11 +934,13 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
             repo = task_repo(gym, task, task_mode)
             for name in pending:
                 if budget_usd is not None and spent >= budget_usd:
-                    return {"status": "budget_reached", "spent_usd": spent, "runs": finished}
+                    return {"status": "budget_reached", "kind": kind, "spent_usd": spent, "runs": finished,
+                            "skipped": skipped}
                 lane = resolved[name]
-                key = result_key(task["id"], name, task_mode)
-                workflow_id = f"gym-{task['id']}-{WORKFLOW_TAGS.get(task_mode, '')}{_slug(name)}-{uuid.uuid4().hex[:8]}"
-                worktree = task_root(gym, task, task_mode) / ("lanes-hints" if task_mode == "hidden+hints" else "lanes") / _slug(name)
+                key = result_key(task["id"], name, task_mode, kind)
+                tag = "lz-" if localize else WORKFLOW_TAGS.get(task_mode, "")
+                workflow_id = f"gym-{task['id']}-{tag}{_slug(name)}-{uuid.uuid4().hex[:8]}"
+                worktree = task_root(gym, task, task_mode) / lanes_dir(task_mode, kind) / _slug(name)
                 _remove_worktree(repo, worktree)
                 worktree.parent.mkdir(parents=True, exist_ok=True)
                 git(repo, "worktree", "add", "-q", "--detach", str(worktree), start_sha)
@@ -807,13 +950,18 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
                     # workflow state already goes to the control workspace (#81).
                     (worktree / ".fusion").symlink_to(gym / ".fusion", target_is_directory=True)
                 _append(gym, {"schema": RESULT_SCHEMA, "event": "started", "key": key, "task_mode": task_mode,
-                              "workflow_id": workflow_id, "started_at_ms": int(time.time() * 1000)})
+                              "kind": kind, "workflow_id": workflow_id, "started_at_ms": int(time.time() * 1000)})
                 # Hidden test files live outside the gym only for this run.
-                fixture_dir = Path(tempfile.mkdtemp(prefix="fusion-gym-fixtures-")) if task_mode in HIDDEN_MODES else None
+                fixture_dir = (Path(tempfile.mkdtemp(prefix="fusion-gym-fixtures-"))
+                               if task_mode in HIDDEN_MODES and not localize else None)
                 started = time.monotonic()
+                remaining = None if budget_usd is None else budget_usd - spent
                 try:
-                    fixtures = write_fixtures(task, fixture_dir) if fixture_dir else None
-                    spec = build_spec(task, lane, None if budget_usd is None else budget_usd - spent, task_mode, fixtures)
+                    if localize:
+                        spec = build_localize_spec(task, lane, remaining)
+                    else:
+                        fixtures = write_fixtures(task, fixture_dir) if fixture_dir else None
+                        spec = build_spec(task, lane, remaining, task_mode, fixtures)
                     outcome = runner(gym, config, spec, run_id=workflow_id,
                                      worktree={"workspace": str(worktree), "base_sha": start_sha}).run()
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
@@ -829,12 +977,21 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
                     patch = git(repo, "diff", "--binary", start_sha, tree, binary=True)
                 except (OSError, ValueError, subprocess.SubprocessError):
                     pass
-                row = summarize(task, name, lane, outcome, diff_files, wall_ms, task_mode)
-                row["gate_label"] = withdraw_untrusted_label(gym, row)
+                evidence = gym / "results" / task["id"] / mode_dir(task_mode, kind) / _slug(name)
+                evidence.mkdir(parents=True, exist_ok=True)
+                if localize:
+                    row = summarize_localize(task, name, lane, outcome, diff_files, wall_ms)
+                    if row["completed"]:
+                        row["grade_label"] = grade_label(gym, row)
+                    answer = _read_answer(((outcome.get("nodes") or [{}])[0].get("result") or {}))
+                    if answer:
+                        (evidence / f"{workflow_id}.answer.md").write_text(answer, encoding="utf-8")
+                        row["answer_file"] = str(evidence / f"{workflow_id}.answer.md")
+                else:
+                    row = summarize(task, name, lane, outcome, diff_files, wall_ms, task_mode)
+                    row["gate_label"] = withdraw_untrusted_label(gym, row)
                 if outcome.get("error"):
                     row["error"] = outcome["error"]
-                evidence = gym / "results" / task["id"] / mode_dir(task_mode) / _slug(name)
-                evidence.mkdir(parents=True, exist_ok=True)
                 (evidence / f"{workflow_id}.patch").write_bytes(patch)
                 row["patch"] = str(evidence / f"{workflow_id}.patch")
                 _append(gym, row)
@@ -843,10 +1000,21 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
                 if not keep_worktrees:
                     _remove_worktree(repo, worktree)
         audit(gym)
-        return {"status": "complete", "mode": mode, "spent_usd": spent, "runs": finished}
+        return {"status": "complete", "mode": mode, "kind": kind, "spent_usd": spent, "runs": finished,
+                "skipped": skipped}
 
 
 AUDIT_EVIDENCE = "gym audit: no lane has solved this task from its prompt"
+LOCALIZE_AUDIT_EVIDENCE = "gym audit: no lane has localized this task from its prompt"
+# Per kind: the verdict proving a task can be done from its prompt, the
+# verdict a negative label comes from, that label's source, the row field
+# holding it, and the retraction's evidence.
+AUDIT_KINDS = {
+    "fix": ("solved", "unsolved", "structural_gate", "gate_label",
+            AUDIT_EVIDENCE, "its hidden tests may expect what the prompt never states"),
+    "localize": ("localized", "missed", GRADE_SOURCE, "grade_label",
+                 LOCALIZE_AUDIT_EVIDENCE, "its prompt may not identify the code the fix changed"),
+}
 
 
 def audit(gym):
@@ -858,57 +1026,118 @@ def audit(gym):
     lane solves it, labels this audit retracted are restored. Positives and
     labels from any other source are never touched. Each hidden mode is its
     own evidence: a task solved with interface hints says nothing about
-    whether its bare prompt was enough, and vice versa."""
+    whether its bare prompt was enough, and vice versa. Each kind is its own
+    evidence too: a localization negative (gym_grade) counts only once some
+    lane localized that task, whatever the fix runs did."""
     from fusion_decisions import DecisionStore, label_provenance, read_jsonl, reviewed_labels
     store = DecisionStore(gym)
     latest = {}
     for row in read_results(gym):
-        if row.get("event") == "finished" and row.get("mode") in HIDDEN_MODES and row.get("completed"):
+        if (row.get("event") == "finished" and row.get("mode") in HIDDEN_MODES and row.get("completed")
+                and row.get("kind") in AUDIT_KINDS):
             latest[row["key"]] = row
-    solved = {(row["mode"], row["task"]) for row in latest.values() if row.get("verdict") == "solved"}
+    solved = {(row["kind"], row["mode"], row["task"]) for row in latest.values()
+              if row.get("verdict") == AUDIT_KINDS[row["kind"]][0]}
     events = read_jsonl(store.path)
     answers, _ = reviewed_labels(events)
     sources = label_provenance(events)
-    audited = {e["id"] for e in events if e.get("event") == "label" and str(e.get("evidence", "")).startswith(AUDIT_EVIDENCE)}
+    audited = {e["id"] for e in events if e.get("event") == "label"
+               and str(e.get("evidence", "")).startswith((AUDIT_EVIDENCE, LOCALIZE_AUDIT_EVIDENCE))}
     retracted, restored = [], []
     for row in latest.values():
-        decision = (row.get("gate_label") or {}).get("decision_id") or (row.get("gate_label") or {}).get("id")
+        _, negative, label_source, field, evidence, caveat = AUDIT_KINDS[row["kind"]]
+        decision = (row.get(field) or {}).get("decision_id") or (row.get(field) or {}).get("id")
         if not decision:
             continue
         current = answers.get(decision, {}).get("failed_task")
         source = (sources.get(decision, {}).get("failed_task") or {}).get("source")
-        solvable = (row["mode"], row["task"]) in solved
-        if not solvable and current == "true" and source == "structural_gate":
-            store.append("label", id=decision, answers={}, verified=True, replace=True, source="structural_gate",
-                         evidence=f"{AUDIT_EVIDENCE} in mode {row['mode']} ({row['key']}); its hidden tests may expect what the prompt never states.")
+        solvable = (row["kind"], row["mode"], row["task"]) in solved
+        if not solvable and current == "true" and source == label_source:
+            store.append("label", id=decision, answers={}, verified=True, replace=True, source=label_source,
+                         evidence=f"{evidence} in mode {row['mode']} ({row['key']}); {caveat}.")
             retracted.append(row["key"])
-        elif solvable and decision in audited and current is None and row.get("verdict") == "unsolved":
+        elif solvable and decision in audited and current is None and row.get("verdict") == negative:
+            done = "localized" if row["kind"] == "localize" else "solved"
             store.append("label", id=decision, answers={"failed_task": "true"}, verified=True, replace=False,
-                         source="structural_gate", evidence=f"Restored: a lane solved {row['task']} from the same prompt ({row['mode']}).")
+                         source=label_source, evidence=f"Restored: a lane {done} {row['task']} from the same prompt ({row['mode']}).")
             restored.append(row["key"])
     modes = {}
     for mode in HIDDEN_MODES:
-        attempted = {row["task"] for row in latest.values() if row["mode"] == mode}
+        attempted = {row["task"] for row in latest.values() if row["kind"] == "fix" and row["mode"] == mode}
         if attempted:
-            done = {task for kind, task in solved if kind == mode}
+            done = {task for kind, which, task in solved if kind == "fix" and which == mode}
             modes[mode] = {"solved_tasks": sorted(done), "unsolved_tasks": sorted(attempted - done)}
     summary = {"modes": modes, "retracted": retracted, "restored": restored}
+    attempted = {row["task"] for row in latest.values() if row["kind"] == "localize"}
+    if attempted:
+        done = {task for kind, _, task in solved if kind == "localize"}
+        summary["localize"] = {"localized_tasks": sorted(done), "unlocalized_tasks": sorted(attempted - done)}
     (Path(gym) / "audit.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     return summary
 
 
 # ---------------------------------------------------------------- report
 
+def _localize_section(rows):
+    """Per lane: verdict counts, file acc@1, mean file recall@3 and
+    precision, mean symbol recall, cost and time. Invalid answers score 0;
+    symbol recall averages only tasks whose fix changed a symbol in B."""
+    section = {"lanes": {}, "tasks": {}}
+    for row in rows:
+        lane = section["lanes"].setdefault(row["lane"], {
+            "attempted": 0, "localized": 0, "partial": 0, "missed": 0, "invalid_answer": 0, "wrote_files": 0,
+            "file_acc_at_1": 0, "file_recall_at_3": 0.0, "file_precision": 0.0, "symbol_recall": 0.0,
+            "symbol_tasks": 0, "cost_usd": 0.0, "duration_ms": 0, "grade_labels": {}})
+        scores = row.get("scores") or {}
+        lane["attempted"] += 1
+        lane[row["verdict"]] = lane.get(row["verdict"], 0) + 1
+        lane["wrote_files"] += bool(row.get("changed"))
+        lane["file_acc_at_1"] += bool(scores.get("file_acc_at_1"))
+        lane["file_recall_at_3"] += scores.get("file_recall_at_3") or 0
+        lane["file_precision"] += scores.get("file_precision") or 0
+        if (row.get("truth") or {}).get("symbols"):
+            lane["symbol_tasks"] += 1
+            lane["symbol_recall"] += scores.get("symbol_recall") or 0
+        lane["cost_usd"] += row.get("cost_usd") or 0
+        lane["duration_ms"] += row.get("duration_ms") or 0
+        answer = json.dumps(((row.get("grade_label") or {}).get("answers")) or None)
+        lane["grade_labels"][answer] = lane["grade_labels"].get(answer, 0) + 1
+        task = section["tasks"].setdefault(row["task"], {"localized_by": [], "attempted_by": []})
+        task["attempted_by"].append(row["lane"])
+        if row["verdict"] == "localized":
+            task["localized_by"].append(row["lane"])
+    for lane in section["lanes"].values():
+        n, m = lane["attempted"], lane.pop("symbol_tasks")
+        lane["file_acc_at_1"] = round(lane["file_acc_at_1"] / n, 3)
+        lane["file_recall_at_3"] = round(lane["file_recall_at_3"] / n, 3)
+        lane["file_precision"] = round(lane["file_precision"] / n, 3)
+        lane["symbol_recall"] = round(lane["symbol_recall"] / m, 3) if m else None
+        lane["mean_duration_s"] = round(lane["duration_ms"] / n / 1000, 1)
+        lane["cost_usd"] = round(lane["cost_usd"], 4)
+    for task in section["tasks"].values():
+        task["localized_by"].sort()
+        task["attempted_by"].sort()
+    section["lanes"] = dict(sorted(section["lanes"].items()))
+    section["tasks"] = dict(sorted(section["tasks"].items()))
+    return section
+
+
 def report(gym):
-    """Per mode (hidden, visible): per-lane rates and per-task solvers. The
-    modes measure different things and are never pooled."""
+    """Per kind, then per mode (hidden, visible): per-lane rates and per-task
+    solvers. `modes` is the fix kind; `localize` the localization kind. The
+    kinds and modes measure different things and are never pooled."""
     latest = {}
     for row in read_results(gym):
         if row.get("event") == "finished":
             latest[row["key"]] = row
-    modes = {}
+    modes, localized = {}, []
     for row in latest.values():
         if not row.get("completed"):
+            continue
+        if row["kind"] == "localize":
+            localized.append(row)
+            continue
+        if row["kind"] != "fix":
             continue
         section = modes.setdefault(row["mode"], {"lanes": {}, "tasks": {}})
         lane = section["lanes"].setdefault(row["lane"], {
@@ -942,13 +1171,20 @@ def report(gym):
         section["lanes"] = dict(sorted(section["lanes"].items()))
         section["tasks"] = dict(sorted(section["tasks"].items()))
     pending = sorted(key for key, row in latest.items() if not row.get("completed"))
-    return {"gym": str(Path(gym).resolve()), "modes": {mode: modes[mode] for mode in MODES if mode in modes},
-            "incomplete": pending}
+    value = {"gym": str(Path(gym).resolve()), "modes": {mode: modes[mode] for mode in MODES if mode in modes}}
+    if localized:
+        value["localize"] = _localize_section(localized)
+    return {**value, "incomplete": pending}
 
 
 MODE_TITLES = {"hidden": "hidden tests (worker sees only the problem text)",
                "hidden+hints": "hidden tests + interface hints (problem text plus the names and signatures the tests call)",
                "visible": "visible tests (the fix's tests are in the worker's tree)"}
+LOCALIZE_TITLE = "localize (read-only: name the files and symbols the fix changes, graded against the fix)"
+
+
+def _percent(value):
+    return "-" if value is None else f"{value * 100:.0f}"
 
 
 def table(value):
@@ -963,6 +1199,21 @@ def table(value):
         lines.append("")
         for task_id, task in section["tasks"].items():
             lines.append(f"{task_id:<12} solved by: {', '.join(task['solved_by']) or 'none'}"
+                         f"  (of {', '.join(task['attempted_by'])})")
+        lines.append("")
+    section = value.get("localize")
+    if section:
+        lines += [f"== {LOCALIZE_TITLE}",
+                  f"{'lane':<22} {'tasks':>5} {'local':>5} {'part':>4} {'miss':>4} {'inval':>5} {'acc@1%':>6} "
+                  f"{'rec@3%':>6} {'prec%':>5} {'sym%':>5} {'cost$':>8} {'mean s':>7}"]
+        for name, lane in section["lanes"].items():
+            lines.append(f"{name:<22} {lane['attempted']:>5} {lane['localized']:>5} {lane['partial']:>4} {lane['missed']:>4} "
+                         f"{lane['invalid_answer']:>5} {_percent(lane['file_acc_at_1']):>6} "
+                         f"{_percent(lane['file_recall_at_3']):>6} {_percent(lane['file_precision']):>5} "
+                         f"{_percent(lane['symbol_recall']):>5} {lane['cost_usd']:>8.2f} {lane['mean_duration_s']:>7.1f}")
+        lines.append("")
+        for task_id, task in section["tasks"].items():
+            lines.append(f"{task_id:<12} localized by: {', '.join(task['localized_by']) or 'none'}"
                          f"  (of {', '.join(task['attempted_by'])})")
         lines.append("")
     if value["incomplete"]:
@@ -1004,6 +1255,9 @@ def add_parser(sub):
     run_cmd.add_argument("--no-interface-hints", action="store_true",
                          help="hidden mode without the interface section (names and signatures the tests call); "
                               "results are keyed as mode hidden, hinted runs as hidden+hints")
+    run_cmd.add_argument("--kind", choices=KINDS, default="fix",
+                         help="fix (default): implement the fix, graded by the hidden tests; localize: read-only, "
+                              "name the files and symbols the fix changes, graded against the fix (no hints)")
     report_cmd = commands.add_parser("report", help="per-lane and per-task results of a gym directory")
     report_cmd.add_argument("gym_dir")
     audit_cmd = commands.add_parser("audit", help="retract negatives from tasks no lane has solved; restore them once one does")
@@ -1020,8 +1274,13 @@ def command(args, workspace, as_json=False, out=None):
     if args.gym_command == "run":
         if args.max_tasks is not None and args.max_tasks < 1:
             raise ValueError("--max-tasks must be at least 1")
+        localize = args.kind == "localize"
+        if localize and args.visible_tests:
+            raise ValueError("--kind localize runs on the pre-fix tree without tests; drop --visible-tests")
+        mode = ("visible" if args.visible_tests else "hidden" if args.no_interface_hints or localize
+                else "hidden+hints")
         result = run(args.tasks, args.lanes, args.gym_workspace, args.max_tasks, args.budget_usd, args.keep_worktrees,
-                     mode="visible" if args.visible_tests else "hidden" if args.no_interface_hints else "hidden+hints")
+                     mode=mode, kind=args.kind)
         print(json.dumps(result, indent=2) if as_json else
               f"{result['status']}: {len(result['runs'])} runs, ${result['spent_usd']:.2f}\n" + table(report(args.gym_workspace)),
               file=out)
