@@ -770,6 +770,23 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'se
         self.assertNotIn("an older turn", saved)
         self.assertNotIn("answer", result["artifacts"])
 
+    def test_free_openrouter_models_cost_nothing_whatever_claude_code_estimates(self):
+        orc = self.write_agent(
+            "orc",
+            """
+import json
+print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'session_id': 'free',
+                  'total_cost_usd': 3.57, 'result': 'STATUS: success\\nSUMMARY: done\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}))
+""",
+        )
+        self.config(claude=orc)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            fusion_core.main(["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude",
+                              "--read-only", "--model", "vendor/model:free", "do it"])
+        usage = json.loads(output.getvalue())["usage"]
+        self.assertEqual((usage["cost_usd"], usage["cost_estimate_usd"]), (0.0, 3.57))
+
     def test_claude_permission_denials_fall_back_to_raw_entry_when_unrecognized(self):
         claude = self.write_agent(
             "claude-denied-unknown-shape",
