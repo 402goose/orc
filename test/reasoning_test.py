@@ -259,3 +259,15 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":12,"output_tok
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PinOutsideAdviceListTest(unittest.TestCase):
+    def test_a_pin_outside_the_advice_list_runs_without_advice(self):
+        from fusion_reasoning import pair_candidates
+        config = {"decisions": {"model_effort_pairs": [
+            {"agent": "claude", "model": "claude-opus-5-5", "reasoning_effort": "high"},
+            {"agent": "claude", "model": "claude-sonnet-5", "reasoning_effort": "high"}]}}
+        pinned = {"model": "claude-opus-5-5", "reasoning_effort": "medium"}
+        self.assertEqual(pair_candidates(config, pinned, agent="claude"), [])
+        listed = {"model": "claude-opus-5-5", "reasoning_effort": "high"}
+        self.assertEqual(pair_candidates(config, listed, agent="claude")[0], listed)

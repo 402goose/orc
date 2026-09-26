@@ -132,7 +132,9 @@ def pair_candidates(config, settings, write=False, agent="codex"):
         if pair not in pairs:
             pairs.append(pair)
     if selected not in pairs:
-        raise ValueError("explicit model/effort pair is not in decisions.model_effort_pairs")
+        # The list is Laya's advisory menu, not an allowlist: a pin outside it
+        # runs as pinned and simply gets no advice.
+        return []
     pairs.remove(selected)
     return [selected, *pairs]
 

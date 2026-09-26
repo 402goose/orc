@@ -1665,6 +1665,12 @@ def dispatch(
             with open(answer_path, "w", encoding="utf-8", opener=lambda name, flags: os.open(name, flags, 0o600)) as stream:
                 stream.write(summary.strip() + "\n")
         model = event_model or model
+        if str(model or "").endswith(":free") and "cost_usd" in usage:
+            # Claude Code prices every model at Anthropic list rates; an
+            # OpenRouter :free model costs nothing, so the estimate must not
+            # count toward budgets or routing cost.
+            usage["cost_estimate_usd"] = usage.pop("cost_usd")
+            usage["cost_usd"] = 0.0
         if metadata.get("execution_choice") and event_model:
             metadata["execution_choice"]["observed"] = {
                 "model": event_model, "reasoning_effort": None, "status": "model_reported",
