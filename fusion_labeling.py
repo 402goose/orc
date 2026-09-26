@@ -324,7 +324,7 @@ def approve_council(workspace, decision_id, suggestion_id, garden_policy=None):
         labels = [e for e in own if e.get('event') == 'label' and e.get('verified')]
         existing = next((e for e in labels if e.get('suggestion_id') == suggestion_id and e.get('source') == 'council_approved_suggestion'), None)
         # Council answers supersede structural gate labels per question; every other source is kept.
-        if any(e.get('source') not in {'council_approved_suggestion', GATE_SOURCE} for e in labels):
+        if any(e.get('source') not in {'council_approved_suggestion', *AUTOMATIC_SOURCES} for e in labels):
             return {"status": "needs_review", "answers": {}, "reason": "Human-reviewed labels were preserved"}
         if existing:
             pending = sorted(set(record['questions']) - set(existing['answers']))
@@ -438,11 +438,11 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
                              reviewers=[{"agent": "lead", "run_id": run_id, "accepted": bool(accepted)}])
         # The input the gate labeled is the one the verdict labels too, so one
         # run is one example; otherwise the latest complete input.
-        gated = {e.get("id") for e in events if e.get("event") == "label" and e.get("source") == GATE_SOURCE}
+        gated = {e.get("id") for e in events if e.get("event") == "label" and e.get("source") in AUTOMATIC_SOURCES}
         record = (next((e for e in reversed(decisions) if labelable_record(e) and e["id"] in gated), None)
                   or next((e for e in reversed(decisions) if labelable_record(e)), None))
         own = [e for e in events if record and e.get("id") == record["id"]]
-        if any(e.get("event") == "label" and e.get("verified") and e.get("source") not in {VERDICT_SOURCE, GATE_SOURCE}
+        if any(e.get("event") == "label" and e.get("verified") and e.get("source") not in {VERDICT_SOURCE, *AUTOMATIC_SOURCES}
                for e in own):
             return {"status": "preserved", "decision_id": record["id"], "reason": "Another reviewer's labels on this decision were kept"}
         task = read_run_task(Path(evidence_path).parent)
@@ -487,13 +487,17 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
 
 
 GATE_SOURCE = "structural_gate"
+GYM_SOURCE = "gym_grade"
+AUTOMATIC_SOURCES = {GATE_SOURCE, GYM_SOURCE}
 INTAKE_SOURCE = "user_explicit"
 # Who may overwrite whom, per answered question. A source never overwrites a
 # label from a higher one; a higher source supersedes a lower one only for the
 # questions it answers. user_explicit answers intake only and ranks with a
-# human, because it is the user's own statement of intent.
+# human, because it is the user's own statement of intent. gym_grade (the
+# gym's grade of a read-only answer against a reference fix) ranks with the
+# structural gate: both are objective and label only inputs they recorded.
 LABEL_PRECEDENCE = {"human": 4, "human_approved_suggestion": 4, INTAKE_SOURCE: 4,
-                    "council_approved_suggestion": 3, VERDICT_SOURCE: 2, GATE_SOURCE: 1}
+                    "council_approved_suggestion": 3, VERDICT_SOURCE: 2, GATE_SOURCE: 1, GYM_SOURCE: 1}
 
 
 def _automatic_labels_off(config):
@@ -576,15 +580,18 @@ def gate_label(config, workspace, record, codes, receipts):
 
 def restore_gate_labels(store, record_id, events, answered):
     """After a lead verdict replaces its labels on an input, put back the gate's
-    answers for questions the verdict did not answer, still as structural_gate."""
-    gate = [e for e in events if e.get("id") == record_id and e.get("event") == "label"
-            and e.get("verified") and e.get("source") == GATE_SOURCE and e.get("answers")]
-    if not gate:
-        return
-    answers = {key: value for key, value in gate[-1]["answers"].items() if key not in answered}
-    if answers:
-        store.append("label", id=record_id, answers=answers, evidence=gate[-1].get("evidence", ""), verified=True,
-                     replace=False, source=GATE_SOURCE, reviewers=gate[-1].get("reviewers", []))
+    answers for questions the verdict did not answer, still as structural_gate
+    (and the gym's grade, still as gym_grade). A source whose latest event is
+    a retraction (the gym's audit) has nothing to put back."""
+    for source in (GATE_SOURCE, GYM_SOURCE):
+        gate = [e for e in events if e.get("id") == record_id and e.get("event") == "label"
+                and e.get("verified") and e.get("source") == source]
+        if not gate or not gate[-1].get("answers"):
+            continue
+        answers = {key: value for key, value in gate[-1]["answers"].items() if key not in answered}
+        if answers:
+            store.append("label", id=record_id, answers=answers, evidence=gate[-1].get("evidence", ""), verified=True,
+                         replace=False, source=source, reviewers=gate[-1].get("reviewers", []))
 
 
 def intake_label(workspace, config, record, state, kind, context, build_id):

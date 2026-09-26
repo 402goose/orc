@@ -482,17 +482,19 @@ behind it are (below).
 
 ### Labels recorded automatically
 
-Three sources label without a click. Each is `verified`, carries evidence,
+Four sources label without a click. Each is `verified`, carries evidence,
 and every exported answer names its source in `label_provenance`:
 
 | Source | Decision | Answers | Written when |
 | --- | --- | --- | --- |
 | `lead_verdict` | acceptance | `plausible`, `failed_task` (above) | `fusion outcome` with a reason |
 | `structural_gate` | acceptance | `failed_task` only | a workflow node reported success and the gate's objective codes decide it |
+| `gym_grade` | acceptance | `failed_task` only | a gym localization run reported success and its answer was graded against the reference fix (ORC gym, Localization) |
 | `user_explicit` | intake | `workflow` | a user typed `fusion build --kind discovery\|build\|debug\|review` |
 
 `mode: off` turns all of them off; `"automatic_labels": false` turns off
-`structural_gate` and `user_explicit`.
+`structural_gate`, `gym_grade` (it labels the input the gate records) and
+`user_explicit`.
 
 #### Structural gate labels
 
@@ -571,10 +573,14 @@ A source never overwrites a label from a higher one; a higher source
 supersedes a lower one only for the questions it answers:
 
 `human` = `human_approved_suggestion` = `user_explicit` >
-`council_approved_suggestion` > `lead_verdict` > `structural_gate`
+`council_approved_suggestion` > `lead_verdict` > `structural_gate` = `gym_grade`
 
 A gate labels only the fresh input it recorded, so it never overwrites
-anything. A lead verdict replaces its own earlier answers and the gate's
+anything. `gym_grade` is the same kind of source: objective (a grade against
+a reference fix), and it labels only the input the gate recorded for a
+read-only gym run, which the gate itself leaves unlabeled. It never
+overwrites a label that is already there; lead verdicts and council
+approvals supersede it per question, as they do the gate's. A lead verdict replaces its own earlier answers and the gate's
 answers to the questions it answers, and keeps the rest. A council approval
 is not blocked by gate labels (it is by any other source's). Every label
 event stays in `events.jsonl`, so a disagreement between a gate and a later
@@ -583,6 +589,7 @@ verdict remains auditable.
 ```sh
 orc fusion decisions export .fusion/decisions/no-gate.jsonl --exclude-source structural_gate
 orc fusion decisions export .fusion/decisions/judged.jsonl --exclude-source structural_gate --exclude-source user_explicit
+orc fusion decisions export .fusion/decisions/no-gym-grade.jsonl --exclude-source gym_grade
 ```
 
 #### Outcomes are not labels, and Laya's veto is not an outcome
@@ -1315,6 +1322,122 @@ one changed signature in `fusion_decisions`. pr-105: three new `fusion_core`
 functions. pr-103, pr-87, pr-98, pr-60, pr-71 and pr-81 get none, because
 their tests call only existing, unchanged signatures. Those tasks are
 underspecified in behaviour, not in interface, and hints do not help them.
+
+### Localization (read-only kind)
+
+**Why.** Every other gym task is a write task. Automatic routing also sends
+read-only stages (explore, plan, review) to lanes, and those are where cheap
+lanes (free OpenRouter models, low effort) belong, but there was no honest
+benchmark for read-only work. Localization, naming the files and functions
+a fix must change, is objective and gradeable against the reference fix.
+It is the first stage of Agentless and the localization metric SWE-bench
+analyses report.
+
+```sh
+orc fusion gym run ~/orc-gym/tasks --workspace ~/orc-gym/ws --kind localize \
+  --lanes claude-sonnet-high agy-flash-low --budget-usd 2
+```
+
+**Ground truth.** `gym extract` stores `localization` in the task JSON
+(`fusion_gym_localize.ground_truth`, stdlib `ast` plus `git diff -U0 B C`):
+
+- `files`: the fix's changed files that are neither tests (the same rule as
+  extraction) nor docs (`*.md`, `*.rst`, `*.txt`, `*.adoc`, or under
+  `doc/` or `docs/`; listed in `docs`, never graded).
+- `symbols`: for each changed Python file, the innermost function, class
+  or method enclosing each changed line, as `module.qualname`
+  (`fusion_workflow.WorkflowRunner._gate`). Added and modified lines are
+  resolved in C, removed lines in B, so a deleted function counts. A nested
+  function counts as the function that holds it; a line in a class body
+  outside any method counts as the class; module-level lines (imports,
+  constants) name no symbol. The module is the path with `/` as `.`,
+  without `.py`, `__init__` or a leading `src/`.
+- `new_files` / `new_symbols`: the entries that do not exist in B. A worker
+  that sees only B cannot name them, so they are recorded but not graded.
+
+Task JSON from before this existed gets it at run time from the source
+repository (read-only `git diff` / `cat-file`), in memory only. A task whose
+fix changed no source file that exists in B is skipped for this kind.
+
+**Run.** `gym run --kind localize` (default `--kind fix`) uses the hidden
+form: a worktree of the task's B repository (`lanes-localize/`), one
+read-only node (`write: false`, role `localization`, `max_attempts: 1`,
+`required_handoff: [summary]`), no checks and no fixtures. The prompt is the
+task's problem text, built exactly as for hidden fix tasks, then:
+"Do not change any file: this is a read-only task. Find where in this
+repository the problem above has to be fixed ... End your answer with
+exactly one fenced block tagged `localization` holding a JSON object"
+`{"files": [...], "symbols": [...]}`, ranked most likely first, at most 10
+each, then the normal handoff.
+
+**Why no hints.** Interface hints name the new or changed symbols the tests
+call and the file each lives in; for localization that is the answer.
+`--kind localize` always runs mode `hidden`: `gym.run` refuses
+`hidden+hints` and `visible` for it, and the CLI refuses
+`--visible-tests`.
+
+**Grading** (from the worker's `answer.md`, its whole final message; only
+the graded files and symbols, i.e. those that exist in B):
+
+- The answer must hold exactly one ```` ```localization ```` block with a
+  JSON object whose `files` is a non-empty list of strings and whose
+  `symbols` (optional) is a list of strings. Anything else, or no answer, is
+  `invalid_answer` (its scores are 0). Lists are deduplicated and cut to 10.
+  `./a.py` reads as `a.py`; `a.py::C.m` and `a.py:C.m` as `a.C.m`; a
+  trailing `(...)` is dropped.
+- `file_recall@k` (k = 1, 3, 5): the share of changed files among the top k.
+  `file_precision`: the share of named files that changed. `file_acc_at_1`:
+  the top file changed. `symbol_recall`: the share of changed symbols named
+  anywhere in `symbols` (exact match), null when the fix changed no symbol
+  in B.
+- Verdict `localized`: the top max(3, n) files hold all n changed files
+  (top 3 unless the fix changed more than three). `missed`: none of the top 3
+  changed. `partial`: anything between.
+
+**Rows, keys, report.** Rows carry `kind` (fix rows `"fix"`; rows written
+before kinds read as fix), `truth`, `answer`, `scores`, `changed` (should be
+empty), `grade_label`, and an `answer_file` copy under
+`results/<task>/localize/<lane>/`. Keys are `<task>:<lane>:hidden:localize`,
+while fix keys keep `<task>:<lane>:<mode>`, so resume, report and audit
+never pool kinds. `gym report` keeps fix results under `modes` and adds a
+`localize` section: per lane, verdict counts, `wrote_files`, file acc@1,
+mean file recall@3 and precision, mean symbol recall (over tasks with a
+graded symbol), cost and mean time; per task, the lanes that localized it.
+
+**Labels.** Read-only nodes have no checks, so the structural gate records
+the acceptance input of a reported success and leaves it unlabeled. The gym
+then labels that input, source `gym_grade`, only when the worker reported
+success: `localized` is `failed_task=false`; `missed` (no changed file in
+its top 3) is `failed_task=true`. `partial` and `invalid_answer` stay
+unlabeled (a format failure is a parser fact, as for handoff fields), as
+does any run whose worker changed a file, and any input that already has a
+label. The evidence names the key, the verdict, the changed files and the
+answer's top 3. `gym_grade` is in the precedence list and in
+`--exclude-source` (Labels recorded automatically, above).
+
+**Solvability, per kind.** The audit applies to localization on its own
+evidence: a `gym_grade` negative is retracted (append-only) until some lane
+has localized that task, and restored once one does. A fix solved on the
+task is not evidence that its prompt locates the code, and a localization
+is not evidence that the fix can be done; `audit.json` reports
+`localize: {localized_tasks, unlocalized_tasks}` beside the fix `modes`.
+
+**Ground truth on real tasks (2026-09-25, read-only).**
+
+| Task | Files | Symbols (new in C, ungraded, in italics) |
+| --- | --- | --- |
+| pr-61 | `install.sh` | none (not Python) |
+| pr-86 | `fusion_core.py`, `fusion_policy.py` | `fusion_core.fitted_orc_models`, `fusion_policy.route_candidates` |
+| pr-88 | `fusion_policy.py` (`FUSION_DECISIONS.md` is a doc) | `fusion_policy.rank_by_outcomes`, `fusion_policy.route_task`, *`fusion_policy.exploration`* |
+| pr-103 | `fusion_labeling.py`, `fusion_workflow.py` | `fusion_labeling.gate_answers`, `fusion_workflow.WorkflowRunner._gate` |
+| pr-105 | `fusion_core.py`, `fusion_policy.py` | `fusion_core.RunStore.trace_span`, `fusion_core._denial_note`, `fusion_core.dispatch`, `fusion_policy.route_candidates`, and six new `fusion_core` helpers |
+
+**Caveats.** A symbol whose docstring or comment alone changed counts as
+changed. Only one reference fix is known: a different correct fix in other
+files is graded as a miss, as in SWE-bench localization. Symbols are
+resolved for Python only; other files are graded by path. The worker's
+tree is B, so the same network and neighbouring-directory leaks as hidden
+fix runs apply.
 
 ## Run the loop without the UI
 
