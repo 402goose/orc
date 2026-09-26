@@ -1224,6 +1224,38 @@ print(json.dumps({'type':'result','subtype':'error','is_error':True,'session_id'
         # binary once instead of three separate worker attempts discovering it.
         self.assertFalse((self.workspace / ".fusion" / "runs").exists())
 
+    def test_a_claude_quota_does_not_cool_down_orc_routes(self):
+        claude = self.write_agent(
+            "quota-native-claude",
+            """
+import json
+print(json.dumps({'type':'result','subtype':'error','is_error':True,'session_id':'s','result':"You've hit your session limit; resets at 5:10am"}))
+""",
+        )
+        orc = self.write_agent(
+            "orc",
+            """
+import json
+print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':'o',
+                  'result':'STATUS: success\\nSUMMARY: done on OpenRouter\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}))
+""",
+        )
+        self.config(claude=claude)
+        config = json.loads((self.workspace / ".fusion.json").read_text())
+        config.setdefault("routes", {})["free"] = {"agent": "claude", "command": str(orc), "model": "vendor/model:free"}
+        (self.workspace / ".fusion.json").write_text(json.dumps(config))
+        spec = {"task": "accounts", "max_parallel": 1, "nodes": [
+            {"id": "native", "task": "a", "agent": "claude"},
+            {"id": "native2", "task": "b", "agent": "claude", "needs": ["native"]},
+            {"id": "free", "task": "c", "agent": "claude", "route": "free"}]}
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        result = run_workflow(self.workspace, config, spec_path)
+        statuses = {node["id"]: node["status"] for node in result["nodes"]}
+        # The claude.ai limit pauses native Claude only; the OpenRouter lane runs.
+        self.assertEqual(statuses["native"], "paused_quota")
+        self.assertEqual(statuses["free"], "success")
+
     def test_lane_cooldown_prevents_further_dispatch_in_same_run(self):
         calls = self.bin_dir / "calls.txt"
         claude = self.write_agent(
