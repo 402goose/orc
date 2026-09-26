@@ -703,9 +703,19 @@ class WorkflowRunner:
             )
         return "\n".join(lines)
 
-    def _agent_command_for(self, agent: str) -> str:
-        settings = core.agent_settings(self.config, {"agent": agent, "route": None, "settings_overrides": {}})
+    def _agent_command_for(self, agent: str, route: str | None = None) -> str:
+        settings = core.agent_settings(self.config, {"agent": agent, "route": route, "settings_overrides": {}})
         return str(settings.get("command", agent))
+
+    def _lane_key(self, agent: str, route: str | None = None) -> str:
+        """Lane health belongs to an account, not a harness name: `orc` routes
+        run Claude Code against OpenRouter, so a claude.ai quota must not cool
+        them down (and theirs must not cool native Claude)."""
+        try:
+            launcher = Path(self._agent_command_for(agent, route)).name
+        except ValueError:
+            launcher = agent
+        return f"{agent}@orc" if launcher == "orc" else agent
 
     def _set_lane(self, agent: str, status: str, reason: str) -> None:
         if self.lane_health.get(agent, {}).get("status") == status:
@@ -720,20 +730,24 @@ class WorkflowRunner:
         real call to find out a lane is already blocked. A resume is an
         explicit "try again now", so it skips the trace-history cooldown but
         still gets the executable check and its own in-run cooldown."""
-        for agent in {node["agent"] for node in self.nodes.values()}:
-            if agent == "auto":
-                continue
-            command = self._agent_command_for(agent)
+        lanes = {(node["agent"], node.get("route")) for node in self.nodes.values() if node["agent"] != "auto"}
+        for agent, route in lanes:
+            command = self._agent_command_for(agent, route)
             if core.executable(command) is None:
-                self._set_lane(agent, "blocked", f"{command} is not available on PATH")
+                self._set_lane(self._lane_key(agent, route), "blocked", f"{command} is not available on PATH")
         if self.resume:
             return
         store = core.RunStore(self.control_workspace)
         now = core.now_ms()
         seen: set[str] = set()
         for span in store.traces(limit=50):
-            agent = span.get("agent")
-            if not agent or agent in seen:
+            if not span.get("agent"):
+                continue
+            try:
+                agent = self._lane_key(span["agent"], span.get("route"))
+            except (KeyError, ValueError):
+                agent = span["agent"]
+            if agent in seen:
                 continue
             seen.add(agent)
             if agent in self.lane_health:
@@ -1346,7 +1360,7 @@ BLOCKERS: unresolved issues, or none
             for node in self.nodes.values():
                 if node["status"] != "pending":
                     continue
-                lane = self.lane_health.get(node["agent"])
+                lane = self.lane_health.get(self._lane_key(node["agent"], node.get("route")))
                 if lane:
                     status = "paused_quota" if lane["status"] == "cooldown" else "blocked"
                     node["status"] = status
@@ -1568,7 +1582,8 @@ BLOCKERS: unresolved issues, or none
                         node["status"] = "paused_quota"
                         self._event("node.paused_quota", {"node_id": node_id, "attempt": node["attempts"]})
                         if node["agent"] != "auto":
-                            self._set_lane(node["agent"], "cooldown", f"node {node_id} reported a quota/session limit")
+                            self._set_lane(self._lane_key(node["agent"], node.get("route")), "cooldown",
+                                           f"node {node_id} reported a quota/session limit")
                     elif action == "ask":
                         node["status"] = "blocked"
                         self._event("node.needs_input", {"node_id": node_id, "problems": problems})
