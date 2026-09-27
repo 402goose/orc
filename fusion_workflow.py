@@ -409,18 +409,22 @@ class WorkflowRunner:
         run_id: str | None = None,
         resume: bool = False,
         worktree: dict[str, Any] | None = None,
+        control_workspace: Path | None = None,
     ):
         """`worktree` is a checkout the caller already prepared (`workspace`
         and `base_sha`), as `fusion gym` does: workers and checks run there,
-        while runs, traces and decisions stay in `workspace`."""
+        while runs, traces and decisions stay in the selected control workspace
+        (by default `workspace`). Capture the store before starting threads so
+        a CLI override wins over the environment in every node."""
         self.workspace = workspace
-        self.control_workspace = workspace
+        self.store = core.RunStore(workspace, control_workspace)
+        self.control_workspace = self.store.workspace
         self.config = config
         self.spec = validate_spec(spec)
         self.run_id = run_id or _run_id()
         self.started_at_ms = core.now_ms()
         self.resume = resume
-        self.root = workspace / ".fusion" / "workflows" / self.run_id
+        self.root = self.store.root / "workflows" / self.run_id
         self.nodes_root = self.root / "nodes"
         self.manifest_path = self.root / "manifest.json"
         self.events_path = self.root / "events.jsonl"
@@ -479,7 +483,7 @@ class WorkflowRunner:
                                     "node_id": key, "cost_usd": _result_cost(node.get("result") or {})}
                                    for key, node in manifest.get("nodes", {}).items()]
         recorded = {item.get("run_id") for item in self.attempt_ledger}
-        for span in core.RunStore(self.control_workspace).traces(limit=100000):
+        for span in self.store.traces(limit=100000):
             # Recover a receipt written after the last manifest flush (e.g. interrupted coordinator).
             if span.get("trace_id") == self.run_id and span.get("run_id") not in recorded:
                 self.attempt_ledger.append({"run_id": span["run_id"], "cost_usd": _result_cost(span),
@@ -628,7 +632,7 @@ class WorkflowRunner:
         cache_result = {"status": "cache_hit", "usage": {}, "changed": [], "tests": [], "blockers": [], "artifacts": {}}
         metadata = {"model": resolved.get("model")}
         try:
-            core.RunStore(self.control_workspace).trace_span(self.config, task, cache_result, now, now, metadata)
+            self.store.trace_span(self.config, task, cache_result, now, now, metadata)
         except OSError:
             pass  # telemetry is best-effort; never let it break a resume.
 
@@ -682,6 +686,8 @@ class WorkflowRunner:
             "started_at_ms": self.started_at_ms,
             "coordinator_pid": os.getpid(),
         }
+        if self.store.control_workspace is not None:
+            manifest.update(workspace=str(self.workspace.resolve()), control_workspace=str(self.control_workspace))
         temp = self.manifest_path.with_suffix(".tmp")
         temp.write_text(core.json_text(manifest) + "\n", encoding="utf-8")
         temp.replace(self.manifest_path)
@@ -737,7 +743,7 @@ class WorkflowRunner:
                 self._set_lane(self._lane_key(agent, route), "blocked", f"{command} is not available on PATH")
         if self.resume:
             return
-        store = core.RunStore(self.control_workspace)
+        store = self.store
         now = core.now_ms()
         seen: set[str] = set()
         for span in store.traces(limit=50):
@@ -975,7 +981,8 @@ BLOCKERS: unresolved issues, or none
         if "content" in item:
             return item["content"].encode("utf-8")
         source = Path(item["from_file"]).expanduser()
-        return (source if source.is_absolute() else self.control_workspace / source).read_bytes()
+        base = self.workspace if self.store.control_workspace is not None else self.control_workspace
+        return (source if source.is_absolute() else base / source).read_bytes()
 
     def _fixture_digests(self, node: dict[str, Any]) -> list[dict[str, Any]] | None:
         """Path and content digest of each fixture, or None when one is unreadable."""
@@ -1269,7 +1276,7 @@ BLOCKERS: unresolved issues, or none
             task["task"] += ("\nAfter you finish, the coordinator runs these checks: "
                              + "; ".join(shlex.join(check) for check in task["verification_argv"])
                              + ". You may run exactly these commands yourself.")
-        store = core.RunStore(self.control_workspace)
+        store = self.store
         task["progress_label"] = node_id
         store.write_json(self._node_dir(node_id) / "active.json", {"run_id": task["run_id"], "attempt": attempt})
         task["excluded_routes"] = list(node.get("excluded_routes", []))
@@ -1321,6 +1328,7 @@ BLOCKERS: unresolved issues, or none
                     "usage": {},
                     "artifacts": {},
                 }
+        result["workspace"] = str(self.workspace.resolve())
         result["workflow_id"] = self.run_id
         result["node_id"] = node_id
         result["attempt"] = attempt
@@ -1335,7 +1343,7 @@ BLOCKERS: unresolved issues, or none
         if not run_id:
             return
         now = core.now_ms()
-        core.RunStore(self.control_workspace).trace_span(
+        self.store.trace_span(
             self.config, {**task, "run_id": run_id, "agent": "gate", "route": None},
             {"status": "success" if accepted else "failed", "blockers": list(problems), "usage": {}},
             now, now, {},
@@ -1606,7 +1614,7 @@ BLOCKERS: unresolved issues, or none
         self._event("workflow.finished", {"status": status, "spent_usd": self._spent()})
         if status == "success" and self.spec.get("publish", {}).get("mode") == "auto":
             from fusion_publish import auto_publish
-            auto_publish(self.control_workspace, self.run_id, self.config)
+            auto_publish(self.workspace if self.store.control_workspace else self.control_workspace, self.run_id, self.config)
         return self.result(status, acceptance_problems)
 
     def result(self, status: str | None = None, acceptance_problems: list[str] | None = None) -> dict[str, Any]:
@@ -1680,7 +1688,8 @@ def reroute_resume_spec(manifest: dict[str, Any], config: dict[str, Any], node_i
 def resume_workflow(workspace: Path, config: dict[str, Any], run_id: str, spec_path: Path | None = None,
                     node_id: str | None = None, agent: str | None = None, route: str | None = None,
                     max_attempts: int | None = None) -> dict[str, Any]:
-    manifest_path = workspace / ".fusion" / "workflows" / run_id / "manifest.json"
+    store = core.RunStore(workspace)
+    manifest_path = store.root / "workflows" / run_id / "manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -1691,12 +1700,19 @@ def resume_workflow(workspace: Path, config: dict[str, Any], run_id: str, spec_p
     # or dependency evidence actually changed, not the whole graph.
     if spec_path and any(value is not None for value in (node_id, agent, route, max_attempts)):
         raise ValueError("Use either --spec or stage retry options")
+    control = store.control_workspace
+    if manifest.get("control_workspace") and manifest.get("workspace"):
+        worker = Path(manifest["workspace"])
+        control = store.workspace
+        if worker != workspace:
+            config, _ = core.load_config(worker, control)
+        workspace = worker
     spec = load_spec(spec_path) if spec_path else reroute_resume_spec(manifest, config, node_id, agent, route, max_attempts)
-    return WorkflowRunner(workspace, config, spec, run_id=run_id, resume=True).run()
+    return WorkflowRunner(workspace, config, spec, run_id=run_id, resume=True, control_workspace=control).run()
 
 
 def workflow_status(workspace: Path, run_id: str) -> dict[str, Any]:
-    path = workspace / ".fusion" / "workflows" / run_id / "manifest.json"
+    path = core.RunStore(workspace).root / "workflows" / run_id / "manifest.json"
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -1723,6 +1739,7 @@ def workflow_report(workspace: Path, run_id: str) -> dict[str, Any]:
     """
     from fusion_report import command, findings, read_answer, reported_cost
     from fusion_publish import public_status
+    workspace = core.RunStore(workspace).workspace
     manifest = workflow_status(workspace, run_id)
     nodes = manifest.get("nodes") or {}
     spec_nodes = {node["id"]: node for node in (manifest.get("spec", {}).get("graph", {}).get("nodes") or [])}

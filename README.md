@@ -738,6 +738,39 @@ fusion ultra --cheap-only 'Explore and review this without spending on a strong 
 fusion ultra --harness codex 'Run the full bounded pipeline through Codex.'
 ```
 
+To collect evidence from several checkouts in one controller directory:
+
+```sh
+fusion --workspace /path/to/product --control-workspace /path/to/controller --json delegate --agent codex "Implement the change"
+export FUSION_CONTROL_WORKSPACE=/path/to/controller
+fusion --workspace /path/to/another-product delegate --agent codex "Review the change"
+fusion status                         # `runs` is an alias
+fusion trace
+fusion outcome RUN_ID --accepted --reason "Verified the tests and diff"
+fusion decisions routing-report
+```
+
+The control directory is chosen by `--control-workspace`, then
+`FUSION_CONTROL_WORKSPACE`, then the worker workspace. Paths are resolved to
+absolute paths. Runs, traces, outcomes, decisions, routing logs, labels, and
+workflow evidence live under the control directory's `.fusion/`. Workers still
+execute in `--workspace`; each run receipt records that absolute `workspace`.
+With an explicit control directory, sessions are scoped to the worker checkout,
+and writer locks for other checkouts live in the control store. Receipts remain
+available after a disposable worker checkout is removed. To inspect them later,
+use the same flag/env or run Fusion from the controller directory.
+
+Configuration loads defaults, then `$ORC_HOME/fusion.json` (normally
+`~/.config/orc/fusion.json`), then `FUSION_CONFIG` or the `.fusion.json` found
+upward from the worker workspace. If a control directory is explicitly selected,
+its own `.fusion.json` is deep-merged last for `routes`, `decisions`, `learning`,
+`quota`, `cache`, and `gym` only. Controller policy wins for those keys; other
+worker settings, including native agent commands, permissions, and timeouts,
+remain worker-scoped. Named routes can supply their usual route-specific worker
+settings. Config-source reporting continues to identify the worker/global file.
+With no flag or environment setting, storage and config behavior stay unchanged,
+apart from the added `workspace` field in run receipts.
+
 `fusion` uses a single writer lock for a workspace, so two write tasks cannot edit the same checkout at once. Use separate Git worktrees when you want parallel write tasks. Read-only tasks can run independently. The default Codex sidekick uses `codex exec --json`; the default Claude sidekick uses Claude Code print mode with structured JSON output.
 
 A worker's overall status (`STATUS: success|partial|blocked|error`) is still a

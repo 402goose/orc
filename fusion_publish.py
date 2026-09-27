@@ -62,8 +62,10 @@ def text(workspace, *args):
 def root_for(workspace, run_id):
     if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
         raise ValueError("Invalid workflow identifier")
-    root = (Path(workspace) / ".fusion/workflows" / run_id).resolve()
-    if not root.is_relative_to((Path(workspace) / ".fusion").resolve()):
+    from fusion_core import RunStore
+    store = RunStore(Path(workspace))
+    root = (store.root / "workflows" / run_id).resolve()
+    if not root.is_relative_to(store.root.resolve()):
         raise ValueError("Workflow path escapes workspace")
     return root
 
@@ -126,12 +128,14 @@ def setup_worktree(workspace, run_id, task, opts):
     root = root_for(workspace, run_id)
     repo, url, base_sha = fetch_base(workspace, opts)
     branch = branch_name(task, run_id)
-    directory = Path(workspace).resolve() / ".fusion/worktrees" / run_id
+    from fusion_core import RunStore
+    store = RunStore(Path(workspace))
+    directory = store.workspace.resolve() / ".fusion/worktrees" / run_id
     directory.parent.mkdir(parents=True, exist_ok=True)
     git(workspace, "worktree", "add", "-b", branch, str(directory), base_sha)
     if (directory / ".fusion").exists():
         raise ValueError("Repository tracks .fusion; cannot share workflow artifacts")
-    (directory / ".fusion").symlink_to((Path(workspace) / ".fusion").resolve(), target_is_directory=True)
+    (directory / ".fusion").symlink_to(store.root.resolve(), target_is_directory=True)
     context = {**opts, "repo": repo, "remote_url": url, "base_sha": base_sha,
                "branch": branch, "workspace": str(directory), "isolated": True}
     save(root / "git.json", context)

@@ -104,7 +104,8 @@ def prepare(workspace, config, idea, kind=None, budget_usd=0, max_attempts=2, *,
     if across and kind and kind != "sweep":
         raise ValueError(f"--across fans out a read-only sweep and cannot be combined with --kind {kind}")
     build_id = "build-" + uuid.uuid4().hex[:12]
-    root = Path(workspace) / ".fusion" / "builds" / build_id
+    from fusion_core import RunStore
+    root = RunStore(Path(workspace)).root / "builds" / build_id
     root.mkdir(parents=True, mode=0o700)
     _update_status(root, schema="fusion.build.v1", build_id=build_id, status="running", phase="intake",
                    message="reading the request", started_at_ms=int(time.time() * 1000),
@@ -124,7 +125,9 @@ def _prepare(workspace, config, idea, kind, budget_usd, max_attempts, build_id, 
     source = source_for(idea, workspace)
     read_only = bool(PLANNING_ONLY.search(source["text"]))
     fallback = "discovery" if read_only else "debug" if re.search(r"\b(fix|bug|broken|regression)\b", idea, re.I) else "review" if re.match(r"\s*review\b", idea, re.I) else "build"
-    engine = DecisionEngine(workspace, config)
+    from fusion_core import RunStore
+    control_workspace = RunStore(Path(workspace)).workspace
+    engine = DecisionEngine(control_workspace, config)
     _update_status(root, phase="classification", message="waiting for Laya intake classification; first checkpoint load can take tens of seconds")
     intake_state = {"request": source["text"], "planning_only": read_only}
     record = engine.decide("intake", intake_state, INTAKE_QUESTIONS, {"group": build_id})
@@ -146,7 +149,7 @@ def _prepare(workspace, config, idea, kind, budget_usd, max_attempts, build_id, 
     if kind and kind_source == "user":
         if selected == kind:
             from fusion_labeling import intake_label as label_intake
-            intake_label = label_intake(workspace, config, record, intake_state, kind, {"group": build_id}, build_id)
+            intake_label = label_intake(control_workspace, config, record, intake_state, kind, {"group": build_id}, build_id)
         else:
             intake_label = {"status": "skipped", "reason": f"--kind {kind} was overridden by the request's own scope ({selected})"}
     _update_status(root, phase="preparing", message=f"saving the {selected} brief and workflow")

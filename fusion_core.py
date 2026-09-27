@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from contextvars import ContextVar
 import fcntl
 import hashlib
 import json
@@ -158,7 +159,17 @@ def workspace_path(value: str | None) -> Path:
     return candidate.resolve()
 
 
-def load_config(workspace: Path) -> tuple[dict[str, Any], Path | None]:
+# Scope a CLI override to one invocation, including embedded main() callers.
+# RunStore captures it before workflow threads start; children receive it in env.
+_CONTROL_WORKSPACE: ContextVar[Path | None] = ContextVar("fusion_control_workspace", default=None)
+
+
+def selected_control_workspace(value: str | Path | None = None) -> Path | None:
+    selected = value or _CONTROL_WORKSPACE.get() or os.environ.get("FUSION_CONTROL_WORKSPACE")
+    return Path(selected).expanduser().resolve() if selected else None
+
+
+def load_config(workspace: Path, control_workspace: Path | None = None) -> tuple[dict[str, Any], Path | None]:
     path_value = os.environ.get("FUSION_CONFIG")
     path = Path(path_value).expanduser().resolve() if path_value else find_upward(".fusion.json", workspace)
     global_path = Path(os.environ.get("ORC_HOME") or Path.home() / ".config/orc") / "fusion.json"
@@ -176,6 +187,18 @@ def load_config(workspace: Path) -> tuple[dict[str, Any], Path | None]:
         # Stage maps are complete workflow definitions, not additive defaults.
         if isinstance(parsed.get("ultra"), dict) and "stages" in parsed["ultra"]:
             merged.setdefault("ultra", {})["stages"] = parsed["ultra"]["stages"]
+    control = selected_control_workspace(control_workspace)
+    control_path = control / ".fusion.json" if control is not None else None
+    if control_path is not None and control_path.is_file() and control_path != path:
+        try:
+            parsed = json.loads(control_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"fusion: cannot read {control_path}: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise SystemExit(f"fusion: {control_path} must contain a JSON object")
+        # Controller policy must not replace worker commands or permissions.
+        keys = {"routes", "decisions", "learning", "quota", "cache", "gym"}
+        merged = deep_merge(merged, {key: value for key, value in parsed.items() if key in keys})
     execution_mode(merged)
     return merged, source
 
@@ -882,9 +905,10 @@ def fetch_remote_summary(remote: dict[str, Any], hours: int, every_install: bool
 
 
 class RunStore:
-    def __init__(self, workspace: Path):
-        self.workspace = workspace
-        self.root = workspace / ".fusion"
+    def __init__(self, workspace: Path, control_workspace: Path | None = None):
+        self.control_workspace = selected_control_workspace(control_workspace)
+        self.workspace = self.control_workspace or workspace
+        self.root = self.workspace / ".fusion"
         self.runs = self.root / "runs"
         self.sessions_path = self.root / "sessions.json"
         self.session_use_path = self.root / "session_use.json"
@@ -1042,13 +1066,17 @@ class RunStore:
 
 
 @contextlib.contextmanager
-def writer_lock(workspace: Path, enabled: bool) -> Iterator[None]:
+def writer_lock(workspace: Path, enabled: bool, control_workspace: Path | None = None) -> Iterator[None]:
     if not enabled:
         yield
         return
     lock_dir = workspace / ".fusion"
+    lock_name = "workspace-writer.lock"
+    if control_workspace is not None and control_workspace.resolve() != workspace.resolve():
+        lock_dir = control_workspace / ".fusion" / "locks"
+        lock_name = hashlib.sha256(str(workspace.resolve()).encode()).hexdigest() + ".lock"
     lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / "workspace-writer.lock"
+    lock_path = lock_dir / lock_name
     with lock_path.open("w", encoding="utf-8") as handle:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -1636,6 +1664,7 @@ def run_directory(workspace: Path, run_id: str) -> Path | None:
     """
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id or ""):
         return None
+    workspace = RunStore(workspace).workspace
     root = (Path(workspace) / ".fusion").resolve()
     for directory in [RunStore(workspace).runs / run_id,
                       *sorted((Path(workspace) / ".fusion" / "worktrees").glob(f"*/.fusion/runs/{run_id}"))]:
@@ -1658,6 +1687,7 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool, reason: str = "
     from fusion_decisions import DecisionStore
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id or ""):
         raise ValueError("run_id must be a Fusion run id")
+    workspace = RunStore(workspace).workspace
     result_path = (run_directory(workspace, run_id) or RunStore(workspace).runs / run_id) / "result.json"
     try:
         result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -1682,6 +1712,12 @@ def dispatch(
     from fusion_policy import route_task, review_task
     if os.environ.get("FUSION_READ_ONLY") == "1" and task["write"]:
         raise ValueError("this Fusion session permits read-only work only")
+    task["workspace"] = str(Path(task["workspace"]).resolve())
+    if store.control_workspace is not None:
+        # A shared store must never resume another checkout's conversation.
+        suffix = ":workspace=" + hashlib.sha256(task["workspace"].encode()).hexdigest()
+        if not task["session_key"].endswith(suffix):
+            task["session_key"] += suffix
     route_task(config, task, store)
     # Pinned choices do not resume a session created for a different pair.
     # Keep legacy session keys unchanged when effort is inherited.
@@ -1707,6 +1743,8 @@ def dispatch(
             session_id, session["resume_skipped"] = None, "cold"
     session["resumed"] = bool(session_id)
     argv, env, metadata = agent_command(config, task, session_id)
+    if store.control_workspace is not None:
+        env["FUSION_CONTROL_WORKSPACE"] = str(store.control_workspace)
     metadata["execution_mode"] = execution_mode(config)
     metadata["lane_key"] = lane_key(task["agent"], agent_settings(config, task))
     task["resolved"] = metadata
@@ -1717,6 +1755,7 @@ def dispatch(
         result = {
             "schema": SCHEMA,
             "run_id": task["run_id"],
+            "workspace": task["workspace"],
             "status": "error",
             "agent": task["agent"],
             "route": task.get("route"),
@@ -1763,7 +1802,7 @@ def dispatch(
     try:
         with contextlib.ExitStack() as stack:
             with progress.activity(label, "acquiring workspace writer lock" if task["write"] else "preparing read-only worker"):
-                stack.enter_context(writer_lock(Path(task["workspace"]), task["write"]))
+                stack.enter_context(writer_lock(Path(task["workspace"]), task["write"], store.control_workspace))
             store.event(run_dir, "worker.started", {"argv": argv, "resumed_session": bool(session_id), **session})
             if metadata.get("execution_choice"):
                 metadata["execution_choice"]["dispatch"] = {"status": "attempted", "argv": argv}
@@ -1846,6 +1885,7 @@ def dispatch(
     result = {
         "schema": SCHEMA,
         "run_id": task["run_id"],
+        "workspace": task["workspace"],
         "status": status,
         "execution_mode": execution_mode(config),
         "agent": task["agent"],
@@ -1935,7 +1975,8 @@ def run_ultra(
     stage_names = stage_names[:limit]
 
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
-    ultra_dir = workspace / ".fusion" / "ultra" / run_id
+    store = RunStore(workspace)
+    ultra_dir = store.root / "ultra" / run_id
     ultra_dir.mkdir(parents=True, exist_ok=False)
     manifest_path = ultra_dir / "manifest.json"
     manifest: dict[str, Any] = {
@@ -1947,7 +1988,6 @@ def run_ultra(
     }
     manifest_path.write_text(json_text(manifest) + "\n", encoding="utf-8")
 
-    store = RunStore(workspace)
     stage_results: list[dict[str, Any]] = []
     previous_paths: list[str] = []
     pipeline_status = "success"
@@ -2178,12 +2218,12 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
             except Exception as exc:
                 response = mcp_error(str(exc))
         elif method == "resources/list":
-            response = {"resources": fusion_mcp.list_resources(workspace)}
+            response = {"resources": fusion_mcp.list_resources(store.workspace)}
         elif method == "resources/templates/list":
             response = {"resourceTemplates": fusion_mcp.RESOURCE_TEMPLATES}
         elif method == "resources/read":
             try:
-                response = fusion_mcp.read_resource((request.get("params") or {}).get("uri", ""), workspace)
+                response = fusion_mcp.read_resource((request.get("params") or {}).get("uri", ""), store.workspace)
             except Exception as exc:
                 response = mcp_error(str(exc))
         elif method == "tools/call":
@@ -2195,7 +2235,7 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
                     payload = {"runs": store.recent(int(args.get("limit", 10)))}
                 elif name == "fusion_decisions":
                     from fusion_decisions import DecisionStore
-                    payload = {"decisions": DecisionStore(workspace).records()[-max(1, min(50, int(args.get("limit", 10)))):]}
+                    payload = {"decisions": DecisionStore(store.workspace).records()[-max(1, min(50, int(args.get("limit", 10)))):]}
                 elif name == "fusion_outcome":
                     if not isinstance(args.get("accepted"), bool):
                         raise ValueError("accepted must be true or false")
@@ -2227,12 +2267,13 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
                         raise ValueError("task is required")
                     payload = dispatch(target_config, task, target_store)
                 else:
-                    payload = fusion_mcp.dispatch_async_tool(name, args, workspace)
+                    target = workspace if name == "fusion_run_start" else store.workspace
+                    payload = fusion_mcp.dispatch_async_tool(name, args, target)
                 response = mcp_result(payload)
                 if isinstance(payload, dict) and payload.get("workflow_id"):
                     # Hand back evidence URIs rather than inlining artifacts.
                     response["content"] = response["content"] + fusion_mcp.evidence_links(
-                        workspace, str(payload["workflow_id"])
+                        store.workspace, str(payload["workflow_id"])
                     )
             except Exception as exc:  # MCP must return a tool error instead of corrupting stdout.
                 response = mcp_error(str(exc))
@@ -2272,6 +2313,9 @@ def mcp_config_file(workspace: Path, read_only: bool = False) -> tuple[tempfile.
         }
     }
     handle = tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix="fusion-mcp-", delete=False, encoding="utf-8")
+    control = selected_control_workspace()
+    if control is not None:
+        config["mcpServers"]["fusion"]["env"]["FUSION_CONTROL_WORKSPACE"] = str(control)
     json.dump(config, handle)
     handle.write("\n")
     handle.flush()
@@ -2279,6 +2323,7 @@ def mcp_config_file(workspace: Path, read_only: bool = False) -> tuple[tempfile.
 
 
 def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str | None, interactive: bool = True, read_only: bool = False) -> int:
+    control = selected_control_workspace()
     yolo = execution_mode(config) == "yolo"
     if agent == "claude":
         settings = config["claude"]
@@ -2305,6 +2350,8 @@ def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str |
         try:
             env = os.environ.copy()
             env["FUSION_WORKSPACE"] = str(workspace)
+            if control is not None:
+                env["FUSION_CONTROL_WORKSPACE"] = str(control)
             if read_only:
                 env["FUSION_READ_ONLY"] = "1"
             return subprocess.run(argv, cwd=workspace, env=env, check=False).returncode
@@ -2322,6 +2369,8 @@ def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str |
             *codex_permission_args(workspace, settings, not read_only), "-a", "never" if read_only else "on-request"]
         argv = [command, "-C", str(workspace), *permissions, "-c", f"mcp_servers.fusion.command={json.dumps(sys.executable)}", "-c", f"mcp_servers.fusion.args={args_toml}"]
         argv += ["-c", f"mcp_servers.fusion.env.FUSION_WORKSPACE={json.dumps(str(workspace))}"]
+        if control is not None:
+            argv += ["-c", f"mcp_servers.fusion.env.FUSION_CONTROL_WORKSPACE={json.dumps(str(control))}"]
         if read_only:
             argv += ["-c", 'mcp_servers.fusion.env.FUSION_READ_ONLY="1"']
         if settings.get("model"):
@@ -2335,6 +2384,8 @@ def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str |
                 argv.append(task)
         env = os.environ.copy()
         env["FUSION_WORKSPACE"] = str(workspace)
+        if control is not None:
+            env["FUSION_CONTROL_WORKSPACE"] = str(control)
         if read_only:
             env["FUSION_READ_ONLY"] = "1"
         return subprocess.run(argv, cwd=workspace, env=env, check=False).returncode
@@ -2411,6 +2462,7 @@ def doctor(workspace: Path, config: dict[str, Any]) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fusion", description="Lead/sidekick orchestration for Claude Code, Codex CLI, and Antigravity CLI")
     parser.add_argument("--workspace", help="workspace to operate in; defaults to the current directory")
+    parser.add_argument("--control-workspace", help="store Fusion evidence here; defaults to FUSION_CONTROL_WORKSPACE or --workspace")
     parser.add_argument("--json", action="store_true", help="emit machine-readable output")
     display = parser.add_mutually_exclusive_group()
     display.add_argument("--progress", dest="progress", action="store_true", default=None, help="show live progress on stderr, including when redirected")
@@ -2515,7 +2567,7 @@ def build_parser() -> argparse.ArgumentParser:
     workflow_watch.add_argument("--once", action="store_true", help="show a snapshot and exit")
 
     sub.add_parser("doctor", help="check the local CLI prerequisites")
-    status = sub.add_parser("status", help="show recent runs")
+    status = sub.add_parser("status", aliases=["runs"], help="show recent runs")
     status.add_argument("--limit", type=int, default=20)
     trace = sub.add_parser("trace", help="show recent telemetry spans")
     trace.add_argument("--limit", type=int, default=100)
@@ -2562,20 +2614,24 @@ def main(argv: list[str] | None = None) -> int:
         enabled = setting == "1" or setting == "auto" and sys.stderr.isatty() and not args.json
     if args.command == "mcp-serve":
         enabled = False
+    token = _CONTROL_WORKSPACE.set(selected_control_workspace(args.control_workspace))
     with progress.session(enabled):
         try:
             return _main(args, parser)
         except KeyboardInterrupt:
             progress.emit("fusion", "detached from watcher" if args.command == "workflow" and args.workflow_command == "watch" else "interrupted; partial logs remain in .fusion")
             return 130
+        finally:
+            _CONTROL_WORKSPACE.reset(token)
 
 
 def _main(args, parser) -> int:
     workspace = workspace_path(args.workspace)
+    control_workspace = RunStore(workspace).workspace
     if args.command == "usage":
         from fusion_usage import command as usage_command
         try:
-            return usage_command(args, workspace)
+            return usage_command(args, control_workspace)
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
     if args.command == "ui":
@@ -2608,14 +2664,14 @@ def _main(args, parser) -> int:
     if args.command == "decisions":
         from fusion_decision_cli import run as run_decisions
         try:
-            return run_decisions(args, workspace, config)
+            return run_decisions(args, control_workspace, config)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             parser.error(str(exc))
     if args.command == "mcp-serve":
         return run_mcp(workspace, config)
     if args.command == "doctor":
         return doctor(workspace, config)
-    if args.command == "status":
+    if args.command in {"status", "runs"}:
         payload = RunStore(workspace).recent(args.limit)
         print(json_text(payload) if args.json else json_text(payload))
         return 0
@@ -2670,7 +2726,7 @@ def _main(args, parser) -> int:
             return 0
         payload = {
             "local_enabled": (config.get("telemetry") or {}).get("enabled", True),
-            "local_path": str(workspace / ".fusion" / "traces.jsonl"),
+            "local_path": str(RunStore(workspace).traces_path),
             "remote_enabled": enabled,
             "remote_token_configured": bool(remote.get("token")),
             "remote_endpoint": remote.get("endpoint") or None,
@@ -2694,7 +2750,7 @@ def _main(args, parser) -> int:
 
         try:
             if args.workflow_command == "watch":
-                return progress.watch_workflow(workspace, args.run_id, as_json=args.json, once=args.once)
+                return progress.watch_workflow(control_workspace, args.run_id, as_json=args.json, once=args.once)
             if args.workflow_command == "run":
                 result = run_workflow(workspace, config, Path(args.spec).expanduser().resolve(), args.task)
             elif args.workflow_command == "publish":
@@ -2705,7 +2761,7 @@ def _main(args, parser) -> int:
                 result = resume_workflow(workspace, config, args.run_id, spec_path, args.node, args.agent, args.route, args.max_attempts)
             elif args.workflow_command == "report":
                 from fusion_report import format_report, select_report
-                result = workflow_report(workspace, args.run_id)
+                result = workflow_report(control_workspace, args.run_id)
                 result = select_report(result, node=args.node, finding=args.finding, all_nodes=args.all)
                 rendered_report = format_report(result, brief=args.brief)
                 if args.output:
@@ -2716,7 +2772,7 @@ def _main(args, parser) -> int:
                     if not args.json:
                         print(f"Saved report: {output}", file=sys.stderr)
             else:
-                result = workflow_status(workspace, args.run_id)
+                result = workflow_status(control_workspace, args.run_id)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             if args.json:
                 print(json_text({"schema": "fusion.workflow.v1", "status": "error", "error": str(exc)}))
