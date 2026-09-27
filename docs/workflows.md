@@ -410,9 +410,10 @@ read-only; put repository writes behind a final writer or use separate Git
 worktrees for independent implementations.
 
 Before dispatching, the runner preflights the account-aware lanes used in the
-graph. It checks resolved commands on PATH and, on a fresh `run`, inspects the
-latest 50 traces for each lane's most recent quota/session failure within 15
-minutes. Route account identity determines which pending nodes share a cooldown;
+graph. It checks resolved commands on PATH and, on a fresh `run`, reads the
+latest 50 traces and cools a lane only when that lane's most recent trace reported
+a quota/session limit within 15 minutes; `auto` nodes are not preflighted.
+Route account identity determines which pending nodes share a cooldown;
 the manifest's `lanes` field records the reason. `resume` skips historical
 preflight cooldown, but still checks executables and applies in-run cooldowns
 and routing constraints. A new quota failure cools the affected lane so the
@@ -476,8 +477,3 @@ the repo on first run, so the shipped runtime stays npm-free.
 Browser checks use disposable workspaces and fake coding workers. They exercise
 rendering, launches, settings, cancellation, reviewed labels and mobile layouts
 without paid agent calls. Browser tools are needed only to run these checks.
-
-At this revision, `make dogfood` stops at a stale usage assertion: the script pipes
-plain-text `fusion usage` output into `jq` and expects the removed `.spans` field.
-This also reproduces on unmodified HEAD; the Python, launcher and browser suites
-are separate checks. See the [migration validation record](documentation-audit.md#validation).

@@ -44,15 +44,13 @@ headless `streaming-json` output, a fresh session, and no subagents; its default
 in restricted mode. The adapter reads model, usage and nonpartial cost when
 reported. The older `plain` fallback lacks structured tool/usage receipts. Set
 `grok.permission_mode` to `acceptEdits` for explicitly authorized writer work.
-Named ORC routes can use other configured models; automatic ORC selection still
+Named ORC routes can use other configured models; automatic ORC selection still requires passing tool-fit evidence.
 
 ## Accounts and quota headroom
 
-requires passing tool-fit evidence.
-
 Named routes in `.fusion.json` can set `env` to an object of string environment
 variables. These override the inherited worker environment; values expand `~`
-and `$HOME` (including `${HOME}`) before the worker starts. For example:
+and environment variables such as `$HOME` before the worker starts. For example:
 
 ```json
 {"routes": {"claude-second": {

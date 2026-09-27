@@ -60,8 +60,9 @@ From the repository you want worked on, with an authenticated worker installed:
 
 ```sh
 fusion doctor
-# Persistently disable remote reporting if that is your preference:
+# Persistently disable remote reporting for this project's `.fusion.json`:
 fusion telemetry off
+# For all projects, set telemetry.remote: false in $ORC_HOME/fusion.json.
 # One bounded task; choose another installed agent if needed:
 fusion delegate --agent codex --read-only --role reviewer \
   --success 'Concrete findings with file references' \

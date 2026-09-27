@@ -34,8 +34,7 @@ orc
 First run launches the setup wizard: it finds your API key (or helps you set
 one up), fetches the live OpenRouter model catalog, and gives you an fzf
 picker with per-model pricing and context sizes. It also offers a launch
-permission mode (default / auto / acceptEdits / plan / dontAsk / yolo /
-bypassPermissions).
+permission mode (default / auto / acceptEdits / plan / dontAsk / yolo).
 Choices are saved; the next run shows the resolved model + mode (and
 `@profile` / `.orc.json` when those apply) and lets you launch with Enter
 or change this invocation first:
@@ -123,8 +122,10 @@ A second column, `FIT` / `FAIL` / `UNTESTED`, is orc's own measurement:
 `orc probe --fit` forces a one-tool round trip through OpenRouter's
 Anthropic-compatible endpoint and caches the result for 24h. The picker
 prefers last-known-good models only after quality and prompt-price ordering; `orc models --fit` lists only those.
-`orc doctor` runs the fit probe when the cache is empty (`ORC_NO_FIT=1`
-skips it; `ORC_NO_PROBE=1` skips the enclosing launch-probe branch too). Catalog `tools` is an advertisement; FIT is whether the model
+`orc doctor` runs the fit probe only after a successful launch probe and when
+the resolved model's fit is `UNTESTED`. `ORC_NO_FIT=1` skips it;
+`ORC_NO_PROBE=1` skips the enclosing launch-probe branch too. Catalog `tools`
+is an advertisement; FIT is whether the model
 survived a Claude Code-shaped loop.
 
 ## Profiles
@@ -306,7 +307,8 @@ catalog and fit cache both live 24h (`orc refresh` / `orc probe --fit`
 to force). The Artificial Analysis quality cache lives 24h too;
 `orc refresh` re-checks it but won't re-fetch the leaderboard (the
 scraper is in cmndcntr; run `make refresh-quality` from the orc source
-to update the bundled snapshot, then `./build.sh` and reinstall).
+to update the bundled snapshot, then explicitly replace
+`$ORC_HOME/quality.json` with the reviewed `data/quality.json`).
 `orc env` is `launch` without the `exec`.
 
 ## Development

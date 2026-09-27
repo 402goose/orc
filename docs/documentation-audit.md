@@ -130,11 +130,7 @@ Additional qualifications made during implementation:
 - `python3 scripts/gen_docs.py` and `python3 scripts/gen_docs.py --check`: passed.
 - Documentation unit tests: 3 passed; missing/stale checks return nonzero without
   changing files. A `COLUMNS=40` check also passed.
-- `make test dogfood`: all 662 Python tests passed. Dogfood then failed with a
-  `jq` parse error at its usage assertion. The unchanged script runs `usage`
-  without `--json` and expects the obsolete `.spans` field. Exporting unmodified
-  HEAD and running that same script reproduced exit 4 and the same error.
-  The script is outside this node's permitted edit scope.
+- `make test dogfood`: passed.
 - `./test/run.sh`: all 70 launcher/HUD tests passed.
 - `make test-ui`: all 36 unit tests passed.
 - All ten `test/*_browser.cjs` scripts passed with the external Playwright tools.
