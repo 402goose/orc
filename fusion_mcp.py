@@ -418,14 +418,19 @@ def start_run(
 
     from fusion_workflow import WORKFLOW_ID_ENV
 
-    logs = workspace / ".fusion"
+    from fusion_core import RunStore
+    store = RunStore(workspace)
+    environment = {**os.environ, WORKFLOW_ID_ENV: workflow_id}
+    if store.control_workspace is not None:
+        environment["FUSION_CONTROL_WORKSPACE"] = str(store.control_workspace)
+    logs = store.root
     logs.mkdir(parents=True, exist_ok=True)
     handle = open(logs / "mcp-launch.log", "ab")
     try:
         proc = spawn(
             argv,
             cwd=str(workspace),
-            env={**os.environ, WORKFLOW_ID_ENV: workflow_id},
+            env=environment,
             stdin=subprocess.DEVNULL,
             stdout=handle,
             stderr=handle,
@@ -437,7 +442,7 @@ def start_run(
     _LAUNCHED.append(proc)
     pid = getattr(proc, "pid", None)
     evidence = [f"orc://workflow/{workflow_id}/{leaf}" for leaf in ("manifest", "report")]
-    registered = workspace / ".fusion" / "workflows" / workflow_id
+    registered = store.root / "workflows" / workflow_id
 
     # Confirm the run actually came up, so a launch that dies immediately is
     # reported as failed rather than as a handle that will never resolve.
@@ -459,7 +464,7 @@ def start_run(
                 "kind": kind,
                 "pid": pid,
                 "error": "the run exited before registering a workflow",
-                "log": _tail(workspace / ".fusion" / "mcp-launch.log"),
+                "log": _tail(logs / "mcp-launch.log"),
             }
         sleep(0.25)
 
