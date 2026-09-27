@@ -1674,7 +1674,8 @@ def run_directory(workspace: Path, run_id: str) -> Path | None:
     return None
 
 
-def record_outcome(workspace: Path, run_id: str, accepted: bool, reason: str = "") -> dict[str, Any]:
+def record_outcome(workspace: Path, run_id: str, accepted: bool | None = None, reason: str = "", *,
+                   stage: str | None = None, withdraw: bool = False, unmeasured: bool = False) -> dict[str, Any]:
     """The lead's verdict on a delegation, after inspecting its diff and tests.
 
     Delegations have no coordinator gate, so without this their only signal is
@@ -1683,8 +1684,22 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool, reason: str = "
     success also becomes an acceptance label (fusion_labeling.verdict_label).
     A run found in a workflow worktree is recorded here, in this workspace's
     decision store, with evidence pointing at its worktree path.
+
+    Stages are metadata; append order determines the latest measured verdict.
+    Withdrawal removes all prior external verdicts, preserving independent gate
+    evidence. Unmeasured is audit-only and leaves the last measured verdict intact.
     """
     from fusion_decisions import DecisionStore
+    if accepted is not None and not isinstance(accepted, bool):
+        raise ValueError("accepted must be true or false")
+    if not isinstance(withdraw, bool) or not isinstance(unmeasured, bool):
+        raise ValueError("withdraw and unmeasured must be true or false")
+    if sum((accepted is not None, withdraw, unmeasured)) != 1:
+        raise ValueError("choose exactly one of accepted/rejected, withdraw, or unmeasured")
+    if stage is not None and stage not in ("gate", "verify", "land"):
+        raise ValueError("stage must be gate, verify, or land")
+    if withdraw and not str(reason).strip():
+        raise ValueError("withdraw requires a reason")
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id or ""):
         raise ValueError("run_id must be a Fusion run id")
     workspace = RunStore(workspace).workspace
@@ -1693,10 +1708,23 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool, reason: str = "
         result = json.loads(result_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ValueError(f"no completed Fusion run {run_id} in this workspace") from exc
-    event = {"task_id": run_id, "group": result.get("trace_id") or run_id, "accepted": bool(accepted),
+    event = {"task_id": run_id, "group": result.get("trace_id") or run_id,
              "status": result.get("status"), "source": "lead", "reason": str(reason)[:2000],
              "route": result.get("route"), "agent": result.get("agent"), "model": result.get("model"),
              "evidence": str(result_path)}
+    if stage is not None:
+        event["stage"] = stage
+    if withdraw or unmeasured:
+        mode = "withdraw" if withdraw else "unmeasured"
+        event[mode] = True
+        DecisionStore(workspace).append("outcome_" + mode, **event)
+        if withdraw:
+            from fusion_labeling import withdraw_verdict_labels
+            label = withdraw_verdict_labels(workspace, run_id, str(reason))
+        else:
+            label = {"status": "unchanged", "reason": "Unmeasured outcomes do not change labels"}
+        return {"recorded": True, **event, "label": label}
+    event["accepted"] = accepted
     DecisionStore(workspace).append("outcome", **event)
     from fusion_labeling import verdict_label
     label = verdict_label(workspace, load_config(workspace)[0], run_id, result, bool(accepted), reason, str(result_path))
@@ -2116,16 +2144,19 @@ def tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "fusion_outcome",
-            "outputSchema": {"type": "object", "properties": {"recorded": {"type": "boolean"}, "task_id": {"type": "string"}, "accepted": {"type": "boolean"}, "label": {"type": "object"}}, "required": ["recorded"]},
-            "description": "Record your verdict on a delegated run after inspecting its diff and tests. Accepted/rejected outcomes rank future automatic routes; a worker's own success claim does not. With a reason, a verdict on a reported success also becomes a local acceptance training label (source lead_verdict).",
+            "outputSchema": {"type": "object", "properties": {"recorded": {"type": "boolean"}, "task_id": {"type": "string"}, "accepted": {"type": "boolean"}, "withdraw": {"type": "boolean"}, "unmeasured": {"type": "boolean"}, "stage": {"type": "string", "enum": ["gate", "verify", "land"]}, "label": {"type": "object"}}, "required": ["recorded"]},
+            "description": "Record a verdict on a run. The latest measured verdict ranks future automatic routes; stages are gate, verify, or land. With a reason, a verdict on a reported success also becomes an acceptance training label. Choose accepted (true/false), withdraw (remove external verdicts and labels, with a reason), or unmeasured (audit a grader failure without changing ranking or labels).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "run_id": {"type": "string", "description": "run_id from the fusion_delegate result."},
                     "accepted": {"type": "boolean"},
+                    "withdraw": {"type": "boolean"},
+                    "unmeasured": {"type": "boolean"},
+                    "stage": {"type": "string", "enum": ["gate", "verify", "land"]},
                     "reason": {"type": "string", "description": "What you verified or why you rejected it. Required for the verdict to become a training label."},
                 },
-                "required": ["run_id", "accepted"],
+                "required": ["run_id"],
             },
         },
         {
@@ -2237,9 +2268,11 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
                     from fusion_decisions import DecisionStore
                     payload = {"decisions": DecisionStore(store.workspace).records()[-max(1, min(50, int(args.get("limit", 10)))):]}
                 elif name == "fusion_outcome":
-                    if not isinstance(args.get("accepted"), bool):
+                    if "accepted" in args and not isinstance(args["accepted"], bool):
                         raise ValueError("accepted must be true or false")
-                    payload = record_outcome(workspace, str(args.get("run_id", "")), args["accepted"], str(args.get("reason", "")))
+                    payload = record_outcome(workspace, str(args.get("run_id", "")), args.get("accepted"),
+                                             str(args.get("reason", "")), stage=args.get("stage"),
+                                             withdraw=args.get("withdraw", False), unmeasured=args.get("unmeasured", False))
                 elif name == "fusion_delegate":
                     agent = args.get("agent")
                     if agent not in {"auto", "codex", "claude", "agy", "grok"}:
@@ -2526,6 +2559,10 @@ def build_parser() -> argparse.ArgumentParser:
     verdict = outcome.add_mutually_exclusive_group(required=True)
     verdict.add_argument("--accepted", dest="accepted", action="store_true")
     verdict.add_argument("--rejected", dest="accepted", action="store_false")
+    verdict.add_argument("--withdraw", action="store_true", help="withdraw external verdicts and labels; requires --reason")
+    verdict.add_argument("--unmeasured", action="store_true", help="record an unscored run without changing routing evidence")
+    outcome.set_defaults(accepted=None)
+    outcome.add_argument("--stage", choices=("gate", "verify", "land"), help="external lifecycle stage; the latest measured verdict wins")
     outcome.add_argument("--reason", default="", help="what you verified; required for the verdict to become an acceptance label")
 
     ultra = sub.add_parser("ultra", help="run a bounded UltraCode-style explore/plan/implement/review pipeline")
@@ -2840,7 +2877,8 @@ def _main(args, parser) -> int:
         lead = args.agent or config.get("lead", "claude")
         return launch_lead(workspace, config, lead, args.task, interactive=args.command == "lead")
     if args.command == "outcome":
-        print(json_text(record_outcome(workspace, args.run_id, args.accepted, args.reason)))
+        print(json_text(record_outcome(workspace, args.run_id, args.accepted, args.reason,
+                                       stage=args.stage, withdraw=args.withdraw, unmeasured=args.unmeasured)))
         return 0
     if args.command == "delegate":
         task = make_task(
