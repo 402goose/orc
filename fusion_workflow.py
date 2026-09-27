@@ -756,7 +756,7 @@ class WorkflowRunner:
             if not isinstance(end_time, (int, float)):
                 continue
             age_ms = now - end_time
-            if 0 <= age_ms <= LANE_COOLDOWN_SECONDS * 1000 and core.quota_failure(span):
+            if 0 <= age_ms <= LANE_COOLDOWN_SECONDS * 1000 and core.failure_class(span) == "quota":
                 self._set_lane(agent, "cooldown", f"a {agent} run reported a quota/session limit {int(age_ms / 1000)}s ago")
 
     def _prompt(self, node: dict[str, Any]) -> str:
@@ -1578,7 +1578,7 @@ BLOCKERS: unresolved issues, or none
                         node["status"] = "pending"
                         self._event("node.switching", {"node_id": node_id, "excluded_routes": node["excluded_routes"],
                                                        "from_route": result.get("route") or result.get("agent"), "reason": core.failure_class(result)})
-                    elif core.quota_failure(result):
+                    elif core.failure_class(result) == "quota":
                         node["status"] = "paused_quota"
                         self._event("node.paused_quota", {"node_id": node_id, "attempt": node["attempts"]})
                         if node["agent"] != "auto":
