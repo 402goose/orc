@@ -712,10 +712,10 @@ class WorkflowRunner:
         run Claude Code against OpenRouter, so a claude.ai quota must not cool
         them down (and theirs must not cool native Claude)."""
         try:
-            launcher = Path(self._agent_command_for(agent, route)).name
+            settings = core.agent_settings(self.config, {"agent": agent, "route": route})
         except ValueError:
-            launcher = agent
-        return f"{agent}@orc" if launcher == "orc" else agent
+            settings = {}
+        return core.lane_key(agent, settings)
 
     def _set_lane(self, agent: str, status: str, reason: str) -> None:
         if self.lane_health.get(agent, {}).get("status") == status:

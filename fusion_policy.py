@@ -144,9 +144,9 @@ def route_candidates(config, task, store, rejected=None):
     for excluded in unhealthy:
         lane = config.get("routes", {}).get(excluded, {})
         agent = lane.get("agent", excluded)
-        settings = {**config.get(agent, {}), **lane}
-        if Path(str(settings.get("command", agent))).name != "orc":
-            unavailable_commands.add((agent, settings.get("command", agent)))
+        settings = core.deep_merge(config.get(agent, {}), lane)
+        if Path(str(settings.get("command", agent))).name != "orc" or core.route_account(settings):
+            unavailable_commands.add((core.lane_key(agent, settings), settings.get("command", agent)))
     seen = set()
     seen_commands = set()
     for span in store.traces(limit=200):
@@ -156,14 +156,14 @@ def route_candidates(config, task, store, rejected=None):
         history[key].append(span)
         agent = span.get("agent")
         lane = config.get("routes", {}).get(span.get("route"), {})
-        settings = {**config.get(agent, {}), **lane}
-        family = (agent, settings.get("command", agent))
+        settings = core.deep_merge(config.get(agent, {}), lane)
+        family = (core.lane_key(agent, settings), settings.get("command", agent))
         if key not in seen and 0 <= time.time() * 1000 - span.get("end_time_ms", 0) < core.LANE_COOLDOWN_SECONDS * 1000:
             if span.get("failure_class") == "quota" or (span.get("failure_class") == "permission_denied"
                                                         and span.get("execution_mode", "restricted") == core.execution_mode(config)
                                                         and core.denial_blocks_lane(span)):
                 unhealthy.add(key)
-                if family not in seen_commands and Path(str(family[1])).name != "orc":
+                if family not in seen_commands and (Path(str(family[1])).name != "orc" or core.route_account(settings)):
                     unavailable_commands.add(family)
         seen.add(key)
         seen_commands.add(family)
@@ -194,7 +194,7 @@ def route_candidates(config, task, store, rejected=None):
             except ValueError as exc:
                 drop(key, str(exc))
                 continue
-        if (agent, settings.get("command", agent)) in unavailable_commands:
+        if (core.lane_key(agent, settings), settings.get("command", agent)) in unavailable_commands:
             drop(key, f"{settings.get('command', agent)} is already known to be unavailable this run")
             continue
         if not core.executable(settings.get("command", agent)):
