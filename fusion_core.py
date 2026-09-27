@@ -1353,7 +1353,16 @@ def _orc_model_ids(command: str, filter_args: list[str]) -> list[str]:
     return ids
 
 
-def select_orc_model(command: str, selector: str, allow_untested: bool = False) -> str | None:
+def excluded_models(settings: dict[str, Any]) -> set[str]:
+    """`exclude_models` of an orc route: model ids its selector never offers."""
+    value = settings.get("exclude_models") or []
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("routes.<name>.exclude_models must be a list of model ids")
+    return set(value)
+
+
+def select_orc_model(command: str, selector: str, allow_untested: bool = False,
+                     exclude: set[str] | frozenset[str] = frozenset()) -> str | None:
     """Ask orc for its current ranked model; never hard-code a volatile model id.
 
     Free/best selectors require a model that already passed `orc probe --fit`
@@ -1365,17 +1374,21 @@ def select_orc_model(command: str, selector: str, allow_untested: bool = False) 
     if selector not in {"free", "best"}:
         return None
     if allow_untested:
-        ranked = _orc_model_ids(command, ["--free", "--tools"] if selector == "free" else ["--tools"])
+        ranked = [model for model in _orc_model_ids(command, ["--free", "--tools"] if selector == "free" else ["--tools"])
+                  if model not in exclude]
         return ranked[0] if ranked else None
-    fitted = fitted_orc_models(command, selector, 1)
+    fitted = fitted_orc_models(command, selector, 1, exclude)
     return fitted[0] if fitted else None
 
 
-def fitted_orc_models(command: str, selector: str, limit: int) -> list[str]:
-    """orc's quality ranking, restricted to models that passed `orc probe --fit`."""
+def fitted_orc_models(command: str, selector: str, limit: int,
+                      exclude: set[str] | frozenset[str] = frozenset()) -> list[str]:
+    """orc's quality ranking, restricted to models that passed `orc probe --fit`
+    and not in `exclude` (a route's exclude_models)."""
     if selector not in {"free", "best"}:
         return []
-    ranked = _orc_model_ids(command, ["--free", "--tools"] if selector == "free" else ["--tools"])
+    ranked = [model for model in _orc_model_ids(command, ["--free", "--tools"] if selector == "free" else ["--tools"])
+              if model not in exclude]
     if selector == "best":
         ranked = [candidate for candidate in ranked if not candidate.endswith(":free")]
     fit_ids = set(_orc_model_ids(command, ["--fit"]))
@@ -1491,6 +1504,7 @@ def agent_command(
                 command,
                 str(settings.get("model_selector", "")),
                 bool(settings.get("allow_untested", False)),
+                excluded_models(settings),
             ) or ""
         if command_name == "orc" and selected_model:
             argv += ["-m", selected_model]

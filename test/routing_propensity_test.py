@@ -52,7 +52,7 @@ class RoutingPropensityTest(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.workspace = Path(temp.name)
-        env = patch.dict(os.environ)
+        env = patch.dict(os.environ, {"ORC_HOME": str(self.workspace / "orc-home")})
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop("FUSION_DECISIONS_MODE", None)
@@ -88,7 +88,7 @@ class RoutingPropensityTest(unittest.TestCase):
         [log] = self.logs()
         self.assertEqual((log["task_id"], log["scope"], log["chosen"], log["explored"]), (task["run_id"], "automatic", "codex", False))
         self.assertEqual(log["policy"], {"rank_by_outcomes": 2, "explore": True, "warm_epsilon": None, "epsilon": 0.0,
-                                         "routing_epsilon": 0.0, "laya_applied": False})
+                                         "routing_epsilon": 0.0, "laya_applied": False, "priors": None})
         self.assertEqual({c["key"]: c["propensity"] for c in log["candidates"]}, {"codex": 1.0, "claude": 0.0})
         self.assertIn("checked_runs", log["candidates"][0])
         self.assertEqual(log["decision_id"], task["decisions"]["routing"])

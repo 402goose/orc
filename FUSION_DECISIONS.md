@@ -112,6 +112,47 @@ it. Interactive lead sessions use their own provider controls.
    A task that names such a route without pinning a model gets its model
    chosen inside that route the same way (when decisions mode is not off);
    the named route itself is never swapped for another lane.
+   `"exclude_models": ["provider/model:free", ...]` on an orc route drops
+   those ids from its selector before arms are taken (and from the model a
+   single-arm route picks at dispatch); a route's pinned `model` is never
+   excluded. See [Lane priors](#lane-priors-from-the-gym-to-routing) for
+   the gym evidence behind excluding two free models.
+
+   **Evidence per work class.** Read-only and writing work differ (the gym
+   shows lanes that localize well and fix poorly, and the reverse), so a
+   lane's local outcomes are counted for the task's class: spans with
+   `write: true` for a writer, `write: false` otherwise. A lane with no
+   verified outcome in that class falls back to all its outcomes pooled
+   (spans recorded without `write` join only the pool). Each candidate
+   carries `checked_runs_local`, `acceptance_rate_local` and `local_class`
+   (`write`, `read`, `pooled`, or null with no evidence).
+
+   **Gym priors.** When a lane priors file exists (see
+   [Lane priors](#lane-priors-from-the-gym-to-routing)), each candidate's
+   gym record for the task's class is added as pseudo-counts before
+   ranking: `prior_attempts = min(weight x gym attempts, cap)` and
+   `prior_successes = prior_attempts x gym success rate`. `checked_runs`
+   and `acceptance_rate`, which ranking and the exploration minimum read,
+   are local plus prior; the `*_local` fields are local only, and `prior`
+   names the matched entry (`key`, `match`, `class`, `gym_attempts`,
+   `gym_successes`, `mean_cost_usd`, `mean_seconds`, `generated_at`). The
+   budget filter and `mean_cost_usd` stay local. Configuration:
+
+   ```json
+   "decisions": {"priors": {"path": "~/.config/orc/lane_priors.json", "weight": 0.5, "cap": 10}}
+   ```
+
+   All keys are optional; these are the defaults, the path being
+   `lane_priors.json` under `ORC_HOME`. `"priors": false` turns priors
+   off. A missing file means no priors; a file that is not
+   `fusion.lane_priors.v1` is an error. Why these defaults: a gym task is
+   ORC's own repository graded by hidden tests, not this workspace's work,
+   so one gym attempt is worth half a local verified outcome; and no lane's
+   gym record counts for more than 10 local outcomes, so after 10 local
+   outcomes local evidence carries at least half the weight and after 30,
+   three quarters. With the default minimum of 3, a lane needs 6 counted
+   gym attempts in a class to skip forced exploration on gym evidence
+   alone.
 
    Delegations have no acceptance gate. After inspecting one, the lead
    records its verdict so it counts:
@@ -231,14 +272,20 @@ nothing is logged and nothing explores.
 {"event": "routing_log", "task_id": "RUN_ID", "group": "...", "decision_id": "... or null",
  "scope": "automatic | route_arms", "write": false, "role": "implementation",
  "policy": {"rank_by_outcomes": 3, "explore": true, "warm_epsilon": null,
-            "epsilon": 0.1, "routing_epsilon": 0.1, "laya_applied": false},
- "candidates": [{"key": "codex", "checked_runs": 4, "acceptance_rate": 0.75, "...": "...", "propensity": 0.95},
-                {"key": "claude", "checked_runs": 0, "...": "...", "propensity": 0.05}],
+            "epsilon": 0.1, "routing_epsilon": 0.1, "laya_applied": false,
+            "priors": {"path": "~/.config/orc/lane_priors.json", "weight": 0.5, "cap": 10,
+                       "generated_at": "2026-09-26T04:30:00Z"}},
+ "candidates": [{"key": "codex", "checked_runs": 4, "acceptance_rate": 0.75, "checked_runs_local": 4,
+                 "acceptance_rate_local": 0.75, "local_class": "read", "prior_attempts": 0, "...": "...", "propensity": 0.95},
+                {"key": "claude", "checked_runs": 0, "prior_attempts": 0, "...": "...", "propensity": 0.05}],
  "chosen": "codex", "explored": false}
 ```
 
 `candidates` is the final ranked order with the same evidence fields Laya's
-routing decision sees. `policy.rank_by_outcomes` is the minimum checked
+routing decision sees, local and gym evidence side by side
+(`checked_runs_local`, `prior_attempts`, `prior`). `policy.priors` is the
+priors configuration that applied, or `null` when no priors file was
+loaded. `policy.rank_by_outcomes` is the minimum checked
 runs (`null` when ranking is off), `explore` whether unproven lanes led the
 ranking, `epsilon` the exploration rate actually applied to this choice and
 `routing_epsilon` the configured one. `propensity` is the probability this
@@ -1037,6 +1084,8 @@ orc fusion gym run ~/orc-gym/tasks --workspace ~/orc-gym/ws \
   --lanes claude-sonnet-high claude-opus-high claude-fable-medium agy --budget-usd 10
 # 3. Per-mode, per-lane and per-task results.
 orc fusion gym report ~/orc-gym/ws
+# 4. Export per-lane priors that automatic routing in every workspace reads.
+orc fusion gym priors ~/orc-gym/ws
 ```
 
 **Hidden vs visible.** The first live batch (4 tasks x 4 lanes, visible
@@ -1438,6 +1487,118 @@ files is graded as a miss, as in SWE-bench localization. Symbols are
 resolved for Python only; other files are graded by path. The worker's
 tree is B, so the same network and neighbouring-directory leaks as hidden
 fix runs apply.
+
+### Lane priors: from the gym to routing
+
+**Why.** The gym is its own workspace, and automatic routing ranks lanes
+only from the current workspace's traces and outcomes, so nothing the gym
+measured reached real routing. `gym priors` exports it, and
+`route_candidates` in every workspace reads it (see Routing, above).
+
+```sh
+orc fusion gym priors ~/orc-gym/ws                  # writes ~/.config/orc/lane_priors.json (ORC_HOME)
+orc fusion gym priors ~/orc-gym/ws --out /tmp/p.json # elsewhere; --out - prints only
+```
+
+It reads `results.jsonl` only (it writes neither `audit.json` nor labels)
+and writes `fusion.lane_priors.v1`:
+
+```json
+{"schema": "fusion.lane_priors.v1", "source": "gym", "gym": "...", "generated_at": "2026-09-26T04:30:00Z",
+ "excluded": {"partial": 2, "unsolved_by_all": 45}, "unsolved_by_all": {"hidden": ["pr-60", "..."], "localize": ["pr-81", "pr-89"]},
+ "priors": {"claude:claude-opus-5-5:high": {"agent": "claude", "route": null, "model": "claude-opus-5-5",
+            "reasoning_effort": "high", "gym_lanes": ["claude-opus-high"],
+            "write": {"attempts": 7, "successes": 5, "mean_cost_usd": 1.318, "mean_seconds": 316.9,
+                      "source": "gym", "generated_at": "2026-09-26T04:30:00Z"}}}}
+```
+
+**What counts.** The latest completed row per result key, hidden modes
+only (`visible` measures making given tests pass):
+
+- `write` (kind `fix`, both `hidden` and `hidden+hints`): `solved` is a
+  success, `unsolved` and `regressed` failures. `invalid_baseline`
+  (measured the machine) and `tampered` are excluded; `unavailable`,
+  paused and interrupted runs are not completed and never count.
+- `read` (kind `localize`): `localized` is a success; `missed` and
+  `invalid_answer` are failures. An invalid answer stays unlabeled for
+  Laya (a format failure is a parser fact, not a judgment of content), but
+  for routing it is what it looks like: the lane was given a read-only
+  task and returned nothing usable. `partial` is excluded, as it is from
+  labels: it is neither a success nor a miss.
+- Rows on a task no lane solved in that hidden mode (fix) or no lane
+  localized (localize) are excluded, by the same criterion as the
+  solvability audit: an underspecified task says nothing about a lane.
+  This also puts the rates on "tasks that can be done from the prompt",
+  closer in scale to local gate acceptance.
+
+`mean_cost_usd` and `mean_seconds` are over the counted rows (cost is what
+the workflow reported; rows from before #116 price `:free` OpenRouter
+models at Anthropic rates).
+
+**Mapping lanes to candidates.** Each entry is keyed for reading as the
+routing key such a lane would carry (the route, `route:model` for an arm,
+else the agent, then any pinned model and effort), but matching is by the
+tuple, never the name. A candidate matches the entry with its exact
+`(agent, route, model, reasoning_effort)` (empty values as null), else
+the entries with its `(agent, model, reasoning_effort)` pooled across
+route names: route names are workspace-local labels, and a route that pins
+the same agent, model and effort as a gym lane runs the same lane. So:
+
+- a bare agent lane (`agy`, `{"agent": "agy"}`) matches the automatic
+  `agy` candidate when that workspace pins no model for agy;
+- an orc route arm (`free-dots`, `{"agent": "claude", "route":
+  "orc-free", "model": "dots-studio/...:free"}`) matches the
+  `orc-free:dots-studio/...:free` arm, or any route's arm with that model;
+- a pinned-model lane that is not a route (`claude-opus-high`, `{"agent":
+  "claude", "model": "claude-opus-5-5", "reasoning_effort": "high"}`)
+  matches only a candidate with that model and effort. Automatic routing
+  offers bare agents and configured routes, so to use it, configure a
+  route that pins the pair, e.g. `"routes": {"opus-high": {"agent":
+  "claude", "model": "claude-opus-5-5", "reasoning_effort": "high"}}`. A
+  bare `claude` candidate (its default model) has no prior unless the gym
+  ran a bare `claude` lane.
+
+**On the real gym (2026-09-26: 143 completed hidden-mode results, 96 counted).**
+
+| Lane (gym name) | Class | Counted | Successes | Rate | Pseudo-counts (0.5, cap 10) | Mean s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `agy` | write | 9 | 7 | 0.78 | 4.5 | 605 |
+| `agy-flash-low` | write | 4 | 3 | 0.75 | 2.0 | 1443 |
+| `agy-flash-medium` | write | 5 | 3 | 0.60 | 2.5 | 654 |
+| `agy-flash-medium` | read | 16 | 16 | 1.00 | 8.0 | 207 |
+| `claude-fable-medium` | write | 8 | 5 | 0.62 | 4.0 | 411 |
+| `claude-opus-high` | write | 7 | 5 | 0.71 | 3.5 | 317 |
+| `claude-opus-medium` | read | 8 | 7 | 0.88 | 4.0 | 27 |
+| `claude-sonnet-high` | write | 8 | 4 | 0.50 | 4.0 | 789 |
+| `claude-sonnet-high` | read | 7 | 7 | 1.00 | 3.5 | 119 |
+| `free-cohere` | read | 8 | 0 | 0.00 | 4.0 | 274 |
+| `free-dots` | read | 9 | 7 | 0.78 | 4.5 | 926 |
+| `free-nemotron` | read | 7 | 0 | 0.00 | 3.5 | 302 |
+
+Excluded: 45 rows on tasks no lane solved or localized (hidden: pr-60,
+71, 72, 79, 81, 87, 88, 98, 103, 105; hidden+hints: pr-72, 88, 105;
+localize: pr-81, 89) and 2 partial localizations. The free lanes never
+completed a fix run (every one was unavailable), so they have no `write`
+prior.
+
+**Excluding models from orc-free.** Cohere and Nemotron returned no usable
+localization in 15 counted attempts (every one `invalid_answer`). The
+recommended global config (`~/.config/orc/fusion.json`), not applied
+automatically:
+
+```json
+{"routes": {"orc-free": {"agent": "claude", "command": "orc", "model_selector": "free",
+                         "permission_mode": "plan", "permission_prompts": "none", "max_budget_usd": 0.1,
+                         "exclude_models": ["cohere/north-mini-code:free",
+                                            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"]}}}
+```
+
+**Caveats.** The gym's tasks are ORC's own fixes; its lanes ran under the
+gym's `.fusion.json` (yolo there), so a lane's prior describes it on that
+distribution and those permissions. Priors carry no recency: re-export
+after new gym runs. An unmeasured lane still scores the uninformative
+`(0 + 1) / (0 + 2)` in ranking, so with `explore` off a lane with no
+evidence can outrank one with a measured rate below one half.
 
 ## Run the loop without the UI
 
