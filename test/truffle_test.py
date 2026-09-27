@@ -68,7 +68,7 @@ class TruffleTest(unittest.TestCase):
 
     def saved_hunt(self, count=2):
         scout_id = "truffle-123456789abc"
-        rows, _ = truffle.parse_assessment("```truffle\n" + json.dumps({"candidates": [candidate(n) for n in range(1, count+1)], "skipped": []}) + "\n```", self.issues[:count], count, self.workspace)
+        rows, _, _ = truffle.parse_assessment("```truffle\n" + json.dumps({"candidates": [candidate(n) for n in range(1, count+1)], "skipped": []}) + "\n```", self.issues[:count], count, self.workspace)
         record = dict(id=scout_id, status="ready", repo="fixture/project", head=pub.text(self.workspace, "rev-parse", "HEAD"),
                       candidates=rows, skipped=[], target=count, scanned=count, started_at_ms=core.now_ms())
         pub.save(truffle.root_for(self.workspace, scout_id) / "hunt.json", record)
@@ -101,6 +101,60 @@ class TruffleTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "explicit agent or route"):
             truffle.hunt_options(agent="auto", model="free/model")
 
+    def test_hunt_keeps_valid_candidates_before_and_after_bad_quotes(self):
+        for number in (1, 2, 3):
+            with self.subTest(number=number):
+                rows = [candidate(n) for n in (1, 2, 3)]
+                rows[number - 1]["evidence"].append(dict(path="app.txt", line=1, quote="made up"))
+                value = dict(candidates=rows, skipped=[dict(number=4, reason="Not tractable")])
+                with patch.object(core, "dispatch", side_effect=self.draft_worker(value)):
+                    result = truffle.hunt(self.workspace, self.config, count=3)
+                self.assertEqual(result["status"], "ready", result)
+                self.assertEqual([r["number"] for r in result["candidates"]], [n for n in (1, 2, 3) if n != number])
+                self.assertEqual(result["skipped"], value["skipped"])
+                self.assertEqual(result["rejected"], [dict(number=number, title=issue(number)["title"],
+                                                        reason="Source quote could not be verified: app.txt:1")])
+                saved = pub.read(truffle.root_for(self.workspace, result["id"]) / "hunt.json")
+                self.assertEqual(saved, result)
+
+    def test_hunt_fails_when_every_candidate_has_an_unverifiable_quote(self):
+        rows = [candidate(n) for n in (1, 2)]
+        rows[0]["evidence"].insert(0, dict(path="app.txt", line=1, quote="made up"))
+        rows[1]["evidence"][0].update(line=99)
+        value = dict(candidates=rows, skipped=[dict(number=n, reason="Not tractable") for n in (3, 4)])
+        with patch.object(core, "dispatch", side_effect=self.draft_worker(value)):
+            result = truffle.hunt(self.workspace, self.config, count=2)
+        self.assertEqual(result["status"], "failed", result)
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(result["skipped"], value["skipped"])
+        self.assertIn("No candidate survived", result["message"])
+        self.assertEqual(result["rejected"], [dict(number=n, title=issue(n)["title"],
+                                                reason=f"Source quote could not be verified: app.txt:{line}")
+                                              for n, line in ((1, 1), (2, 99))])
+        saved = pub.read(truffle.root_for(self.workspace, result["id"]) / "hunt.json")
+        self.assertEqual(saved, result)
+
+    def test_quote_verification_uses_the_cited_line_range(self):
+        (self.workspace / "app.txt").write_text("before\nafter\n")
+        rows = [candidate(n) for n in (1, 2, 3)]
+        rows[0]["evidence"][0].update(line=2)
+        rows[1]["evidence"][0].update(end_line=3)
+        value = dict(candidates=rows, skipped=[])
+        parsed, skipped, rejected = truffle.parse_assessment("```truffle\n" + json.dumps(value) + "\n```",
+                                                           self.issues[:3], 3, self.workspace)
+        self.assertEqual([r["number"] for r in parsed], [3])
+        self.assertEqual(skipped, [])
+        self.assertEqual([r["number"] for r in rejected], [1, 2])
+
+    def test_hunt_can_skip_every_issue_without_quote_rejections(self):
+        value = dict(candidates=[], skipped=[dict(number=n, reason="Not tractable") for n in (1, 2, 3, 4)])
+        with patch.object(core, "dispatch", side_effect=self.draft_worker(value)):
+            result = truffle.hunt(self.workspace, self.config)
+        self.assertEqual(result["status"], "ready", result)
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(result["rejected"], [])
+        self.assertEqual(result["skipped"], value["skipped"])
+
     def test_zero_candidates_and_github_failures_are_explicit(self):
         self.issues = []
         with patch.object(core, "dispatch", side_effect=AssertionError("No worker needed")):
@@ -112,12 +166,10 @@ class TruffleTest(unittest.TestCase):
         self.assertEqual(failed["status"], "failed")
         self.assertIn("gh auth failed", failed["message"])
 
-    def test_fabricated_quotes_unknown_issues_and_scope_are_rejected(self):
+    def test_unknown_issues_and_invalid_scope_are_rejected(self):
         base = dict(candidates=[candidate(1)], skipped=[])
         mutations = [lambda v: v["candidates"][0].update(number=999),
-                     lambda v: v["candidates"][0]["evidence"][0].update(quote="made up"),
                      lambda v: v["candidates"][0]["evidence"][0].update(path="../outside"),
-                     lambda v: v["candidates"][0]["evidence"][0].update(line=99),
                      lambda v: v["candidates"][0].update(verification=[]),
                      lambda v: v["candidates"].append(candidate(1)),
                      lambda v: v["candidates"][0].update(risk="high")]

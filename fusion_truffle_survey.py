@@ -179,7 +179,9 @@ def parse_grades(answer, issues, workspace):
             candidate = grade.get("candidate")
             if not isinstance(candidate, dict) or candidate.get("number") != number:
                 raise ValueError("Ripe and promising grades require a matching candidate")
-            parsed, _ = truffle.parse_assessment("```truffle\n" + json.dumps({"candidates": [candidate], "skipped": []}) + "\n```", [known[number]], 1, workspace)
+            parsed, _, rejected = truffle.parse_assessment("```truffle\n" + json.dumps({"candidates": [candidate], "skipped": []}) + "\n```", [known[number]], 1, workspace)
+            if rejected:
+                raise ValueError(rejected[0]["reason"])
             if grade["grade"] == "A" and (parsed[0]["effort"] != "small" or parsed[0]["risk"] != "low"):
                 raise ValueError("Ripe grades require small effort and low risk")
             candidates.append({**parsed[0], "grade": grade["grade"]})
