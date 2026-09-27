@@ -32,6 +32,7 @@ class ClaudeNativeProbe(unittest.TestCase):
             )
             argv, _, _ = core.agent_command(core.DEFAULTS, task, None)
             argv[argv.index("--output-format") + 1] = "stream-json"
+            argv.remove("--verbose")  # Keep the deliberate local validation failure.
             env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "CLAUDE_CONFIG_DIR": directory,
                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_TELEMETRY": "1"}
             prefix = [shutil.which("sandbox-exec"), "-p", "(version 1) (allow default) (deny network*)"]
