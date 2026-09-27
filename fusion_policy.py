@@ -197,8 +197,8 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None):
     headroom = {entry["lane_key"]: quota_assessment(entry, thresholds, now / 1000)
                 for entry in usage.headroom(store.workspace, include_raw=False) if entry.get("lane_key") and entry.get("quota")}
     history = defaultdict(list)
-    outcomes = {event["task_id"]: event["accepted"] for event in read_jsonl(DecisionStore(store.workspace).path)
-                if event.get("event") == "outcome"}
+    outcomes = {run_id: event["accepted"] for run_id, event in
+                effective_outcomes(read_jsonl(DecisionStore(store.workspace).path)).items()}
     unhealthy = set(task.get("excluded_routes", []))
     unavailable_commands = set()
     for excluded in unhealthy:
@@ -562,6 +562,27 @@ def route_task(config, task, store, rng=None):
                             chosen=selected["key"], explored=explored)
 
 
+def effective_outcomes(events):
+    """One measured outcome per run, in append order, excluding withdrawn leads.
+
+    Keep independent gate evidence so withdrawing the external lifecycle restores
+    it, without reviving an earlier external stage. Unmeasured events are audit-only.
+    """
+    independent, external = {}, {}
+    for index, event in enumerate(events):
+        run_id = event.get("task_id")
+        if not run_id:
+            continue
+        if event.get("event") == "outcome_withdraw" and event.get("source") == "lead":
+            external.pop(run_id, None)
+        elif event.get("event") == "outcome" and isinstance(event.get("accepted"), bool):
+            target = external if event.get("source") == "lead" else independent
+            target[run_id] = (index, event)
+    return {run_id: max((table[run_id] for table in (independent, external) if run_id in table),
+                        key=lambda item: item[0])[1]
+            for run_id in independent.keys() | external.keys()}
+
+
 def routing_report(events):
     """Per-lane acceptance from logged routing choices, inverse-propensity weighted.
 
@@ -572,12 +593,11 @@ def routing_report(events):
     lane) / available, `snips_acceptance` normalises by the summed weights, and
     `ess` is (sum w)^2 / sum w^2. A lane given propensity 0 in any of those
     choices has no overlap there, so neither estimate is reported for it."""
-    logs, outcomes, vetoed, sources = {}, {}, 0, {}
+    events = list(events)
+    logs, outcomes, vetoed, sources = {}, effective_outcomes(events), 0, {}
     for event in events:
         if event.get("event") == "routing_log" and event.get("task_id"):
             logs[event["task_id"]] = event
-        elif event.get("event") == "outcome" and event.get("task_id"):
-            outcomes[event["task_id"]] = event
     lanes = {}
     joined = 0
     for task_id, log in logs.items():

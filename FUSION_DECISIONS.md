@@ -165,6 +165,33 @@ it. Interactive lead sessions use their own provider controls.
    MCP leads call `fusion_outcome` with `run_id`, `accepted` and `reason`.
    The latest verdict for a run wins. A verdict with a reason also becomes
    an acceptance label; see [Learn from verified runs](#learn-from-verified-runs).
+
+   An external lifecycle (e.g. a build system with frozen acceptance suites)
+   reports through the same command:
+
+   ```sh
+   fusion outcome RUN_ID --accepted --stage gate --reason "frozen suite passed"
+   fusion outcome RUN_ID --rejected --stage land --reason "merge validation failed"
+   fusion outcome RUN_ID --unmeasured --reason "grader infra error"
+   fusion outcome RUN_ID --withdraw --reason "grader dispute upheld"
+   ```
+
+   - `--stage gate|verify|land` is recorded with the verdict. Stages are not
+     ordered: the latest measured verdict in append order wins, so a later
+     `land` rejection overrides an earlier `gate` acceptance.
+   - `--unmeasured` writes an `outcome_unmeasured` audit event. It is not a
+     rejection and changes neither route ranking nor labels.
+   - `--withdraw` requires `--reason`. It writes an `outcome_withdraw` audit
+     event, drops every lead verdict for the run from route ranking, and
+     retracts its `lead_verdict` labels through the same path the gym uses
+     for untrusted gate labels. Workflow gate outcomes and gate, human or
+     council labels on the run are kept, so ranking returns to what it was
+     before the external verdicts.
+
+   Exactly one of `--accepted`, `--rejected`, `--unmeasured` or `--withdraw`
+   is required. MCP `fusion_outcome` takes the same fields: exactly one of
+   `accepted`, `withdraw: true` or `unmeasured: true`, plus optional `stage`
+   and `reason`. All are recorded in the control workspace's store.
 3. **Recovery:** classifies actual acceptance results as continue, repair,
    switch, ask or stop. A classifier cannot accept a failed check, bypass a
    permission denial, increase attempts, or discard prior spend. A qualified

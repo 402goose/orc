@@ -748,10 +748,12 @@ def withdraw_untrusted_label(gym, row):
     label = row.get("gate_label") or {}
     if row.get("verdict") not in {"tampered", "invalid_baseline"} or label.get("status") != "labeled":
         return label
-    from fusion_decisions import DecisionStore
-    DecisionStore(gym).append("label", id=label["decision_id"], answers={}, verified=True, replace=True,
-                              source="structural_gate",
-                              evidence=f"Retracted by gym: verdict {row['verdict']} on {row['key']}.")
+    from fusion_decisions import DecisionStore, read_jsonl
+    from fusion_labeling import withdraw_untrusted_label as retract_label
+    store = DecisionStore(gym)
+    with store.review_lock():
+        retract_label(store, label["decision_id"], "structural_gate",
+                      f"Retracted by gym: verdict {row['verdict']} on {row['key']}.", read_jsonl(store.path))
     return {**label, "status": "retracted", "reason": f"gym verdict {row['verdict']}"}
 
 

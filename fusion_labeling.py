@@ -578,6 +578,52 @@ def gate_label(config, workspace, record, codes, receipts):
     return {"status": "labeled", "decision_id": record["id"], "answers": answers, "source": GATE_SOURCE, "reason": reason}
 
 
+def withdraw_untrusted_label(store, decision_id, source, evidence, events):
+    """Append a source's retraction, preserving other active reviewers' answers.
+
+    Shared by the gym audit and external verdict withdrawal. The caller holds
+    review_lock; events is its snapshot of the decision log before retraction.
+    """
+    active = {}
+    for event in events:
+        if event.get("event") != "label" or event.get("id") != decision_id or not event.get("verified"):
+            continue
+        if event.get("replace"):
+            active.clear()
+        for key, value in event.get("answers", {}).items():
+            active[key] = (value, event)
+    store.append("label", id=decision_id, answers={}, verified=True, replace=True,
+                 source=source, evidence=evidence)
+    preserved = set()
+    for key, (value, event) in active.items():
+        if event.get("source", "human") != source:
+            # Carry provenance with the surviving answer, including suggestion
+            # and council metadata; never attribute it to the withdrawn grader.
+            payload = {k: v for k, v in event.items() if k not in {"event", "schema", "time_ms", "answers", "replace"}}
+            store.append("label", **payload, answers={key: value}, replace=False)
+            preserved.add(key)
+    if source == VERDICT_SOURCE:
+        restore_gate_labels(store, decision_id, events, preserved)
+
+
+def withdraw_verdict_labels(workspace, run_id, reason):
+    """Retract every external acceptance label for a run, even if labeling is off."""
+    store = DecisionStore(workspace)
+    withdrawn = []
+    with store.review_lock():
+        events = read_jsonl(store.path)
+        decisions = {e["id"] for e in events if e.get("event") == "decision" and e.get("kind") == "acceptance"
+                     and e.get("context", {}).get("task_id") == run_id}
+        for decision_id in sorted(decisions):
+            own = [e for e in events if e.get("event") == "label" and e.get("id") == decision_id
+                   and e.get("verified") and e.get("source") == VERDICT_SOURCE]
+            if own and own[-1].get("answers"):
+                withdraw_untrusted_label(store, decision_id, VERDICT_SOURCE,
+                                         f"External verdict withdrawn on run {run_id}: {reason}", events)
+                withdrawn.append(decision_id)
+    return {"status": "retracted" if withdrawn else "unchanged", "decision_ids": withdrawn, "reason": reason}
+
+
 def restore_gate_labels(store, record_id, events, answered):
     """After a lead verdict replaces its labels on an input, put back the gate's
     answers for questions the verdict did not answer, still as structural_gate
