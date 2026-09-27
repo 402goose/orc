@@ -25,6 +25,7 @@ from typing import Any, Iterator
 
 from fusion_decisions import DEFAULTS as DECISION_DEFAULTS
 import fusion_progress as progress
+from fusion_usage import event_quota
 from fusion_reasoning import EFFORTS, validate_pair
 
 
@@ -38,6 +39,7 @@ DEFAULTS: dict[str, Any] = {
     "sidekick": "codex",
     "timeout_seconds": 3600,
     "max_result_chars": 12000,
+    "quota": {"pace_margin": 0.15, "soft": 0.85, "hard": 0.97},
     "telemetry": {
         "enabled": True,
         "include_content": False,
@@ -610,7 +612,7 @@ def provider_denials(agent: str, stdout: str) -> list[dict[str, str]]:
     if agent not in {"claude", "agy"}:
         return []
     try:
-        value = json.loads(stdout)
+        value = claude_result(stdout) if agent == "claude" else json.loads(stdout)
     except (TypeError, ValueError):
         return []
     if not isinstance(value, dict):
@@ -932,6 +934,7 @@ class RunStore:
             "write": task.get("write", False),
             "execution_choice": result.get("execution_choice"),
             "usage": result.get("usage") or {},
+            **({"quota": result["quota"]} if result.get("quota") is not None else {}),
             "session_key": task.get("session_key"),
             **({"lane_key": metadata["lane_key"]} if metadata.get("lane_key") else {}),
             "resumed": bool(result.get("resumed")),
@@ -1218,11 +1221,37 @@ def claude_final_thinking(session_id: str) -> str:
     return ""
 
 
-def parse_claude_output(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None, list[str]]:
+def claude_result(stdout: str):
+    """The final result has the same schema in JSON and verbose stream JSON."""
     try:
-        value = json.loads(stdout)
+        return json.loads(stdout)
     except json.JSONDecodeError:
-        return None, stdout.strip(), None, {}, None, []
+        result = None
+        for line in stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict) and event.get("type") == "result":
+                result = event
+        return result
+
+
+def parse_quota(agent: str, stdout: str):
+    quota = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        observed = event_quota(agent, event)
+        if observed is not None:
+            quota = observed
+    return quota
+
+
+def parse_claude_output(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None, list[str]]:
+    value = claude_result(stdout)
     if not isinstance(value, dict):
         return None, stdout.strip(), None, {}, None, []
     session_id = value.get("session_id")
@@ -1549,7 +1578,7 @@ def agent_command(
             ) or ""
         if command_name == "orc" and selected_model:
             argv += ["-m", selected_model]
-        argv += ["-p", "--output-format", "json"]
+        argv += ["-p", "--output-format", "stream-json", "--verbose"]
         if yolo:
             argv += ["--dangerously-skip-permissions", "--settings", '{"sandbox":{"enabled":false}}']
             if command_name == "orc":
@@ -1840,6 +1869,9 @@ def dispatch(
         },
     }
     ended_at_ms = now_ms()
+    quota = parse_quota(task["agent"], worker_stdout)
+    if quota is not None:
+        result["quota"] = quota
     store.touch_session(task["session_key"], ended_at_ms)
     verdict = classify_verdict(result)
     result.update(verdict=verdict["verdict"], verdict_reason=verdict.get("reason"), resets_at=verdict.get("resets_at"))

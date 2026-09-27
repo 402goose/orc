@@ -224,7 +224,48 @@ def account_identity(*items):
     return None
 
 
-def headroom(workspace=None, *, codex_home=None):
+def normalize_quota(provider, value, *, normalized=False):
+    """Normalize recorded provider windows, rejecting malformed numeric values."""
+    if not isinstance(value, dict):
+        return None
+    raw = value.get("windows" if normalized else "unifiedWindows", {}) if provider == "claude" or normalized else value
+    windows = {}
+    for name, window in raw.items() if isinstance(raw, dict) else []:
+        if not isinstance(window, dict):
+            continue
+        used = window.get("used" if normalized else "utilization" if provider == "claude" else "used_percent")
+        scale = 100 if provider == "codex" and not normalized else 1
+        valid = isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used) and 0 <= used <= scale
+        reset = timestamp(window.get("resetsAt" if provider == "claude" and not normalized else "resets_at"))
+        if not valid and reset is None:
+            continue
+        entry = {"used": used / scale if valid else None, "resets_at": reset.timestamp() if reset else None}
+        minutes = window.get("window_minutes")
+        if isinstance(minutes, (int, float)) and not isinstance(minutes, bool) and math.isfinite(minutes) and minutes > 0:
+            entry["window_minutes"] = minutes
+        windows[name] = entry
+    status = value.get("status")
+    status = status if isinstance(status, str) else None
+    return {"windows": windows, "status": status} if windows or status else None
+
+
+def event_quota(provider, event):
+    """Exec events and rollout/RunStore envelopes share the same normalizer."""
+    if not isinstance(event, dict):
+        return None
+    if provider == "claude" and event.get("type") == "rate_limit_event":
+        return normalize_quota(provider, event.get("rate_limit_info"))
+    if provider == "codex" and isinstance(event.get("rate_limits"), dict):
+        return normalize_quota(provider, event["rate_limits"])
+    for key in ("payload", "event"):
+        if isinstance(event.get(key), dict):
+            quota = event_quota(provider, event[key])
+            if quota is not None:
+                return quota
+    return None
+
+
+def headroom(workspace=None, *, codex_home=None, include_raw=True):
     """Latest known quota windows per recorded account, independent of --since.
 
     Missing identities/windows stay null. Observations without timestamps use
@@ -254,7 +295,30 @@ def headroom(workspace=None, *, codex_home=None):
         except OSError:
             return datetime.min.replace(tzinfo=UTC)
 
-    for path in sorted((codex_root(codex_home) / "sessions").rglob("*.jsonl")):
+    def observe_trace(trace, source):
+        provider, lane = trace.get("agent"), trace.get("lane_key")
+        quota = normalize_quota(provider, trace.get("quota"), normalized=True)
+        when = timestamp(trace.get("end_time_ms")) or timestamp(trace.get("timestamp"))
+        if (provider not in {"claude", "codex"} or not isinstance(lane, str)
+                or not (lane == provider or lane.startswith(provider + "@")) or quota is None or when is None):
+            return
+        # Keep the usage reader's original provider-shaped windows for callers.
+        windows = {}
+        for name, window in quota["windows"].items():
+            windows[name] = ({"utilization": window["used"], "resetsAt": window["resets_at"]}
+                             if provider == "claude" else
+                             {"used_percent": window["used"] * 100 if window["used"] is not None else None,
+                              "window_minutes": window.get("window_minutes"), "resets_at": window["resets_at"]})
+        observe(provider, lane, windows, when, source)
+        entry = accounts[provider, lane]
+        if not entry.get("observed_at") or timestamp(entry["observed_at"]) <= when:
+            entry.update(lane_key=lane, quota=quota, observed_at=iso(when), source=str(source))
+
+    ledger = Path(workspace or Path.cwd()) / ".fusion" / "traces.jsonl"
+    for trace in json_lines(ledger):
+        observe_trace(trace, ledger)
+
+    for path in sorted((codex_root(codex_home) / "sessions").rglob("*.jsonl")) if include_raw else []:
         account = None
         for event in json_lines(path):
             payload = event.get("payload")
@@ -270,6 +334,9 @@ def headroom(workspace=None, *, codex_home=None):
         if not run.is_dir():
             continue
         trace = json_object(run / "trace.json")
+        observe_trace(trace, run / "trace.json")
+        if not include_raw:
+            continue
         task = json_object(run / "task.json")
         result = json_object(run / "result.json")
         account = account_identity(trace, task, result)

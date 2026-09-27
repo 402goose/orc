@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
+import math
 from pathlib import Path
 import random
 import time
@@ -10,6 +11,7 @@ import time
 from fusion_decisions import (DecisionEngine, DecisionStore, ACCEPTANCE_QUESTIONS, RECOVERY_QUESTIONS, REVIEW_QUESTIONS,
                               acceptance_state, read_jsonl, state_cap)
 import fusion_progress as progress
+import fusion_usage as usage
 
 
 def context(task):
@@ -121,7 +123,62 @@ def priors_policy(config):
     return {**settings, "generated_at": index["generated_at"]} if index else None
 
 
-def route_candidates(config, task, store, rejected=None):
+def quota_settings(config):
+    settings = {"pace_margin": .15, "soft": .85, "hard": .97, **(config.get("quota") or {})}
+    for name in ("pace_margin", "soft", "hard"):
+        value = settings[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"quota.{name} must be a fraction between 0 and 1")
+    if settings["soft"] > settings["hard"]:
+        raise ValueError("quota.soft must not exceed quota.hard")
+    return settings
+
+
+def quota_assessment(observation, thresholds, now):
+    """Expired windows impose no constraint; unknown duration disables pacing."""
+    quota = observation["quota"]
+    reasons, tight, exhausted = [], False, False
+    windows = {}
+    # A rejection lasts until the most-used window resets, not the longest one.
+    timed = [(name, window) for name, window in quota["windows"].items() if usage.timestamp(window.get("resets_at"))]
+    binding = min(timed, key=lambda item: (-(item[1].get("used") if item[1].get("used") is not None else -1),
+                                           usage.timestamp(item[1]["resets_at"]).timestamp()), default=(None, None))[0]
+    for name, window in quota["windows"].items():
+        reset = usage.timestamp(window.get("resets_at"))
+        active = reset is None or reset.timestamp() > now
+        minutes = window.get("window_minutes") or {"five_hour": 300, "seven_day": 10080}.get(name)
+        elapsed = max(0, min(1, 1 - (reset.timestamp() - now) / (minutes * 60))) if reset and minutes else None
+        windows[name] = {**window, "active": active, "elapsed": elapsed}
+        if not active:
+            continue
+        if quota.get("status") == "rejected" and name == binding:
+            exhausted = True
+            reasons.append(f"{name}: rejected until {usage.iso(reset)}")
+        used = window.get("used")
+        if used is None:
+            continue
+        if used > thresholds["hard"]:
+            exhausted = True
+            reasons.append(f"{name}: used {used:.3f} exceeds hard {thresholds['hard']:.3f}")
+        if used > thresholds["soft"]:
+            tight = True
+            reasons.append(f"{name}: used {used:.3f} exceeds soft {thresholds['soft']:.3f}")
+        if elapsed is not None and used > elapsed + thresholds["pace_margin"]:
+            tight = True
+            reasons.append(f"{name}: used {used:.3f} exceeds elapsed {elapsed:.3f} + pace_margin {thresholds['pace_margin']:.3f}")
+    return {"lane_key": observation["lane_key"], "windows": windows, "status": quota.get("status"),
+            "classification": "exhausted" if exhausted else "tight" if tight else "available",
+            "reasons": reasons or ["within quota thresholds" if any(w["active"] for w in windows.values()) else "no active quota windows"],
+            "thresholds": thresholds, "observed_at": observation.get("observed_at"), "source": observation.get("source")}
+
+
+def rank_by_quota(candidates):
+    # All candidates in a routing decision have already passed this work class's
+    # eligibility checks. Stable sorting preserves every existing tie breaker.
+    return sorted(candidates, key=lambda c: c.get("quota", {}).get("classification") == "tight")
+
+
+def route_candidates(config, task, store, rejected=None, quota_audit=None):
     """Pass `rejected` to collect why each lane was dropped. The reasons live
     beside the checks that produce them so an explanation can never drift from
     the filter it is explaining."""
@@ -136,6 +193,9 @@ def route_candidates(config, task, store, rejected=None):
     work = "write" if task.get("write") else "read"
     ttl_ms = core.cache_settings(config)["ttl_seconds"] * 1000
     now = core.now_ms()
+    thresholds = quota_settings(config)
+    headroom = {entry["lane_key"]: quota_assessment(entry, thresholds, now / 1000)
+                for entry in usage.headroom(store.workspace, include_raw=False) if entry.get("lane_key") and entry.get("quota")}
     history = defaultdict(list)
     outcomes = {event["task_id"]: event["accepted"] for event in read_jsonl(DecisionStore(store.workspace).path)
                 if event.get("event") == "outcome"}
@@ -180,6 +240,13 @@ def route_candidates(config, task, store, rejected=None):
         if agent not in {"claude", "codex", "agy", "grok"}:
             continue
         settings = core.agent_settings(config, {"agent": agent, "route": route})
+        quota = headroom.get(core.lane_key(agent, settings))
+        if quota:
+            if quota_audit is not None:
+                quota_audit[key] = quota
+            if quota["classification"] == "exhausted":
+                drop(key, "; ".join(quota["reasons"]))
+                continue
         if settings.get("reasoning_effort") is not None:
             from fusion_reasoning import native_capability, validate_pair
             try:
@@ -278,6 +345,7 @@ def route_candidates(config, task, store, rejected=None):
             checked = len(verified) + prior["prior_attempts"]
             accepted = sum(verified) + prior.get("prior_successes", 0)
             choices.append({"key": arm, "agent": agent, "route": route, "model": model, **effort,
+                            **({"quota": quota} if quota else {}),
                             "runs": len(spans), "reported_success_rate": sum(s.get("status") == "success" for s in spans) / len(spans) if spans else None,
                             "checked_runs": round(checked, 3) if prior["prior_attempts"] else checked,
                             "acceptance_rate": (round(accepted / checked, 4) if prior["prior_attempts"] else accepted / checked) if checked else None,
@@ -288,11 +356,7 @@ def route_candidates(config, task, store, rejected=None):
                             "mean_cost_usd_cold": sum(split_costs[False]) / len(split_costs[False]) if split_costs[False] else None,
                             "session_idle_s": lane_idle, "warm": lane_idle is not None and lane_idle * 1000 < ttl_ms,
                             "mean_ms": sum(s.get("duration_ms", 0) for s in spans) / len(spans) if spans else None})
-            if len(choices) == 8:
-                break
-        if len(choices) == 8:
-            break
-    return choices
+    return rank_by_quota(choices)[:8]
 
 
 def no_route_reason(config, task, store):
@@ -371,7 +435,7 @@ def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None, explore=True):
         return (1, -(accepted + 1) / (checked + 2), index)
     ranked = sorted(enumerate(candidates), key=score)
     if warm_epsilon is None:
-        return [candidate for _, candidate in ranked]
+        return rank_by_quota([candidate for _, candidate in ranked])
     tiers = []
     for item in ranked:
         bucket, rate, _ = score(item)
@@ -379,7 +443,7 @@ def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None, explore=True):
             tiers[-1][2].append(item[1])
         else:
             tiers.append((bucket, rate, [item[1]]))
-    return [candidate for _, _, tier in tiers for candidate in sorted(tier, key=lambda c: not c.get("warm"))]
+    return rank_by_quota([candidate for _, _, tier in tiers for candidate in sorted(tier, key=lambda c: not c.get("warm"))])
 
 
 def route_task(config, task, store, rng=None):
@@ -390,6 +454,7 @@ def route_task(config, task, store, rng=None):
     engine = DecisionEngine(store.workspace, config)
     epsilon = routing_epsilon(config)
     automatic = task["agent"] == "auto" and not task.get("route")
+    quota_audit, rejected = {}, {}
     if task["agent"] == "auto" and task.get("route"):
         task["agent"] = config.get("routes", {}).get(task["route"], {}).get("agent")
         if task["agent"] not in {"codex", "claude", "agy", "grok"}:
@@ -407,7 +472,7 @@ def route_task(config, task, store, rng=None):
         within_route = False
         minimum = explore = None
         if automatic:
-            candidates = route_candidates(config, task, store)
+            candidates = route_candidates(config, task, store, rejected=rejected, quota_audit=quota_audit)
             if ranking:
                 minimum, explore = exploration(ranking, task, candidates)
                 candidates = rank_by_outcomes(candidates, minimum, warm_epsilon, explore)
@@ -415,6 +480,7 @@ def route_task(config, task, store, rng=None):
                     # Independence outranks track record: a review stays with a
                     # different harness than the implementer when one is available.
                     candidates.sort(key=lambda item: item["agent"] == task["prefer_different_agent"])
+            candidates = rank_by_quota(candidates)
         else:
             from fusion_reasoning import pair_candidates, pair_key
             settings = core.agent_settings(config, task)
@@ -433,6 +499,9 @@ def route_task(config, task, store, rng=None):
                 **({"reasoning_effort": settings["reasoning_effort"]} if settings.get("reasoning_effort") is not None else {}),
             }]
     if not candidates:
+        if automatic and quota_audit:
+            engine.store.append("routing_log", **context(task), scope="automatic", candidates=[], chosen=None,
+                                quota=quota_audit, rejected=rejected, policy={"quota": quota_settings(config)})
         raise ValueError(no_route_reason(config, task, store))
     selected, applied, record = candidates[0], False, None
     # A single candidate is not a choice: nothing to record, and Laya rejects one-option choices.
@@ -479,14 +548,16 @@ def route_task(config, task, store, rng=None):
                   "ranked by verified outcomes; advice does not change dispatch" if config.get("decisions", {}).get("rank_by_outcomes") else
                   "configured preference order; advice does not change dispatch")
         engine.applied(record, selected["key"], applied, reason + ("; epsilon exploration picked this lane" if explored else ""))
-    if scope and engine.options["mode"] != "off":
+    if scope and (engine.options["mode"] != "off" or quota_audit):
         keys = [c["key"] for c in candidates]
         chances = propensities(keys, selected["key"], 0.0 if applied else effective)
         engine.store.append("routing_log", **context(task), decision_id=record["id"] if record else None, scope=scope,
                             write=bool(task.get("write")), role=task.get("role"),
                             policy={"rank_by_outcomes": minimum, "explore": explore, "warm_epsilon": warm_epsilon if ranking else None,
                                     "epsilon": effective, "routing_epsilon": epsilon, "laya_applied": applied,
-                                    "priors": priors_policy(config)},
+                                    "priors": priors_policy(config),
+                                    **({"quota": quota_settings(config)} if quota_audit else {})},
+                            **({"quota": quota_audit, "rejected": rejected} if quota_audit else {}),
                             candidates=[{**c, "propensity": chances[c["key"]]} for c in candidates],
                             chosen=selected["key"], explored=explored)
 
@@ -551,6 +622,8 @@ def routing_report(events):
     if len(logs) - joined - vetoed:
         warnings.append(f"{len(logs) - joined - vetoed} logged routing choices have no outcome yet")
     return {"schema": "fusion.routing_report.v1", "logged_choices": len(logs), "with_outcome": joined,
+            "quota_decisions": [{"task_id": task_id, "chosen": log.get("chosen"), "quota": log["quota"],
+                                 "rejected": log.get("rejected", {})} for task_id, log in logs.items() if log.get("quota")],
             "vetoed_outcomes_skipped": vetoed, "outcome_sources": sources,
             "explored": sum(bool(log.get("explored")) for log in logs.values()), "lanes": rows, "warnings": warnings}
 
