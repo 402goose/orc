@@ -606,7 +606,7 @@ def _denial_name(item: Any) -> str | None:
     return str(name) if name else None
 
 
-def provider_denied_tools(agent: str, stdout: str) -> list[str]:
+def provider_denials(agent: str, stdout: str) -> list[dict[str, str]]:
     if agent not in {"claude", "agy"}:
         return []
     try:
@@ -616,7 +616,22 @@ def provider_denied_tools(agent: str, stdout: str) -> list[str]:
     if not isinstance(value, dict):
         return []
     items = value.get("permission_denials" if agent == "claude" else "denied_actions")
-    return normalize_tools(_denial_name(item) for item in items) if isinstance(items, list) else []
+    denied = []
+    for item in items if isinstance(items, list) else []:
+        names = normalize_tools([_denial_name(item)])
+        if not names:
+            continue
+        tool_input = item.get("tool_input", item.get("input") if agent == "agy" else None)
+        if isinstance(tool_input, (dict, list)):
+            input_head = json.dumps(tool_input, ensure_ascii=False, separators=(",", ":"))
+        else:
+            input_head = str(tool_input) if tool_input is not None else ""
+        denied.append({"tool": names[0], "input_head": input_head[:120]})
+    return denied
+
+
+def provider_denied_tools(agent: str, stdout: str) -> list[str]:
+    return normalize_tools(item["tool"] for item in provider_denials(agent, stdout))
 
 
 def blocker_denied_tools(blockers: Any) -> list[str]:
@@ -1765,6 +1780,7 @@ def dispatch(
     duration_ms = int((time.monotonic() - started) * 1000)
     progress.emit(label, f"worker {status} after {progress.elapsed(duration_ms / 1000)}; exit {exit_code}")
     blockers = handoff.get("blockers", []) + (evidence_notes if task["agent"] != "codex" else []) + ([failure] if failure else [])
+    denied = provider_denials(task["agent"], worker_stdout)
     result = {
         "schema": SCHEMA,
         "run_id": task["run_id"],
@@ -1779,7 +1795,9 @@ def dispatch(
         "changed": handoff.get("changed", []),
         "tests": handoff.get("tests", []),
         "blockers": blockers,
-        "denied_tools": provider_denied_tools(task["agent"], worker_stdout) or blocker_denied_tools(blockers),
+        "denied_tools": normalize_tools(item["tool"] for item in denied) or blocker_denied_tools(blockers),
+        "denied": denied,
+        "denied_count": len(denied),
         "command_evidence": evidence_notes if task["agent"] == "codex" else [],
         "exit_code": exit_code,
         "duration_ms": duration_ms,

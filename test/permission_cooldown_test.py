@@ -31,6 +31,45 @@ class DeniedToolsParsingTest(unittest.TestCase):
         self.assertEqual(core.provider_denied_tools("claude", "plain text"), [])
         self.assertEqual(core.provider_denied_tools("grok", json.dumps({"permission_denials": [{"tool_name": "Read"}]})), [])
 
+    def test_denied_inputs_are_compact_and_truncated_after_serialization(self):
+        tool_input = {"command": "echo café " + "x" * 150, "cwd": "/repo"}
+        stdout = json.dumps({"permission_denials": [
+            {"tool_name": " Bash(command) ", "tool_input": tool_input},
+            {"tool_name": "Bash", "tool_input": "y" * 121},
+            {"tool_name": "Read", "tool_input": "z" * 120},
+        ]})
+        self.assertEqual(core.provider_denials("claude", stdout), [
+            {"tool": "Bash", "input_head": json.dumps(tool_input, ensure_ascii=False, separators=(",", ":"))[:120]},
+            {"tool": "Bash", "input_head": "y" * 120},
+            {"tool": "Read", "input_head": "z" * 120},
+        ])
+        self.assertEqual(core.provider_denied_tools("claude", stdout), ["Bash", "Read"])
+
+    def test_agy_denied_inputs_and_missing_inputs(self):
+        stdout = json.dumps({"denied_actions": [
+            {"action": "command", "display_name": "RunCommand", "input": {"command": "make", "cwd": "/repo"}},
+            {"action": "view_file", "tool_input": "/repo/file"},
+            {"action": "command", "input": "x" * 121},
+            {"action": "view_file"},
+            {"action": "view_file", "input": None},
+        ]})
+        self.assertEqual(core.provider_denials("agy", stdout), [
+            {"tool": "RunCommand", "input_head": '{"command":"make","cwd":"/repo"}'},
+            {"tool": "view_file", "input_head": "/repo/file"},
+            {"tool": "command", "input_head": "x" * 120},
+            {"tool": "view_file", "input_head": ""},
+            {"tool": "view_file", "input_head": ""},
+        ])
+
+    def test_missing_or_malformed_denials_are_empty(self):
+        for agent in ("claude", "agy"):
+            key = "permission_denials" if agent == "claude" else "denied_actions"
+            for stdout in ("plain text", "[]", "null", "{}", json.dumps({key: {"tool_name": "Read"}}),
+                           json.dumps({key: [None, "Read", {}, {"tool_name": "()"}]})):
+                with self.subTest(agent=agent, stdout=stdout):
+                    self.assertEqual(core.provider_denials(agent, stdout), [])
+        self.assertEqual(core.provider_denials("grok", json.dumps({"permission_denials": [{"tool_name": "Read"}]})), [])
+
     def test_blocker_fallback(self):
         blockers = ["permission denied: Write(/etc/hosts)", "agy denied: RunCommand: blocked",
                     "agy auto-denied tools in headless mode: ViewFile, RunCommand; configure sandboxed commands",
@@ -102,6 +141,7 @@ class DeniedToolsDispatchTest(unittest.TestCase):
         store = core.RunStore(self.workspace)
         task = core.make_task(self.workspace, agent, "Check the fixture", "review", [], [], None, True, False)
         result = core.dispatch(self.config, task, store)
+        self.assertEqual(json.loads((Path(result["artifacts"]["run_dir"]) / "result.json").read_text()), result)
         return result, store.traces(limit=1)[-1]
 
     def test_claude_denials_reach_result_and_span(self):
@@ -112,15 +152,23 @@ class DeniedToolsDispatchTest(unittest.TestCase):
                                    {"tool_name": "Bash", "reason": "not allowed"}]})
         self.assertEqual(core.failure_class(result), "permission_denied")
         self.assertEqual(result["denied_tools"], ["Bash"])
+        self.assertEqual(result["denied"], [{"tool": "Bash", "input_head": '{"command":"make"}'},
+                                            {"tool": "Bash", "input_head": ""}])
+        self.assertEqual(result["denied_count"], 2)
+        self.assertEqual(result["verdict"], "blocked_by_permissions")
         self.assertEqual(span["denied_tools"], ["Bash"])
         self.assertEqual(span["failure_class"], "permission_denied")
         self.assertFalse(core.denial_blocks_lane(span))
 
     def test_agy_denials_reach_result_and_span(self):
         result, span = self.dispatch("agy", {"status": "SUCCESS", "response": "",
-                                             "denied_actions": [{"action": "view_file", "display_name": "ViewFile"}]})
+                                             "denied_actions": [{"action": "view_file", "display_name": "ViewFile",
+                                                                 "input": {"path": "/repo/file"}}]})
         self.assertEqual(core.failure_class(result), "permission_denied")
         self.assertEqual(result["denied_tools"], ["ViewFile"])
+        self.assertEqual(result["denied"], [{"tool": "ViewFile", "input_head": '{"path":"/repo/file"}'}])
+        self.assertEqual(result["denied_count"], 1)
+        self.assertEqual(result["verdict"], "blocked_by_permissions")
         self.assertEqual(span["denied_tools"], ["ViewFile"])
         self.assertTrue(core.denial_blocks_lane(span))
 
@@ -129,7 +177,18 @@ class DeniedToolsDispatchTest(unittest.TestCase):
             "is_error": False, "session_id": "s",
             "result": "STATUS: blocked\nSUMMARY: stuck\nCHANGED: none\nTESTS: none\nBLOCKERS: permission denied: Write(/etc/hosts)"})
         self.assertEqual(result["denied_tools"], ["Write"])
+        self.assertEqual(result["denied"], [])
+        self.assertEqual(result["denied_count"], 0)
         self.assertEqual(span["denied_tools"], ["Write"])
+
+    def test_absent_denials_have_empty_result_fields(self):
+        for agent, payload in (("claude", {"result": "done"}), ("agy", {"status": "SUCCESS", "response": "done"})):
+            with self.subTest(agent=agent):
+                result, span = self.dispatch(agent, payload)
+                self.assertEqual(result["denied_tools"], [])
+                self.assertEqual(result["denied"], [])
+                self.assertEqual(result["denied_count"], 0)
+                self.assertEqual(span["denied_tools"], [])
 
 
 if __name__ == "__main__":
