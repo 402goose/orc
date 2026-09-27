@@ -335,5 +335,4 @@ Quota observations are historical; absent cost and usage must remain unknown.
 Verification proves only the checks actually run; review worker evidence before
 publishing or turning an outcome into a label.
 
-See [launcher caveats](docs/launcher.md#caveats), [evidence limits](docs/learning.md),
-and the [migration audit and corrected claims](docs/documentation-audit.md).
+See [launcher caveats](docs/launcher.md#caveats) and [evidence limits](docs/learning.md).
