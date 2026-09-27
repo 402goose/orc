@@ -331,6 +331,35 @@ def parse_handoff(text: str) -> dict[str, Any]:
     }
 
 
+# Reset time a CLI printed with its quota message ("resets 5:40pm", "resets at 17:40").
+RESETS_RE = re.compile(r"resets?(?:\s+(?:at|in))?\s+([0-9][0-9:]*\s*(?:am|pm)?[^\n.·]*)", re.IGNORECASE)
+# Only an answer that opens by declining is a refusal: "refused" or "I won't"
+# inside ordinary blocker prose is not.
+REFUSAL_RE = re.compile(r"\A\W*(?:I(?:'m| am) (?:sorry|not able)[^.\n]*(?:help|assist)|I can(?:'|no)t (?:help|assist) with|I won't (?:help|assist) with)", re.IGNORECASE)
+
+
+def classify_verdict(result: dict[str, Any]) -> dict[str, Any]:
+    """A structural verdict beside the worker's free-text summary: ok | error | quota | refused |
+    blocked_by_permissions. It is derived from failure_class(), the one vocabulary lane cooldown,
+    recovery and telemetry already share, so the four can never disagree. Status comes first: a
+    successful run that mentions a rate limit in its summary is ok. A quota carries the reset text
+    the CLI printed, so a harness can treat it as an unmeasured round instead of a zero score."""
+    kind = failure_class(result)
+    if kind == "permission_denied":
+        return {"verdict": "blocked_by_permissions", "reason": ", ".join(result.get("denied_tools") or []) or "permission denied"}
+    if result.get("status") in {"success", "partial", "cache_hit"}:
+        return {"verdict": "ok", "reason": result.get("status")}
+    text = " ".join(str(item) for item in [*(result.get("blockers") or []), result.get("summary") or ""])
+    if kind == "quota":
+        match = RESETS_RE.search(text)
+        return {"verdict": "quota", "reason": "quota", "resets_at": match.group(1).strip() if match else None}
+    if REFUSAL_RE.search(str(result.get("summary") or "")):
+        return {"verdict": "refused", "reason": "declined"}
+    if kind == "missing_executable" or result.get("exit_code") == 127:
+        return {"verdict": "error", "reason": "missing_binary"}
+    return {"verdict": "error", "reason": kind or str(result.get("status") or "error")}
+
+
 def json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
 
@@ -531,6 +560,9 @@ def usage_summary(spans: list[dict[str, Any]]) -> dict[str, Any]:
 # recovery classification and telemetry so the three can never disagree.
 QUOTA_MARKERS = ("usage limit", "session limit", "rate limit", "quota", "credits",
                  "resets at", "resets ", "too many requests")
+# One vocabulary for permission refusals, shared the same way.
+PERMISSION_MARKERS = ("permission denied", "agy denied", "agy auto-denied", "permission check blocked",
+                      "no way to approve")
 LANE_COOLDOWN_SECONDS = 900
 
 
@@ -609,7 +641,7 @@ def failure_class(result: dict[str, Any]) -> str | None:
     if result.get("failure_phase") in {"snapshot_before_review", "snapshot_after_review"}:
         return "coordinator_error"
     text = " ".join(str(item) for item in result.get("blockers", [])).lower()
-    if "permission denied" in text or "agy denied" in text or "agy auto-denied" in text:
+    if any(marker in text for marker in PERMISSION_MARKERS):
         return "permission_denied"
     if result.get("status") in {"success", "cache_hit"}:
         return None
@@ -1596,6 +1628,8 @@ def dispatch(
             "model": metadata.get("model"),
             "execution_choice": metadata.get("execution_choice"),
             "summary": f"{argv[0]} is not available on PATH",
+            "verdict": "error",
+            "verdict_reason": "missing_binary",
             "changed": [],
             "tests": [],
             "blockers": [f"install or expose {argv[0]} before dispatching"],
@@ -1605,6 +1639,8 @@ def dispatch(
             **session,
             "artifacts": {"run_dir": str(run_dir)},
         }
+        verdict = classify_verdict(result)
+        result.update(verdict=verdict["verdict"], verdict_reason=verdict.get("reason"), resets_at=verdict.get("resets_at"))
         store.write_json(run_dir / "result.json", result)
         store.event(run_dir, "run.finished", {"result": result})
         store.trace_span(config, task, result, started_at_ms, now_ms(), metadata)
@@ -1742,6 +1778,8 @@ def dispatch(
     }
     ended_at_ms = now_ms()
     store.touch_session(task["session_key"], ended_at_ms)
+    verdict = classify_verdict(result)
+    result.update(verdict=verdict["verdict"], verdict_reason=verdict.get("reason"), resets_at=verdict.get("resets_at"))
     store.write_json(run_dir / "result.json", result)
     store.event(run_dir, "run.finished", {"result": result})
     store.trace_span(config, task, result, started_at_ms, ended_at_ms, {**metadata, "model": model})
