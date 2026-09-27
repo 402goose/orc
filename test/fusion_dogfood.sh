@@ -91,8 +91,8 @@ printf '%s\n' "$STATUS" | jq -e 'length == 3 and all(.[]; .result.status == "suc
 TRACE="$(PYTHONDONTWRITEBYTECODE=1 "$ROOT/fusion" --workspace "$WORKSPACE" trace --limit 10)"
 printf '%s\n' "$TRACE" | jq -e 'length == 3 and all(.[]; .schema == "fusion.trace.v1")' >/dev/null
 
-USAGE="$(PYTHONDONTWRITEBYTECODE=1 "$ROOT/fusion" --workspace "$WORKSPACE" usage --limit 10)"
-printf '%s\n' "$USAGE" | jq -e '.spans == 3 and .total.input_tokens == 12 and .total.output_tokens == 8' >/dev/null
+USAGE="$(PYTHONDONTWRITEBYTECODE=1 "$ROOT/fusion" --workspace "$WORKSPACE" --json usage --limit 10)"
+printf '%s\n' "$USAGE" | jq -e '.sources.orc.calls == 3 and .sources.orc.input_tokens == 12 and .sources.orc.output_tokens == 8' >/dev/null
 
 cat > "$WORKSPACE/workflow.json" <<'JSON'
 {

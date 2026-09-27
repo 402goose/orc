@@ -460,6 +460,32 @@ print(json.dumps({"type": "turn.completed", "usage": {}}))
         self.assertIn("write node finished without changing any file",
                       outcome["nodes"][0]["result"]["blockers"])
 
+    def test_a_retry_that_finds_its_work_done_is_not_a_no_change_failure(self):
+        """Baselines belong to the node. Attempt 1 writes the required file but
+        reports a blocker, so the node retries; attempt 2 has nothing left to
+        change. Against attempt 2's own start nothing changed, but against the
+        node's start the work is there."""
+        self.git_workspace()
+        body = (
+            "import json, os\n"
+            "first = not os.path.exists('made.txt')\n"
+            "open('made.txt','w').write('x')\n"
+            "blockers = 'an unrelated pre-existing failure outside this scope' if first else 'none'\n"
+            "text = 'STATUS: success\\nSUMMARY: wrote made.txt\\nCHANGED: made.txt\\nTESTS: checked\\nBLOCKERS: ' + blockers\n"
+            "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':text}}))\n"
+            "print(json.dumps({'type':'turn.completed','usage':{}}))\n"
+        )
+        codex = self.write_agent("codex-retry-write", body)
+        self.config(codex=codex)
+        node = {"id": "implement", "role": "implementation", "agent": "codex", "write": True,
+                "task": "Implement it", "required_files": ["made.txt"],
+                "acceptance": {"required_handoff": ["summary", "tests"]}}
+        path = self.workspace / "retrynode.json"
+        path.write_text(json.dumps({"task": "build", "max_attempts": 2, "nodes": [node]}))
+        outcome = run_workflow(self.workspace, json.loads((self.workspace / ".fusion.json").read_text()), path)
+        self.assertEqual(outcome["status"], "success", outcome)
+        self.assertEqual(outcome["nodes"][0]["attempts"], 2)
+
     def test_a_workspace_without_git_is_not_blocked_by_the_gate(self):
         """Unavailable is not evidence of no change.
 
