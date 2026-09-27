@@ -756,7 +756,7 @@ class WorkflowRunner:
             if not isinstance(end_time, (int, float)):
                 continue
             age_ms = now - end_time
-            if 0 <= age_ms <= LANE_COOLDOWN_SECONDS * 1000 and core.failure_class(span) == "quota":
+            if 0 <= age_ms <= LANE_COOLDOWN_SECONDS * 1000 and (span.get("failure_class") or core.failure_class(span)) == "quota":
                 self._set_lane(agent, "cooldown", f"a {agent} run reported a quota/session limit {int(age_ms / 1000)}s ago")
 
     def _prompt(self, node: dict[str, Any]) -> str:
