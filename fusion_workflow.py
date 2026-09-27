@@ -1494,10 +1494,15 @@ BLOCKERS: unresolved issues, or none
                         selected["required_files"] = sorted(
                             dict.fromkeys(list(selected.get("required_files") or []) + inherited)
                         )
-                    selected["_artifact_baseline"] = {
-                        relative: _fingerprint(self.workspace / relative)
-                        for relative in selected.get("required_files", [])
-                    }
+                    # Baselines belong to the node, not the attempt: a retry
+                    # that finds its predecessor's work already done changed
+                    # the tree relative to where the node started.
+                    first_attempt = selected["attempts"] == 1 or "_artifact_baseline" not in selected
+                    if first_attempt:
+                        selected["_artifact_baseline"] = {
+                            relative: _fingerprint(self.workspace / relative)
+                            for relative in selected.get("required_files", [])
+                        }
                     if selected["write"]:
                         # The plan's verification becomes this node's checks;
                         # their pre-change run must precede the tree baseline
@@ -1508,7 +1513,8 @@ BLOCKERS: unresolved issues, or none
                     # A writer that writes nothing did not do the work. Record
                     # the tree so acceptance can check the repository itself
                     # rather than the worker's account of it.
-                    selected["_tree_baseline"] = self._tree() if selected["write"] else None
+                    if first_attempt or "_tree_baseline" not in selected:
+                        selected["_tree_baseline"] = self._tree() if selected["write"] else None
                     attempt = selected["attempts"]
                     writer = bool(selected["write"])
                     if writer:
