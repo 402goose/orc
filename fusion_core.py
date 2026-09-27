@@ -573,8 +573,14 @@ LANE_COOLDOWN_SECONDS = 900
 
 
 def quota_failure(result: dict[str, Any]) -> bool:
-    text = " ".join(str(item) for item in result.get("blockers", []))
-    text = f"{text} {result.get('summary', '')}".lower()
+    quota = result.get("quota")
+    if isinstance(quota, dict) and quota.get("status") == "rejected":
+        return True
+    if "provider_failure" in result:
+        text = str(result.get("provider_failure") or "").lower()
+    else:
+        text = " ".join(str(item) for item in result.get("blockers", []))
+        text = f"{text} {result.get('summary', '')}".lower()
     return any(marker in text for marker in QUOTA_MARKERS)
 
 
@@ -1851,6 +1857,7 @@ def dispatch(
         "changed": handoff.get("changed", []),
         "tests": handoff.get("tests", []),
         "blockers": blockers,
+        "provider_failure": failure,
         "denied_tools": normalize_tools(item["tool"] for item in denied) or blocker_denied_tools(blockers),
         "denied": denied,
         "denied_count": len(denied),
