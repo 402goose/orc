@@ -21,6 +21,7 @@ class ClaudeArgvTest(unittest.TestCase):
         # unlike fixtures that merely inspect argv[-1] or always return success.
         parser = argparse.ArgumentParser()
         parser.add_argument("-p", action="store_true")
+        parser.add_argument("--verbose", action="store_true")
         parser.add_argument("--allowedTools", nargs="+")
         parser.add_argument("--mcp-config", nargs="+")
         parser.add_argument("--strict-mcp-config", action="store_true")
@@ -39,6 +40,8 @@ class ClaudeArgvTest(unittest.TestCase):
                 argv, _, _ = core.agent_command(core.DEFAULTS, task, session)
                 parsed = self.parse_fixture(argv)
                 self.assertEqual(parsed.prompt, core.brief_for(task))
+                self.assertEqual(parsed.output_format, "stream-json")
+                self.assertTrue(parsed.verbose)
                 self.assertEqual(parsed.allowedTools, tools)
                 self.assertEqual(parsed.resume, session)
                 self.assertEqual(parsed.permission_mode, "plan")

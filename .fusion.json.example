@@ -1,6 +1,7 @@
 {
   "lead": "claude",
   "sidekick": "codex",
+  "quota": {"pace_margin": 0.15, "soft": 0.85, "hard": 0.97},
   "telemetry": {"enabled": true, "include_content": false},
   "routes": {
     "orc-free": {

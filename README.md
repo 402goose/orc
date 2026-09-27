@@ -467,6 +467,38 @@ share cooldowns; a second account remains available for automatic fallback.
 ORC keeps its separate launcher lane (`claude@orc@acct2` with an account).
 Routes without account settings retain their existing lane keys and cooldowns.
 
+Automatic routing also uses the latest recorded quota for each lane, including
+its account. Claude runs use `stream-json --verbose`; the final result retains
+the existing result fields, with an additional `quota` when reported. Claude
+rate-limit events and Codex `rate_limits` are normalized into `quota.windows`
+with `used` fractions (0–1), `resets_at` Unix seconds, and Codex window duration
+in `window_minutes`, and saved in the run result and trace. The existing
+`fusion usage` headroom reader also exposes these trace observations.
+
+Configure the thresholds in `.fusion.json`:
+
+```json
+{"quota": {"pace_margin": 0.15, "soft": 0.85, "hard": 0.97}}
+```
+
+A lane is **tight** when any active window's usage exceeds `soft`, or exceeds
+the elapsed fraction of that window plus `pace_margin`. Elapsed time uses
+Claude's five-hour/seven-day windows or Codex's reported duration. Tight lanes
+rank after other eligible lanes for the same work class, including after
+outcome and cache ranking. A lane is **exhausted** above `hard`, or when its
+status is `rejected` before its most-used window resets; automatic routing
+excludes it. Comparisons are strict, thresholds must be fractions, and `soft`
+cannot exceed `hard`. Expired windows stop constraining routing. Unknown
+duration disables only the pacing comparison; missing quota preserves the
+existing order.
+
+Explicit routes stay pinned, and existing authorized exploration still applies.
+Quota-free traces do not erase an earlier observation, and observations without
+a recorded lane key cannot constrain unrelated accounts. Routing logs and
+`fusion decisions routing-report` include quota windows, classifications,
+thresholds, and reasons for demotions and exclusions, even before an outcome
+is recorded. These quota decisions are logged even with decision advice off.
+
 The server binds only to `127.0.0.1`. Use the complete URL printed in your terminal
 to connect a browser; its fragment carries a per-machine access capability, stored at
 `$ORC_HOME/ui-token` and reused across restarts.
