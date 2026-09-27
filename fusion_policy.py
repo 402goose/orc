@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
 from pathlib import Path
 import random
 import time
@@ -15,6 +16,111 @@ def context(task):
     return {"task_id": task["run_id"], "group": task.get("parent_task_id") or task["run_id"]}
 
 
+PRIOR_WEIGHT = 0.5
+PRIOR_CAP = 10
+_PRIORS_CACHE = {}
+
+
+def prior_settings(config):
+    """`decisions.priors`: {path, weight, cap}, or None when set to false.
+
+    `weight` pseudo-counts per gym attempt (default 0.5: a gym task is ORC's
+    own repository with hidden tests, not this workspace's work, so it is
+    worth half a local verified outcome) and at most `cap` per lane and work
+    class (default 10: a lane's gym record never outweighs ten local
+    outcomes, so local evidence dominates as it accumulates)."""
+    import fusion_gym
+    value = (config.get("decisions") or {}).get("priors", {})
+    if value is False:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("decisions.priors must be an object ({path, weight, cap}) or false")
+    settings = {"path": str(Path(value["path"]).expanduser()) if value.get("path") else str(fusion_gym.default_priors_path()),
+                "weight": value.get("weight", PRIOR_WEIGHT), "cap": value.get("cap", PRIOR_CAP)}
+    for name in ("weight", "cap"):
+        if isinstance(settings[name], bool) or not isinstance(settings[name], (int, float)) or settings[name] < 0:
+            raise ValueError(f"decisions.priors.{name} must be a non-negative number")
+    return settings
+
+
+def load_priors(settings):
+    """The index of an exported priors file, or None when there is none.
+
+    `exact` keys entries by (agent, route, model, reasoning_effort). `lane`
+    pools entries by (agent, model, reasoning_effort): a route name is a
+    workspace-local label, and a route that pins the same agent, model and
+    effort as a gym lane runs the same lane."""
+    import fusion_gym
+    if not settings:
+        return None
+    path = Path(settings["path"])
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    stamp = (str(path), stat.st_mtime_ns, stat.st_size)
+    if stamp in _PRIORS_CACHE:
+        return _PRIORS_CACHE[stamp]
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read lane priors {path}: {exc}") from exc
+    if not isinstance(value, dict) or value.get("schema") != fusion_gym.PRIORS_SCHEMA or not isinstance(value.get("priors"), dict):
+        raise ValueError(f"{path} is not a {fusion_gym.PRIORS_SCHEMA} file; re-export it with `fusion gym priors`")
+    exact, lane = {}, {}
+    for key, entry in value["priors"].items():
+        agent, route, model, effort = fusion_gym.lane_tuple(entry)
+        exact[(agent, route, model, effort)] = {**entry, "key": key}
+        pooled = lane.setdefault((agent, model, effort), {"key": []})
+        pooled["key"].append(key)
+        for work in fusion_gym.WORK_CLASSES.values():
+            stats = entry.get(work)
+            if not stats or not stats.get("attempts"):
+                continue
+            into = pooled.setdefault(work, {"attempts": 0, "successes": 0, "mean_cost_usd": 0.0, "mean_seconds": 0.0,
+                                            "generated_at": stats.get("generated_at")})
+            total = into["attempts"] + stats["attempts"]
+            for mean in ("mean_cost_usd", "mean_seconds"):
+                into[mean] = round((into[mean] * into["attempts"] + (stats.get(mean) or 0) * stats["attempts"]) / total, 4)
+            into["attempts"], into["successes"] = total, into["successes"] + stats["successes"]
+    for pooled in lane.values():
+        pooled["key"] = "+".join(sorted(pooled["key"]))
+    index = {"path": str(path), "generated_at": value.get("generated_at"), "exact": exact, "lane": lane}
+    _PRIORS_CACHE.clear()
+    _PRIORS_CACHE[stamp] = index
+    return index
+
+
+def prior_for(index, candidate, work, weight, cap):
+    """Pseudo-counts for one candidate and work class ("write" or "read"):
+    min(weight * gym attempts, cap) attempts at the gym's success rate. The
+    exact (agent, route, model, effort) entry first, else the lane pooled
+    across route names."""
+    if not index:
+        return {"prior_attempts": 0}
+    agent, model, effort = candidate["agent"], candidate.get("model") or None, candidate.get("reasoning_effort") or None
+    match, entry = "exact", index["exact"].get((agent, candidate.get("route") or None, model, effort))
+    if not ((entry or {}).get(work) or {}).get("attempts"):
+        match, entry = "lane", index["lane"].get((agent, model, effort))
+    stats = (entry or {}).get(work) or {}
+    if not stats.get("attempts"):
+        return {"prior_attempts": 0}
+    attempts = min(weight * stats["attempts"], cap)
+    return {"prior_attempts": round(attempts, 3),
+            "prior_successes": round(attempts * stats["successes"] / stats["attempts"], 3),
+            "prior": {"key": entry["key"], "match": match, "class": work, "gym_attempts": stats["attempts"],
+                      "gym_successes": stats["successes"], "mean_cost_usd": stats.get("mean_cost_usd"),
+                      "mean_seconds": stats.get("mean_seconds"), "source": "gym",
+                      "generated_at": stats.get("generated_at") or index.get("generated_at")}}
+
+
+def priors_policy(config):
+    """What the routing log records about priors: None when none applied."""
+    settings = prior_settings(config)
+    index = load_priors(settings)
+    return {**settings, "generated_at": index["generated_at"]} if index else None
+
+
 def route_candidates(config, task, store, rejected=None):
     """Pass `rejected` to collect why each lane was dropped. The reasons live
     beside the checks that produce them so an explanation can never drift from
@@ -25,6 +131,9 @@ def route_candidates(config, task, store, rejected=None):
         if rejected is not None:
             rejected.setdefault(key, why)
     yolo = core.execution_mode(config) == "yolo"
+    priors = prior_settings(config)
+    index = load_priors(priors)
+    work = "write" if task.get("write") else "read"
     ttl_ms = core.cache_settings(config)["ttl_seconds"] * 1000
     now = core.now_ms()
     history = defaultdict(list)
@@ -107,6 +216,11 @@ def route_candidates(config, task, store, rejected=None):
         if Path(command).name == "orc":
             # Automatic ORC routes require passing tool-fit evidence even for explicit models.
             model = settings.get("model")
+            try:
+                exclude = core.excluded_models(settings)
+            except ValueError as exc:
+                drop(key, str(exc))
+                continue
             if model:
                 if model not in core._orc_model_ids(command, ["--fit"]):
                     drop(key, f"{model} has no passing `orc probe --fit` evidence")
@@ -114,7 +228,7 @@ def route_candidates(config, task, store, rejected=None):
                 models = [model]
             else:
                 try:
-                    models = core.fitted_orc_models(command, str(settings.get("model_selector", "best")), arms)
+                    models = core.fitted_orc_models(command, str(settings.get("model_selector", "best")), arms, exclude)
                 except (ValueError, RuntimeError, OSError) as exc:
                     drop(key, f"no ORC model passed tool-fit for this route ({exc})")
                     continue
@@ -132,9 +246,13 @@ def route_candidates(config, task, store, rejected=None):
             # A success is the worker's claim until a gate or lead checks it; an
             # error is observed. Quota and permission failures are lane health
             # (cooldown), not evidence about quality.
-            verified = [outcomes[span["run_id"]] if span.get("run_id") in outcomes else False for span in spans
+            evidence = [(span, outcomes[span["run_id"]] if span.get("run_id") in outcomes else False) for span in spans
                         if span.get("run_id") in outcomes or (span.get("status") == "error"
                                                               and span.get("failure_class") not in {"quota", "permission_denied"})]
+            # Read-only and writing work differ: this task's class counts when
+            # it has any evidence, else every class pooled.
+            same = [ok for span, ok in evidence if "write" in span and bool(span["write"]) == (work == "write")]
+            verified = same or [ok for _, ok in evidence]
             costs = [core.number(span["usage"].get("cost_usd", span["usage"].get("cost", 0))) for span in spans
                      if "cost_usd" in span.get("usage", {}) or "cost" in span.get("usage", {})]
             mean_cost = sum(costs) / len(costs) if costs else None
@@ -152,10 +270,19 @@ def route_candidates(config, task, store, rejected=None):
             if task.get("budget_remaining_usd") is not None and mean_cost is not None and mean_cost > task["budget_remaining_usd"]:
                 drop(arm, f"its average reported cost ${mean_cost:.4f} exceeds the ${task['budget_remaining_usd']:.4f} left in the budget")
                 continue
-            choices.append({"key": arm, "agent": agent, "route": route, "model": model,
-                            **({"reasoning_effort": settings["reasoning_effort"]} if settings.get("reasoning_effort") is not None else {}),
+            effort = {"reasoning_effort": settings["reasoning_effort"]} if settings.get("reasoning_effort") is not None else {}
+            prior = prior_for(index, {"agent": agent, "route": route, "model": model, **effort}, work,
+                              priors["weight"], priors["cap"]) if index else {"prior_attempts": 0}
+            # Gym priors are pseudo-counts: checked_runs and acceptance_rate,
+            # which ranking reads, include them; the *_local fields do not.
+            checked = len(verified) + prior["prior_attempts"]
+            accepted = sum(verified) + prior.get("prior_successes", 0)
+            choices.append({"key": arm, "agent": agent, "route": route, "model": model, **effort,
                             "runs": len(spans), "reported_success_rate": sum(s.get("status") == "success" for s in spans) / len(spans) if spans else None,
-                            "checked_runs": len(verified), "acceptance_rate": sum(verified) / len(verified) if verified else None,
+                            "checked_runs": round(checked, 3) if prior["prior_attempts"] else checked,
+                            "acceptance_rate": (round(accepted / checked, 4) if prior["prior_attempts"] else accepted / checked) if checked else None,
+                            "checked_runs_local": len(verified), "acceptance_rate_local": sum(verified) / len(verified) if verified else None,
+                            "local_class": work if same else "pooled" if verified else None, **prior,
                             "mean_cost_usd": mean_cost,
                             "mean_cost_usd_warm": sum(split_costs[True]) / len(split_costs[True]) if split_costs[True] else None,
                             "mean_cost_usd_cold": sum(split_costs[False]) / len(split_costs[False]) if split_costs[False] else None,
@@ -358,7 +485,8 @@ def route_task(config, task, store, rng=None):
         engine.store.append("routing_log", **context(task), decision_id=record["id"] if record else None, scope=scope,
                             write=bool(task.get("write")), role=task.get("role"),
                             policy={"rank_by_outcomes": minimum, "explore": explore, "warm_epsilon": warm_epsilon if ranking else None,
-                                    "epsilon": effective, "routing_epsilon": epsilon, "laya_applied": applied},
+                                    "epsilon": effective, "routing_epsilon": epsilon, "laya_applied": applied,
+                                    "priors": priors_policy(config)},
                             candidates=[{**c, "propensity": chances[c["key"]]} for c in candidates],
                             chosen=selected["key"], explored=explored)
 

@@ -74,7 +74,8 @@ class PublicationTest(unittest.TestCase):
         self.mock = patch.object(pub, "gh", self.github)
         self.mock.start()
         self.addCleanup(self.mock.stop)
-        self.env = patch.dict(os.environ, {"FUSION_DECISIONS_MODE": "off", "FUSION_TELEMETRY": "0"})
+        self.env = patch.dict(os.environ, {"FUSION_DECISIONS_MODE": "off", "FUSION_TELEMETRY": "0",
+                                           "ORC_HOME": str(self.root / "orc-home")})
         self.env.start()
         self.addCleanup(self.env.stop)
         self.config = {**core.DEFAULTS, "publish": {"mode": "manual", "base": "staging", "remote": "origin", "draft": True}}

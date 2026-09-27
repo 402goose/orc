@@ -49,7 +49,7 @@ class DecisionsTest(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.workspace = Path(temp.name)
-        env = patch.dict(os.environ)
+        env = patch.dict(os.environ, {"ORC_HOME": str(self.workspace / "orc-home")})
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop("FUSION_DECISIONS_MODE", None)
