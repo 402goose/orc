@@ -447,6 +447,26 @@ token usage and cost are unknown unless reported by a future adapter. Set
 Named ORC routes can use other configured models; automatic ORC selection still
 requires passing tool-fit evidence.
 
+Named routes in `.fusion.json` can set `env` to an object of string environment
+variables. These override the inherited worker environment; values expand `~`
+and `$HOME` (including `${HOME}`) before the worker starts. For example:
+
+```json
+{"routes": {"claude-second": {
+  "agent": "claude",
+  "env": {"CLAUDE_CONFIG_DIR": "~/.claude-second"},
+  "account": "acct2"
+}}}
+```
+
+The optional non-empty string `account` identifies the subscription for lane
+health and quota/permission cooldowns, giving this route the lane `claude@acct2`.
+Without it, Fusion uses the expanded `CLAUDE_CONFIG_DIR`, then `CODEX_HOME`, from
+the route environment as the account identity. Routes using the same account
+share cooldowns; a second account remains available for automatic fallback.
+ORC keeps its separate launcher lane (`claude@orc@acct2` with an account).
+Routes without account settings retain their existing lane keys and cooldowns.
+
 The server binds only to `127.0.0.1`. Use the complete URL printed in your terminal
 to connect a browser; its fragment carries a per-machine access capability, stored at
 `$ORC_HOME/ui-token` and reused across restarts.

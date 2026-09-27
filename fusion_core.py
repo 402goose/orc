@@ -1332,6 +1332,30 @@ def agent_settings(config: dict[str, Any], task: dict[str, Any]) -> dict[str, An
     return settings
 
 
+def route_env(settings: dict[str, Any]) -> dict[str, str]:
+    env = settings.get("env", {})
+    if not isinstance(env, dict) or any(not isinstance(key, str) or not isinstance(value, str)
+                                        for key, value in env.items()):
+        raise ValueError("route env must be an object with string names and values")
+    return {key: os.path.expanduser(os.path.expandvars(value)) for key, value in env.items()}
+
+
+def route_account(settings: dict[str, Any]) -> str:
+    account = settings.get("account")
+    if account is not None:
+        if not isinstance(account, str) or not account:
+            raise ValueError("route account must be a non-empty string")
+        return account
+    env = route_env(settings)
+    return env.get("CLAUDE_CONFIG_DIR") or env.get("CODEX_HOME") or ""
+
+
+def lane_key(agent: str, settings: dict[str, Any]) -> str:
+    key = f"{agent}@orc" if Path(str(settings.get("command", agent))).name == "orc" else agent
+    account = route_account(settings)
+    return f"{key}@{account}" if account else key
+
+
 def _orc_model_ids(command: str, filter_args: list[str]) -> list[str]:
     try:
         completed = subprocess.run(
@@ -1430,6 +1454,7 @@ def agent_command(
         raise ValueError("reasoning_effort is currently supported only for native Codex, Claude Code and agy")
     yolo = execution_mode(config) == "yolo"
     env = os.environ.copy()
+    env.update(route_env(settings))
     if agent == "codex":
         from fusion_reasoning import execution_choice
         choice = execution_choice(settings)
@@ -1447,7 +1472,7 @@ def agent_command(
         if model:
             argv += ["-m", model]
         argv.append("-")
-        return argv, os.environ.copy(), {"command": command, "model": settings.get("model") or "",
+        return argv, env, {"command": command, "model": settings.get("model") or "",
                                          "execution_choice": choice}
     if agent == "agy":
         command = settings.get("command", "agy")
@@ -1473,7 +1498,7 @@ def agent_command(
             argv += ["--print-timeout", str(print_timeout)]
         if session_id:
             argv += ["--conversation", session_id]
-        return argv, os.environ.copy(), {"command": command, "model": selected_model,
+        return argv, env, {"command": command, "model": selected_model,
                                          **({"execution_choice": choice} if choice else {})}
     if agent == "grok":
         command = settings.get("command", "grok")
@@ -1489,7 +1514,7 @@ def agent_command(
             argv += ["--sandbox", "none", "--no-plan"]
         if settings.get("model"):
             argv += ["--model", settings["model"]]
-        return argv, os.environ.copy(), {"command": command, "model": settings.get("model") or "", "output_format": output_format}
+        return argv, env, {"command": command, "model": settings.get("model") or "", "output_format": output_format}
     if agent == "claude":
         command = settings.get("command", "claude")
         command_name = Path(command).name
