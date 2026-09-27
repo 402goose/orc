@@ -2160,22 +2160,41 @@ if __name__ == "__main__":
 
 
 class VerdictTest(unittest.TestCase):
+    """classify_verdict derives from failure_class(): one vocabulary with lane
+    cooldown, recovery and telemetry (fusion_core, QUOTA_MARKERS)."""
+    def verdict(self, status, blockers=(), summary="", exit_code=1):
+        return fusion_core.classify_verdict({"status": status, "blockers": list(blockers), "summary": summary, "exit_code": exit_code})
+
     def test_session_limit_is_quota_with_reset(self):
-        verdict = fusion_core.classify_verdict("error", None, "You've hit your session limit · resets 5:40pm", 1)
+        verdict = self.verdict("error", ["You've hit your session limit · resets 5:40pm"])
         self.assertEqual(verdict["verdict"], "quota")
-        self.assertEqual(verdict["reason"], "session limit")
         self.assertTrue(verdict["resets_at"].startswith("5:40pm"))
 
     def test_success_is_ok(self):
-        self.assertEqual(fusion_core.classify_verdict("success", None, "STATUS: success", 0)["verdict"], "ok")
+        self.assertEqual(self.verdict("success", summary="STATUS: success", exit_code=0)["verdict"], "ok")
 
     def test_permission_block(self):
-        verdict = fusion_core.classify_verdict("error", None, "the permission check blocked it: this session has no way to approve commands", 1)
+        verdict = self.verdict("error", ["the permission check blocked it: this session has no way to approve commands"])
         self.assertEqual(verdict["verdict"], "blocked_by_permissions")
+        self.assertEqual(fusion_core.failure_class({"status": "error", "blockers": ["the permission check blocked it"]}),
+                         "permission_denied", "the same phrase cools the lane down")
 
     def test_timeout_and_missing_binary_are_errors_with_reasons(self):
-        self.assertEqual(fusion_core.classify_verdict("blocked", "timeout after 3600 seconds", "worker timed out", 124)["reason"], "timeout")
-        self.assertEqual(fusion_core.classify_verdict("error", None, "claude is not available on PATH", 127)["reason"], "missing_binary")
+        self.assertEqual(self.verdict("blocked", ["timeout after 3600 seconds"], "worker timed out", 124)["reason"], "timeout")
+        self.assertEqual(self.verdict("error", ["claude is not available on PATH"], exit_code=127)["reason"], "missing_binary")
 
     def test_refusal(self):
-        self.assertEqual(fusion_core.classify_verdict("error", None, "I can't help with that request.", 1)["verdict"], "refused")
+        self.assertEqual(self.verdict("error", summary="I can't help with that request.")["verdict"], "refused")
+
+    def test_quota_vocabulary_matches_lane_cooldown(self):
+        # "credits" and "resets" cool a lane down (QUOTA_MARKERS), so they are quota here too.
+        result = {"status": "error", "blockers": ["credits exhausted"], "summary": "", "exit_code": 1}
+        self.assertTrue(fusion_core.quota_failure(result))
+        self.assertEqual(fusion_core.classify_verdict(result)["verdict"], "quota")
+
+    def test_success_that_mentions_a_rate_limit_is_ok(self):
+        self.assertEqual(self.verdict("success", summary="Added backoff when the API returns a rate limit.", exit_code=0)["verdict"], "ok")
+
+    def test_refusal_words_inside_blockers_are_not_a_refusal(self):
+        verdict = self.verdict("error", ["the push was refused by the remote"], summary="I won't retry without approval of the plan.")
+        self.assertEqual(verdict["verdict"], "error")
