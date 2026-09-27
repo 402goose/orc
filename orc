@@ -380,7 +380,8 @@ fetch_models() {
 #
 # The bundled seed (data/quality.json in the orc source) is shipped with
 # the script and copied to $ORC_HOME/quality.json on first run, so the
-# picker has a real ranking out of the box. `orc refresh` re-fetches.
+# picker has a real ranking out of the box. `orc refresh` only seeds a
+# missing quality cache or warns if stale; it does not re-fetch quality data.
 
 fetch_quality() {
   mkdir -p "$ORC_HOME"
