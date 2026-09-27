@@ -194,7 +194,7 @@ def parse_assessment(answer, issues, target, workspace):
             raise ValueError("Each issue needs a reason")
     if seen != set(known):
         raise ValueError("Scout must assess or explain skipping every supplied issue")
-    candidates = []
+    candidates, rejected = [], []
     for row in value["candidates"]:
         if row.get("effort") not in {"small", "medium"} or row.get("risk") not in {"low", "medium"}:
             raise ValueError("Only bounded, small/medium effort and low/medium risk fixes belong in the shortlist")
@@ -206,6 +206,7 @@ def parse_assessment(answer, issues, target, workspace):
         evidence = row.get("evidence")
         if not isinstance(evidence, list) or not 1 <= len(evidence) <= 10:
             raise ValueError("Candidate needs source evidence")
+        rejection = None
         for item in evidence:
             if not isinstance(item, dict) or not required_string(item.get("path")) or not required_string(item.get("quote")):
                 raise ValueError("Evidence needs a path and exact source quote")
@@ -220,11 +221,14 @@ def parse_assessment(answer, issues, target, workspace):
                 raise ValueError("Evidence source is missing or too large")
             lines = path.read_text(errors="replace").splitlines()
             if end > len(lines) or item["quote"] not in "\n".join(lines[start - 1:end]):
-                raise ValueError(f"Source quote could not be verified: {item['path']}:{start}")
+                rejection = f"Source quote could not be verified: {item['path']}:{start}"
         issue = known[row["number"]]
+        if rejection:
+            rejected.append({"number": row["number"], "title": issue["title"], "reason": rejection})
+            continue
         candidates.append({**{k: row[k] for k in ("number", "reason", "effort", "risk", "plan", "verification", "acceptance", "reproduction", "evidence")},
                            "title": issue["title"], "url": issue["url"], "updated_at": issue["updatedAt"], "status": "ready"})
-    return candidates, [{"number": row["number"], "reason": row["reason"]} for row in value["skipped"]]
+    return candidates, [{"number": row["number"], "reason": row["reason"]} for row in value["skipped"]], rejected
 
 
 SCOUT_PROMPT = """You are Truffle pig, scouting tractable GitHub issues for Fusion. TRUFFLE_SCOUT_V1.
@@ -261,7 +265,7 @@ def hunt(workspace, config, **settings):
         scout_id = "truffle-" + uuid.uuid4().hex[:12]
         root = root_for(workspace, scout_id)
         record = dict(id=scout_id, status="scouting", pid=os.getpid(), started_at_ms=core.now_ms(),
-                      target=settings["count"], settings=settings, candidates=[], skipped=[], message="Reading open GitHub issues")
+                      target=settings["count"], settings=settings, candidates=[], skipped=[], rejected=[], message="Reading open GitHub issues")
         save(root / "hunt.json", record)
         try:
             repo, _ = repo_for(workspace, settings["remote"])
@@ -301,9 +305,12 @@ def hunt(workspace, config, **settings):
                 if result.get("status") != "success" or result.get("exit_code") != 0:
                     raise ValueError("Scout failed: " + str(result.get("blockers") or result.get("summary")))
                 answer = (workspace / ".fusion/runs" / result["run_id"] / "answer.md").read_text()
-                candidates, skipped = parse_assessment(answer, eligible, settings["count"], workspace)
+                candidates, skipped, rejected = parse_assessment(answer, eligible, settings["count"], workspace)
                 record["candidates"] = candidates
                 record["skipped"] += skipped
+                record["rejected"] = rejected
+                if rejected and not candidates:
+                    raise ValueError("No candidate survived source quote verification")
             record.update(status="ready", message=f"{len(record['candidates'])} source-backed candidates from {len(issues)} issues. Review before queueing.")
             progress.emit("truffle", record["message"])
         except BaseException as exc:
