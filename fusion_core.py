@@ -933,6 +933,7 @@ class RunStore:
             "execution_choice": result.get("execution_choice"),
             "usage": result.get("usage") or {},
             "session_key": task.get("session_key"),
+            **({"lane_key": metadata["lane_key"]} if metadata.get("lane_key") else {}),
             "resumed": bool(result.get("resumed")),
             "session_idle_s": result.get("session_idle_s"),
             **({"resume_skipped": result["resume_skipped"]} if result.get("resume_skipped") else {}),
@@ -1672,6 +1673,7 @@ def dispatch(
     session["resumed"] = bool(session_id)
     argv, env, metadata = agent_command(config, task, session_id)
     metadata["execution_mode"] = execution_mode(config)
+    metadata["lane_key"] = lane_key(task["agent"], agent_settings(config, task))
     task["resolved"] = metadata
     store.write_json(run_dir / "task.json", task)
     binary = executable(argv[0])
@@ -2478,8 +2480,15 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--limit", type=int, default=20)
     trace = sub.add_parser("trace", help="show recent telemetry spans")
     trace.add_argument("--limit", type=int, default=100)
-    usage = sub.add_parser("usage", help="summarize token usage and latency from telemetry")
-    usage.add_argument("--limit", type=int, default=10000)
+    usage = sub.add_parser("usage", help="show local ORC, Claude and Codex usage and quota")
+    usage.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    usage.add_argument("--since", default="24h", help="lookback duration (24h, 7d) or ISO timestamp")
+    usage.add_argument("--by", choices=("session", "project", "model", "agent"), default="session")
+    usage.add_argument("--top", type=int, help="display the N groups with most context tokens")
+    usage.add_argument("--limit", type=int, help="limit ORC spans read (provider transcripts remain complete)")
+    usage.add_argument("--record", action="store_true", help="save one full snapshot per UTC day")
+    usage.add_argument("--context-threshold", type=float, default=200000)
+    usage.add_argument("--calls-per-hour-threshold", type=float, default=60)
 
     telemetry = sub.add_parser("telemetry", help="local and remote telemetry configuration")
     telemetry_sub = telemetry.add_subparsers(dest="telemetry_command", required=True)
@@ -2524,6 +2533,12 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main(args, parser) -> int:
     workspace = workspace_path(args.workspace)
+    if args.command == "usage":
+        from fusion_usage import command as usage_command
+        try:
+            return usage_command(args, workspace)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
     if args.command == "ui":
         from fusion_ui import serve
         return serve(workspace, args.port, not args.no_open)
@@ -2567,10 +2582,6 @@ def _main(args, parser) -> int:
         return 0
     if args.command == "trace":
         payload = RunStore(workspace).traces(args.limit)
-        print(json_text(payload))
-        return 0
-    if args.command == "usage":
-        payload = usage_summary(RunStore(workspace).traces(args.limit))
         print(json_text(payload))
         return 0
     if args.command == "telemetry":
