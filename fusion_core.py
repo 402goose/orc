@@ -353,6 +353,10 @@ def classify_verdict(result: dict[str, Any]) -> dict[str, Any]:
     if kind == "quota":
         match = RESETS_RE.search(text)
         return {"verdict": "quota", "reason": "quota", "resets_at": match.group(1).strip() if match else None}
+    # Structural first: exit code 3 is the refusal code tenet-cli's
+    # agent-outcome contract uses. A first-person decline is only a fallback.
+    if result.get("exit_code") == 3:
+        return {"verdict": "refused", "reason": "exit_code_3"}
     if REFUSAL_RE.search(str(result.get("summary") or "")):
         return {"verdict": "refused", "reason": "declined"}
     if kind == "missing_executable" or result.get("exit_code") == 127:

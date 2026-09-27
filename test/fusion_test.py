@@ -2198,3 +2198,12 @@ class VerdictTest(unittest.TestCase):
     def test_refusal_words_inside_blockers_are_not_a_refusal(self):
         verdict = self.verdict("error", ["the push was refused by the remote"], summary="I won't retry without approval of the plan.")
         self.assertEqual(verdict["verdict"], "error")
+
+    def test_harness_refusals_are_errors_and_exit_3_is_a_refusal(self):
+        # TENET reason strings ("land refused", "verify refused") are harness facts,
+        # not a model declining; the structural exit code 3 is.
+        verdict = self.verdict("error", ["tenet build land refused merged-result not-clean"],
+                               summary="tenet build land refused merged-result not-clean")
+        self.assertEqual(verdict["verdict"], "error")
+        self.assertEqual(self.verdict("error", exit_code=3), {"verdict": "refused", "reason": "exit_code_3"})
+
