@@ -27,7 +27,8 @@ text and B, names the files and symbols the fix must change, and the gym
 grades that against the fix's diff (fusion_gym_localize); no checks run.
 
 `report` reads the gym's results: per kind, mode, lane and task, from
-receipts only.
+receipts only. `priors` exports them per lane and work class (fix: write,
+localize: read) as the lane priors automatic routing reads (fusion_policy).
 """
 from __future__ import annotations
 
@@ -1017,6 +1018,22 @@ AUDIT_KINDS = {
 }
 
 
+def _latest_hidden(gym):
+    """The latest completed hidden-mode row per key, for the kinds the audit knows."""
+    latest = {}
+    for row in read_results(gym):
+        if (row.get("event") == "finished" and row.get("mode") in HIDDEN_MODES and row.get("completed")
+                and row.get("kind") in AUDIT_KINDS):
+            latest[row["key"]] = row
+    return latest
+
+
+def _solved(latest):
+    """{(kind, mode, task)} some lane solved (fix) or localized (localize)."""
+    return {(row["kind"], row["mode"], row["task"]) for row in latest.values()
+            if row.get("verdict") == AUDIT_KINDS[row["kind"]][0]}
+
+
 def audit(gym):
     """A negative gym label claims the worker failed a task that could be done.
     SWE-bench Verified drops tasks whose hidden tests expect something the
@@ -1031,13 +1048,8 @@ def audit(gym):
     lane localized that task, whatever the fix runs did."""
     from fusion_decisions import DecisionStore, label_provenance, read_jsonl, reviewed_labels
     store = DecisionStore(gym)
-    latest = {}
-    for row in read_results(gym):
-        if (row.get("event") == "finished" and row.get("mode") in HIDDEN_MODES and row.get("completed")
-                and row.get("kind") in AUDIT_KINDS):
-            latest[row["key"]] = row
-    solved = {(row["kind"], row["mode"], row["task"]) for row in latest.values()
-              if row.get("verdict") == AUDIT_KINDS[row["kind"]][0]}
+    latest = _latest_hidden(gym)
+    solved = _solved(latest)
     events = read_jsonl(store.path)
     answers, _ = reviewed_labels(events)
     sources = label_provenance(events)
@@ -1074,6 +1086,114 @@ def audit(gym):
         summary["localize"] = {"localized_tasks": sorted(done), "unlocalized_tasks": sorted(attempted - done)}
     (Path(gym) / "audit.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     return summary
+
+
+# ---------------------------------------------------------------- lane priors
+
+PRIORS_SCHEMA = "fusion.lane_priors.v1"
+# Work class per kind: a fix writes, a localization only reads.
+WORK_CLASSES = {"fix": "write", "localize": "read"}
+# Per kind: verdicts that count as a success and as a failure. Everything
+# else is excluded: invalid_baseline measured the machine, tampered graded
+# itself, and a partial localization is neither (grade_label leaves it
+# unlabeled too). invalid_answer is a failure here, unlike for labels: a lane
+# that returns no usable answer failed the read-only task it was routed.
+PRIOR_VERDICTS = {"fix": ({"solved"}, {"unsolved", "regressed"}),
+                  "localize": ({"localized"}, {"missed", "invalid_answer"})}
+
+
+def default_priors_path():
+    """Beside the global fusion.json, under ORC_HOME."""
+    return Path(os.environ.get("ORC_HOME") or Path.home() / ".config/orc") / "lane_priors.json"
+
+
+def lane_tuple(spec):
+    """(agent, route, model, reasoning_effort) with empty values as None."""
+    spec = spec or {}
+    return tuple(spec.get(name) or None for name in ("agent", "route", "model", "reasoning_effort"))
+
+
+def lane_prior_key(spec):
+    """The routing key a candidate for this lane would carry: the route (with
+    `:model` for an arm), else the agent, then any pinned model and effort.
+    Informational only: routing matches on the tuple, not the name."""
+    agent, route, model, effort = lane_tuple(spec)
+    return ":".join(part for part in (route or agent, model, effort) if part)
+
+
+def lane_priors(gym, now=None):
+    """Per lane and work class, from completed hidden-mode rows (latest per
+    key): attempts, successes, mean cost and wall seconds. Rows on a task no
+    lane solved (fix, per hidden mode) or localized are excluded, as the audit
+    withholds their negatives: an underspecified task says nothing about a
+    lane. Both hidden modes count toward `write`, each audited on its own."""
+    latest = _latest_hidden(gym)
+    solved = _solved(latest)
+    generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time()))
+    priors, excluded, unsolvable = {}, {}, {}
+    for row in sorted(latest.values(), key=lambda r: r["key"]):
+        kind, verdict = row["kind"], row.get("verdict")
+        wins, losses = PRIOR_VERDICTS[kind]
+        scope = row["mode"] if kind == "fix" else "localize"
+        if (kind, row["mode"], row["task"]) not in solved:
+            unsolvable.setdefault(scope, set()).add(row["task"])
+            excluded["unsolved_by_all"] = excluded.get("unsolved_by_all", 0) + 1
+            continue
+        if verdict not in wins | losses or row.get("tampered"):
+            excluded[verdict or "none"] = excluded.get(verdict or "none", 0) + 1
+            continue
+        spec = row.get("lane_spec") or {}
+        if not spec.get("agent"):
+            excluded["no_lane_spec"] = excluded.get("no_lane_spec", 0) + 1
+            continue
+        agent, route, model, effort = lane_tuple(spec)
+        entry = priors.setdefault(lane_prior_key(spec), {"agent": agent, "route": route, "model": model,
+                                                          "reasoning_effort": effort, "gym_lanes": []})
+        if row["lane"] not in entry["gym_lanes"]:
+            entry["gym_lanes"].append(row["lane"])
+        stats = entry.setdefault(WORK_CLASSES[kind], {"attempts": 0, "successes": 0, "_cost": 0.0, "_ms": 0})
+        stats["attempts"] += 1
+        stats["successes"] += verdict in wins
+        stats["_cost"] += float(row.get("cost_usd") or 0)
+        stats["_ms"] += int(row.get("duration_ms") or 0)
+    for entry in priors.values():
+        entry["gym_lanes"].sort()
+        for work in WORK_CLASSES.values():
+            stats = entry.get(work)
+            if stats:
+                cost, ms = stats.pop("_cost"), stats.pop("_ms")
+                stats.update(mean_cost_usd=round(cost / stats["attempts"], 4),
+                             mean_seconds=round(ms / stats["attempts"] / 1000, 1),
+                             source="gym", generated_at=generated_at)
+    return {"schema": PRIORS_SCHEMA, "source": "gym", "gym": str(Path(gym).resolve()), "generated_at": generated_at,
+            "counted": {"write": "completed hidden and hidden+hints fix runs: solved vs unsolved/regressed",
+                        "read": "completed localize runs: localized vs missed/invalid_answer"},
+            "excluded": dict(sorted(excluded.items())),
+            "unsolved_by_all": {scope: sorted(tasks) for scope, tasks in sorted(unsolvable.items())},
+            "priors": dict(sorted(priors.items()))}
+
+
+def write_priors(value, path):
+    path = Path(path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    temporary.replace(path)
+    return path
+
+
+def priors_table(value):
+    lines = [f"{'key':<60} {'class':<5} {'n':>3} {'ok':>3} {'rate':>5} {'cost$':>7} {'mean s':>7}"]
+    for key, entry in value["priors"].items():
+        for work in WORK_CLASSES.values():
+            stats = entry.get(work)
+            if stats:
+                lines.append(f"{key:<60} {work:<5} {stats['attempts']:>3} {stats['successes']:>3} "
+                             f"{stats['successes'] / stats['attempts']:>5.2f} {stats['mean_cost_usd']:>7.4f} "
+                             f"{stats['mean_seconds']:>7.1f}")
+    lines.append("excluded: " + (", ".join(f"{k} {v}" for k, v in value["excluded"].items()) or "none"))
+    lines += [f"unsolved by all ({scope}): {', '.join(tasks)}" for scope, tasks in value["unsolved_by_all"].items()]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- report
@@ -1262,6 +1382,10 @@ def add_parser(sub):
     report_cmd.add_argument("gym_dir")
     audit_cmd = commands.add_parser("audit", help="retract negatives from tasks no lane has solved; restore them once one does")
     audit_cmd.add_argument("gym_dir")
+    priors_cmd = commands.add_parser("priors", help="export per-lane, per-work-class success priors for routing")
+    priors_cmd.add_argument("gym_dir")
+    priors_cmd.add_argument("--out", help="where to write them (default: lane_priors.json under ORC_HOME, "
+                                          "~/.config/orc; `-` prints only)")
 
 
 def command(args, workspace, as_json=False, out=None):
@@ -1284,6 +1408,12 @@ def command(args, workspace, as_json=False, out=None):
         print(json.dumps(result, indent=2) if as_json else
               f"{result['status']}: {len(result['runs'])} runs, ${result['spent_usd']:.2f}\n" + table(report(args.gym_workspace)),
               file=out)
+        return 0
+    if args.gym_command == "priors":
+        value = lane_priors(args.gym_dir)
+        path = None if args.out == "-" else write_priors(value, args.out or default_priors_path())
+        print(json.dumps(value, indent=2) if as_json else
+              priors_table(value) + (f"\nwrote {path}" if path else ""), file=out)
         return 0
     if args.gym_command == "audit":
         value = audit(args.gym_dir)
