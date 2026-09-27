@@ -1180,6 +1180,26 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
         self.assertEqual(report["blockers"], [])
         self.assertIsNone(report["resume_command"])
 
+    def test_successful_worker_discussing_quota_is_not_a_quota_pause(self):
+        claude = self.write_agent(
+            "quota-topic-claude",
+            """
+import json
+text = "SUMMARY: planned quota routing\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none. Assumptions: an exhausted quota cannot constrain unrelated lanes; rate limit windows reset at their resets_at."
+print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':'s','result':text}))
+""",
+        )
+        self.config(claude=claude)
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps({"task": "quota topic", "max_attempts": 1,
+                                         "nodes": [{"id": "plan", "task": "plan", "agent": "claude"}]}), encoding="utf-8")
+        config = json.loads((self.workspace / ".fusion.json").read_text())
+        result = run_workflow(self.workspace, config, spec_path)
+        self.assertNotEqual(result["status"], "paused_quota")
+        manifest = json.loads((self.workspace / ".fusion" / "workflows" / result["workflow_id"] / "manifest.json").read_text())
+        self.assertNotEqual(manifest["nodes"]["plan"]["status"], "paused_quota")
+        self.assertNotIn("claude", manifest.get("lanes") or {})
+
     def test_workflow_report_surfaces_blockers_and_resume_command(self):
         claude = self.write_agent(
             "report-quota-claude",
