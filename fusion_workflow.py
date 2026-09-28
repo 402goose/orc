@@ -11,6 +11,7 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import contextlib
 import copy
+import fnmatch
 import hashlib
 import json
 import os
@@ -297,6 +298,62 @@ def expand_spec(spec: dict[str, Any]) -> tuple[dict[str, Any], dict[str, list[st
     return {"nodes": expanded}, base_to_ids
 
 
+def _check_argv(check: Any) -> Any:
+    return check.get("argv") if isinstance(check, dict) else check
+
+
+def _validate_checks(checks: Any) -> None:
+    if checks is None:
+        return
+    if not isinstance(checks, list):
+        raise ValueError("acceptance.checks must be a list")
+    for check in checks:
+        # Preserve the legacy argv gate's runtime validation.
+        if not isinstance(check, dict):
+            continue
+        argv = _check_argv(check)
+        if (set(check) - {"argv", "sha256", "path", "min_tests"} or not isinstance(argv, list)
+                or not argv or not all(isinstance(p, str) and p and "\x00" not in p for p in argv)):
+            raise ValueError("acceptance check object requires argv of non-empty strings and only argv/sha256/path/min_tests")
+        if "sha256" in check and (not isinstance(check["sha256"], str)
+                                  or not re.fullmatch(r"[0-9a-fA-F]{64}", check["sha256"])):
+            raise ValueError("acceptance check sha256 must be a 64-character hexadecimal digest")
+        if "path" in check and (not isinstance(check["path"], str) or not check["path"]
+                                or "\x00" in check["path"] or "sha256" not in check):
+            raise ValueError("acceptance check path must be a non-empty path with sha256")
+        if "min_tests" in check and (type(check["min_tests"]) is not int or check["min_tests"] < 0):
+            raise ValueError("acceptance check min_tests must be a nonnegative integer")
+
+
+def _sha256(path: Path) -> str | None:
+    try:
+        if not path.is_file():
+            return None
+        with path.open("rb") as handle:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+            return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _tests_run(paths: list[Path]) -> int | None:
+    counts = []
+    for path in paths:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                match = re.search(r"\bRan (\d+) tests?\b", line)
+                if match:
+                    counts.append(int(match[1]))
+                # Only pytest's terminal summary, not collection/progress lines.
+                if re.search(r"\bin \d+(?:\.\d+)?s\b", line):
+                    parts = re.findall(r"\b(\d+) (?:passed|failed|errors?|xfailed|xpassed)\b", line)
+                    if parts:
+                        counts.append(sum(map(int, parts)))
+    return max(counts) if counts else None
+
+
 def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(spec, dict):
         raise ValueError("workflow spec must be an object")
@@ -346,11 +403,14 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
         if before is not None and (not isinstance(before, bool) or (before and not node["write"])):
             raise ValueError(f"workflow node {node['id']} acceptance.before must be a boolean on a write node")
         if isinstance(node.get("acceptance"), dict):
+            _validate_checks(node["acceptance"].get("checks"))
             _validate_fixtures(node["id"], node["acceptance"].get("fixtures"))
             targeted = node["acceptance"].get("fail_to_pass")
             if targeted is not None and (before is not True or not isinstance(targeted, list)
-                                         or any(check not in (node["acceptance"].get("checks") or []) for check in targeted)):
+                                         or any(_check_argv(check) not in [_check_argv(c) for c in node["acceptance"].get("checks") or []]
+                                                for check in targeted)):
                 raise ValueError(f"workflow node {node['id']} acceptance.fail_to_pass must list some of its checks and needs acceptance.before")
+            _validate_checks(targeted)
         if node.get("independent_of") and node["independent_of"] not in node["needs"]:
             raise ValueError("independent_of must name a direct dependency")
 
@@ -386,13 +446,14 @@ def load_spec(path: Path) -> dict[str, Any]:
     return validate_spec(value)
 
 
-def _authored_before_checks(node: dict[str, Any]) -> list[list[str]]:
+def _authored_before_checks(node: dict[str, Any]) -> list[Any]:
     """A write node's authored argv checks that opted into a pre-change run."""
     acceptance = node.get("acceptance") or {}
     if not node.get("write") or not isinstance(acceptance, dict) or acceptance.get("before") is not True:
         return []
     return [command for command in _as_list(acceptance.get("checks"))
-            if isinstance(command, list) and command and all(isinstance(part, str) for part in command)]
+            if isinstance(_check_argv(command), list) and _check_argv(command)
+            and all(isinstance(part, str) for part in _check_argv(command))]
 
 
 def _result_cost(result: dict[str, Any]) -> float:
@@ -459,6 +520,8 @@ class WorkflowRunner:
         if resume:
             self._load_existing()
         else:
+            for node in self.nodes.values():
+                self._bind_check_contracts(node)
             self.root.mkdir(parents=True, exist_ok=bool(self.git_context))
             self.nodes_root.mkdir(parents=True, exist_ok=True)
             self._write_manifest("running")
@@ -496,7 +559,8 @@ class WorkflowRunner:
             result = old.get("result")
             self.nodes[node_id]["result"] = result
             self.nodes[node_id]["excluded_routes"] = old.get("excluded_routes", [])
-            for key in ("_artifact_baseline", "_tree_baseline", "review_repair", "repair_feedback"):
+            for key in ("_artifact_baseline", "_tree_baseline", "_check_input_pins", "_declared_check_paths",
+                        "acceptance_warnings", "review_repair", "repair_feedback"):
                 if key in old:
                     self.nodes[node_id][key] = old[key]
             status = str(old.get("status", "pending"))
@@ -510,6 +574,8 @@ class WorkflowRunner:
                 if lane and lane not in self.nodes[node_id]["excluded_routes"]:
                     self.nodes[node_id]["excluded_routes"].append(lane)
             self.nodes[node_id]["status"] = "success" if status == "success" else "pending"
+        for node in self.nodes.values():
+            self._bind_check_contracts(node, infer=node["attempts"] == 0)
         self._invalidate_stale_receipts()
         self._write_manifest("running")
         self._event("workflow.resumed", {})
@@ -585,6 +651,16 @@ class WorkflowRunner:
                 self._baseline_plan_checks(node, run=False)
                 self._baseline_authored_checks(node, run=False)
             accepted, problems = self._accept_node(node, result)
+            if result.get("check_inputs_changed"):
+                from fusion_decisions import DecisionStore
+                from fusion_labeling import withdraw_gate_labels
+                withdrawal = withdraw_gate_labels(self.control_workspace, result.get("run_id"), result["check_inputs_changed"])
+                if withdrawal["decision_ids"]:
+                    result["gate_label"] = {**(result.get("gate_label") or {}), **withdrawal}
+                DecisionStore(self.control_workspace).append(
+                    "outcome_excluded", task_id=result.get("run_id"), group=self.run_id,
+                    check_inputs_changed=result["check_inputs_changed"], excluded_reason="check inputs changed (tampered)")
+                self._record_gate({"role": node["role"], "trace_id": self.run_id, "write": node["write"]}, result, accepted, problems)
             if result.get("acceptance_checks"):
                 # Resume rechecks have their own receipts; keep node.json and
                 # the manifest pointing at the same latest observations.
@@ -835,6 +911,104 @@ BLOCKERS: unresolved issues, or none
         except Exception:
             return None
 
+    def _check_inputs(self, check: Any, *, include_directories: bool = False) -> list[str]:
+        """Existing workspace inputs, including unittest discovery's test files."""
+        argv = _check_argv(check)
+        if not isinstance(argv, list) or not all(isinstance(p, str) for p in argv):
+            return []
+        root = self.workspace.resolve()
+        workspace_alias = Path(os.path.abspath(self.workspace))
+        candidates = list(argv)
+        if isinstance(check, dict) and check.get("path"):
+            candidates.append(check["path"])
+        if len(argv) >= 4 and Path(argv[0]).name.startswith("python") and argv[1:4] == ["-m", "unittest", "discover"]:
+            start, pattern = ".", "test*.py"
+            args = iter(argv[4:])
+            for arg in args:
+                if arg in {"-s", "--start-directory"}:
+                    start = next(args, ".")
+                elif arg in {"-p", "--pattern"}:
+                    pattern = next(args, "test*.py")
+                elif arg.startswith("--start-directory="):
+                    start = arg.split("=", 1)[1]
+                elif arg.startswith("--pattern="):
+                    pattern = arg.split("=", 1)[1]
+            directory = root / start
+            if directory.is_dir() and directory.resolve().is_relative_to(root):
+                candidates.extend(str(p) for p in directory.rglob("*") if fnmatch.fnmatch(p.name, pattern))
+        inputs = set()
+        for part in candidates:
+            try:
+                path = Path(os.path.abspath(self.workspace / part))
+                if ((path.is_file() or (include_directories and path.is_dir()))
+                        and path.resolve().is_relative_to(root)):
+                    # Keep symlinks inside the workspace in the saved path:
+                    # redirecting a link must be observed at the gate too.
+                    base = workspace_alias if path.is_relative_to(workspace_alias) else root
+                    relative = path.relative_to(base) if path.is_relative_to(base) else path.resolve().relative_to(root)
+                    inputs.add(str(relative))
+            except (OSError, ValueError):
+                continue
+        return sorted(inputs)
+
+    def _pin_check_inputs(self, node: dict[str, Any]) -> None:
+        checks = [*_as_list((node.get("acceptance") or {}).get("checks")), *(node.get("_plan_checks") or [])]
+        # Never recapture after a worker has run, including older manifests
+        # without pins. An empty dictionary is still a saved baseline.
+        if node["attempts"] == 1 and "_check_input_pins" not in node:
+            paths = {path for check in checks for path in self._check_inputs(check)}
+            node["_check_input_pins"] = {path: _sha256(self.workspace / path) for path in sorted(paths)}
+        warnings = [f"Unpinned acceptance check uses workspace input: {path}"
+                    for path in sorted({path for check in checks if isinstance(check, list)
+                                        for path in self._check_inputs(check, include_directories=True)})]
+        node["acceptance_warnings"] = warnings
+        for warning in warnings:
+            self._event("acceptance.check.warning", {"node_id": node["id"], "message": warning})
+
+    def _bind_check_contracts(self, node: dict[str, Any], *, infer: bool = True) -> None:
+        """Choose evaluator paths before dispatch; never infer from a worker's tree.
+
+        Explicit paths also support fixtures or evaluators that do not exist yet.
+        Older resumes lacking a binding must declare a path instead of letting
+        newly planted argv files silently select a different evaluator.
+        """
+        acceptance = node.get("acceptance") or {}
+        if not isinstance(acceptance, dict):
+            return
+        paths = node.setdefault("_declared_check_paths", {})
+        for check in _as_list(acceptance.get("checks")):
+            if not isinstance(check, dict) or "sha256" not in check:
+                continue
+            key = json.dumps(check, sort_keys=True)
+            if key in paths:
+                continue
+            path = self.workspace / check["path"] if "path" in check else None
+            if path is None and infer:
+                # Bare argv[0] is resolved by the subprocess through PATH,
+                # never by treating a same-named workspace file as the program.
+                path = next((self.workspace / part for index, part in enumerate(check["argv"])
+                             if (index != 0 or os.path.dirname(part))
+                             and (self.workspace / part).is_file()), None)
+            if path is None:
+                raise ValueError(f"workflow node {node['id']} cannot bind acceptance sha256 to a file before dispatch; "
+                                 'declare an explicit "path"')
+            # Keep symlinks in the path: hashing a resolved target would miss a
+            # worker redirecting the path that the command actually executes.
+            paths[key] = os.path.abspath(path)
+
+    @contextlib.contextmanager
+    def _declared_check_contract(self, check: dict[str, Any], receipt: dict[str, Any], bound_path: str | None):
+        """Check the actual evaluator after fixtures are installed, before launch."""
+        if "sha256" in check:
+            path = Path(bound_path) if bound_path is not None else None
+            observed = _sha256(path) if path is not None else None
+            receipt["contract"] = {"path": str(path) if path else None, "sha256": check["sha256"].lower(),
+                                   "observed_sha256": observed}
+            if observed != check["sha256"].lower():
+                receipt["problem_code"] = "check_contract_changed"
+                raise ValueError("acceptance check contract changed; review and version the contract explicitly")
+        yield
+
     def _acceptance_check(self, node: dict[str, Any], result: dict[str, Any],
                           command: Any, index: int, *, phase: str = "after",
                           env: dict[str, str] | None = None, timeout: int | None = None,
@@ -856,6 +1030,8 @@ BLOCKERS: unresolved issues, or none
         adds variables to the inherited environment and only their names are
         recorded; `annotations` are saved in the receipt (origin, vacuity).
         """
+        declaration = command if isinstance(command, dict) else {}
+        command = _check_argv(command)
         attempt = int(result.get("attempt") or node.get("attempts") or 0)
         directory = (self._node_dir(node["id"]) / "acceptance" / f"attempt-{attempt}"
                      / f"{'before-' if phase == 'before' else ''}check-{index + 1}-{uuid.uuid4().hex[:12]}")
@@ -874,6 +1050,8 @@ BLOCKERS: unresolved issues, or none
             **({"env_overrides": sorted(env)} if env else {}),
             **(annotations or {}),
             "argv": command,
+            **({"declaration": declaration} if declaration else {}),
+            **({"check_inputs_changed": result["check_inputs_changed"]} if result.get("check_inputs_changed") else {}),
             "cwd": str(self.workspace.resolve()),
             "started_at_ms": core.now_ms(),
             "finished_at_ms": None,
@@ -906,6 +1084,8 @@ BLOCKERS: unresolved issues, or none
                 timeout = int(timeout or self.config.get("timeout_seconds", 3600))
                 receipt["timeout_seconds"] = timeout
                 with self._fixtures_applied(node, directory, receipt), \
+                        self._declared_check_contract(declaration, receipt,
+                            (node.get("_declared_check_paths") or {}).get(json.dumps(declaration, sort_keys=True))), \
                         subprocess.Popen(command, cwd=self.workspace, stdin=subprocess.DEVNULL,
                                          env={**os.environ, **env} if env else None, stdout=stdout, stderr=stderr,
                                          start_new_session=(os.name == "posix")) as process:
@@ -978,6 +1158,12 @@ BLOCKERS: unresolved issues, or none
             snapshot.replace(path)
             receipt["outputs"][name] = {"path": str(path), "sha256": digest.hexdigest(), "bytes": size,
                                         "capture_bytes_observed": observed_size}
+        if "min_tests" in declaration:
+            receipt["min_tests"] = declaration["min_tests"]
+            receipt["tests_run"] = _tests_run([stdout_path, stderr_path])
+            if receipt["status"] in {"passed", "failed"} and (receipt["tests_run"] is None or receipt["tests_run"] < declaration["min_tests"]):
+                receipt.update(status="failed", problem_code="check_tests_missing",
+                               error=f"acceptance check ran {receipt['tests_run']} tests; expected at least {declaration['min_tests']}")
         save()
         self._event("acceptance.check.finished", {"node_id": node["id"], "attempt": attempt,
                                                   "status": receipt["status"], "receipt": str(receipt_path)})
@@ -1120,7 +1306,7 @@ BLOCKERS: unresolved issues, or none
                     receipts.append(self._acceptance_check(node, {"attempt": node["attempts"]}, command, index,
                                                            phase="before", env=env, timeout=timeout))
                 except OSError as exc:
-                    receipts.append({"argv": command, "phase": "before", "status": "error", "error": str(exc)})
+                    receipts.append({"argv": _check_argv(command), "phase": "before", "status": "error", "error": str(exc)})
         node[key] = {"checks": checks, "receipts": receipts, **({"fixtures": fixtures} if fixtures else {})}
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(core.json_text(node[key]) + "\n", encoding="utf-8")
@@ -1159,6 +1345,10 @@ BLOCKERS: unresolved issues, or none
         # Older/rechecked receipts remain on disk in their unique directories.
         result["acceptance_checks"] = []
         result["gate_codes"] = []
+        result["check_inputs_changed"] = sorted(path for path, digest in (node.get("_check_input_pins") or {}).items()
+                                                if _sha256(self.workspace / path) != digest)
+        if result["check_inputs_changed"]:
+            self._event("node.check_inputs_changed", {"node_id": node["id"], "check_inputs_changed": result["check_inputs_changed"]})
         if core.failure_class(result) == "coordinator_error":
             # The coordinator failed to establish the review evidence. Worker
             # handoff checks cannot repair this and only obscure the real error.
@@ -1214,7 +1404,7 @@ BLOCKERS: unresolved issues, or none
             extra: dict[str, Any] = {}
             vacuous = None
             if origin == "plan" or command in with_before:
-                baseline = before[origin].get(json.dumps(command))
+                baseline = before[origin].get(json.dumps(_check_argv(command)))
                 # Vacuous: it already passed before the change. Known only
                 # when a baseline ran; a baseline that could not run is unknown.
                 vacuous = {"passed": True, "failed": False}.get((baseline or {}).get("status"))
@@ -1231,13 +1421,16 @@ BLOCKERS: unresolved issues, or none
                 continue
             result["acceptance_checks"].append(receipt)
             if receipt["status"] != "passed":
-                label = " ".join(command) if isinstance(command, list) and all(isinstance(part, str) for part in command) else str(command)
+                argv = _check_argv(command)
+                label = " ".join(argv) if isinstance(argv, list) and all(isinstance(part, str) for part in argv) else str(command)
                 detail = {"origin": origin, "check_index": index, "status": receipt["status"], "vacuous": vacuous,
                           "exit_code": receipt.get("exit_code"),
-                          "targeted": origin == "authored" and command in (((node.get("acceptance") or {}).get("fail_to_pass")) or []),
-                          "test_failure": receipt["status"] == "failed" and isinstance(command, list)
-                          and counts_as_failure(command, receipt.get("exit_code"))}
-                if receipt["error"]:
+                          "targeted": origin == "authored" and argv in [_check_argv(c) for c in acceptance.get("fail_to_pass") or []],
+                          "test_failure": receipt["status"] == "failed" and isinstance(argv, list)
+                          and counts_as_failure(argv, receipt.get("exit_code"))}
+                if receipt.get("problem_code"):
+                    problem(receipt["problem_code"], receipt["error"], **detail)
+                elif receipt["error"]:
                     problem("check_error", f"acceptance check could not run: {label} ({receipt['error']})", **detail)
                 else:
                     problem("check_failed", f"acceptance check failed: {label}", **detail)
@@ -1351,7 +1544,8 @@ BLOCKERS: unresolved issues, or none
         now = core.now_ms()
         self.store.trace_span(
             self.config, {**task, "run_id": run_id, "agent": "gate", "route": None},
-            {"status": "success" if accepted else "failed", "blockers": list(problems), "usage": {}},
+            {"status": "success" if accepted else "failed", "blockers": list(problems), "usage": {},
+             "check_inputs_changed": result.get("check_inputs_changed", [])},
             now, now, {},
         )
 
@@ -1571,6 +1765,7 @@ BLOCKERS: unresolved issues, or none
                         # their pre-change run must precede the tree baseline
                         # so its caches never count as the worker's change.
                         self._prepare_plan_checks(selected)
+                        self._pin_check_inputs(selected)
                         self._baseline_plan_checks(selected)
                         self._baseline_authored_checks(selected)
                     # A writer that writes nothing did not do the work. Record
@@ -1628,7 +1823,7 @@ BLOCKERS: unresolved issues, or none
                     if gate_input:
                         # Only objective gate codes label; the veto above never does.
                         result["gate_label"] = gate_label(self.config, self.control_workspace, gate_input, codes,
-                                                          result.get("acceptance_checks", []))
+                                                          result.get("acceptance_checks", []), result.get("check_inputs_changed"))
                     if problems:
                         result.setdefault("blockers", []).extend(problems)
                     previous = node.get("result") or {}
@@ -1850,6 +2045,8 @@ def workflow_report(workspace: Path, run_id: str) -> dict[str, Any]:
             "execution_choice": result.get("execution_choice"),
             "changed": result.get("changed", []),
             "tests": result.get("tests", []),
+            "acceptance_warnings": node.get("acceptance_warnings", []),
+            "check_inputs_changed": result.get("check_inputs_changed", []),
             "digest": digest[:12] if digest else None,
             "decisions": decision_store.summaries(result.get("decisions")) if result.get("decisions") else {},
         })

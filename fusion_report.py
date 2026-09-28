@@ -189,6 +189,10 @@ def format_report(report, *, brief=False):
         lines.append(f"  {node['id']} [{node['agent']}]: {node['status']} (attempts={node['attempts']}{duration})")
         if brief and node.get("summary"):
             lines.append(f"    {progress.clean(node['summary'], 400)}")
+        for warning in node.get("acceptance_warnings", []):
+            lines.append(f"    Warning: {terminal_text(warning)}")
+        if node.get("check_inputs_changed"):
+            lines.append("    Untrusted check evidence (tampered): " + ", ".join(terminal_text(p) for p in node["check_inputs_changed"]))
         for kind, decision in (node.get("decisions") or {}).items():
             if decision.get("status") != "ok":
                 continue

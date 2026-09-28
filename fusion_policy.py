@@ -209,7 +209,10 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None):
             unavailable_commands.add((core.lane_key(agent, settings), settings.get("command", agent)))
     seen = set()
     seen_commands = set()
+    untrusted = set()
     for span in store.traces(limit=200):
+        if span.get("check_inputs_changed"):
+            untrusted.add(span.get("run_id"))
         key = span.get("route") or span.get("agent")
         if not key:
             continue
@@ -314,8 +317,8 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None):
             # error is observed. Quota and permission failures are lane health
             # (cooldown), not evidence about quality.
             evidence = [(span, outcomes[span["run_id"]] if span.get("run_id") in outcomes else False) for span in spans
-                        if span.get("run_id") in outcomes or (span.get("status") == "error"
-                                                              and span.get("failure_class") not in {"quota", "permission_denied"})]
+                        if span.get("run_id") not in untrusted and (span.get("run_id") in outcomes or
+                            (span.get("status") == "error" and span.get("failure_class") not in {"quota", "permission_denied"}))]
             # Read-only and writing work differ: this task's class counts when
             # it has any evidence, else every class pooled.
             same = [ok for span, ok in evidence if "write" in span and bool(span["write"]) == (work == "write")]
@@ -567,20 +570,25 @@ def effective_outcomes(events):
 
     Keep independent gate evidence so withdrawing the external lifecycle restores
     it, without reviving an earlier external stage. Unmeasured events are audit-only.
+    Changed check inputs exclude the run, including previously recorded successes.
     """
     independent, external = {}, {}
+    untrusted = set()
     for index, event in enumerate(events):
         run_id = event.get("task_id")
         if not run_id:
             continue
-        if event.get("event") == "outcome_withdraw" and event.get("source") == "lead":
+        if event.get("event") in {"outcome", "outcome_excluded"} and event.get("check_inputs_changed"):
+            untrusted.add(run_id)
+            independent.pop(run_id, None)
+        elif event.get("event") == "outcome_withdraw" and event.get("source") == "lead":
             external.pop(run_id, None)
         elif event.get("event") == "outcome" and isinstance(event.get("accepted"), bool):
             target = external if event.get("source") == "lead" else independent
             target[run_id] = (index, event)
     return {run_id: max((table[run_id] for table in (independent, external) if run_id in table),
                         key=lambda item: item[0])[1]
-            for run_id in independent.keys() | external.keys()}
+            for run_id in independent.keys() | external.keys() if run_id not in untrusted}
 
 
 def routing_report(events):
@@ -693,7 +701,7 @@ def accept_node(config, workspace, workflow_id, node, result):
 REPORT_CODES = frozenset({"worker_blockers", "required_handoff_empty", "repeated_failure"})
 
 
-def outcome_counts(accepted, status, gate_codes=(), laya_veto=False):
+def outcome_counts(accepted, status, gate_codes=(), laya_veto=False, check_inputs_changed=None):
     """Whether a workflow outcome is evidence for route ranking and labeling.
 
     An acceptance counts, and so does a rejection with any observed cause (a
@@ -703,6 +711,8 @@ def outcome_counts(accepted, status, gate_codes=(), laya_veto=False):
     active acceptance head label itself, or turn a parser artifact into a
     lane's failure.
     """
+    if check_inputs_changed:
+        return False
     if accepted or status != "success":
         return True
     codes = {code.get("code") if isinstance(code, dict) else code for code in gate_codes or ()}
@@ -749,10 +759,13 @@ def recovery(config, workspace, workflow_id, node, result, accepted, max_attempt
     if engine.options["mode"] != "off":
         # An outcome that is not evidence is written under another event name,
         # so every reader of "outcome" events (route ranking) skips it.
-        counted = outcome_counts(accepted, result.get("status"), gate_codes, laya_veto)
+        changed = result.get("check_inputs_changed", [])
+        counted = outcome_counts(accepted, result.get("status"), gate_codes, laya_veto, changed)
         codes = [code.get("code") if isinstance(code, dict) else code for code in gate_codes or ()]
         engine.store.append("outcome" if counted else "outcome_excluded", task_id=result.get("run_id"), group=workflow_id,
                             accepted=accepted, status=result.get("status"), laya_veto=bool(laya_veto), gate_codes=codes,
-                            **({} if counted else {"excluded_reason": "rejected only by Laya's veto or by the worker's own report"}),
+                            check_inputs_changed=changed,
+                            **({} if counted else {"excluded_reason": "check inputs changed (tampered)" if changed else
+                                                  "rejected only by Laya's veto or by the worker's own report"}),
                             evidence=str(workspace / ".fusion" / "workflows" / workflow_id / "nodes" / node.get("id", "unknown") / "node.json"))
     return actual, record["id"]

@@ -524,7 +524,7 @@ def record_gate_input(config, workspace, workflow_id, node, result):
                                   {"task_id": result.get("run_id"), "group": workflow_id}, source=GATE_SOURCE)
 
 
-def gate_answers(codes, receipts):
+def gate_answers(codes, receipts, check_inputs_changed=None):
     """(answers, reason) from objective gate codes only, read like SWE-bench's
     FAIL_TO_PASS / PASS_TO_PASS.
 
@@ -539,6 +539,8 @@ def gate_answers(codes, receipts):
     plausibly matches the task. Blockers and handoff fields are parsed from
     the worker's report (Laya's own inputs), so they never label.
     """
+    if check_inputs_changed or any(r.get("check_inputs_changed") for r in receipts):
+        return None, "check inputs changed (tampered); structural gate evidence is untrusted"
     for code in codes:
         if code.get("code") == "check_failed" and code.get("vacuous") is True and code.get("test_failure"):
             return {"failed_task": "true"}, "a check that passed before the change fails after it"
@@ -557,9 +559,9 @@ def gate_answers(codes, receipts):
     return None, "no executed check failed before the change and passed after it"
 
 
-def gate_label(config, workspace, record, codes, receipts):
+def gate_label(config, workspace, record, codes, receipts, check_inputs_changed=None):
     """Attach the objective gate label to the input record_gate_input saved."""
-    answers, reason = gate_answers(codes, receipts)
+    answers, reason = gate_answers(codes, receipts, check_inputs_changed)
     if record.get("truncated"):
         return {"status": "skipped", "decision_id": record["id"], "reason": "input truncated; long briefs stay unlabeled"}
     if not answers:
@@ -576,6 +578,24 @@ def gate_label(config, workspace, record, codes, receipts):
                      evidence=f"Structural gate on run {run_id}: {reason}." + ("\n" + "\n".join(cited) if cited else ""),
                      reviewers=[{"agent": "gate", "run_id": run_id, "codes": [code.get("code") for code in codes]}])
     return {"status": "labeled", "decision_id": record["id"], "answers": answers, "source": GATE_SOURCE, "reason": reason}
+
+
+def withdraw_gate_labels(workspace, run_id, changed):
+    """Resume can discover that a previously trusted evaluator was edited."""
+    store = DecisionStore(workspace)
+    withdrawn = []
+    reason = "check inputs changed (tampered): " + ", ".join(changed)
+    with store.review_lock():
+        events = read_jsonl(store.path)
+        decisions = {e["id"] for e in events if e.get("event") == "decision" and e.get("kind") == "acceptance"
+                     and e.get("context", {}).get("task_id") == run_id}
+        for decision_id in sorted(decisions):
+            own = [e for e in events if e.get("event") == "label" and e.get("id") == decision_id
+                   and e.get("verified") and e.get("source") == GATE_SOURCE]
+            if own and own[-1].get("answers"):
+                withdraw_untrusted_label(store, decision_id, GATE_SOURCE, reason, events)
+                withdrawn.append(decision_id)
+    return {"status": "retracted" if withdrawn else "unlabeled", "decision_ids": withdrawn, "reason": reason}
 
 
 def withdraw_untrusted_label(store, decision_id, source, evidence, events):

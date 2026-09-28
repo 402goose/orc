@@ -52,6 +52,46 @@ can misreport that. A writer with nothing to do can opt out with
 `acceptance.allow_no_changes`; a workspace without Git abstains rather than
 failing every write.
 
+Acceptance checks may be plain argv arrays or objects with a pinned evaluator:
+
+```json
+{"acceptance": {"checks": [{"argv": ["python3", "/opt/evaluators/acceptance.py"], "sha256": "<64 hexadecimal characters>", "min_tests": 15}]}}
+```
+
+`sha256` pins the first existing file named by an argv element when the runner
+initializes, or the file named by an explicit `path` key. Relative paths resolve
+against the workspace. A bare command name in argv[0], such as `python3`, is
+looked up through PATH and is excluded from this file selection. Use `path` when
+an absolute interpreter path would otherwise be selected, or when the evaluator
+does not exist yet (for example, an acceptance fixture). Without an identifiable
+file or explicit `path`, validation fails before dispatch. The selected path is
+saved in node state and reused across retries and resumes, so a worker cannot
+redirect the digest check by planting a file named after an earlier argument.
+Older runs without saved paths must provide an explicit `path` to resume a
+declared hash check; Fusion does not infer one from the already modified tree.
+The coordinator checks the digest after applying acceptance fixtures and before
+launching the command. A missing or changed evaluator fails with
+`check_contract_changed`: the acceptance contract changed and needs explicit
+review/versioning. Optional `min_tests` requires an observed unittest `Ran N tests`
+or pytest terminal summary with at least that many executed tests; skipped and
+deselected pytest tests do not count. A shortfall or unrecognized count fails with
+`check_tests_missing`. Objects also work with `before` and `fail_to_pass`.
+
+For write nodes, Fusion saves hashes of existing workspace files named by check
+arguments and files selected by `python3 -m unittest discover -s DIR -p PATTERN`
+(default pattern `test*.py`) before the first attempt. Retries and resumes retain
+those hashes. Editing or deleting an input records `check_inputs_changed` in the
+node and its check receipts. Passing checks still accept the node, but the run
+cannot supply positive structural labels or verified routing evidence. New test
+files do not trigger this flag. Plain argv checks remain supported; workspace
+inputs produce a dispatch warning and a report line. Keep trusted evaluators
+outside the worker's writable workspace and pin them explicitly when their
+integrity must be a hard gate. Hashes detect changes; they do not sandbox workers.
+Automatic pins do not expand pytest directory arguments. A check that rewrites
+its own inputs during the before-phase run will also trigger the integrity flag.
+Test counts come from evaluator output, so the evaluator must be trusted to
+report them honestly.
+
 In a generated `build`, the planning node declares what the implementation must
 produce, as one fenced `acceptance-contract` block:
 
@@ -70,6 +110,8 @@ allows. Each runs on the tree before the change and again after it; a check
 that already passed before is `vacuous` and proves nothing. They run
 unsandboxed with your privileges, like the tests the worker runs. See
 [executed plan verification](../FUSION_DECISIONS.md#executed-plan-verification).
+Planning contracts cannot introduce executable `checks`; only authored workflow
+specifications may declare them.
 
 ## Control room
 
