@@ -358,7 +358,7 @@ same MCP delegation tools for Claude workers.
 For real orchestration, use `fusion workflow` with a JSON graph. Unlike the
 linear Ultra preset, a workflow can map one node over many items, fan in on
 explicit dependencies, run independent read-only nodes concurrently, retry
-invalid handoffs, pause on provider quota, and resume from the persisted
+invalid handoffs, send review blockers back to the writer for repair, pause on provider quota, and resume from the persisted
 manifest without repeating accepted nodes.
 
 Git snapshot failures are coordinator errors: Fusion stops without spending
@@ -380,7 +380,10 @@ fusion --workspace . workflow report WORKFLOW_ID
 acceptance criteria, verification commands and caveats. It recovers full answers
 from older provider logs; new runs save a separate `answer.md`. The report shows
 actual workers, durations and blockers, and distinguishes unreported cost from
-an explicitly reported zero. Reporting starts no agents and leaves receipts intact.
+an explicitly reported zero. Review repair loops show the ordered attempts:
+implement → review → implement (repair) → review. The manifest's `attempt_ledger`
+and structured report retain the source review and repair provenance.
+Reporting starts no agents and leaves receipts intact.
 
 ```sh
 orc fusion workflow report WORKFLOW_ID                # final output
@@ -408,6 +411,17 @@ acceptance checks pass. `max_parallel`, `max_attempts`, `budget_usd`, and the
 single-writer limit are enforced by the scheduler. Keep fan-out nodes
 read-only; put repository writes behind a final writer or use separate Git
 worktrees for independent implementations.
+
+When a read-only review reports unresolved blockers in a valid handoff, its
+normal `repair` action can reopen a successful direct write dependency. Fusion
+chooses `independent_of` when it names a writer, otherwise the first writer in
+`needs` order. Both nodes must have attempts remaining. The writer receives the
+original review blockers appended to its prompt, keeps its node baselines and
+route exclusions, and runs through the normal scheduler and budget checks;
+the review waits for that repair to succeed before running again. Each review
+and writer can participate in only one such repair loop, persisted across resume.
+Quota, provider errors, missing handoff fields and other harness failures retain
+their existing retry, switch or pause behavior without reopening the writer.
 
 Before dispatching, the runner preflights the account-aware lanes used in the
 graph. It checks resolved commands on PATH and, on a fresh `run`, reads the
