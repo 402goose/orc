@@ -47,6 +47,18 @@ class Isolated(unittest.TestCase):
 
 
 class ExportTest(Isolated):
+    def test_changed_check_inputs_neither_establish_solvability_nor_supply_priors(self):
+        write_rows(self.root, [
+            {**row("pr-1", "opus", OPUS, "solved"), "check_inputs_changed": ["grade.py"]},
+            row("pr-1", "agy", AGY, "unsolved"),
+            row("pr-2", "agy", AGY, "solved"),
+            {**row("pr-2", "opus", OPUS, "solved"), "check_inputs_changed": ["grade.py"]},
+        ])
+        value = gym.lane_priors(self.root)
+        self.assertEqual(list(value["priors"]), ["agy"])
+        self.assertEqual(value["priors"]["agy"]["write"]["attempts"], 1)
+        self.assertEqual(value["unsolved_by_all"], {"hidden": ["pr-1"]})
+
     def test_counts_audited_hidden_rows_per_lane_and_work_class(self):
         rows = [
             # pr-1 solvable in hidden: opus solved (twice keyed: the latest row wins), agy unsolved.

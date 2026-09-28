@@ -44,13 +44,159 @@ class AcceptanceReceiptsTest(unittest.TestCase):
         self.addCleanup(environment.stop)
         self.config = {"codex": {"command": str(self.worker)}, "timeout_seconds": 5}
 
-    def runner(self, checks):
+    def runner(self, checks, *, write=False):
         return WorkflowRunner(self.workspace, self.config, {
             "task": "Exercise coordinator acceptance evidence",
             "max_attempts": 1,
-            "nodes": [{"id": "verify", "agent": "codex", "task": "Return a fixture handoff",
+            "nodes": [{"id": "verify", "agent": "codex", "write": write, "task": "Return a fixture handoff",
                        "acceptance": {"required_handoff": ["summary"], "checks": checks}}],
         })
+
+    def test_writer_cannot_redirect_declared_hash_to_planted_argv_files(self):
+        original = "raise SystemExit(1)\n"
+        weakened = "from pathlib import Path\nPath('evaluator-ran').touch()\n"
+        (self.workspace / "grade.py").write_text(original)
+        edits = (f"pathlib.Path('python3').write_text({original!r})\n"
+                 f"pathlib.Path('-B').write_text({original!r})\n"
+                 f"pathlib.Path('grade.py').write_text({weakened!r})\n")
+        self.worker.write_text(self.worker.read_text().replace("sys.stdin.read()\n", "sys.stdin.read()\n" + edits))
+        check = {"argv": ["python3", "-B", "grade.py"], "sha256": hashlib.sha256(original.encode()).hexdigest()}
+        runner = self.runner([check], write=True)
+        outcome = runner.run()
+        result = outcome["nodes"][0]["result"]
+        self.assertEqual(outcome["status"], "failed", outcome)
+        self.assertEqual(result["gate_codes"][0]["code"], "check_contract_changed")
+        self.assertFalse((self.workspace / "evaluator-ran").exists())
+        receipt = result["acceptance_checks"][0]
+        self.assertEqual(Path(receipt["contract"]["path"]), self.workspace / "grade.py")
+        self.assertIsNone(receipt["process"]["pid"])
+        self.assertEqual((self.workspace / "python3").read_text(), original)
+
+    def test_declared_path_survives_resume_with_deleted_evaluator_and_decoy(self):
+        original = "# original evaluator passes\n"
+        script = self.workspace / "grade.py"
+        script.write_text(original)
+        check = {"argv": ["python3", "grade.py"], "sha256": hashlib.sha256(original.encode()).hexdigest()}
+        runner = self.runner([check], write=True)
+        first = runner.run()
+        self.assertEqual(first["status"], "success", first)
+        paths = json.loads(runner.manifest_path.read_text())["nodes"]["verify"]["_declared_check_paths"]
+        script.unlink()
+        (self.workspace / "python3").write_text(original)
+        resumed = resume_workflow(self.workspace, self.config, first["workflow_id"])
+        self.assertEqual(resumed["status"], "failed", resumed)
+        result = resumed["nodes"][0]["result"]
+        self.assertEqual(result["gate_codes"][0]["code"], "check_contract_changed")
+        self.assertEqual(result["acceptance_checks"][0]["contract"]["path"], str(script))
+        self.assertEqual(json.loads(runner.manifest_path.read_text())["nodes"]["verify"]["_declared_check_paths"], paths)
+
+    def test_bare_program_is_not_an_inferred_evaluator_even_when_file_exists(self):
+        (self.workspace / "python3").write_text("# unrelated workspace file\n")
+        script = self.workspace / "grade.py"
+        script.write_text("# actual evaluator\n")
+        check = {"argv": ["python3", "grade.py"], "sha256": hashlib.sha256(script.read_bytes()).hexdigest()}
+        self.assertEqual(self.runner([check]).run()["status"], "success")
+        script.unlink()
+        with self.assertRaisesRegex(ValueError, 'explicit "path"'):
+            self.runner([check])
+        self.assertEqual(self.calls.read_text().splitlines(), ["call"])
+
+    def test_explicit_path_binds_an_evaluator_created_by_a_fixture(self):
+        body = "# trusted fixture evaluator\n"
+        check = {"argv": ["python3", "grade.py"], "path": "grade.py",
+                 "sha256": hashlib.sha256(body.encode()).hexdigest()}
+        runner = self.runner([check])
+        runner.nodes["verify"]["acceptance"]["fixtures"] = [{"path": "grade.py", "content": body}]
+        self.assertEqual(runner.run()["status"], "success")
+        self.assertFalse((self.workspace / "grade.py").exists())
+
+    def test_resume_without_a_saved_binding_requires_an_explicit_path(self):
+        script = self.workspace / "grade.py"
+        script.write_text("# evaluator\n")
+        check = {"argv": ["python3", "grade.py"], "sha256": hashlib.sha256(script.read_bytes()).hexdigest()}
+        runner = self.runner([check])
+        first = runner.run()
+        manifest = json.loads(runner.manifest_path.read_text())
+        del manifest["nodes"]["verify"]["_declared_check_paths"]
+        runner.manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'explicit "path"'):
+            resume_workflow(self.workspace, self.config, first["workflow_id"])
+
+    def test_declared_hash_is_checked_before_launch(self):
+        script = self.workspace / "grade.py"
+        script.write_text("raise AssertionError('must not execute')\n")
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit):
+                check = {"argv": ["python3", "grade.py"], "sha256": "0" * 64}
+                if explicit:
+                    check["path"] = "grade.py"
+                outcome = self.runner([check]).run()
+                result = outcome["nodes"][0]["result"]
+                self.assertEqual(outcome["status"], "failed")
+                self.assertEqual(result["gate_codes"][0]["code"], "check_contract_changed")
+                receipt = result["acceptance_checks"][0]
+                self.assertIsNone(receipt["process"]["pid"])
+                self.assertIn("contract changed", receipt["error"])
+                self.assert_receipt(receipt, "error")
+
+    def test_pinned_fixture_digest_describes_the_executed_content(self):
+        body = "print('Ran 2 tests in 0.001s')\n"
+        (self.workspace / "grade.py").write_text("raise AssertionError('worker version')\n")
+        check = {"argv": ["python3", "grade.py"], "path": "grade.py",
+                 "sha256": hashlib.sha256(body.encode()).hexdigest(), "min_tests": 2}
+        runner = self.runner([check])
+        runner.nodes["verify"]["acceptance"]["fixtures"] = [{"path": "grade.py", "content": body}]
+        outcome = runner.run()
+        self.assertEqual(outcome["status"], "success", outcome)
+        self.assertEqual(outcome["nodes"][0]["result"]["acceptance_checks"][0]["tests_run"], 2)
+        self.assertIn("worker version", (self.workspace / "grade.py").read_text())
+
+    def test_minimum_test_count_requires_observed_tests(self):
+        for output, minimum, passed, count in (("Ran 1 test in 0.01s", 2, False, 1),
+                                               ("=== 2 passed, 1 skipped in 0.02s ===", 3, False, 2),
+                                               ("=== 3 passed in 0.02s ===", 3, True, 3),
+                                               ("no tests ran in 0.01s", 1, False, None)):
+            with self.subTest(output=output):
+                body = f"print({output!r})\n"
+                (self.workspace / "grade.py").write_text(body)
+                check = {"argv": ["python3", "grade.py"], "sha256": hashlib.sha256(body.encode()).hexdigest(),
+                         "min_tests": minimum}
+                outcome = self.runner([check]).run()
+                self.assertEqual(outcome["status"], "success" if passed else "failed")
+                result = outcome["nodes"][0]["result"]
+                receipt = result["acceptance_checks"][0]
+                self.assertEqual(receipt["tests_run"], count)
+                self.assert_receipt(receipt, "passed" if passed else "failed")
+                if not passed:
+                    self.assertEqual(result["gate_codes"][0]["code"], "check_tests_missing")
+
+    def test_check_objects_are_validated(self):
+        for check in ({}, {"argv": "python3"}, {"argv": []}, {"argv": ["python3"], "sha256": "bad"},
+                      {"argv": ["python3"], "path": "grade.py"}, {"argv": ["python3"], "min_tests": True},
+                      {"argv": ["python3"], "min_tests": -1}, {"argv": ["python3"], "min_tests": 1.5},
+                      {"argv": ["python3"], "unexpected": 1}):
+            with self.subTest(check=check), self.assertRaises(ValueError):
+                self.runner([check])
+
+    def test_automatic_pins_keep_symlink_paths_and_default_discovery_pattern(self):
+        (self.workspace / "suite").mkdir()
+        (self.workspace / "suite/test_one.py").write_text("# original\n")
+        (self.workspace / "suite/helper.py").write_text("# not selected\n")
+        link = self.workspace / "linked"
+        link.symlink_to("suite", target_is_directory=True)
+        runner = self.runner([["python3", "linked/test_one.py"],
+                              ["python3", "-m", "unittest", "discover", "-s", "suite"]])
+        node = runner.nodes["verify"]
+        node["attempts"] = 1
+        runner._pin_check_inputs(node)
+        self.assertEqual(set(node["_check_input_pins"]), {"linked/test_one.py", "suite/test_one.py"})
+        (self.workspace / "other").mkdir()
+        (self.workspace / "other/test_one.py").write_text("# replacement\n")
+        link.unlink()
+        link.symlink_to("other", target_is_directory=True)
+        result = {"status": "success", "summary": "done", "check_inputs_changed": ["worker-forged"]}
+        runner._accept_node(node, result)
+        self.assertEqual(result["check_inputs_changed"], ["linked/test_one.py"])
 
     def assert_receipt(self, receipt, expected_status):
         self.assertEqual(receipt["status"], expected_status)

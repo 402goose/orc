@@ -1,6 +1,7 @@
 """Objective acceptance evidence: executed plan verification, gate labels,
 outcomes free of Laya's own veto, and explicit intake intent (#91-#93, #95)."""
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -17,9 +18,9 @@ import fusion_decisions
 from fusion_build import prepare
 from fusion_decisions import ACCEPTANCE_QUESTIONS, DecisionStore, digest, label_provenance, read_jsonl, reviewed_labels
 from fusion_labeling import gate_answers
-from fusion_policy import outcome_counts, route_candidates
+from fusion_policy import effective_outcomes, outcome_counts, route_candidates
 from fusion_verification import counts_as_failure, plan_checks, to_argv
-from fusion_workflow import WorkflowRunner, parse_acceptance_contract
+from fusion_workflow import WorkflowRunner, parse_acceptance_contract, resume_workflow, workflow_report
 from decisions_test import Backend
 
 WORKER = '''import json, pathlib, sys
@@ -114,6 +115,15 @@ class VerificationPolicyTest(unittest.TestCase):
 
 
 class GateAnswersTest(unittest.TestCase):
+    def test_changed_inputs_exclude_prior_and_later_positive_outcomes(self):
+        events = [{"event": "outcome", "task_id": "worker", "accepted": True},
+                  {"event": "outcome_excluded", "task_id": "worker", "check_inputs_changed": ["test.py"]},
+                  {"event": "outcome", "task_id": "worker", "source": "lead", "accepted": True}]
+        self.assertEqual(effective_outcomes(events), {})
+        self.assertFalse(outcome_counts(True, "success", check_inputs_changed=["test.py"]))
+        self.assertIsNone(gate_answers([], [{"status": "passed", "vacuous": False,
+                                            "check_inputs_changed": ["test.py"]}])[0])
+
     def test_only_objective_codes_label(self):
         failed = {"code": "check_failed", "vacuous": False, "test_failure": True}
         # Failed before and still fails: possibly a pre-existing failure the plan's
@@ -197,6 +207,91 @@ class HonestLabelsTest(unittest.TestCase):
 
     def gate_labels(self):
         return [e for e in self.events("label") if e.get("source") == "structural_gate"]
+
+    def assert_untrusted(self, result):
+        self.assertEqual(result["gate_codes"], [])
+        self.assertNotEqual(result["gate_label"]["status"], "labeled")
+        self.assertNotIn(result["run_id"], effective_outcomes(read_jsonl(self.store.path)))
+        store = core.RunStore(self.workspace)
+        spans = [s for s in store.traces() if s["run_id"] == result["run_id"]]
+        with patch.object(store, "traces", return_value=spans):
+            codex = next(c for c in route_candidates(self.config, core.make_task(
+                self.workspace, "auto", "x", "implementation", [], [], None, False, True), store) if c["key"] == "codex")
+        self.assertEqual(codex["checked_runs_local"], 0)
+
+    def test_editing_an_existing_check_passes_but_cannot_label_or_rank(self):
+        outcome, nodes = self.run_build({"verification": [["python3", "hello_exists.py"]]},
+                                        write={"hello_exists.py": "# replaced evaluator\n"})
+        self.assertEqual(outcome["status"], "success", outcome)
+        result = nodes["implement"]["result"]
+        self.assertEqual(result["check_inputs_changed"], ["hello_exists.py"])
+        self.assert_untrusted(result)
+        receipt = result["acceptance_checks"][0]
+        self.assertEqual(receipt["check_inputs_changed"], ["hello_exists.py"])
+        self.assertEqual(json.loads(Path(receipt["artifacts"]["receipt"]).read_text()), receipt)
+        spans = [s for s in core.RunStore(self.workspace).traces() if s.get("agent") == "gate" and s["run_id"] == result["run_id"]]
+        self.assertEqual(spans[-1]["check_inputs_changed"], ["hello_exists.py"])
+        report = workflow_report(self.workspace, outcome["workflow_id"])
+        row = next(n for wave in report["waves"] for n in wave["nodes"] if n["id"] == "implement")
+        self.assertIn("hello_exists.py", row["acceptance_warnings"][0])
+        events = [json.loads(line) for line in Path(outcome["artifacts"]["events"]).read_text().splitlines()]
+        self.assertTrue(any(e["type"] == "acceptance.check.warning" for e in events))
+        self.assertTrue(any(e["type"] == "node.check_inputs_changed" for e in events))
+
+    def test_resume_keeps_pins_and_withdraws_prior_gate_evidence(self):
+        outcome, nodes = self.run_build({"verification": [["python3", "hello_exists.py"]]}, write={"hello.py": "x\n"})
+        original = nodes["implement"]["result"]
+        self.assertEqual(original["gate_label"]["status"], "labeled")
+        manifest_path = Path(outcome["artifacts"]["manifest"])
+        pins = json.loads(manifest_path.read_text())["nodes"]["implement"]["_check_input_pins"]
+        (self.workspace / "hello_exists.py").write_text("# changed after success\n")
+        resumed = resume_workflow(self.workspace, self.config, outcome["workflow_id"])
+        result = next(n for n in resumed["nodes"] if n["id"] == "implement")["result"]
+        self.assertEqual(resumed["status"], "success", resumed)
+        self.assertEqual(result["run_id"], original["run_id"])
+        self.assertEqual(result["gate_label"]["status"], "retracted")
+        self.assertEqual(json.loads(manifest_path.read_text())["nodes"]["implement"]["_check_input_pins"], pins)
+        self.assert_untrusted(result)
+        self.assertEqual(self.gate_labels()[-1]["answers"], {})
+
+    def test_discovery_pins_existing_tests_but_allows_new_tests(self):
+        body = "import unittest\nfrom pathlib import Path\nclass Test(unittest.TestCase):\n def test_exists(self): self.assertTrue(Path('hello.py').exists())\n"
+        (self.workspace / "test_existing.py").write_text(body)
+        command = ["python3", "-m", "unittest", "discover", "-s", ".", "-p", "test*.py"]
+        outcome, nodes = self.run_build({"verification": [command]},
+                                        write={"hello.py": "x", "test_added.py": "import unittest\nclass Test(unittest.TestCase):\n def test_new(self): self.assertTrue(True)\n"})
+        result = nodes["implement"]["result"]
+        self.assertEqual(outcome["status"], "success", outcome)
+        self.assertEqual(result["check_inputs_changed"], [])
+        self.assertEqual(result["gate_label"]["status"], "labeled")
+        (self.workspace / "test_existing.py").unlink()
+        resumed = resume_workflow(self.workspace, self.config, outcome["workflow_id"])
+        result = next(n for n in resumed["nodes"] if n["id"] == "implement")["result"]
+        self.assertEqual(resumed["status"], "success", resumed)
+        self.assertEqual(result["check_inputs_changed"], ["test_existing.py"])
+        self.assert_untrusted(result)
+
+    def test_object_checks_keep_before_and_fail_to_pass_matching(self):
+        self.spec_path.write_text(json.dumps({"write": {"hello.py": "x"}}))
+        argv = ["python3", "hello_exists.py"]
+        check = {"argv": argv, "sha256": hashlib.sha256(HELLO_EXISTS.encode()).hexdigest()}
+        spec = {"nodes": [{"id": "implement", "agent": "codex", "write": True, "task": "Implement it",
+                            "acceptance": {"before": True, "checks": [check], "fail_to_pass": [argv]}}]}
+        outcome = WorkflowRunner(self.workspace, self.config, spec).run()
+        result = outcome["nodes"][0]["result"]
+        self.assertEqual(outcome["status"], "success", outcome)
+        self.assertEqual(result["acceptance_checks"][0]["vacuous"], False)
+        self.assertEqual(result["gate_label"]["answers"], {"failed_task": "false"})
+
+    def test_retry_does_not_recapture_edited_inputs(self):
+        outcome, nodes = self.run_build({"verification": [["python3", "hello_exists.py"]]}, attempts=2,
+                                        sequence=[{"hello_exists.py": "raise SystemExit(1)\n"},
+                                                  {"hello_exists.py": "# now passes\n"}])
+        self.assertEqual(outcome["status"], "success", outcome)
+        result = nodes["implement"]["result"]
+        self.assertEqual(result["attempt"], 2)
+        self.assertEqual(result["check_inputs_changed"], ["hello_exists.py"])
+        self.assert_untrusted(result)
 
     def test_a_check_that_fails_before_and_passes_after_labels_the_task_done(self):
         outcome, nodes = self.run_build({"verification": [["python3", "hello_exists.py"], "npm install", "pytest | tee x"]},

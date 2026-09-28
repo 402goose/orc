@@ -18,6 +18,16 @@ outcome. The latest measured external verdict for a run feeds outcome ranking.
 A verdict with a reason on a reported success can also produce an acceptance
 training label. Acceptance does not prove that the selected lane was optimal.
 
+Write workflows fingerprint existing acceptance inputs before the first attempt.
+If a worker changes or deletes one, `check_inputs_changed` marks the receipts and
+gate span as untrusted (`tampered`). The node can still succeed, but its structural
+gate produces no training label and its outcome is excluded from routing counts
+and ranking. New tests are allowed. Resume retains the original pins and retracts
+earlier structural labels and gate outcomes if a recheck detects changed inputs;
+independent human reviewers' labels are preserved. Gym results with this flag are
+tampered evidence, including hidden modes, and cannot establish task solvability
+or contribute lane priors.
+
 ```sh
 fusion outcome RUN_ID --accepted --stage gate --reason "The regression check passed"
 fusion outcome RUN_ID --rejected --stage verify --reason "Independent review reproduced the failure"
