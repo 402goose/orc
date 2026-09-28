@@ -431,8 +431,8 @@ def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None, explore=True, cos
     candidate past one whose rate is more than epsilon better.
 
     Configured cost tiers break ties before warmth, lower first, with unset
-    costs tied after configured costs. Without warm_epsilon, cost_epsilon
-    defines the tiers when any cost is configured. Exploration of unproven
+    costs tied after configured costs. When any cost is configured, tiers use
+    the wider of warm_epsilon and cost_epsilon. Exploration of unproven
     lanes also tries cheaper tiers first. Cost never moves a lane across
     evidence tiers. Quota demotion
     retains priority over all outcome, cost and warmth ordering.
@@ -447,10 +447,11 @@ def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None, explore=True, cos
     ranked = sorted(enumerate(candidates), key=score)
     has_cost = any(c.get("cost_tier") is not None for c in candidates)
     epsilon = warm_epsilon
-    if epsilon is None and has_cost:
+    if has_cost:
         if isinstance(cost_epsilon, bool) or not isinstance(cost_epsilon, (int, float)) or not 0 <= cost_epsilon < 1:
             raise ValueError("decisions.cost_epsilon must be a number in [0, 1)")
-        epsilon = cost_epsilon
+        # Warmth and cost both only break ties, so the wider band defines a tie.
+        epsilon = cost_epsilon if epsilon is None else max(epsilon, cost_epsilon)
     if epsilon is None:
         return rank_by_quota([candidate for _, candidate in ranked])
     tiers = []
@@ -585,7 +586,7 @@ def route_task(config, task, store, rng=None):
                             policy={"rank_by_outcomes": minimum, "explore": explore, "warm_epsilon": warm_epsilon if ranking else None,
                                     "epsilon": effective, "routing_epsilon": epsilon, "laya_applied": applied,
                                     "priors": priors_policy(config),
-                                    **({"cost_epsilon": warm_epsilon if warm_epsilon is not None else cost_epsilon}
+                                    **({"cost_epsilon": cost_epsilon if warm_epsilon is None else max(warm_epsilon, cost_epsilon)}
                                        if ranking and any(c.get("cost_tier") is not None for c in candidates) else {}),
                                     **({"quota": quota_settings(config)} if quota_audit else {})},
                             **({"quota": quota_audit, "rejected": rejected} if quota_audit else {}),

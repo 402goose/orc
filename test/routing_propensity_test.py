@@ -120,6 +120,14 @@ class RoutingPropensityTest(unittest.TestCase):
         self.config["cache"] = {"warm_epsilon": .05}
         self.assertEqual(self.route(self.task(write=True))["route"], "cheap")
 
+    def test_cost_band_is_the_wider_of_warm_and_cost_epsilon(self):
+        opus = {"key": "claude-opus-high", "checked_runs": 3.5, "acceptance_rate": 0.71, "cost_tier": 3}
+        codex = {"key": "codex-astra-high", "checked_runs": 4.0, "acceptance_rate": 0.62, "cost_tier": 1}
+        keys = lambda **kw: [c["key"] for c in rank_by_outcomes([opus, codex], 3, explore=False, **kw)]
+        self.assertEqual(keys(warm_epsilon=.05, cost_epsilon=.10), ["codex-astra-high", "claude-opus-high"])
+        self.assertEqual(keys(warm_epsilon=.05, cost_epsilon=.05), ["claude-opus-high", "codex-astra-high"])
+        self.assertEqual(keys(warm_epsilon=.10, cost_epsilon=.05), ["codex-astra-high", "claude-opus-high"])
+
     def test_cost_tier_requires_integer_and_route_can_clear_preference(self):
         self.config["codex"]["cost_tier"] = 2
         self.config["routes"] = {"unset": {"agent": "codex", "cost_tier": None}}

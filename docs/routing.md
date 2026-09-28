@@ -61,9 +61,9 @@ agent. Lower numbers rank first. Unset or `null` costs are tied after configured
 costs; when no costs are configured, existing rankings are unchanged.
 
 The router groups smoothed acceptance scores `(accepted + 1) / (checked + 2)`
-within `cache.warm_epsilon` of the best score in each tier. Without cache
-configuration, setting any cost tier enables `decisions.cost_epsilon` (default
-`0.05`) for this grouping. Within a tier, quota headroom comes first, then lower
+within a band of the best score in each tier: `cache.warm_epsilon`, or, when
+any cost tier is set, the wider of `cache.warm_epsilon` and
+`decisions.cost_epsilon` (default `0.05`). Within a tier, quota headroom comes first, then lower
 cost, then warm sessions, then existing order. Cost never crosses evidence
 tiers: clearly better verified evidence wins. Unproven lanes are still tried
 first so every arm earns evidence, cheapest tier first; quota demotion retains
