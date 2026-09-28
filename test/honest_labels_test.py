@@ -312,6 +312,11 @@ class HonestLabelsTest(unittest.TestCase):
         self.assertEqual((decision["kind"], decision["status"], decision["source"], decision["context"]["task_id"]),
                          ("acceptance", "unscored", "structural_gate", result["run_id"]))
         self.assertIn("hello_exists.py", label["evidence"])
+        state = json.loads(decision["state"])
+        self.assertIn('"argv": ["python3", "hello_exists.py"]', state["deliverable"])
+        self.assertIn('"status": "passed"', state["deliverable"])
+        saved = json.loads((Path(result["artifacts"]["run_dir"]) / "result.json").read_text())
+        self.assertEqual(saved["acceptance_checks"], result["acceptance_checks"])
         scored = [e for e in self.events("decision", result["run_id"]) if e["status"] == "ok"]
         self.assertEqual(json.loads(scored[0]["state"]), json.loads(decision["state"]), "the gate and Laya see one input")
         [counted] = self.events("outcome", result["run_id"])
@@ -331,6 +336,10 @@ class HonestLabelsTest(unittest.TestCase):
         # pre-existing failure unrelated to the task, so it labels nothing.
         self.assertEqual(result["gate_label"]["status"], "unlabeled")
         self.assertEqual(self.gate_labels(), [])
+        decision = self.store.get(result["gate_label"]["decision_id"])
+        self.assertIn('"status": "failed"', json.loads(decision["state"])["deliverable"])
+        saved = json.loads((Path(result["artifacts"]["run_dir"]) / "result.json").read_text())
+        self.assertEqual(saved["acceptance_checks"], result["acceptance_checks"])
         [outcome_event] = self.events("outcome", result["run_id"])
         self.assertEqual((outcome_event["accepted"], outcome_event["gate_codes"]), (False, ["check_failed"]))
 

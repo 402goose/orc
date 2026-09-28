@@ -169,6 +169,18 @@ Each question lists its allowed_labels. Return the exact STRING label, including
 "true" or "false" for boolean questions, never a JSON boolean or a probability.
 Unknown is an abstention, not "false". Assess each question independently: missing
 evidence for one question must not prevent answering another supported question.
+Long deliverables are routinely excerpted with a visible truncation marker; a
+marker alone is not a reason to abstain. Judge from what the input shows:
+- plausible: answer from visible content when it shows concrete, task-relevant
+  results (paths, findings, the requested artifact). Abstain only if the input
+  announces results but shows none of them (for example, "three corrections:"
+  with no corrections visible), or truncation hides everything the question needs.
+- failed_task: answer "true" only with visible evidence the task was not done;
+  answer "false" when visible content shows the requested work and nothing
+  contradicts it; abstain when the deciding evidence is hidden.
+Supplemental evidence cannot fill a gap in the original input.
+For acceptance, judge the node_task when supplied: it is this step's assignment;
+the overall request provides context and may include work for other stages.
 In addition to the required handoff, return exactly one fenced block in this format:
 ```label-suggestion
 {"answers":{"question_key":{"value":"allowed label","reason":"Why this answer follows from the input","evidence":["E1"]}},"abstentions":{"unanswered_key":"What evidence is missing"}}
@@ -307,7 +319,7 @@ def suggest(workspace, config, decision_id, agent="auto", labeling_mode="single"
 
 def approve_council(workspace, decision_id, suggestion_id, garden_policy=None):
     """Explicitly enabled council approvals never overwrite a human review."""
-    from fusion_decisions import reviewed_labels
+    from fusion_decisions import reviewed_labels, STATE_VERSION
     from fusion_garden import locked, settings
     store = DecisionStore(workspace)
     with (locked(workspace) if garden_policy else contextlib.nullcontext()), store.review_lock():
@@ -315,6 +327,16 @@ def approve_council(workspace, decision_id, suggestion_id, garden_policy=None):
             current = settings(workspace)
             if not current['enabled'] or current['approval_mode'] != 'council' or current.get('policy_id') != garden_policy:
                 return {"status": "needs_review", "answers": {}, "reason": "Automatic approval was paused or its settings changed"}
+        record = store.get(decision_id)
+        try:
+            state = json.loads(record.get("state", ""))
+        except (ValueError, TypeError):
+            state = {}
+        version = record.get("state_version", 0)
+        if (not isinstance(version, int) or version < STATE_VERSION or record.get("source_truncated")
+                or (isinstance(state, dict) and state.get("source_truncated"))):
+            return {"status": "needs_review", "answers": {},
+                    "reason": "Automatic approval requires current state_version and input without source_truncated"}
         record = labelable(store, decision_id)
         events = read_jsonl(store.path)
         own = [e for e in events if e.get('id') == decision_id]
@@ -465,7 +487,9 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
             engine = DecisionEngine(workspace, config)
             if gate:
                 record = engine.record_unscored("acceptance", None, gate["questions"], gate.get("context"),
-                                                encoded=gate["state"], source=VERDICT_SOURCE)
+                                                encoded=gate["state"], source=VERDICT_SOURCE,
+                                                state_version=gate.get("state_version", 0),
+                                                source_truncated=gate.get("source_truncated", False))
             else:
                 state = acceptance_state(task, result, state_cap(engine.options), engine.state_tokens("acceptance"))
                 group = task.get("parent_task_id") or task.get("trace_id") or run_id
@@ -511,8 +535,8 @@ def _automatic_labels_off(config):
 
 
 def record_gate_input(config, workspace, workflow_id, node, result):
-    """Record the acceptance input of a reported success before the structural
-    gate decides it, without running Laya. It is the input accept_node builds,
+    """Record the acceptance input of a reported success with structural
+    check receipts, without running Laya. It is the input accept_node builds,
     so a gate label and a classifier prediction describe the same input.
     None when the worker did not report success or automatic labels are off."""
     from fusion_decisions import ACCEPTANCE_QUESTIONS, DecisionEngine, acceptance_state, state_cap

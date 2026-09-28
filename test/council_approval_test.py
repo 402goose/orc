@@ -11,7 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fusion_core as core
 import fusion_garden as garden
-from fusion_decisions import DecisionStore, read_jsonl
+from fusion_decisions import DecisionStore, read_jsonl, STATE_VERSION
 from fusion_labeling import suggest, approve_council
 from fusion_learning import decision_rows, learning_summary
 from fusion_ui import ControlRoom, atomic_json
@@ -25,7 +25,8 @@ class CouncilApprovalTest(unittest.TestCase):
         self.workspace = Path(self.temp.name) / 'repo'
         self.config = seed_workspace(self.workspace)
         self.store = DecisionStore(self.workspace)
-        self.record = dict(id='decision', kind='review', status='ok', truncated=False, state='Review payment rounding.',
+        self.record = dict(id='decision', kind='review', status='ok', truncated=False, state_version=STATE_VERSION,
+                           state='Review payment rounding.',
                            questions={'specialty': {'type':'choice','criteria':{'general':'general','payments':'payments'}},
                                       'needs_review':{'type':'noul'}}, schema_hash='fixture', prediction={}, context={})
         self.store.append('decision', **self.record)
@@ -44,6 +45,17 @@ class CouncilApprovalTest(unittest.TestCase):
 
     def labels(self):
         return [e for e in read_jsonl(self.store.path) if e['event']=='label']
+
+    def test_old_versions_and_source_truncation_never_get_automatic_approval(self):
+        for overrides in ({'state_version': STATE_VERSION - 1}, {'state_version': 0},
+                          {'source_truncated': True, 'truncated': True},
+                          {'state': '{"source_truncated":true}'}):
+            with self.subTest(overrides=overrides):
+                self.store.append('decision', **{**self.record, **overrides})
+                result = approve_council(self.workspace, 'decision', 'unused')
+                self.assertEqual(result['status'], 'needs_review')
+                self.assertIn('state_version', result['reason'])
+                self.assertEqual(self.labels(), [])
 
     def test_opt_in_unanimous_approval_is_exported_with_council_provenance(self):
         draft = self.run_council(approval='human')
