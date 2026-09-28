@@ -1464,6 +1464,9 @@ def agent_settings(config: dict[str, Any], task: dict[str, Any]) -> dict[str, An
     overrides = task.get("settings_overrides") or {}
     if isinstance(overrides, dict):
         settings = deep_merge(settings, overrides)
+    cost_tier = settings.get("cost_tier")
+    if cost_tier is not None and (isinstance(cost_tier, bool) or not isinstance(cost_tier, int)):
+        raise ValueError("cost_tier must be an integer or null")
     return settings
 
 

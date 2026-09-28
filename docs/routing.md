@@ -3,6 +3,7 @@
 [Start here](../README.md) · [CLI reference](cli.md) · [MCP reference](mcp.md)
 
 - [Automatic and explicit choices](#automatic-and-explicit-choices)
+- [Cost tie-breakers](#cost-tie-breakers)
 - [Accounts and quota headroom](#accounts-and-quota-headroom)
 - [Antigravity lanes](#antigravity-lanes)
 - [Prompt cache and sessions](#prompt-cache-and-sessions)
@@ -46,6 +47,31 @@ in restricted mode. The adapter reads model, usage and nonpartial cost when
 reported. The older `plain` fallback lacks structured tool/usage receipts. Set
 `grok.permission_mode` to `acceptEdits` for explicitly authorized writer work.
 Named ORC routes can use other configured models; automatic ORC selection still requires passing tool-fit evidence.
+
+Every eligible lane participates in ranking, including routes late in the
+configuration. After outcome ranking, different-agent preference and quota
+ordering, the first eight candidates become the choice options and routing log.
+
+## Cost tie-breakers
+
+With `decisions.rank_by_outcomes` enabled, optional integer `cost_tier` settings
+prefer cheaper lanes when verified evidence is close. Set them on an agent
+(`claude`, `codex`, `agy`, or `grok`) or a named route; the route overrides the
+agent. Lower numbers rank first. Unset or `null` costs are tied after configured
+costs; when no costs are configured, existing rankings are unchanged.
+
+The router groups smoothed acceptance scores `(accepted + 1) / (checked + 2)`
+within `cache.warm_epsilon` of the best score in each tier. Without cache
+configuration, setting any cost tier enables `decisions.cost_epsilon` (default
+`0.05`) for this grouping. Within a tier, quota headroom comes first, then lower
+cost, then warm sessions, then existing order. Cost never crosses evidence
+tiers: clearly better verified evidence wins. Unproven-lane exploration is
+unchanged, and quota demotion retains priority across tiers.
+
+Each logged candidate includes its resolved `cost_tier`; the log policy records
+the effective `cost_epsilon` when cost ranking applies. `fusion decisions
+routing-report` includes `routing_policies` with each decision's policy and
+candidate cost tiers, even before an outcome exists.
 
 ## Accounts and quota headroom
 
