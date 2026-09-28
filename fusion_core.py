@@ -1340,6 +1340,23 @@ def parse_quota(agent: str, stdout: str):
     return quota
 
 
+def codex_rollout_quota(session_id: str | None, env: dict[str, str]) -> dict[str, Any] | None:
+    """`codex exec --json` omits rate limits; the session's rollout records them."""
+    if not session_id or not re.fullmatch(r"[A-Za-z0-9-]+", session_id):
+        return None
+    sessions = Path(env.get("CODEX_HOME") or Path.home() / ".codex").expanduser() / "sessions"
+    matches = sorted(sessions.glob(f"*/*/*/rollout-*-{session_id}.jsonl"), key=lambda path: path.stat().st_mtime)
+    if not matches:
+        return None
+    try:
+        with matches[-1].open("rb") as handle:
+            handle.seek(max(0, handle.seek(0, os.SEEK_END) - 262144))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    return parse_quota("codex", tail)
+
+
 def parse_claude_output(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None, list[str]]:
     value = claude_result(stdout)
     if not isinstance(value, dict):
@@ -1830,6 +1847,7 @@ def dispatch(
             session_id, session["resume_skipped"] = None, "cold"
     session["resumed"] = bool(session_id)
     argv, env, metadata = agent_command(config, task, session_id)
+    session_id_seen = session_id
     if store.control_workspace is not None:
         env["FUSION_CONTROL_WORKSPACE"] = str(store.control_workspace)
     metadata["execution_mode"] = execution_mode(config)
@@ -1908,6 +1926,7 @@ def dispatch(
             metadata["execution_choice"]["dispatch"]["status"] = "returned"
         if task["agent"] == "codex":
             new_session, summary, failure, usage, event_model, evidence_notes = parse_codex_events(completed.stdout)
+            session_id_seen = new_session
         elif task["agent"] == "agy":
             new_session, summary, failure, usage, event_model, evidence_notes = parse_agy_output(completed.stdout)
         elif task["agent"] == "grok":
@@ -2004,6 +2023,8 @@ def dispatch(
     }
     ended_at_ms = now_ms()
     quota = parse_quota(task["agent"], worker_stdout)
+    if quota is None and task["agent"] == "codex":
+        quota = codex_rollout_quota(session_id_seen, env)
     if quota is not None:
         result["quota"] = quota
     store.touch_session(task["session_key"], ended_at_ms)
