@@ -803,7 +803,49 @@ def announce_remote_telemetry(endpoint: str) -> None:
     )
 
 
+def remote_telemetry_disabled_reasons(telemetry: dict[str, Any]) -> list[str]:
+    remote = telemetry.get("remote") or {}
+    reasons = []
+    if telemetry.get("enabled", True) is False:
+        reasons.append("telemetry.enabled is false")
+    if not remote.get("enabled"):
+        reasons.append("telemetry.remote.enabled is false")
+    if os.environ.get("FUSION_TELEMETRY") == "0":
+        reasons.append("FUSION_TELEMETRY=0")
+    if not remote.get("endpoint"):
+        reasons.append("telemetry.remote.endpoint is not configured")
+    return reasons
+
+
+_REMOTE_TELEMETRY_SENDER = """
+import json
+import sys
+import urllib.request
+
+try:
+    message = json.load(sys.stdin)
+    request = urllib.request.Request(
+        message["endpoint"],
+        data=json.dumps(message["payload"], ensure_ascii=False).encode("utf-8"),
+        method="POST", headers={"Content-Type": "application/json"},
+    )
+    if message["token"]:
+        request.add_header("Authorization", "Bearer " + message["token"])
+    urllib.request.urlopen(request, timeout=3).close()
+except Exception:
+    pass
+"""
+
+
 def send_remote_telemetry(remote: dict[str, Any], span: dict[str, Any]) -> None:
+    """Start a detached sender; dispatch never waits for the network or child."""
+    try:
+        _send_remote_telemetry(remote, span)
+    except Exception:
+        pass
+
+
+def _send_remote_telemetry(remote: dict[str, Any], span: dict[str, Any]) -> None:
     """Best-effort, deliberately reduced telemetry send. Never raises: a
     down or misconfigured collector must never affect the actual dispatch.
     Strips everything the local trace span carries that could be
@@ -836,13 +878,19 @@ def send_remote_telemetry(remote: dict[str, Any], span: dict[str, Any]) -> None:
         }],
     }
     try:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(endpoint, data=body, method="POST", headers={"Content-Type": "application/json"})
-        token = str(remote.get("token") or "")
-        if token:
-            request.add_header("Authorization", f"Bearer {token}")
-        urllib.request.urlopen(request, timeout=3).close()
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        body = json.dumps({"endpoint": endpoint, "token": str(remote.get("token") or ""),
+                           "payload": payload}, ensure_ascii=False).encode("utf-8")
+        child = subprocess.Popen(
+            [sys.executable, "-c", _REMOTE_TELEMETRY_SENDER],
+            start_new_session=True, stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, bufsize=0,
+        )
+        with child.stdin:
+            # Even an oversized payload or a stalled child must not block a
+            # dispatch. A partial write simply drops this best-effort send.
+            os.set_blocking(child.stdin.fileno(), False)
+            child.stdin.write(body)
+    except Exception:
         pass
 
 
@@ -987,7 +1035,7 @@ class RunStore:
         # FUSION_TELEMETRY=0 stops the send without touching the local trace:
         # lane cooldown, resume and `fusion usage` all read that file, and
         # opting out of reporting should not cost the machine its own records.
-        if remote.get("enabled") and os.environ.get("FUSION_TELEMETRY") != "0":
+        if not remote_telemetry_disabled_reasons(telemetry):
             send_remote_telemetry(remote, span)
 
     def traces(self, limit: int = 100) -> list[dict[str, Any]]:
@@ -2542,7 +2590,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("task", help="initial task for the lead")
 
     delegate = sub.add_parser("delegate", help="run one bounded sidekick task")
-    delegate.add_argument("--agent", choices=["auto", "claude", "codex", "agy", "grok"], required=True)
+    delegate.add_argument("--agent", choices=["auto", "claude", "codex", "agy", "grok"], help="worker agent; defaults to the named route agent")
     delegate.add_argument("--role", default="implementation")
     delegate.add_argument("--read-only", action="store_true", help="give the worker a read-only workspace")
     delegate.add_argument("--fresh", action="store_true", help="start a fresh agent session")
@@ -2620,12 +2668,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     telemetry = sub.add_parser("telemetry", help="local and remote telemetry configuration")
     telemetry_sub = telemetry.add_subparsers(dest="telemetry_command", required=True)
-    telemetry_sub.add_parser("status", help="show what remote telemetry is configured to send, if any")
+    telemetry_sub.add_parser("status", help="show effective remote telemetry state and reasons sending is disabled")
     telemetry_sub.add_parser("on", help="turn remote reporting on for this workspace")
     telemetry_sub.add_parser("off", help="turn remote reporting off for this workspace; local traces keep working")
     telemetry_report = telemetry_sub.add_parser(
         "report", help="show the usage and failure patterns this machine reported; --all needs a shared token"
     )
+    telemetry_report.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     telemetry_report.add_argument("--hours", type=int, default=168, help="lookback window in hours (default: 168, 7 days)")
     telemetry_report.add_argument(
         "--all", action="store_true",
@@ -2761,8 +2810,13 @@ def _main(args, parser) -> int:
             print(f"remote telemetry {state} for this workspace ({path})"
                   + ("" if wanted else "; local traces keep working"))
             return 0
+        disabled_reasons = remote_telemetry_disabled_reasons(config.get("telemetry") or {})
+        configured_enabled = enabled
+        enabled = not disabled_reasons
         payload = {
             "local_enabled": (config.get("telemetry") or {}).get("enabled", True),
+            "remote_configured_enabled": configured_enabled,
+            "remote_disabled_reasons": disabled_reasons,
             "local_path": str(RunStore(workspace).traces_path),
             "remote_enabled": enabled,
             "remote_token_configured": bool(remote.get("token")),
@@ -2881,6 +2935,17 @@ def _main(args, parser) -> int:
                                        stage=args.stage, withdraw=args.withdraw, unmeasured=args.unmeasured)))
         return 0
     if args.command == "delegate":
+        if args.agent is None:
+            if not args.route:
+                parser.error("delegate requires --agent or a --route with an agent")
+            route = config.get("routes", {}).get(args.route)
+            if not isinstance(route, dict):
+                parser.error(f"unknown Fusion route: {args.route}")
+            args.agent = route.get("agent")
+            if not args.agent:
+                parser.error(f"route {args.route} has no agent; specify --agent")
+            if args.agent not in {"auto", "claude", "codex", "agy", "grok"}:
+                parser.error(f"route {args.route} has an invalid agent: {args.agent}")
         task = make_task(
             workspace,
             args.agent,

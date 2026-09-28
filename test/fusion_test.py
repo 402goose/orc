@@ -1640,22 +1640,7 @@ print(json.dumps({{'type':'result','subtype':'success','is_error':False,'session
                     os.environ["ORC_HOME"] = old_home
 
     def test_remote_telemetry_defaults_on_and_environment_opt_out_stops_sends(self):
-        received = []
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self):
-                received.append(True)
-                self.send_response(200)
-                self.end_headers()
-
-            def log_message(self, *args):
-                pass
-
-        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-        port = server.server_address[1]
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
+        with patch("fusion_core.send_remote_telemetry") as send:
             claude = self.write_agent(
                 "claude-default-telemetry",
                 """
@@ -1666,7 +1651,7 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
             value = {
                 "claude": {"command": str(claude)},
                 # remote.enabled deliberately omitted -- must default to on.
-                "telemetry": {"remote": {"endpoint": f"http://127.0.0.1:{port}/v1/ingest"}},
+                "telemetry": {"remote": {"endpoint": "https://example.invalid/v1/ingest"}},
             }
             (self.workspace / ".fusion.json").write_text(json.dumps(value), encoding="utf-8")
             self.allow_telemetry()
@@ -1675,35 +1660,38 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
                 fusion_core.main(
                     ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "do it"]
                 )
-            self.assertEqual(len(received), 1, "an unconfigured workspace must still report")
+            self.assertEqual(send.call_count, 1, "an unconfigured workspace must still report")
             # ...and one switch stops it, with no config edit.
             with patch.dict(os.environ, {"FUSION_TELEMETRY": "0"}), contextlib.redirect_stdout(io.StringIO()):
                 fusion_core.main(
                     ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "again"]
                 )
-            self.assertEqual(len(received), 1, "FUSION_TELEMETRY=0 must stop the send")
-        finally:
-            server.shutdown()
-            server.server_close()
+            self.assertEqual(send.call_count, 1, "FUSION_TELEMETRY=0 must stop the send")
 
-    def test_remote_telemetry_sends_reduced_payload_when_enabled(self):
+    def test_cli_remote_telemetry_delivers_once_after_dispatch_exits(self):
         received = []
+        entered = threading.Event()
+        release = threading.Event()
+        completed = threading.Event()
+        timed_out = threading.Event()
 
-        class Handler(http.server.BaseHTTPRequestHandler):
+        class Collector(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
-                length = int(self.headers.get("Content-Length", 0))
                 received.append({
-                    "body": json.loads(self.rfile.read(length)),
+                    "body": json.loads(self.rfile.read(int(self.headers["Content-Length"]))),
                     "auth": self.headers.get("Authorization"),
                 })
-                self.send_response(200)
+                entered.set()
+                if not release.wait(10):
+                    timed_out.set()
+                self.send_response(204)
                 self.end_headers()
+                completed.set()
 
             def log_message(self, *args):
                 pass
 
-        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-        port = server.server_address[1]
+        server = http.server.HTTPServer(("127.0.0.1", 0), Collector)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -1716,18 +1704,26 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
             )
             value = {
                 "claude": {"command": str(claude)},
-                "telemetry": {"remote": {"enabled": True, "endpoint": f"http://127.0.0.1:{port}/v1/ingest", "token": "sekret"}},
+                "routes": {"fixture": {"agent": "claude"}},
+                "telemetry": {"remote": {"enabled": True, "endpoint": f"http://127.0.0.1:{server.server_port}/v1/ingest", "token": "sekret"}},
             }
             (self.workspace / ".fusion.json").write_text(json.dumps(value), encoding="utf-8")
             self.allow_telemetry()
-            output = io.StringIO()
-            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(
-                    fusion_core.main(
-                        ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "claude", "--read-only", "do secret/path.py work"]
-                    ),
-                    0,
-                )
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "fusion"), "--workspace", str(self.workspace),
+                 "--json", "delegate", "--route", "fixture", "--read-only",
+                 "do secret/path.py work"],
+                # Less than the sender's three-second network timeout: a
+                # synchronous send must fail this check even if it times out.
+                capture_output=True, text=True, timeout=2,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertEqual(json.loads(result.stdout)["status"], "success")
+            self.assertTrue(entered.wait(5), "CLI exited without delivering telemetry")
+            self.assertFalse(timed_out.is_set(), "dispatch waited for the collector")
+            self.assertFalse(completed.is_set(), "collector response was not held open")
+            release.set()
+            self.assertTrue(completed.wait(2))
             self.assertEqual(len(received), 1)
             self.assertEqual(received[0]["auth"], "Bearer sekret")
             body = received[0]["body"]
@@ -1756,10 +1752,14 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
                 fusion_core.main(["--workspace", str(self.workspace), "telemetry", "status"])
             self.assertEqual(set(json.loads(status.getvalue())["fields_sent"]), set(span))
         finally:
+            release.set()
             server.shutdown()
             server.server_close()
+            thread.join(2)
+        self.assertEqual(len(received), 1)
 
     def test_telemetry_status_reports_configuration(self):
+        self.allow_telemetry()
         self.config()
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -1771,6 +1771,106 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
         self.assertIn("agent", result["fields_sent"])
         self.assertNotIn("blockers", result["fields_sent"])
         self.assertIn("prompt/task text", result["fields_never_sent"])
+
+    def test_delegate_infers_route_agent_and_preserves_explicit_agent(self):
+        value = {"routes": {"test-route": {"agent": "codex"}, "no-agent": {"model": "test"}}}
+        (self.workspace / ".fusion.json").write_text(json.dumps(value))
+        for options, agent, route in (
+            (["--route", "test-route"], "codex", "test-route"),
+            (["--agent", "codex", "--route", "test-route"], "codex", "test-route"),
+            (["--agent", "claude", "--route", "no-agent"], "claude", "no-agent"),
+            (["--agent", "agy"], "agy", None),
+        ):
+            with self.subTest(options=options), patch("fusion_core.dispatch", return_value={"status": "success"}) as dispatch:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = fusion_core.main(["--workspace", str(self.workspace), "--json", "delegate", *options, "inspect"])
+                self.assertEqual(code, 0)
+                task = dispatch.call_args.args[1]
+                self.assertEqual(task["agent"], agent)
+                self.assertEqual(task["route"], route)
+                self.assertEqual(task["session_key"].split(":")[0], agent)
+
+    def test_delegate_without_agent_rejects_missing_or_invalid_route_agent(self):
+        value = {"routes": {"no-agent": {}, "bad-agent": {"agent": "bogus"}}}
+        (self.workspace / ".fusion.json").write_text(json.dumps(value))
+        for options, message in (
+            ([], "requires --agent"),
+            (["--route", "no-agent"], "has no agent"),
+            (["--route", "missing"], "unknown Fusion route"),
+            (["--route", "bad-agent"], "invalid agent"),
+        ):
+            errors = io.StringIO()
+            with self.subTest(options=options), patch("fusion_core.dispatch") as dispatch:
+                with contextlib.redirect_stderr(errors), self.assertRaises(SystemExit) as raised:
+                    fusion_core.main(["--workspace", str(self.workspace), "delegate", *options, "inspect"])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(message, errors.getvalue())
+                dispatch.assert_not_called()
+
+    def test_delegate_explicit_agent_must_match_route(self):
+        self.config()
+        with self.assertRaisesRegex(ValueError, "is for claude, not codex"):
+            fusion_core.main(["--workspace", str(self.workspace), "delegate", "--agent", "codex", "--route", "orc-free", "inspect"])
+
+    def test_telemetry_report_accepts_both_json_positions(self):
+        summary = {"window_hours": 24, "total_spans": 2, "unique_installs": 1, "by_group": []}
+        for arguments in (["--json", "telemetry", "report"], ["telemetry", "report", "--json"]):
+            output = io.StringIO()
+            with self.subTest(arguments=arguments), patch("fusion_core.fetch_remote_summary", return_value=summary) as fetch:
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(fusion_core.main(["--workspace", str(self.workspace), *arguments, "--hours", "24"]), 0)
+                self.assertEqual(json.loads(output.getvalue()), summary)
+                self.assertEqual(fetch.call_args.args[1], 24)
+
+    def test_telemetry_status_matches_effective_send_state(self):
+        for local, remote, env, endpoint, reasons in (
+            (True, True, "1", "https://example.invalid", []),
+            (True, True, "0", "https://example.invalid", ["FUSION_TELEMETRY=0"]),
+            (False, True, "1", "https://example.invalid", ["telemetry.enabled is false"]),
+            (True, False, "1", "https://example.invalid", ["telemetry.remote.enabled is false"]),
+            (True, True, "1", "", ["telemetry.remote.endpoint is not configured"]),
+            (False, False, "0", "", ["telemetry.enabled is false", "telemetry.remote.enabled is false", "FUSION_TELEMETRY=0", "telemetry.remote.endpoint is not configured"]),
+        ):
+            value = {"telemetry": {"enabled": local, "remote": {"enabled": remote, "endpoint": endpoint}}}
+            (self.workspace / ".fusion.json").write_text(json.dumps(value))
+            output = io.StringIO()
+            with self.subTest(local=local, remote=remote, env=env, endpoint=endpoint), patch.dict(os.environ, {"FUSION_TELEMETRY": env}):
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(fusion_core.main(["--workspace", str(self.workspace), "telemetry", "status"]), 0)
+                result = json.loads(output.getvalue())
+                self.assertEqual(result["remote_enabled"], not reasons)
+                self.assertEqual(result["remote_configured_enabled"], remote)
+                self.assertEqual(result["remote_disabled_reasons"], reasons)
+                self.assertEqual(bool(result["fields_sent"]), not reasons)
+                self.assertEqual(result["install_id"] is not None, not reasons)
+                task = fusion_core.make_task(self.workspace, "codex", "inspect", "review", [], [], None, False, False)
+                with patch("fusion_core.send_remote_telemetry") as send:
+                    fusion_core.RunStore(self.workspace).trace_span(value, task, {"status": "success"}, 0, 1, {})
+                self.assertEqual(send.call_count, int(not reasons))
+
+    def test_remote_telemetry_failures_are_best_effort(self):
+        remote = {"endpoint": "https://example.invalid"}
+        with patch("fusion_core.announce_remote_telemetry"), patch("fusion_core.telemetry_install_id", return_value="test"):
+            for error in (OSError("offline"), ValueError("invalid"), RuntimeError("unexpected")):
+                with self.subTest(error=error), patch("fusion_core.subprocess.Popen", side_effect=error) as spawn:
+                    fusion_core.send_remote_telemetry(remote, {})
+                    spawn.assert_called_once()
+            for operation in ("fileno", "write", "close"):
+                with self.subTest(operation=operation), patch("fusion_core.subprocess.Popen") as spawn, patch("fusion_core.os.set_blocking"):
+                    pipe = spawn.return_value.stdin
+                    pipe.__exit__.side_effect = lambda *args: pipe.close()
+                    getattr(pipe, operation).side_effect = OSError("pipe unavailable")
+                    fusion_core.send_remote_telemetry(remote, {})
+                    pipe.close.assert_called_once()
+                    spawn.return_value.wait.assert_not_called()
+                    spawn.return_value.communicate.assert_not_called()
+            # Exercise the actual child program with a mocked transport so
+            # malformed endpoints and unexpected network errors stay silent.
+            for error in (OSError("offline"), ValueError("invalid"), RuntimeError("unexpected")):
+                message = json.dumps({"endpoint": remote["endpoint"], "token": "", "payload": {}})
+                with self.subTest(child_error=error), patch("sys.stdin", io.StringIO(message)), patch("urllib.request.urlopen", side_effect=error) as send:
+                    exec(fusion_core._REMOTE_TELEMETRY_SENDER, {})
+                    send.assert_called_once()
 
     def test_first_send_announces_itself_once_per_machine(self):
         home = Path(os.environ["ORC_HOME"])
@@ -1896,10 +1996,12 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
             self.assertEqual(first, fusion_core.telemetry_install_id(), "one install, not one per span")
             with contextlib.redirect_stderr(io.StringIO()):
                 fusion_core.announce_remote_telemetry("https://example.invalid/v1/ingest")
-            fusion_core.send_remote_telemetry(
-                {"enabled": True, "endpoint": "https://127.0.0.1:1/v1/ingest"},
-                {"agent": "claude", "status": "success", "usage": {}},
-            )
+            with patch("fusion_core.subprocess.Popen", side_effect=OSError("offline")):
+                fusion_core.send_remote_telemetry(
+                    {"enabled": True, "endpoint": "https://example.invalid/v1/ingest"},
+                    {"agent": "claude", "status": "success", "usage": {}},
+                )
+
     def test_ui_token_survives_a_restart_and_stays_private(self):
         import fusion_ui
         home = Path(self.temp.name) / "orc-home"
@@ -2252,4 +2354,3 @@ class VerdictTest(unittest.TestCase):
                                summary="tenet build land refused merged-result not-clean")
         self.assertEqual(verdict["verdict"], "error")
         self.assertEqual(self.verdict("error", exit_code=3), {"verdict": "refused", "reason": "exit_code_3"})
-
