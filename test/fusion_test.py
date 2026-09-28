@@ -221,6 +221,9 @@ print(json.dumps({'type':'result','is_error':True,'session_id':'exhausted-claude
         self.assertEqual(review["attempts"], 2)
         self.assertEqual(review["result"]["agent"], "codex")
         self.assertEqual(review["excluded_routes"], ["claude"])
+        implement = next(n for n in result["nodes"] if n["id"] == "implement")
+        self.assertEqual(implement["attempts"], 1)
+        self.assertNotIn("repair_feedback", implement)
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
         self.assertEqual([c["role"] for c in calls], ["implement", "review"])
         argv = calls[-1]["argv"]
@@ -485,6 +488,189 @@ print(json.dumps({"type": "turn.completed", "usage": {}}))
         outcome = run_workflow(self.workspace, json.loads((self.workspace / ".fusion.json").read_text()), path)
         self.assertEqual(outcome["status"], "success", outcome)
         self.assertEqual(outcome["nodes"][0]["attempts"], 2)
+
+    def review_repair_fixture(self, *, review_status="blocked", failure=None,
+                              max_attempts=2, budget=0, fixes=True, writer_retry=False,
+                              changing_blockers=False, audit=False):
+        self.git_workspace()
+        (self.workspace / "made.txt").write_text("original")
+        codex = self.write_agent("codex-review-repair", f'''
+import json, pathlib, sys
+prompt = sys.stdin.read()
+role = prompt.split("You are node ", 1)[1].split(" ", 1)[0]
+calls_path = pathlib.Path({str(self.calls)!r})
+calls = [json.loads(line) for line in calls_path.read_text().splitlines()] if calls_path.exists() else []
+attempt = 1 + sum(call['role'] == role for call in calls)
+with calls_path.open('a') as stream:
+    stream.write(json.dumps({{'role': role, 'prompt': prompt, 'fixed': pathlib.Path('fix.txt').exists()}}) + '\\n')
+status, blockers, tests = 'success', 'none', 'fixture checked'
+if role == 'implement':
+    if attempt == 1:
+        pathlib.Path('made.txt').write_text('implemented')
+        if {writer_retry!r}:
+            blockers = 'finish implementation verification'
+    elif 'Repair the following review blockers' in prompt and {fixes!r}:
+        assert 'Create fix.txt to resolve the defect' in prompt
+        pathlib.Path('fix.txt').write_text('fixed')
+elif role == 'review':
+    if not pathlib.Path('fix.txt').exists():
+        status, blockers = {review_status!r}, 'Create fix.txt to resolve the defect'
+        if {changing_blockers!r}:
+            blockers += f' (finding {{attempt}})'
+    if {failure!r} and attempt > 1:
+        status, blockers = 'success', 'none'
+    if {failure!r} == 'handoff' and attempt == 1:
+        tests = 'none'
+text = f'STATUS: {{status}}\\nSUMMARY: {{role}} finished\\nCHANGED: none\\nTESTS: {{tests}}\\nBLOCKERS: {{blockers}}'
+print(json.dumps({{'type':'item.completed','item':{{'type':'agent_message','text':text}}}}))
+if {failure!r} == 'provider' and role == 'review' and attempt == 1:
+    print(json.dumps({{'type':'turn.failed','error':{{'message':'provider unavailable'}}}}))
+else:
+    print(json.dumps({{'type':'turn.completed','usage':{{'cost_usd':0.1}}}}))
+''')
+        self.config(codex=codex)
+        spec = {"task": "repair reviewed implementation", "max_attempts": max_attempts,
+                "budget_usd": budget, "nodes": [
+            {"id": "implement", "role": "implementation", "agent": "codex", "write": True,
+             "task": "Implement it", "required_files": ["made.txt"]},
+            {"id": "review", "role": "read-only review", "agent": "codex", "needs": ["implement"],
+             "independent_of": "implement", "task": "Review it",
+             "acceptance": {"required_handoff": ["summary", "tests"]}},
+        ]}
+        if audit:
+            spec["max_parallel"] = 1
+            spec["nodes"].insert(1, {
+                "id": "audit", "role": "audit", "agent": "codex", "needs": ["implement"],
+                "task": "Audit the implementation",
+            })
+        path = self.workspace / "review-repair.json"
+        path.write_text(json.dumps(spec))
+        return json.loads((self.workspace / ".fusion.json").read_text()), path
+
+    def test_review_blockers_repair_writer_and_rerun_review(self):
+        config, path = self.review_repair_fixture()
+        outcome = run_workflow(self.workspace, config, path)
+        self.assertEqual(outcome["status"], "success", outcome)
+        writer, review = outcome["nodes"]
+        self.assertEqual([writer["attempts"], review["attempts"]], [2, 2])
+        self.assertEqual(writer["task"], "Implement it")
+        self.assertEqual((self.workspace / "made.txt").read_text(), "implemented")
+        feedback = writer["repair_feedback"]
+        self.assertEqual(feedback["blockers"], ["Create fix.txt to resolve the defect"])
+        self.assertEqual(feedback, review["review_repair"])
+        report = workflow_report(self.workspace, outcome["workflow_id"])
+        ledger = report["attempt_ledger"]
+        self.assertEqual([entry["node_id"] for entry in ledger], ["implement", "review", "implement", "review"])
+        self.assertEqual(ledger[2]["repair"]["review_run_id"], ledger[1]["run_id"])
+        self.assertEqual(ledger[3]["re_review"], feedback)
+        from fusion_report import format_report, select_report
+        self.assertIn("implement #1 → review #1 → implement #2 (repair) → review #2",
+                      format_report(select_report(report), brief=True))
+        resumed = resume_workflow(self.workspace, config, outcome["workflow_id"])
+        self.assertEqual(resumed["status"], "success", resumed)
+        self.assertEqual([n["attempts"] for n in resumed["nodes"]], [2, 2])
+
+    def test_review_repair_reruns_successful_audit_on_repaired_tree(self):
+        config, path = self.review_repair_fixture(audit=True)
+        outcome = run_workflow(self.workspace, config, path)
+        self.assertEqual(outcome["status"], "success", outcome)
+        writer, audit, review = outcome["nodes"]
+        self.assertEqual([writer["attempts"], audit["attempts"], review["attempts"]], [2, 2, 2])
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertEqual([call["role"] for call in calls],
+                         ["implement", "audit", "review", "implement", "audit", "review"])
+        self.assertEqual([call["fixed"] for call in calls if call["role"] == "audit"], [False, True])
+
+    def test_review_repair_checks_transitive_dependents_before_invalidating(self):
+        config, path = self.review_repair_fixture(audit=True)
+        spec = json.loads(path.read_text())
+        spec["nodes"].insert(0, {
+            "id": "report", "role": "report", "agent": "codex", "needs": ["audit"],
+            "task": "Report audit findings",
+        })
+        for status in ("running", "success"):
+            with self.subTest(dependent_status=status):
+                runner = WorkflowRunner(self.workspace, config, spec)
+                for node in runner.nodes.values():
+                    node.update(status="success", attempts=1, _contract={"marker": node["id"]})
+                runner.nodes["report"]["status"] = status
+                review = runner.nodes["review"]
+                review["status"] = "pending"
+                before = json.loads(json.dumps(runner.nodes))
+                with patch.object(runner, "_event") as event:
+                    repaired = runner._repair_review_dependency(
+                        review, {"status": "blocked", "exit_code": 0}, ["fix the defect"],
+                        [{"code": "worker_blockers"}],
+                    )
+                self.assertEqual(repaired, status == "success")
+                if status == "running":
+                    self.assertEqual(runner.nodes, before)
+                    event.assert_not_called()
+                else:
+                    self.assertEqual(runner.nodes["implement"]["status"], "pending")
+                    for node_id in ("audit", "report"):
+                        self.assertEqual(runner.nodes[node_id]["status"], "pending")
+                        self.assertNotIn("_contract", runner.nodes[node_id])
+                        event.assert_any_call("node.stale", {
+                            "node_id": node_id, "reason": "dependency repaired by review",
+                        })
+
+    def test_review_success_with_blockers_also_repairs(self):
+        config, path = self.review_repair_fixture(review_status="success")
+        outcome = run_workflow(self.workspace, config, path)
+        self.assertEqual(outcome["status"], "success", outcome)
+        self.assertEqual([n["attempts"] for n in outcome["nodes"]], [2, 2])
+
+    def test_review_missing_handoff_does_not_reopen_writer(self):
+        config, path = self.review_repair_fixture(failure="handoff")
+        outcome = run_workflow(self.workspace, config, path)
+        self.assertEqual(outcome["status"], "success", outcome)
+        self.assertEqual([n["attempts"] for n in outcome["nodes"]], [1, 2])
+        self.assertNotIn("repair_feedback", outcome["nodes"][0])
+
+    def test_review_provider_failure_does_not_reopen_writer(self):
+        config, path = self.review_repair_fixture(failure="provider")
+        outcome = run_workflow(self.workspace, config, path)
+        self.assertEqual(outcome["status"], "success", outcome)
+        self.assertEqual([n["attempts"] for n in outcome["nodes"]], [1, 2])
+        self.assertNotIn("repair_feedback", outcome["nodes"][0])
+
+    def test_review_repair_requires_remaining_review_attempt(self):
+        config, path = self.review_repair_fixture(max_attempts=1)
+        outcome = run_workflow(self.workspace, config, path)
+        self.assertEqual(outcome["status"], "failed")
+        self.assertEqual([n["attempts"] for n in outcome["nodes"]], [1, 1])
+        self.assertNotIn("repair_feedback", outcome["nodes"][0])
+
+    def test_review_repair_requires_remaining_writer_attempt(self):
+        config, path = self.review_repair_fixture(writer_retry=True)
+        outcome = run_workflow(self.workspace, config, path)
+        self.assertEqual(outcome["status"], "failed")
+        self.assertEqual([n["attempts"] for n in outcome["nodes"]], [2, 2])
+        self.assertNotIn("repair_feedback", outcome["nodes"][0])
+
+    def test_review_repair_only_reopens_writer_once(self):
+        config, path = self.review_repair_fixture(max_attempts=4, fixes=False, changing_blockers=True)
+        outcome = run_workflow(self.workspace, config, path)
+        self.assertEqual(outcome["status"], "failed")
+        self.assertEqual([n["attempts"] for n in outcome["nodes"]], [2, 4])
+
+    def test_review_repair_resumes_after_budget_pause_with_node_baselines(self):
+        config, path = self.review_repair_fixture(budget=0.2)
+        outcome = run_workflow(self.workspace, config, path)
+        self.assertEqual(outcome["status"], "paused_budget", outcome)
+        self.assertEqual([n["attempts"] for n in outcome["nodes"]], [1, 1])
+        writer = outcome["nodes"][0]
+        self.assertIn("repair_feedback", writer)
+        spec = json.loads(path.read_text())
+        spec["budget_usd"] = 1
+        path.write_text(json.dumps(spec))
+        resumed = resume_workflow(self.workspace, config, outcome["workflow_id"], spec_path=path)
+        self.assertEqual(resumed["status"], "success", resumed)
+        self.assertEqual([n["attempts"] for n in resumed["nodes"]], [2, 2])
+        for key in ("repair_feedback", "_artifact_baseline", "_tree_baseline"):
+            self.assertEqual(resumed["nodes"][0][key], writer[key])
+        self.assertAlmostEqual(resumed["spent_usd"], 0.4)
 
     def test_a_workspace_without_git_is_not_blocked_by_the_gate(self):
         """Unavailable is not evidence of no change.

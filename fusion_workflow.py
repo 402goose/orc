@@ -496,6 +496,9 @@ class WorkflowRunner:
             result = old.get("result")
             self.nodes[node_id]["result"] = result
             self.nodes[node_id]["excluded_routes"] = old.get("excluded_routes", [])
+            for key in ("_artifact_baseline", "_tree_baseline", "review_repair", "repair_feedback"):
+                if key in old:
+                    self.nodes[node_id][key] = old[key]
             status = str(old.get("status", "pending"))
             denied = core.failure_class(result or {}) == "permission_denied"
             access_changed = (result or {}).get("execution_mode", "restricted") != core.execution_mode(self.config)
@@ -767,11 +770,14 @@ class WorkflowRunner:
 
     def _prompt(self, node: dict[str, Any]) -> str:
         required = ", ".join(node.get("required_files", [])) or "none"
+        feedback = node.get("repair_feedback")
+        repair = ("\n\nRepair the following review blockers, then rerun relevant verification:\n"
+                  + core.json_text(feedback)) if feedback else ""
         return f"""You are node {node['id']} in a persisted Fusion workflow.
 
 Workflow: {self.run_id}
 Role: {node['role']}
-Task: {node['task']}
+Task: {node['task']}{repair}
 
 Dependency artifacts:
 {self._dependency_context(node)}
@@ -1361,6 +1367,63 @@ BLOCKERS: unresolved issues, or none
     def _ready(self, node: dict[str, Any]) -> bool:
         return node["status"] == "pending" and all(self.nodes[dependency]["status"] == "success" for dependency in node["needs"])
 
+    def _repair_review_dependency(self, node: dict[str, Any], result: dict[str, Any],
+                                  blockers: list[str], codes: list[dict[str, Any]]) -> bool:
+        """Redirect an ordinary repair to a writer once, using worker evidence only."""
+        if node["write"] or "review" not in node["role"].lower() or node.get("review_repair") or not blockers:
+            return False
+        failure = result.get("failure_class") or core.failure_class(result)
+        # A blocked handoff has verdict=error/failure_class=worker_error even
+        # when the CLI completed normally. Provider/transport errors must not
+        # be mistaken for that substantive review outcome.
+        if (result.get("status") not in {"success", "cache_hit", "partial", "blocked"}
+                or failure not in {None, "worker_error"}
+                or result.get("verdict") not in {None, "ok", "error"}
+                or (result.get("verdict") == "error" and result.get("status") != "blocked")
+                or result.get("provider_failure") or result.get("exit_code") not in {None, 0}):
+            return False
+        gate_codes = {item["code"] for item in codes}
+        if "worker_blockers" not in gate_codes or gate_codes - {
+                "worker_status", "worker_blockers", "check_failed",
+                "required_file_missing", "required_file_unchanged"}:
+            return False
+        if node["attempts"] >= self.spec["max_attempts"]:
+            return False
+        # independent_of identifies the intended writer; otherwise use the
+        # first write dependency in authored needs order, without falling
+        # through to unrelated writers when that target is exhausted.
+        target = node.get("independent_of")
+        if not target or not self.nodes[target]["write"]:
+            target = next((dep for dep in node["needs"] if self.nodes[dep]["write"]), None)
+        if target is None:
+            return False
+        writer = self.nodes[target]
+        if (writer["status"] != "success" or writer.get("repair_feedback")
+                or writer["attempts"] >= self.spec["max_attempts"]):
+            return False
+        downstream = {target}
+        for node_id in self._topological_order():
+            if any(dep in downstream for dep in self.nodes[node_id]["needs"]):
+                downstream.add(node_id)
+        downstream.difference_update({target, node["id"]})
+        if any(self.nodes[node_id]["status"] == "running" for node_id in downstream):
+            return False
+        for node_id in self.nodes:
+            dependent = self.nodes[node_id]
+            if node_id in downstream and dependent["status"] == "success":
+                dependent["status"] = "pending"
+                dependent.pop("_contract", None)
+                self._event("node.stale", {"node_id": node_id, "reason": "dependency repaired by review"})
+        feedback = {"review_node_id": node["id"], "review_attempt": node["attempts"],
+                    "review_run_id": result.get("run_id"), "writer_node_id": target,
+                    "writer_attempt": writer["attempts"] + 1, "blockers": blockers}
+        node["review_repair"] = feedback
+        writer["repair_feedback"] = feedback
+        writer["status"] = "pending"
+        # Attempts, routes, receipts and node baselines survive reopening.
+        self._event("node.repair_requested", feedback)
+        return True
+
     def _block_unrunnable(self) -> None:
         changed = True
         while changed:
@@ -1536,9 +1599,15 @@ BLOCKERS: unresolved issues, or none
                         payload = {"task": {}, "result": {"status": "error", "summary": "worker thread failed", "blockers": [str(exc)]}}
                     node = self.nodes[node_id]
                     result = payload.get("result") or {}
+                    worker_blockers = list(result.get("blockers") or [])
+                    provenance = {}
+                    if node.get("repair_feedback"):
+                        provenance["repair"] = node["repair_feedback"]
+                    if node.get("review_repair"):
+                        provenance["re_review"] = node["review_repair"]
                     self.attempt_ledger.append({"run_id": result.get("run_id"), "node_id": node_id,
                                                 "attempt": node["attempts"], "cost_usd": _result_cost(result),
-                                                "usage": result.get("usage", {})})
+                                                "usage": result.get("usage", {}), **provenance})
                     from fusion_labeling import gate_label, record_gate_input
                     # The input is recorded before the gate decides, for every
                     # reported success, so a failed gate leaves a labelable example
@@ -1603,7 +1672,8 @@ BLOCKERS: unresolved issues, or none
                         self._event("node.needs_input", {"node_id": node_id, "problems": problems})
                     elif action == "repair" and node["attempts"] < self.spec["max_attempts"]:
                         node["status"] = "pending"
-                        self._event("node.retrying", {"node_id": node_id, "attempt": node["attempts"], "problems": problems})
+                        if not self._repair_review_dependency(node, result, worker_blockers, codes):
+                            self._event("node.retrying", {"node_id": node_id, "attempt": node["attempts"], "problems": problems})
                     else:
                         node["status"] = "invalid" if problems and result.get("status") == "success" else "failed"
                         self._event("node.failed", {"node_id": node_id, "attempt": node["attempts"], "problems": problems})
@@ -1812,6 +1882,7 @@ def workflow_report(workspace: Path, run_id: str) -> dict[str, Any]:
         "spent_usd": manifest.get("spent_usd", sum(_result_cost(node.get("result") or {}) for node in nodes.values())),
         "budget_usd": (manifest.get("spec") or {}).get("budget_usd") or 0,
         "waves": [{"wave": wave, "nodes": waves[wave]} for wave in sorted(waves)],
+        "attempt_ledger": manifest.get("attempt_ledger", []),
         "node_ids": list(nodes),
         "outputs": outputs,
         "primary_nodes": primary_nodes,
