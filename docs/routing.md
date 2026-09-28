@@ -13,10 +13,11 @@
 Use `fusion delegate --agent auto --read-only "Review the current diff"` to let
 the router choose an eligible lane. Authored workflow nodes can likewise set
 `"agent": "auto"`. Named routes live under `routes` in `.fusion.json`; a direct
-CLI delegation still requires `--agent`, even when `--route` names the worker.
+CLI delegation infers `--agent` from `--route` when omitted. If the route has no
+agent, supply `--agent` explicitly; an explicit agent must match the route.
 
 ```sh
-fusion delegate --agent claude --route orc-free --read-only "Review the diff"
+fusion delegate --route orc-free --read-only "Review the diff"
 fusion delegate --agent codex --read-only --model gpt-6-astra --reasoning-effort high "Inspect persistence boundaries"
 ```
 

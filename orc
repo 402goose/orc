@@ -36,8 +36,8 @@ key_read() {
     security find-generic-password -ws "$KEYCHAIN_SERVICE" 2>/dev/null || true
   else
     [ -f "$KEY_FILE" ] || return 0
-    if [ -n "$(find "$KEY_FILE" -perm -004 2>/dev/null)" ]; then
-      info "note: $KEY_FILE is readable by other users — fix with: chmod 600 $KEY_FILE"
+    if [ -n "$(find "$KEY_FILE" \( -perm -040 -o -perm -020 -o -perm -010 -o -perm -004 -o -perm -002 -o -perm -001 \) 2>/dev/null)" ]; then
+      info "note: $KEY_FILE has group/world permissions — fix with: chmod 600 $KEY_FILE"
     fi
     cat "$KEY_FILE"
   fi
@@ -48,7 +48,9 @@ key_store() {
     security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$USER" -w "$1"
   else
     mkdir -p "$ORC_HOME"
+    [ -f "$KEY_FILE" ] && chmod 600 "$KEY_FILE"
     (umask 077; printf '%s' "$1" > "$KEY_FILE")
+    chmod 600 "$KEY_FILE"
   fi
 }
 
