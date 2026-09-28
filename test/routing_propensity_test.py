@@ -128,15 +128,17 @@ class RoutingPropensityTest(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "cost_tier"):
                 core.agent_settings({"codex": {"cost_tier": invalid}}, {"agent": "codex"})
 
-    def test_cost_never_beats_clear_evidence_or_changes_exploration(self):
+    def test_cost_never_beats_clear_evidence_and_orders_exploration(self):
         expensive = {"key": "expensive", "checked_runs": 3, "acceptance_rate": 1, "cost_tier": 5}
         cheap = {"key": "cheap", "checked_runs": 7, "acceptance_rate": 6 / 7, "cost_tier": 1}
         keys = lambda candidates, **kw: [c["key"] for c in rank_by_outcomes(candidates, **kw)]
         self.assertEqual(keys([expensive, cheap]), ["cheap", "expensive"])
         self.assertEqual(keys([expensive, {**cheap, "acceptance_rate": 2 / 7}]), ["expensive", "cheap"])
-        new = [{**expensive, "checked_runs": 0}, {**cheap, "checked_runs": 0, "warm": True}]
-        self.assertEqual(keys(new), ["expensive", "cheap"])
+        new = [{**expensive, "checked_runs": 0}, {**cheap, "checked_runs": 0}]
+        self.assertEqual(keys(new), ["cheap", "expensive"])
         self.assertEqual(keys(new, warm_epsilon=.05), ["cheap", "expensive"])
+        unset = [{"key": "a", "checked_runs": 0}, {"key": "b", "checked_runs": 0}]
+        self.assertEqual(keys(unset), ["a", "b"])
         self.assertEqual(keys([expensive, {**cheap, "quota": {"classification": "tight"}}]), ["expensive", "cheap"])
         self.assertEqual(keys([{**expensive, "warm": True}, cheap]), ["cheap", "expensive"])
 
