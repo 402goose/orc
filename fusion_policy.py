@@ -432,8 +432,9 @@ def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None, explore=True, cos
 
     Configured cost tiers break ties before warmth, lower first, with unset
     costs tied after configured costs. Without warm_epsilon, cost_epsilon
-    defines the tiers when any cost is configured. Cost never changes tier-0
-    exploration order or moves a lane across evidence tiers. Quota demotion
+    defines the tiers when any cost is configured. Exploration of unproven
+    lanes also tries cheaper tiers first. Cost never moves a lane across
+    evidence tiers. Quota demotion
     retains priority over all outcome, cost and warmth ordering.
     """
     def score(item):
@@ -460,10 +461,11 @@ def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None, explore=True, cos
         else:
             tiers.append((bucket, rate, [item[1]]))
     def tie_key(candidate, bucket):
-        if bucket == 0:
-            return (0, not candidate.get("warm") if warm_epsilon is not None else False)
         cost = candidate.get("cost_tier")
-        return (cost if cost is not None else math.inf, not candidate.get("warm"))
+        cost = cost if cost is not None else math.inf
+        if bucket == 0:
+            return (cost, not candidate.get("warm") if warm_epsilon is not None else False)
+        return (cost, not candidate.get("warm"))
     return rank_by_quota([candidate for bucket, _, tier in tiers
                           for candidate in sorted(tier, key=lambda c: tie_key(c, bucket))])
 

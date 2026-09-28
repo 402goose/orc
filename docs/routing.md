@@ -65,8 +65,9 @@ within `cache.warm_epsilon` of the best score in each tier. Without cache
 configuration, setting any cost tier enables `decisions.cost_epsilon` (default
 `0.05`) for this grouping. Within a tier, quota headroom comes first, then lower
 cost, then warm sessions, then existing order. Cost never crosses evidence
-tiers: clearly better verified evidence wins. Unproven-lane exploration is
-unchanged, and quota demotion retains priority across tiers.
+tiers: clearly better verified evidence wins. Unproven lanes are still tried
+first so every arm earns evidence, cheapest tier first; quota demotion retains
+priority across tiers.
 
 Each logged candidate includes its resolved `cost_tier`; the log policy records
 the effective `cost_epsilon` when cost ranking applies. `fusion decisions
