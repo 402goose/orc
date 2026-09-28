@@ -46,6 +46,7 @@ after its name. Aliases and hidden subcommands are included below.
 - [fusion decisions probe](#fusion-decisions-probe)
 - [fusion decisions label](#fusion-decisions-label)
 - [fusion decisions suggest](#fusion-decisions-suggest)
+- [fusion decisions eval-drafter](#fusion-decisions-eval-drafter)
 - [fusion decisions export](#fusion-decisions-export)
 - [fusion decisions routing-report](#fusion-decisions-routing-report)
 - [fusion decisions calibrate](#fusion-decisions-calibrate)
@@ -651,10 +652,10 @@ local Laya setup, decisions and reviewed learning
 
 ```text
 usage: fusion decisions [-h]
-                        {setup,status,list,show,probe,label,suggest,export,routing-report,calibrate,train,evaluate} ...
+                        {setup,status,list,show,probe,label,suggest,eval-drafter,export,routing-report,calibrate,train,evaluate} ...
 
 positional arguments:
-  {setup,status,list,show,probe,label,suggest,export,routing-report,calibrate,train,evaluate}
+  {setup,status,list,show,probe,label,suggest,eval-drafter,export,routing-report,calibrate,train,evaluate}
     setup                 install optional runtime and download a checkpoint
     status                show mode, runtime and calibration status
     list                  show recent decisions
@@ -662,6 +663,8 @@ positional arguments:
     label                 record human-reviewed answers with verification evidence
     suggest               draft evidence-backed labels, with optional unanimous council
                           approval
+    eval-drafter          evaluate drafts against human reviews in a temporary decision-
+                          store copy
     export                export reviewed labels, split by workflow group
     routing-report        per-lane acceptance from logged routing propensities (IPS,
                           ESS); read-only
@@ -782,6 +785,22 @@ options:
   --garden-policy GARDEN_POLICY
                           saved garden policy; changes or pausing revoke pending
                           automatic approvals
+```
+
+## fusion decisions eval-drafter
+
+evaluate drafts against human reviews in a temporary decision-store copy
+
+```text
+usage: fusion decisions eval-drafter [-h] [--agent {auto,codex,claude,agy,grok}]
+                                     [--rebuild-input] [--limit LIMIT] [--json]
+
+options:
+  -h, --help              show this help message and exit
+  --agent {auto,codex,claude,agy,grok}
+  --rebuild-input         rebuild acceptance inputs from saved run artifacts
+  --limit LIMIT           maximum reviewed decisions to evaluate
+  --json                  print machine-readable results instead of a summary table
 ```
 
 ## fusion decisions export

@@ -33,6 +33,11 @@ def add_parser(sub):
     suggest.add_argument("--approval", choices=["human", "council"], default="human", help="opt in to automatic approval of unanimous council answers")
     suggest.add_argument("--council-rule", choices=["unanimous", "available"], default="unanimous", help="available skips operationally unavailable members; at least two must agree")
     suggest.add_argument("--garden-policy", help="saved garden policy; changes or pausing revoke pending automatic approvals")
+    evaluation = commands.add_parser("eval-drafter", help="evaluate drafts against human reviews in a temporary decision-store copy")
+    evaluation.add_argument("--agent", choices=["auto", "codex", "claude", "agy", "grok"], default="auto")
+    evaluation.add_argument("--rebuild-input", action="store_true", help="rebuild acceptance inputs from saved run artifacts")
+    evaluation.add_argument("--limit", type=int, help="maximum reviewed decisions to evaluate")
+    evaluation.add_argument("--json", action="store_true", help="print machine-readable results instead of a summary table")
     export = commands.add_parser("export", help="export reviewed labels, split by workflow group")
     export.add_argument("output")
     export.add_argument("--split", choices=["time", "group-hash"],
@@ -102,6 +107,11 @@ def run(args, workspace, config):
     options = DecisionEngine(workspace, config).options
     store = DecisionStore(workspace)
     script = str(Path(__file__).with_name("fusion_laya.py"))
+    if command == "eval-drafter":
+        from fusion_drafter_eval import evaluate_drafter, format_report
+        payload = evaluate_drafter(workspace, config, args.agent, args.rebuild_input, args.limit)
+        print(json.dumps(payload, indent=2, ensure_ascii=False) if args.json else format_report(payload))
+        return 1 if payload["totals"]["errors"] else 0
     if command == "setup":
         uv = shutil.which("uv")
         if not uv:

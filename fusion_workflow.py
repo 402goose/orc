@@ -1477,6 +1477,7 @@ BLOCKERS: unresolved issues, or none
                              + ". You may run exactly these commands yourself.")
         store = self.store
         task["progress_label"] = node_id
+        task["node_task"] = node["task"]
         store.write_json(self._node_dir(node_id) / "active.json", {"run_id": task["run_id"], "attempt": attempt})
         task["excluded_routes"] = list(node.get("excluded_routes", []))
         task["decision_context"] = {"request": node.get("decision_context", node["task"]),
@@ -1804,12 +1805,14 @@ BLOCKERS: unresolved issues, or none
                                                 "attempt": node["attempts"], "cost_usd": _result_cost(result),
                                                 "usage": result.get("usage", {}), **provenance})
                     from fusion_labeling import gate_label, record_gate_input
-                    # The input is recorded before the gate decides, for every
-                    # reported success, so a failed gate leaves a labelable example
-                    # too; only a passed one reaches the classifier.
-                    gate_input = record_gate_input(self.config, self.control_workspace, self.run_id, node, result)
                     with progress.activity(node_id, "checking handoff and acceptance criteria"):
                         accepted, problems, codes = self._gate(node, result)
+                    # Include executed receipts for passing and failing gates.
+                    # Save the same evidence used by artifact-based input rebuilding.
+                    directory = core.run_directory(self.control_workspace, result.get("run_id"))
+                    if directory:
+                        self.store.write_json(directory / "result.json", result)
+                    gate_input = record_gate_input(self.config, self.control_workspace, self.run_id, node, result)
                     laya_veto = False
                     if accepted:
                         # A semantic Done-check leg, spent only on a node that already passed

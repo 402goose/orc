@@ -145,18 +145,19 @@ class VerdictLabelsTest(unittest.TestCase):
         headline = "Fixes https://github.com/hathbanger/orc/issues/46 — Woodland can show the previous survey"
         request = headline + "\nSelected from Truffle pig hunt.\n" + json.dumps({"evidence": ["quote " * 40] * 30})
         node_context = {"request": request, "workflow_kind": "debug", "stage": "implement"}
-        node = {"id": "implement", "role": "implementation", "task": "Read the full request and brief. " * 60,
+        node = {"id": "implement", "role": "implementation", "task": "Fix the survey id race.",
                 "decision_context": node_context}
         run_context = {"request": node_context, "dependencies": [{"status": "success", "changed": ["x.py"] * 50, "blockers": []}]}
         result = {"summary": "Minted the survey id before launch and navigated to it. " * 120,
                   "changed": [f"src/module_{i}.py" for i in range(30)], "tests": ["python3 test/run_python.py: 409 passed"]}
         self.assertGreater(len(request), 6500)
         run_id = self.run_dir(task=node["task"] + "\nWork in this dedicated worktree.", role="implementation",
-                              parent_task_id="wf-9", decision_context=run_context, result=result)
+                              node_task=node["task"], parent_task_id="wf-9", decision_context=run_context, result=result)
         label = self.verdict(run_id, False, "The fix races the UI job id")["label"]
         self.assertEqual(label["status"], "labeled", label)
         verdict_state = self.events("decision")[0]["state"]
         state = json.loads(verdict_state)
+        self.assertEqual(state["node_task"], node["task"])
         self.assertEqual({k: v for k, v in state["task"].items() if k != "request"},
                          {"workflow_kind": "debug", "stage": "implement", "role": "implementation"})
         self.assertTrue(state["task"]["request"].startswith(headline + "\nSelected from Truffle"))

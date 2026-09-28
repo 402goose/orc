@@ -36,6 +36,7 @@ KINDS = {"intake", "routing", "recovery", "review", "acceptance"}
 # "unscored": the input was recorded without running the model, so a verified
 # answer can be attached to it. It has no prediction and never drives an action.
 LABELABLE_STATUSES = {"ok", "unscored"}
+STATE_VERSION = 2
 INTAKE_QUESTIONS = {
     "workflow": {"type": "choice", "instructions": "Which work is requested and permitted?",
                  "criteria": {"discovery": "investigate or plan only", "build": "implement a feature",
@@ -244,7 +245,36 @@ def acceptance_task(source):
     return fields, criterion, detail
 
 
-def acceptance_state(source, result, cap, tokens=None):
+def deliverable_digest(source, result, answer_text=None):
+    """Compact reported work; coordinator receipts stay distinct from claimed tests."""
+    if source.get("write"):
+        return "\n".join(
+            ["Changed files: " + json.dumps(result.get("changed", []), ensure_ascii=False)]
+            + ["Acceptance check: " + json.dumps({k: receipt.get(k) for k in ("argv", "status", "exit_code")},
+                                                ensure_ascii=False)
+               for receipt in result.get("acceptance_checks", [])])
+    if answer_text is None:
+        path = (result.get("artifacts") or {}).get("answer")
+        try:
+            answer_text = Path(path).read_text(errors="replace") if path else ""
+        except OSError:
+            answer_text = ""
+    lines, paragraph_start = [], True
+    for line in answer_text.splitlines():
+        text = line.strip()
+        if not text:
+            paragraph_start = True
+            continue
+        if re.match(r"^(STATUS|SUMMARY|CHANGED|TESTS|BLOCKERS):", text):
+            paragraph_start = True
+            continue
+        if paragraph_start or re.match(r"^(#{1,6}\s|[-*+]\s|\d+[.)]\s)", text):
+            lines.append(text)
+        paragraph_start = bool(re.match(r"^#{1,6}\s", text))
+    return "\n".join(lines)
+
+
+def acceptance_state(source, result, cap, tokens=None, *, answer_text=None):
     """The input for the ACCEPTANCE questions, bounded to `cap` encoded
     characters and to `tokens` estimated tokens (default: what Laya leaves the
     state beside the acceptance questions, `state_tokens("acceptance")`).
@@ -255,10 +285,12 @@ def acceptance_state(source, result, cap, tokens=None):
     satisfies the task, so the criterion is never cut: a task that does not
     fit whole beside a minimal summary is marked `source_truncated` and stays
     unlabeled. The summary is kept from its start -- where a handoff states
-    what was done -- and a request's supporting detail after its first line
-    may be excerpted; each cut carries a visible "[…truncated N chars]"
+    what was done -- then the node assignment and a request's supporting detail
+    after its first line may be excerpted; each cut carries a visible "[…truncated N chars]"
     marker, as do capped `changed` and `tests` lists. An input with visible
-    markers is complete for labeling: it says exactly what the classifier saw.
+    markers records exactly what the classifier saw; questions depending on
+    omitted evidence require abstention. The deliverable fills space remaining
+    after the summary, node assignment and request detail (in that order).
 
     The token bound is met by lowering the character cap in proportion to the
     estimate (estimated_tokens) until the input fits, so the rule above holds
@@ -267,6 +299,7 @@ def acceptance_state(source, result, cap, tokens=None):
     (ACCEPTANCE_LIST_LEVELS) and the cap is lowered again from `cap`.
     """
     tokens = state_tokens("acceptance") if tokens is None else tokens
+    result = {**result, "deliverable": deliverable_digest(source, result, answer_text)}
     for lists in ACCEPTANCE_LIST_LEVELS:
         state = _acceptance_within_tokens(source, result, cap, tokens, lists)
         if not state.get("source_truncated"):
@@ -290,22 +323,34 @@ def _acceptance_within(source, result, cap, limits):
     fields, criterion, detail = acceptance_task(source)
     lists = {key: _listed(result.get(key), limits[key], limits["chars"]) for key in ("changed", "tests")}
     summary = str(result.get("summary") or "")
+    deliverable = result.get("deliverable", "")
+    # A workflow node's task is the assignment; a run's task is a worker prompt.
+    node_task = source.get("node_task", source.get("task")
+                           if ("decision_context" in source or "id" in source) and "run_id" not in source else None)
 
-    def build(request, text):
-        return {"task": request if fields is None else {**fields, "request": request}, "summary": text, **lists}
+    def build(request, text, assignment="", work=""):
+        return {"task": request if fields is None else {**fields, "request": request}, "summary": text, **lists,
+                **({"node_task": assignment} if node_task else {}),
+                **({"deliverable": work} if deliverable else {})}
     joined = "\n" + detail if detail else ""
-    whole = build(criterion + joined, summary)
+    whole = build(criterion + joined, summary, node_task, deliverable)
     if _encoded(whole) <= cap:
         return whole
-    spare = cap - _encoded(build(criterion, "")) - (40 if detail else 0)
+    # Reserve marker space, not the full assignment, beside the minimum summary.
+    detail_marker = 40 if detail else 0
+    work_marker = 40 if deliverable else 0
+    spare = cap - _encoded(build(criterion, "")) - detail_marker - work_marker - (40 if node_task else 0)
     size = _encoded(summary) - 2
-    budget = min(size, max(spare * 3 // 5, min(spare, ACCEPTANCE_MIN_SUMMARY), spare - (_encoded(joined) - 2)))
+    supporting_size = _encoded(joined) - 2 + (_encoded(node_task) - 2 if node_task else 0)
+    budget = min(size, max(spare * 3 // 5, min(spare, ACCEPTANCE_MIN_SUMMARY), spare - supporting_size))
     if budget < min(size, ACCEPTANCE_MIN_SUMMARY):
         return {**whole, "source_truncated": True}
     summary = excerpt(summary, budget)
+    assignment = excerpt(node_task, cap - _encoded(build(criterion, summary)) - detail_marker - work_marker) if node_task else ""
     if detail:
-        joined = excerpt(joined, cap - _encoded(build(criterion, summary)))
-    state = build(criterion + joined, summary)
+        joined = excerpt(joined, cap - _encoded(build(criterion, summary, assignment)) - work_marker)
+    work = excerpt(deliverable, cap - _encoded(build(criterion + joined, summary, assignment))) if deliverable else ""
+    state = build(criterion + joined, summary, assignment, work)
     return state if _encoded(state) <= cap else {**state, "source_truncated": True}
 
 
@@ -776,6 +821,7 @@ class DecisionEngine:
         if kind not in KINDS:
             raise ValueError(f"unknown decision kind: {kind}")
         return {"id": uuid.uuid4().hex, "kind": kind, "mode": self.options["mode"],
+                "state_version": STATE_VERSION,
                 "context": context or {}, "questions": questions, "schema_hash": digest(questions),
                 "status": "off", "recommendations": {}, "prediction": {}, "state_tokens": self.state_tokens(kind)}
 
@@ -784,6 +830,7 @@ class DecisionEngine:
         cap = state_cap(self.options)
         record["state"] = text[:cap]
         record["truncated"] = len(text) > cap or bool(isinstance(state, dict) and state.get("source_truncated"))
+        record["source_truncated"] = bool(isinstance(state, dict) and state.get("source_truncated"))
 
     def record_unscored(self, kind, state, questions, context=None, encoded=None, **extra):
         """Record a decision input without inference, so a verified answer can be
