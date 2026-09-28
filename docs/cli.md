@@ -296,7 +296,7 @@ options:
 run one bounded sidekick task
 
 ```text
-usage: fusion delegate [-h] --agent {auto,claude,codex,agy,grok} [--role ROLE]
+usage: fusion delegate [-h] [--agent {auto,claude,codex,agy,grok}] [--role ROLE]
                        [--read-only] [--fresh] [--session-key SESSION_KEY]
                        [--route ROUTE] [--model MODEL]
                        [--reasoning-effort {high,low,max,medium,minimal,none,ultra,xhigh}]
@@ -309,6 +309,7 @@ positional arguments:
 options:
   -h, --help              show this help message and exit
   --agent {auto,claude,codex,agy,grok}
+                          worker agent; defaults to the named route agent
   --role ROLE
   --read-only             give the worker a read-only workspace
   --fresh                 start a fresh agent session
@@ -584,7 +585,8 @@ usage: fusion telemetry [-h] {status,on,off,report} ...
 
 positional arguments:
   {status,on,off,report}
-    status                show what remote telemetry is configured to send, if any
+    status                show effective remote telemetry state and reasons sending is
+                          disabled
     on                    turn remote reporting on for this workspace
     off                   turn remote reporting off for this workspace; local traces
                           keep working
@@ -597,7 +599,7 @@ options:
 
 ## fusion telemetry status
 
-show what remote telemetry is configured to send, if any
+show effective remote telemetry state and reasons sending is disabled
 
 ```text
 usage: fusion telemetry status [-h]
@@ -633,10 +635,11 @@ options:
 show the usage and failure patterns this machine reported; --all needs a shared token
 
 ```text
-usage: fusion telemetry report [-h] [--hours HOURS] [--all]
+usage: fusion telemetry report [-h] [--json] [--hours HOURS] [--all]
 
 options:
   -h, --help     show this help message and exit
+  --json
   --hours HOURS  lookback window in hours (default: 168, 7 days)
   --all          every install, not just this one; needs telemetry.remote.token, which
                  only the collector's operator has

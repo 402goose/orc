@@ -189,11 +189,15 @@ raw-blocker, local-filesystem or workspace-path fields. Role, route, model and
 trace identifiers are copied directly, however; arbitrary configured strings are
 not scrubbed. Local traces retain more detail than the remote payload.
 
-`fusion telemetry status` reports configured remote enablement, not effective
-send status: actual sending also requires `telemetry.enabled` and respects
-`FUSION_TELEMETRY=0`. A send is synchronous with a three-second network timeout;
-collector errors are swallowed, but completion can be delayed. Remote reports
-refuse when configured remote enablement is false.
+`fusion telemetry status` reports effective send status in `remote_enabled`,
+configured enablement in `remote_configured_enabled`, and any disabling reasons
+in `remote_disabled_reasons`. Sending requires local telemetry and remote
+reporting to be enabled, a configured endpoint, and no `FUSION_TELEMETRY=0` opt-out.
+Sends run in detached child processes with a three-second network timeout. The
+reduced payload is passed over stdin, and the sender can finish after the CLI
+exits. Sends are best-effort: failures are swallowed, and dispatch never waits
+for the network or the child. Remote reports refuse when configured
+remote enablement is false; the env opt-out does not prevent reading reports.
 
 `fusion telemetry report [--hours N]` (default 168, i.e. 7 days) reads your
 own rows back — calls, cost, and average duration grouped by
@@ -204,8 +208,8 @@ span, so it can ask for its own rows back.
 `--all` widens that to every install, and is the only thing that needs the
 shared token in `.fusion.json` under `telemetry.remote.token` — that view
 reveals how many people are running this and what they spend, so it stays
-guarded. Use `fusion --json telemetry report` for the machine-readable form;
-the global `--json` flag goes before `telemetry`.
+guarded. Use `fusion telemetry report --json` or
+`fusion --json telemetry report` for the machine-readable form.
 
 The collector itself (a small Fly + Postgres app) lives in
 [`telemetry/`](../telemetry/).

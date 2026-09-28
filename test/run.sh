@@ -36,6 +36,33 @@ t_contains() {
   esac
 }
 
+echo "== key storage =="
+KEY_HOME="$TMP/key-home"
+KEY_BIN="$TMP/key-bin"
+mkdir -p "$KEY_HOME" "$KEY_BIN"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "Linux\n"' > "$KEY_BIN/uname"
+chmod +x "$KEY_BIN/uname"
+printf '%s\n' '{"key_env":"ORC_TEST_UNUSED_KEY"}' > "$KEY_HOME/config.json"
+unset ORC_TEST_UNUSED_KEY
+key_cli() { ORC_HOME="$KEY_HOME" PATH="$KEY_BIN:$PATH" "$ROOT/orc" key; }
+key_mode() { python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$KEY_HOME/key"; }
+
+printf '2\nfixture-key\n' | key_cli >/dev/null 2>&1
+t "key: new file is private" "0o600" "$(key_mode)"
+t "key: stores pasted value" "fixture-key" "$(cat "$KEY_HOME/key")"
+for mode in 640 620 610 604 602 601; do
+  chmod "$mode" "$KEY_HOME/key"
+  KEY_OUT="$(printf '\n' | key_cli 2>&1 | strip_ansi)"
+  t_contains "key: warns for mode $mode" "group/world permissions" "$KEY_OUT"
+  t_contains "key: warning gives repair command" "chmod 600" "$KEY_OUT"
+done
+chmod 666 "$KEY_HOME/key"
+printf '2\nreplacement-key\n' | key_cli >/dev/null 2>&1
+t "key: overwrite repairs permissions" "0o600" "$(key_mode)"
+t "key: overwrite replaces value" "replacement-key" "$(cat "$KEY_HOME/key")"
+KEY_OUT="$(printf '\n' | key_cli 2>&1 | strip_ansi)"
+t "key: private file has no permissions warning" "0" "$(printf '%s' "$KEY_OUT" | grep -c 'group/world permissions' || true)"
+
 echo "== hud =="
 export MODELS_CACHE="$FIX/models.json"
 export ORC_SESSION_CACHE="$TMP/hud-cache"

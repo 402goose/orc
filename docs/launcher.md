@@ -204,8 +204,8 @@ per project and per model as seen from your machine.
 2. The system key store, where the key wizard stores pasted keys: the macOS
    Keychain (service `orc-openrouter`) on macOS; on Linux a file at
    `$ORC_HOME/key` (normally `~/.config/orc/key`). A new file is created under
-   `umask 077`; overwriting an existing file does not repair its permissions.
-   The warning checks world readability, not all group/world permissions.
+   `umask 077`, and every write applies `chmod 600`, including overwrites.
+   Reading a key file with any group/world permission bits prints a warning.
    The key is not placed in JSON configuration; the Linux key file is plaintext.
 
 If neither is found, **orc refuses to launch** (fail closed) and tells you how
