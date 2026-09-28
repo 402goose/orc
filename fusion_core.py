@@ -300,10 +300,17 @@ def parse_handoff(text: str) -> dict[str, Any]:
             )
         ).strip()
         values: list[str] = []
-        for item in re.split(r"\n(?=[ \t]*(?:[-*+]|\d+[.)])\s+)", value):
+        not_blocking = r"\bnot\s+(?:a\s+|an\s+)?block(?:er|ing)\b|\bnon-?blocking\b"
+        for index, item in enumerate(re.split(r"\n(?=[ \t]*(?:[-*+]|\d+[.)])\s+)", value)):
             item = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", item.strip()).strip()
             if not item:
                 continue
+            # "none. Not blocking, but worth knowing:" declares everything that
+            # follows in this field a note, not a blocker.
+            head = re.match(r"(?:none|nothing|n/a|nil)\b[.;:,—-]?\s*(.*)", item.partition("\n")[0], re.I)
+            sentences = [part for part in re.split(r"(?<=[.!?])\s+", head[1]) if part.strip()] if head else []
+            if index == 0 and sentences and all(re.search(not_blocking, part, re.I) for part in sentences):
+                return []
             first, _, continuation = item.partition("\n")
             # A leading none may explain a workaround. Keep explicit failure
             # signals and all later lines. This vocabulary is a conservative
@@ -319,7 +326,7 @@ def parse_handoff(text: str) -> dict[str, Any]:
             # A sentence the worker explicitly marks as not blocking is a note,
             # even when it mentions failures elsewhere; every other sentence counts.
             explanation = " ".join(sentence for sentence in re.split(r"(?<=[.!?])\s+", explanation)
-                                   if not re.search(r"\bnot\s+(?:a\s+|an\s+)?block(?:er|ing)\b|\bnon-?blocking\b", sentence, re.I))
+                                   if not re.search(not_blocking, sentence, re.I))
             benign_explanation = (
                 not explanation
                 or not re.search(
