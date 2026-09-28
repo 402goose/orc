@@ -179,6 +179,11 @@ def format_report(report, *, brief=False):
         if publication.get("error"):
             lines.append(f"Publication error: {terminal_text(publication['error'])}")
     lines.append("")
+    attempts = report.get("attempt_ledger") or []
+    if any(item.get("repair") for item in attempts):
+        sequence = [f"{item.get('node_id', 'unknown')} #{item.get('attempt', '?')}"
+                    + (" (repair)" if item.get("repair") else "") for item in attempts]
+        lines.append("Attempt sequence: " + " → ".join(sequence))
     for node in stages:
         duration = f", {progress.elapsed(node['duration_ms'] / 1000)}" if node.get("duration_ms") is not None else ""
         lines.append(f"  {node['id']} [{node['agent']}]: {node['status']} (attempts={node['attempts']}{duration})")
