@@ -64,6 +64,26 @@ pairs are documented in [Routing](routing.md). Publication settings are in
 [Workflows](workflows.md#publishing-reviewed-work); telemetry settings are in
 [Usage and telemetry](telemetry.md#remote-telemetry-on-by-default).
 
+Optional integer `cost_tier` settings on native agents or named routes break
+outcome-ranking ties in favor of lower cost. Route settings override agent
+settings; `null` clears an inherited preference. Unset costs stay tied after
+configured costs, and leaving all tiers unset preserves existing rankings.
+For example:
+
+```json
+{
+  "codex": {"cost_tier": 2},
+  "claude": {"cost_tier": 3},
+  "routes": {"economy": {"agent": "codex", "cost_tier": 1}},
+  "decisions": {"rank_by_outcomes": 3, "cost_epsilon": 0.05}
+}
+```
+
+`decisions.cost_epsilon` must be a number in `[0, 1)` and defaults to `0.05`.
+It defines evidence tiers only when a cost is configured and no cache
+configuration supplies `warm_epsilon`. Costs never override clearly better
+evidence or change unproven-lane exploration. See [cost tie-breakers](routing.md#cost-tie-breakers).
+
 ## Control workspace
 
 To collect evidence from several checkouts in one controller directory:

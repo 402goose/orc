@@ -11,7 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fusion_core as core
 from fusion_decisions import DecisionEngine, DecisionStore, digest, read_jsonl
-from fusion_policy import propensities, route_task, routing_report
+from fusion_policy import propensities, rank_by_outcomes, route_candidates, route_task, routing_report
 
 
 class Backend:
@@ -72,6 +72,82 @@ class RoutingPropensityTest(unittest.TestCase):
 
     def logs(self):
         return [e for e in read_jsonl(DecisionStore(self.workspace).path) if e.get("event") == "routing_log"]
+
+    def evidence(self, key, accepted, checked):
+        store = core.RunStore(self.workspace)
+        store.root.mkdir(parents=True, exist_ok=True)
+        for n in range(checked):
+            run_id = f"{key}-{n}"
+            with store.traces_path.open("a") as stream:
+                stream.write(json.dumps({"run_id": run_id, "agent": "codex" if key in self.config["routes"] else key,
+                                         "route": key if key in self.config["routes"] else None, "status": "success"}) + "\n")
+            DecisionStore(self.workspace).append("outcome", task_id=run_id, accepted=n < accepted)
+
+    def test_ninth_route_ranked_before_candidate_cap(self):
+        self.config["decisions"]["rank_by_outcomes"] = 3
+        self.config["routes"] = {f"lane-{n}": {"agent": "codex"} for n in range(1, 10)}
+        self.evidence("lane-9", 3, 3)
+        candidates = route_candidates(self.config, self.task(write=True), core.RunStore(self.workspace))
+        self.assertEqual(len(candidates), 11)
+        self.assertEqual(candidates[-1]["key"], "lane-9")
+        backend = Backend()
+        with patch.object(backend, "predict", wraps=backend.predict) as predict:
+            task = self.route(self.task(write=True), engine=DecisionEngine(self.workspace, self.config, backend))
+        self.assertEqual(task["route"], "lane-9")
+        self.assertEqual(len(predict.call_args.args[1]["route"]["criteria"]), 8)
+        [log] = self.logs()
+        self.assertEqual(len(log["candidates"]), 8)
+        self.assertEqual(log["chosen"], "lane-9")
+
+    def test_cost_tie_breaker_and_route_override_are_logged_and_reported(self):
+        self.config["decisions"]["rank_by_outcomes"] = 3
+        self.config["codex"]["cost_tier"] = 5
+        self.config["routes"] = {"cheap": {"agent": "codex", "cost_tier": 1},
+                                 "inherited": {"agent": "codex"}}
+        self.evidence("codex", 3, 3)
+        self.evidence("cheap", 6, 7)
+        task = self.route(self.task(write=True))
+        self.assertEqual(task["route"], "cheap")
+        [log] = self.logs()
+        costs = {c["key"]: c["cost_tier"] for c in log["candidates"]}
+        self.assertEqual(costs, {"codex": 5, "cheap": 1, "inherited": 5, "claude": None})
+        self.assertEqual(log["policy"]["cost_epsilon"], .05)
+        [reported] = routing_report(self.logs())["routing_policies"]
+        self.assertEqual(reported["policy"], log["policy"])
+        self.assertEqual(reported["cost_tiers"], costs)
+        self.config["decisions"]["cost_epsilon"] = .01
+        self.assertIsNone(self.route(self.task(write=True))["route"])
+        self.config["cache"] = {"warm_epsilon": .05}
+        self.assertEqual(self.route(self.task(write=True))["route"], "cheap")
+
+    def test_cost_tier_requires_integer_and_route_can_clear_preference(self):
+        self.config["codex"]["cost_tier"] = 2
+        self.config["routes"] = {"unset": {"agent": "codex", "cost_tier": None}}
+        self.assertIsNone(core.agent_settings(self.config, {"agent": "codex", "route": "unset"})["cost_tier"])
+        for invalid in (True, 1.5, "1"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "cost_tier"):
+                core.agent_settings({"codex": {"cost_tier": invalid}}, {"agent": "codex"})
+
+    def test_cost_never_beats_clear_evidence_or_changes_exploration(self):
+        expensive = {"key": "expensive", "checked_runs": 3, "acceptance_rate": 1, "cost_tier": 5}
+        cheap = {"key": "cheap", "checked_runs": 7, "acceptance_rate": 6 / 7, "cost_tier": 1}
+        keys = lambda candidates, **kw: [c["key"] for c in rank_by_outcomes(candidates, **kw)]
+        self.assertEqual(keys([expensive, cheap]), ["cheap", "expensive"])
+        self.assertEqual(keys([expensive, {**cheap, "acceptance_rate": 2 / 7}]), ["expensive", "cheap"])
+        new = [{**expensive, "checked_runs": 0}, {**cheap, "checked_runs": 0, "warm": True}]
+        self.assertEqual(keys(new), ["expensive", "cheap"])
+        self.assertEqual(keys(new, warm_epsilon=.05), ["cheap", "expensive"])
+        self.assertEqual(keys([expensive, {**cheap, "quota": {"classification": "tight"}}]), ["expensive", "cheap"])
+        self.assertEqual(keys([{**expensive, "warm": True}, cheap]), ["cheap", "expensive"])
+
+    def test_unset_costs_retain_existing_outcome_and_warmth_rankings(self):
+        candidates = [{"key": "cold", "checked_runs": 3, "acceptance_rate": 1},
+                      {"key": "warm", "checked_runs": 7, "acceptance_rate": 6 / 7, "warm": True},
+                      {"key": "new", "checked_runs": 0}]
+        for null_cost in (False, True):
+            lanes = [{**c, **({"cost_tier": None} if null_cost else {})} for c in candidates]
+            for epsilon, expected in ((None, ["new", "cold", "warm"]), (.05, ["new", "warm", "cold"])):
+                self.assertEqual([c["key"] for c in rank_by_outcomes(lanes, warm_epsilon=epsilon)], expected)
 
     def test_propensities_sum_to_one(self):
         keys = ["a", "b", "c"]

@@ -348,6 +348,7 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None):
             checked = len(verified) + prior["prior_attempts"]
             accepted = sum(verified) + prior.get("prior_successes", 0)
             choices.append({"key": arm, "agent": agent, "route": route, "model": model, **effort,
+                            "cost_tier": settings.get("cost_tier"),
                             **({"quota": quota} if quota else {}),
                             "runs": len(spans), "reported_success_rate": sum(s.get("status") == "success" for s in spans) / len(spans) if spans else None,
                             "checked_runs": round(checked, 3) if prior["prior_attempts"] else checked,
@@ -359,7 +360,7 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None):
                             "mean_cost_usd_cold": sum(split_costs[False]) / len(split_costs[False]) if split_costs[False] else None,
                             "session_idle_s": lane_idle, "warm": lane_idle is not None and lane_idle * 1000 < ttl_ms,
                             "mean_ms": sum(s.get("duration_ms", 0) for s in spans) / len(spans) if spans else None})
-    return rank_by_quota(choices)[:8]
+    return rank_by_quota(choices)
 
 
 def no_route_reason(config, task, store):
@@ -410,7 +411,7 @@ def propensities(keys, chosen, epsilon):
     return {key: share + (1 - epsilon if index == 0 else 0) for index, key in enumerate(keys)}
 
 
-def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None, explore=True):
+def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None, explore=True, cost_epsilon=0.05):
     """Order automatic candidates by verified outcomes, not by worker self-reports.
 
     With `explore` (the default), a candidate with fewer than `minimum` checked
@@ -428,6 +429,12 @@ def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None, explore=True):
     same bucket whose smoothed rate is within epsilon of the best rate in their
     run are one tier, and a warm candidate leads its tier. Warmth never moves a
     candidate past one whose rate is more than epsilon better.
+
+    Configured cost tiers break ties before warmth, lower first, with unset
+    costs tied after configured costs. Without warm_epsilon, cost_epsilon
+    defines the tiers when any cost is configured. Cost never changes tier-0
+    exploration order or moves a lane across evidence tiers. Quota demotion
+    retains priority over all outcome, cost and warmth ordering.
     """
     def score(item):
         index, candidate = item
@@ -437,16 +444,28 @@ def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None, explore=True):
         accepted = (candidate.get("acceptance_rate") or 0) * checked
         return (1, -(accepted + 1) / (checked + 2), index)
     ranked = sorted(enumerate(candidates), key=score)
-    if warm_epsilon is None:
+    has_cost = any(c.get("cost_tier") is not None for c in candidates)
+    epsilon = warm_epsilon
+    if epsilon is None and has_cost:
+        if isinstance(cost_epsilon, bool) or not isinstance(cost_epsilon, (int, float)) or not 0 <= cost_epsilon < 1:
+            raise ValueError("decisions.cost_epsilon must be a number in [0, 1)")
+        epsilon = cost_epsilon
+    if epsilon is None:
         return rank_by_quota([candidate for _, candidate in ranked])
     tiers = []
     for item in ranked:
         bucket, rate, _ = score(item)
-        if tiers and tiers[-1][0] == bucket and rate - tiers[-1][1] <= warm_epsilon + 1e-9:
+        if tiers and tiers[-1][0] == bucket and rate - tiers[-1][1] <= epsilon + 1e-9:
             tiers[-1][2].append(item[1])
         else:
             tiers.append((bucket, rate, [item[1]]))
-    return rank_by_quota([candidate for _, _, tier in tiers for candidate in sorted(tier, key=lambda c: not c.get("warm"))])
+    def tie_key(candidate, bucket):
+        if bucket == 0:
+            return (0, not candidate.get("warm") if warm_epsilon is not None else False)
+        cost = candidate.get("cost_tier")
+        return (cost if cost is not None else math.inf, not candidate.get("warm"))
+    return rank_by_quota([candidate for bucket, _, tier in tiers
+                          for candidate in sorted(tier, key=lambda c: tie_key(c, bucket))])
 
 
 def route_task(config, task, store, rng=None):
@@ -472,13 +491,14 @@ def route_task(config, task, store, rng=None):
         import fusion_core as core
         cache = core.cache_settings(config)
         warm_epsilon = cache["warm_epsilon"] if cache["configured"] else None
+        cost_epsilon = config.get("decisions", {}).get("cost_epsilon", 0.05)
         within_route = False
         minimum = explore = None
         if automatic:
             candidates = route_candidates(config, task, store, rejected=rejected, quota_audit=quota_audit)
             if ranking:
                 minimum, explore = exploration(ranking, task, candidates)
-                candidates = rank_by_outcomes(candidates, minimum, warm_epsilon, explore)
+                candidates = rank_by_outcomes(candidates, minimum, warm_epsilon, explore, cost_epsilon)
                 if task.get("prefer_different_agent"):
                     # Independence outranks track record: a review stays with a
                     # different harness than the implementer when one is available.
@@ -494,13 +514,17 @@ def route_task(config, task, store, rng=None):
                 c for c in route_candidates(config, task, store) if c["route"] == task["route"]]
             if arms and ranking:
                 minimum, explore = exploration(ranking, task, arms)
-                arms = rank_by_outcomes(arms, minimum, warm_epsilon, explore)
+                arms = rank_by_outcomes(arms, minimum, warm_epsilon, explore, cost_epsilon)
             within_route = len(arms) > 1
             candidates = arms or [{"key": pair_key(pair), "agent": task["agent"], "route": task.get("route"), **pair} for pair in pairs] or [{
                 "key": task.get("route") or task["agent"], "agent": task["agent"], "route": task.get("route"),
                 "model": settings.get("model", ""),
                 **({"reasoning_effort": settings["reasoning_effort"]} if settings.get("reasoning_effort") is not None else {}),
             }]
+            for candidate in candidates:
+                candidate["cost_tier"] = settings.get("cost_tier")
+        # Rank every eligible lane before bounding Laya options and the audit log.
+        candidates = candidates[:8]
     if not candidates:
         if automatic and quota_audit:
             engine.store.append("routing_log", **context(task), scope="automatic", candidates=[], chosen=None,
@@ -559,6 +583,8 @@ def route_task(config, task, store, rng=None):
                             policy={"rank_by_outcomes": minimum, "explore": explore, "warm_epsilon": warm_epsilon if ranking else None,
                                     "epsilon": effective, "routing_epsilon": epsilon, "laya_applied": applied,
                                     "priors": priors_policy(config),
+                                    **({"cost_epsilon": warm_epsilon if warm_epsilon is not None else cost_epsilon}
+                                       if ranking and any(c.get("cost_tier") is not None for c in candidates) else {}),
                                     **({"quota": quota_settings(config)} if quota_audit else {})},
                             **({"quota": quota_audit, "rejected": rejected} if quota_audit else {}),
                             candidates=[{**c, "propensity": chances[c["key"]]} for c in candidates],
@@ -650,6 +676,9 @@ def routing_report(events):
     if len(logs) - joined - vetoed:
         warnings.append(f"{len(logs) - joined - vetoed} logged routing choices have no outcome yet")
     return {"schema": "fusion.routing_report.v1", "logged_choices": len(logs), "with_outcome": joined,
+            "routing_policies": [{"task_id": task_id, "policy": log.get("policy", {}),
+                                  "cost_tiers": {c["key"]: c.get("cost_tier") for c in log.get("candidates") or []}}
+                                 for task_id, log in logs.items()],
             "quota_decisions": [{"task_id": task_id, "chosen": log.get("chosen"), "quota": log["quota"],
                                  "rejected": log.get("rejected", {})} for task_id, log in logs.items() if log.get("quota")],
             "vetoed_outcomes_skipped": vetoed, "outcome_sources": sources,
