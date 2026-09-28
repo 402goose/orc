@@ -1020,6 +1020,7 @@ class RunStore:
             **({"resume_skipped": result["resume_skipped"]} if result.get("resume_skipped") else {}),
             "cache_read_ratio": cache_read_ratio(result.get("usage")),
             "changed": result.get("changed", []),
+            "check_inputs_changed": result.get("check_inputs_changed", []),
             "tests": result.get("tests", []),
             "blockers": result.get("blockers", []),
             "denied_tools": result.get("denied_tools") or [],

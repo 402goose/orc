@@ -780,6 +780,7 @@ def summarize(task, lane_name, lane, outcome, diff_files, wall_ms, mode="visible
         tampered = []
     else:
         tampered = sorted(path for path in diff_files if is_test_path(path))
+    tampered = sorted(set(tampered) | set(result.get("check_inputs_changed") or []))
     dispatched = bool(result.get("run_id"))
     status = outcome.get("status")
     if not dispatched or status in {"paused_quota", "paused_budget", "interrupted"}:
@@ -803,6 +804,7 @@ def summarize(task, lane_name, lane, outcome, diff_files, wall_ms, mode="visible
             "workflow_id": outcome.get("workflow_id"), "status": status,
             "verdict": verdict, "completed": completed, "f2p_passed": f2p_passed, "p2p_regressed": p2p_regressed,
             "baseline_ok": baseline_ok, "tampered": tampered, "changed": diff_files,
+            "check_inputs_changed": result.get("check_inputs_changed", []),
             **({"touched_fixtures": touched_fixtures, "worker_tests": worker_tests} if mode in HIDDEN_MODES else {}),
             "worker": {"status": result.get("status"), "agent": result.get("agent"), "route": result.get("route"),
                        "model": result.get("model"), "run_id": result.get("run_id")},
@@ -1033,7 +1035,8 @@ def _latest_hidden(gym):
 def _solved(latest):
     """{(kind, mode, task)} some lane solved (fix) or localized (localize)."""
     return {(row["kind"], row["mode"], row["task"]) for row in latest.values()
-            if row.get("verdict") == AUDIT_KINDS[row["kind"]][0]}
+            if row.get("verdict") == AUDIT_KINDS[row["kind"]][0]
+            and not row.get("tampered") and not row.get("check_inputs_changed")}
 
 
 def audit(gym):
@@ -1141,7 +1144,7 @@ def lane_priors(gym, now=None):
             unsolvable.setdefault(scope, set()).add(row["task"])
             excluded["unsolved_by_all"] = excluded.get("unsolved_by_all", 0) + 1
             continue
-        if verdict not in wins | losses or row.get("tampered"):
+        if verdict not in wins | losses or row.get("tampered") or row.get("check_inputs_changed"):
             excluded[verdict or "none"] = excluded.get(verdict or "none", 0) + 1
             continue
         spec = row.get("lane_spec") or {}
