@@ -118,6 +118,14 @@ none
         inline = core.parse_handoff("STATUS: success\nSUMMARY: Mentions **STATUS:** error inline\nBLOCKERS: none")
         self.assertEqual(inline["reported_status"], "success")
 
+    def test_notes_after_a_declared_non_blocking_none_are_not_blockers(self):
+        text = ("STATUS: success\nSUMMARY: reviewed\nCHANGED: none\nTESTS: ran\n"
+                "BLOCKERS: none. Not blocking, but worth knowing:\n"
+                "- (a) upstream evaluators can't be found at startup; it fails safe.\n"
+                "- (b) pytest directories are not pinned.\n")
+        self.assertEqual(core.parse_handoff(text)["blockers"], [])
+        self.assertTrue(core.parse_handoff("BLOCKERS: none. The suite still fails on CI.\n")["blockers"])
+
     def test_scoped_none_and_explicit_non_blocking_notes(self):
         # Actual implement handoff from truffle run 20260924-175138-wf-886f4e67
         # (#46): rejected twice as a blocker, costing a paid retry.
