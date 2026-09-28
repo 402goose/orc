@@ -394,3 +394,22 @@ class AcceptanceReceiptsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NodeTaskContextTest(unittest.TestCase):
+    def test_string_decision_context_keeps_the_worker_task_out(self):
+        import fusion_decisions as decisions
+        source = {"id": "work", "task": "Worker keeps complete frozen context. " * 50,
+                  "decision_context": "Inspect a bounded contract", "write": False}
+        state = decisions.acceptance_state(source, {"summary": "Observed the boundary", "changed": [], "tests": []}, 6000,
+                                           answer_text="")
+        self.assertNotIn("frozen context", json.dumps(state))
+        self.assertNotIn("node_task", state)
+
+    def test_structured_build_context_adds_the_stage_task(self):
+        import fusion_decisions as decisions
+        source = {"id": "plan", "task": "Produce an implementation brief.", "role": "planning", "write": False,
+                  "decision_context": {"request": "Report what ORC is", "workflow_kind": "discovery", "stage": "plan"}}
+        state = decisions.acceptance_state(source, {"summary": "Brief ready", "changed": [], "tests": []}, 6000,
+                                           answer_text="")
+        self.assertIn("Produce an implementation brief.", json.dumps(state))
