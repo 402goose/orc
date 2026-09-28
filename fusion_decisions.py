@@ -325,8 +325,13 @@ def _acceptance_within(source, result, cap, limits):
     summary = str(result.get("summary") or "")
     deliverable = result.get("deliverable", "")
     # A workflow node's task is the assignment; a run's task is a worker prompt.
+    # A plain-string decision_context is the caller's exact statement of what
+    # decisions may see (admitted frozen context, hidden-test briefs), so the
+    # worker task is only added beside a structured Fusion-built request.
+    context = source.get("decision_context")
+    structured = isinstance(context, dict) or "decision_context" not in source
     node_task = source.get("node_task", source.get("task")
-                           if ("decision_context" in source or "id" in source) and "run_id" not in source else None)
+                           if structured and ("decision_context" in source or "id" in source) and "run_id" not in source else None)
 
     def build(request, text, assignment="", work=""):
         return {"task": request if fields is None else {**fields, "request": request}, "summary": text, **lists,
