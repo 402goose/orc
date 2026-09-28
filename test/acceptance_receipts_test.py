@@ -231,6 +231,9 @@ class AcceptanceReceiptsTest(unittest.TestCase):
         self.assertEqual(node["acceptance"]["checks"], [receipt])
         self.assertEqual(node["result"]["acceptance_checks"], [receipt])
         self.assertEqual(manifest["nodes"]["verify"]["result"]["acceptance_checks"], [receipt])
+        run_dir = Path(node["result"]["artifacts"]["run_dir"])
+        self.assertEqual(json.loads((run_dir / "result.json").read_text())["acceptance_checks"], [receipt])
+        self.assertEqual(json.loads((run_dir / "task.json").read_text())["node_task"], "Return a fixture handoff")
 
     def test_nonzero_and_launch_error_keep_evidence_and_fail_closed(self):
         for command, status in (

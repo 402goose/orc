@@ -85,6 +85,48 @@ policy choices, or previous labels. It can abstain when evidence is missing.
 No repository changes or new verification runs are requested. This uses your
 configured worker account and can incur provider usage.
 
+Acceptance inputs include the node's own assignment, separately from the overall
+request, and a bounded deliverable digest. Read-only digests include answer-body
+headings, list items and opening lines beyond SUMMARY. Write digests include changed
+files and coordinator acceptance-check receipts (argv, status and exit code),
+separately from claimed tests. Summary text keeps priority, followed by excerpts of
+the node assignment and supporting request detail; the digest fills the remaining
+character and token budget. Cuts, including cuts to long node assignments, carry
+visible `[…truncated N chars]` markers. Inputs whose request criterion and minimum
+summary cannot fit beside the excerpt markers are marked
+`source_truncated`. Every new decision records input-builder `state_version: 2`.
+Council automatic approval skips source-truncated inputs and older builder versions,
+independently of whether the structural gate passed.
+
+The drafter abstains per question when the input announces findings without including
+them, or when relevant evidence was truncated. Supplemental artifacts cannot fill
+gaps in the original input.
+
+Compare drafts against effective human labels and human exclusions:
+
+```sh
+fusion decisions eval-drafter --agent codex
+fusion decisions eval-drafter --agent codex --rebuild-input --limit 20 --json
+```
+
+Evaluation copies the decision store into a temporary workspace and dispatches all
+drafter runs there; it never writes to the live store or run artifacts. It includes
+human labels and human-approved suggestions, excluding labels approved solely by
+automatic sources. The table reports agree/disagree/abstain per reviewed question,
+totals, and whether each human exclusion received an all-abstention draft. JSON also
+includes individual decisions, answers and abstention reasons. Worker failures and
+missing rebuild artifacts count as errors, not abstentions, and produce a nonzero
+exit status. `--limit` selects the first N eligible decisions in store order.
+
+`--rebuild-input` rebuilds acceptance inputs with the current builder from saved
+`task.json`, `result.json` and `answer.md` before drafting; other decision kinds keep
+their original input. This measures input-builder changes against the same human
+reference labels. Older workflow wrappers are used to recover the node assignment
+when the dedicated field is absent. Historical runs without saved coordinator
+receipts cannot reconstruct those receipts. Runs and the temporary copy are removed
+after evaluation. Evaluation uses the configured worker account and incurs normal
+provider usage; it does not run acceptance checks again.
+
 Individual label editors inherit the garden’s drafting and approval settings unless
 you choose different settings for that decision. Choose **Label approval → Council
 approves unanimous answers** to switch an existing draft to council assessment,
