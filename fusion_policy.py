@@ -9,13 +9,15 @@ import random
 import time
 
 from fusion_decisions import (DecisionEngine, DecisionStore, ACCEPTANCE_QUESTIONS, RECOVERY_QUESTIONS, REVIEW_QUESTIONS,
-                              acceptance_state, read_jsonl, state_cap)
+                              acceptance_state, normalize_role, read_jsonl, state_cap)
 import fusion_progress as progress
 import fusion_usage as usage
 
 
 def context(task):
-    return {"task_id": task["run_id"], "group": task.get("parent_task_id") or task["run_id"]}
+    role = normalize_role(task.get("role"))
+    return {"task_id": task["run_id"], "group": task.get("parent_task_id") or task["run_id"],
+            **({"role": role} if role else {})}
 
 
 PRIOR_WEIGHT = 0.5
@@ -75,7 +77,7 @@ def load_priors(settings):
         exact[(agent, route, model, effort)] = {**entry, "key": key}
         pooled = lane.setdefault((agent, model, effort), {"key": []})
         pooled["key"].append(key)
-        for work in fusion_gym.WORK_CLASSES.values():
+        for work in sorted(set(fusion_gym.WORK_CLASSES.values()) | {"interpret"}):
             stats = entry.get(work)
             if not stats or not stats.get("attempts"):
                 continue
@@ -94,7 +96,7 @@ def load_priors(settings):
 
 
 def prior_for(index, candidate, work, weight, cap):
-    """Pseudo-counts for one candidate and work class ("write" or "read"):
+    """Pseudo-counts for one candidate and prior class ("write", "read" or "interpret"):
     min(weight * gym attempts, cap) attempts at the gym's success rate. The
     exact (agent, route, model, effort) entry first, else the lane pooled
     across route names."""
@@ -178,7 +180,7 @@ def rank_by_quota(candidates):
     return sorted(candidates, key=lambda c: c.get("quota", {}).get("classification") == "tight")
 
 
-def route_candidates(config, task, store, rejected=None, quota_audit=None):
+def route_candidates(config, task, store, rejected=None, quota_audit=None, minimum=None):
     """Pass `rejected` to collect why each lane was dropped. The reasons live
     beside the checks that produce them so an explanation can never drift from
     the filter it is explaining."""
@@ -191,6 +193,10 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None):
     priors = prior_settings(config)
     index = load_priors(priors)
     work = "write" if task.get("write") else "read"
+    role = normalize_role(task.get("role"))
+    if minimum is None:
+        ranking = (config.get("decisions") or {}).get("rank_by_outcomes")
+        minimum = int(ranking) if ranking and not isinstance(ranking, bool) else 3
     ttl_ms = core.cache_settings(config)["ttl_seconds"] * 1000
     now = core.now_ms()
     thresholds = quota_settings(config)
@@ -322,7 +328,9 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None):
             # Read-only and writing work differ: this task's class counts when
             # it has any evidence, else every class pooled.
             same = [ok for span, ok in evidence if "write" in span and bool(span["write"]) == (work == "write")]
-            verified = same or [ok for _, ok in evidence]
+            role_evidence = [ok for span, ok in evidence if role and normalize_role(span.get("role")) == role]
+            evidence_scope = "role" if role and len(role_evidence) >= minimum else "work"
+            verified = role_evidence if evidence_scope == "role" else same or [ok for _, ok in evidence]
             costs = [core.number(span["usage"].get("cost_usd", span["usage"].get("cost", 0))) for span in spans
                      if "cost_usd" in span.get("usage", {}) or "cost" in span.get("usage", {})]
             mean_cost = sum(costs) / len(costs) if costs else None
@@ -341,8 +349,12 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None):
                 drop(arm, f"its average reported cost ${mean_cost:.4f} exceeds the ${task['budget_remaining_usd']:.4f} left in the budget")
                 continue
             effort = {"reasoning_effort": settings["reasoning_effort"]} if settings.get("reasoning_effort") is not None else {}
-            prior = prior_for(index, {"agent": agent, "route": route, "model": model, **effort}, work,
+            prior_class = "interpret" if work == "read" and role and "interpret" in role else work
+            prior_candidate = {"agent": agent, "route": route, "model": model, **effort}
+            prior = prior_for(index, prior_candidate, prior_class,
                               priors["weight"], priors["cap"]) if index else {"prior_attempts": 0}
+            if index and prior_class != work and not prior.get("prior"):
+                prior = prior_for(index, prior_candidate, work, priors["weight"], priors["cap"])
             # Gym priors are pseudo-counts: checked_runs and acceptance_rate,
             # which ranking reads, include them; the *_local fields do not.
             checked = len(verified) + prior["prior_attempts"]
@@ -354,7 +366,8 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None):
                             "checked_runs": round(checked, 3) if prior["prior_attempts"] else checked,
                             "acceptance_rate": (round(accepted / checked, 4) if prior["prior_attempts"] else accepted / checked) if checked else None,
                             "checked_runs_local": len(verified), "acceptance_rate_local": sum(verified) / len(verified) if verified else None,
-                            "local_class": work if same else "pooled" if verified else None, **prior,
+                            "evidence_scope": evidence_scope,
+                            "local_class": role if evidence_scope == "role" else work if same else "pooled" if verified else None, **prior,
                             "mean_cost_usd": mean_cost,
                             "mean_cost_usd_warm": sum(split_costs[True]) / len(split_costs[True]) if split_costs[True] else None,
                             "mean_cost_usd_cold": sum(split_costs[False]) / len(split_costs[False]) if split_costs[False] else None,
@@ -582,7 +595,7 @@ def route_task(config, task, store, rng=None):
         keys = [c["key"] for c in candidates]
         chances = propensities(keys, selected["key"], 0.0 if applied else effective)
         engine.store.append("routing_log", **context(task), decision_id=record["id"] if record else None, scope=scope,
-                            write=bool(task.get("write")), role=task.get("role"),
+                            write=bool(task.get("write")),
                             policy={"rank_by_outcomes": minimum, "explore": explore, "warm_epsilon": warm_epsilon if ranking else None,
                                     "epsilon": effective, "routing_epsilon": epsilon, "laya_applied": applied,
                                     "priors": priors_policy(config),
@@ -718,7 +731,7 @@ def accept_node(config, workspace, workflow_id, node, result):
     this is ever called, and this function has no path back to True from one."""
     engine = DecisionEngine(workspace, config)
     record = engine.decide("acceptance", acceptance_state(node, result, state_cap(engine.options), engine.state_tokens("acceptance")),
-                           ACCEPTANCE_QUESTIONS, {"task_id": result.get("run_id"), "group": workflow_id})
+                           ACCEPTANCE_QUESTIONS, {"task_id": result.get("run_id"), "group": workflow_id, "role": node.get("role")})
     plausible, applied = True, False
     if engine.allowed(record, "plausible") and record["recommendations"]["plausible"]["value"] == "false":
         plausible, applied = False, True
@@ -775,7 +788,7 @@ def recovery(config, workspace, workflow_id, node, result, accepted, max_attempt
                                        "attempt": node["attempts"], "max_attempts": max_attempts,
                                        "repeated_failure": repeated,
                                        "automatic_lane": node["agent"] == "auto"}, RECOVERY_QUESTIONS,
-                           {"task_id": result.get("run_id"), "group": workflow_id})
+                           {"task_id": result.get("run_id"), "group": workflow_id, "role": node.get("role")})
     applied = False
     if not accepted and failure != "permission_denied" and engine.allowed(record, "action"):
         suggested = record["recommendations"]["action"]["value"]

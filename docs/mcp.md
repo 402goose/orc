@@ -192,7 +192,7 @@ Delegate a bounded task to the other coding agent and receive a structured hando
 
 ## fusion_outcome
 
-Record a verdict on a run. The latest measured verdict ranks future automatic routes; stages are gate, verify, or land. With a reason, a verdict on a reported success also becomes an acceptance training label. Choose accepted (true/false), withdraw (remove external verdicts and labels, with a reason), or unmeasured (audit a grader failure without changing ranking or labels).
+Record a verdict on a run. The latest measured verdict ranks future automatic routes; stages are gate, verify, land, or review. With a reason, a verdict on a reported success also becomes an acceptance training label. Choose accepted (true/false), withdraw (remove external verdicts and labels, with a reason), or unmeasured (audit a grader failure without changing ranking or labels).
 
 ### Input fields
 
@@ -214,7 +214,8 @@ Record a verdict on a run. The latest measured verdict ranks future automatic ro
       "enum": [
         "gate",
         "verify",
-        "land"
+        "land",
+        "review"
       ],
       "type": "string"
     },
