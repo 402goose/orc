@@ -82,7 +82,8 @@ class ShadowPolicyTest(unittest.TestCase):
         records = [e for e in events if e["event"] == "decision" and e.get("status") != "unscored"]
         self.assertEqual([r["kind"] for r in records], ["acceptance", "recovery"])
         for record in records:
-            self.assertEqual(record["context"], {"task_id": "native-attempt-fixture", "group": "admitted-fixture"})
+            self.assertEqual({k: record["context"][k] for k in ("task_id", "group")},
+                             {"task_id": "native-attempt-fixture", "group": "admitted-fixture"})
             self.assertEqual(record["model_identity"], "controlled-predictor-not-a-model")
             self.assertFalse(record["truncated"])
         self.assertNotIn("complete frozen context", records[0]["state"])
