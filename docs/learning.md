@@ -287,3 +287,59 @@ mode). `gym run` calls paid models. See
 
 Export gym evidence with `fusion gym priors GYM_DIR`; see
 [routing priors](routing.md#gym-lane-priors) for defaults and disabling.
+
+
+Use `interpret` to measure read-only triage against factual evidence. Seed it
+from existing extracted fix tasks, including their real check commands,
+verification receipts and diffs:
+
+```sh
+fusion gym extract --kind interpret --tasks /tmp/fix-tasks --out /tmp/interpret-tasks --seed 37 --period 2026-W39
+# Equivalent: fusion gym interpret-seed --tasks /tmp/fix-tasks --out /tmp/interpret-tasks --seed 37 --period 2026-W39
+fusion gym run /tmp/interpret-tasks --kind interpret --lanes codex agy --workspace /tmp/interpret-gym
+fusion gym report /tmp/interpret-gym
+fusion gym priors /tmp/interpret-gym
+```
+
+Each interpret lane receives a fresh disposable evidence-only repository and
+control directory outside the persistent gym, with no shared Git metadata or
+previous answers. Runtime archives and retained trees (`--keep-worktrees`) are
+copied to the coordinator only after that worker exits; the next lane starts
+in another fresh directory. Persisted scores contain aggregate counts, never
+per-question trap or holdout labels. Workers answer question ids in a fenced `interpret` JSON object. Gold answers, template ids
+and split labels stay outside their tree and prompt. Omitted answers, `null`
+and `"abstain"` express uncertainty; other answers are graded exactly after
+normalizing whitespace, case, booleans, numbers and percent signs. Malformed
+answers fail; they do not earn abstention credit. Edits invalidate a read-only
+run and exclude it from priors. A failed tree snapshot is `invalid_snapshot`,
+ungraded and excluded from priors; rerunning retries it.
+
+[Trap templates](../gym/interpret_traps.json) are data: add an evidence mapping,
+question, misleading summary, gold answer and matching control to extend the
+set without code changes. Templates include stale verify HEADs, test overcounts,
+and passed-looking failed gates, plus the observed laptop checkout 73 commits
+behind origin reported current, a 32% throughput fall reported as 15%, and an
+exit-1 command reported as “rung passed.” Observed incidents are replayed as
+scenarios over the source task's material; their provenance is retained in the
+template data. New fix extractions preserve command stdout, stderr and exit
+codes. Older tasks use explicitly marked reconstructed verification receipts.
+
+The same source tasks, seed, templates and period produce identical tasks. A
+seeded hash of template id and period holds out one third of templates (at
+least one), with each control following its template. The period defaults to
+the current ISO week; pin `--period` to reproduce a run. `--split train` and
+`--split holdout` generate separate sets; the default `all` evaluates both.
+Use separate output directories for separate periods or splits. Question order
+rotates too, and task ids include a content digest so old results cannot satisfy
+a changed task.
+
+Reports count correct, abstained and confidently wrong (`misread`) answers,
+trap misread rate, and separate train and holdout scores. Reporting awards 1
+for correct, 0.5 for abstention and 0 for a misread. The separate `interpret`
+routing prior uses training questions only: correct adds one accepted attempt,
+misread or invalid adds one rejected attempt, and abstention adds half a
+rejected attempt. Thus uncertainty is less damaging than a confident error.
+Holdout answers never supply priors. Unlike fix/localize solvability audits,
+curated factual gold does not need another lane to answer correctly before a
+misread counts against a lane. Read-only roles containing `triage` or
+`interpret` use this prior class; other readers retain the `read` class.

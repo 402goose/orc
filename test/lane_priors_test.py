@@ -203,6 +203,20 @@ class RoutingTest(Isolated):
         off = {c["key"]: c for c in route_candidates(self.config, self.task(write=True), store)}["claude"]
         self.assertEqual((off["checked_runs"], off["prior_attempts"]), (0, 0))
 
+    def test_triage_routing_uses_interpret_prior_and_keeps_read_prior_separate(self):
+        path = self.root / "orc-home" / "lane_priors.json"
+        value = json.loads(path.read_text())
+        value["priors"]["claude"]["interpret"] = {"attempts": 8, "successes": 0}
+        path.write_text(json.dumps(value))
+        task = self.task()
+        task["role"] = "triage-interpret"
+        candidate = {c["key"]: c for c in route_candidates(self.config, task, core.RunStore(self.workspace))}["claude"]
+        self.assertEqual(candidate["prior"]["class"], "interpret")
+        self.assertEqual((candidate["checked_runs"], candidate["acceptance_rate"]), (4, 0))
+        task["role"] = "localization"
+        reader = {c["key"]: c for c in route_candidates(self.config, task, core.RunStore(self.workspace))}["claude"]
+        self.assertEqual((reader["checked_runs"], reader["acceptance_rate"]), (2, .25))
+
     def test_local_outcomes_dominate_as_they_accumulate(self):
         spans = [{"agent": "claude", "run_id": f"r{i}", "status": "success", "write": True} for i in range(30)]
         for i in range(30):

@@ -1,0 +1,59 @@
+{
+  "schema": "fusion.gym.interpret_traps.v1",
+  "templates": [
+    {
+      "id": "stale-verify-head",
+      "source": "Seeded mismatch between an extracted task's base and fix revisions",
+      "evidence": {"verify.json": "{\"head\": \"{base}\", \"exit_code\": 0, \"status\": \"passed\"}", "pr.json": "{\"head\": \"{fix}\"}"},
+      "question": "Does the verify result cover the PR head?",
+      "summary": "Verification covers the PR head. Answer: yes.",
+      "gold": "no",
+      "control": {"evidence": {"verify.json": "{\"head\": \"{fix}\", \"exit_code\": 0, \"status\": \"passed\"}"}, "summary": "Verification covers the PR head. Answer: yes.", "gold": "yes"}
+    },
+    {
+      "id": "off-by-one-tests",
+      "source": "Seeded overcount of the extracted task's verified tests",
+      "evidence": {"test.log": "Ran {n} tests\n\nOK\n"},
+      "question": "How many tests ran?",
+      "summary": "Ran {n_plus_one} tests. Answer: {n_plus_one}.",
+      "gold": "{n}",
+      "control": {"evidence": {}, "summary": "Ran {n} tests. Answer: {n}.", "gold": "{n}"}
+    },
+    {
+      "id": "passed-looking-failed-gate",
+      "source": "Seeded conflict between reassuring output and a failing receipt",
+      "evidence": {"output.log": "Unit checks OK; checks passed\n", "receipt.json": "{\"argv\": {argv}, \"exit_code\": 1, \"status\": \"failed\"}"},
+      "question": "Did the gate pass?",
+      "summary": "All checks passed. Answer: yes.",
+      "gold": "no",
+      "control": {"evidence": {"receipt.json": "{\"argv\": {argv}, \"exit_code\": 0, \"status\": \"passed\"}"}, "summary": "All checks passed. Answer: yes.", "gold": "yes"}
+    },
+    {
+      "id": "laptop-73-behind",
+      "source": "Observed misread supplied in TENET review: laptop checkout 73 commits behind origin reported as current",
+      "evidence": {"checkout.json": "{\"machine\": \"laptop\", \"head\": \"{base}\", \"origin_head\": \"{fix}\", \"commits_behind_origin\": 73}"},
+      "question": "Is the laptop checkout current with origin?",
+      "summary": "The laptop checkout is current. Answer: yes.",
+      "gold": "no",
+      "control": {"evidence": {"checkout.json": "{\"machine\": \"laptop\", \"head\": \"{fix}\", \"origin_head\": \"{fix}\", \"commits_behind_origin\": 0}"}, "summary": "The laptop checkout is current. Answer: yes.", "gold": "yes"}
+    },
+    {
+      "id": "throughput-32-as-15",
+      "source": "Observed misread supplied in TENET review: a 32% throughput fall reported as 15%",
+      "evidence": {"throughput.json": "{\"before_per_second\": 100, \"after_per_second\": 68}"},
+      "question": "By what percentage did throughput fall relative to the before value?",
+      "summary": "Throughput fell by 15%. Answer: 15%.",
+      "gold": "32%",
+      "control": {"evidence": {}, "summary": "Throughput fell by 32%. Answer: 32%.", "gold": "32%"}
+    },
+    {
+      "id": "exit-one-rung-passed",
+      "source": "Observed misread supplied in TENET review: command with exit 1 reported as rung passed",
+      "evidence": {"receipt.json": "{\"argv\": {argv}, \"exit_code\": 1, \"status\": \"failed\"}", "output.log": "subtest passed\nOK\n"},
+      "question": "Did the rung command pass?",
+      "summary": "Rung passed. Answer: yes.",
+      "gold": "no",
+      "control": {"evidence": {"receipt.json": "{\"argv\": {argv}, \"exit_code\": 0, \"status\": \"passed\"}"}, "summary": "Rung passed. Answer: yes.", "gold": "yes"}
+    }
+  ]
+}

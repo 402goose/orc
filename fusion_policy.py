@@ -180,6 +180,10 @@ def rank_by_quota(candidates):
     return sorted(candidates, key=lambda c: c.get("quota", {}).get("classification") == "tight")
 
 
+def role_prior_class(work, role):
+    return "interpret" if work == "read" and role and "interpret" in role else work
+
+
 def route_candidates(config, task, store, rejected=None, quota_audit=None, minimum=None):
     """Pass `rejected` to collect why each lane was dropped. The reasons live
     beside the checks that produce them so an explanation can never drift from
@@ -349,7 +353,7 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None, minim
                 drop(arm, f"its average reported cost ${mean_cost:.4f} exceeds the ${task['budget_remaining_usd']:.4f} left in the budget")
                 continue
             effort = {"reasoning_effort": settings["reasoning_effort"]} if settings.get("reasoning_effort") is not None else {}
-            prior_class = "interpret" if work == "read" and role and "interpret" in role else work
+            prior_class = role_prior_class(work, role)
             prior_candidate = {"agent": agent, "route": route, "model": model, **effort}
             prior = prior_for(index, prior_candidate, prior_class,
                               priors["weight"], priors["cap"]) if index else {"prior_attempts": 0}
