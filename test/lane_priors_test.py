@@ -234,6 +234,71 @@ class RoutingTest(Isolated):
             pooled = {c["key"]: c for c in route_candidates(self.config, self.task(), runs)}["codex"]
         self.assertEqual((pooled["checked_runs"], pooled["local_class"]), (3, "pooled"))
 
+    def test_role_evidence_ranks_independently_and_falls_back_below_minimum(self):
+        self.config["decisions"]["priors"] = False
+        self.config["decisions"]["rank_by_outcomes"] = 2
+        spans = []
+        for agent in ("codex", "claude"):
+            for role in ("Triage  Locate", "triage-interpret"):
+                for n in range(2):
+                    run = f"{agent}-{role}-{n}"
+                    spans.append({"agent": agent, "run_id": run, "status": "success", "write": False, "role": role})
+                    DecisionStore(self.workspace).append("outcome", task_id=run, stage="review",
+                        accepted=(agent == "codex") == (role == "Triage  Locate"))
+        runs = core.RunStore(self.workspace)
+        def candidates(role, **kwargs):
+            task = {**self.task(), "role": role}
+            return route_candidates(self.config, task, runs, **kwargs)
+        with patch.object(runs, "traces", return_value=spans):
+            for role, winner in (("triage-locate", "codex"), (" TRIAGE\tINTERPRET ", "claude")):
+                ranked = rank_by_outcomes(candidates(role), minimum=2)
+                self.assertEqual(ranked[0]["key"], winner)
+                self.assertEqual([c["acceptance_rate"] for c in ranked], [1.0, 0.0])
+                self.assertTrue(all(c["evidence_scope"] == "role" and c["checked_runs"] == 2 for c in ranked))
+            fallback = candidates("triage-locate", minimum=3)
+            self.assertTrue(all(c["evidence_scope"] == "work" and c["checked_runs"] == 4
+                                and c["acceptance_rate"] == .5 for c in fallback))
+            # Missing, unknown and unseen roles preserve work-class evidence and ordering.
+            for role in (None, "", " Unknown ", "unseen-role", 42):
+                self.assertEqual(candidates(role), fallback)
+            # An unchecked worker claim must not push a role over the minimum.
+            spans.append({"agent": "codex", "run_id": "unmeasured", "status": "success",
+                          "write": False, "role": "triage-locate"})
+            self.assertEqual(candidates("triage-locate", minimum=3)[0]["evidence_scope"], "work")
+            # Fallback is decided separately for each lane.
+            spans[:] = [s for s in spans if s["run_id"] != "claude-Triage  Locate-1"]
+            mixed = {c["key"]: c for c in candidates("triage-locate")}
+            self.assertEqual(mixed["codex"]["evidence_scope"], "role")
+            self.assertEqual(mixed["claude"]["evidence_scope"], "work")
+            task = {**self.task(), "role": "Triage Locate"}
+            with patch("fusion_policy.DecisionEngine", return_value=DecisionEngine(self.workspace, self.config)), \
+                    patch.object(core.RunStore, "traces", return_value=spans):
+                route_task(self.config, task, runs)
+            log = [e for e in read_jsonl(DecisionStore(self.workspace).path) if e["event"] == "routing_log"][-1]
+            self.assertEqual({c["key"]: c["evidence_scope"] for c in log["candidates"]},
+                             {"codex": "role", "claude": "work"})
+            self.assertEqual(log["role"], "triage-locate")
+
+    def test_role_prior_classes_and_missing_interpret_fallback(self):
+        path = self.root / "orc-home" / "lane_priors.json"
+        value = json.loads(path.read_text())
+        value["priors"]["claude"]["interpret"] = {"attempts": 8, "successes": 8}
+        path.write_text(json.dumps(value))
+        self.config["routes"]["renamed"] = {"agent": "claude"}
+        runs = core.RunStore(self.workspace)
+        for role, write, expected in (("Triage Interpret", False, "interpret"),
+                                     ("triage-locate", False, "read"), ("triage-localize", False, "read"),
+                                     ("triage-interpret", True, "write"), (None, False, "read"),
+                                     ("unknown", False, "read"), ("other", False, "read")):
+            candidates = {c["key"]: c for c in route_candidates(self.config, {**self.task(write), "role": role}, runs)}
+            self.assertEqual(candidates["claude"]["prior"]["class"], expected)
+            self.assertEqual(candidates["renamed"]["prior"]["class"], expected)
+            self.assertEqual(candidates["renamed"]["prior"]["match"], "lane")
+        del value["priors"]["claude"]["interpret"]
+        path.write_text(json.dumps(value))
+        candidates = route_candidates(self.config, {**self.task(), "role": "triage-interpret"}, runs)
+        self.assertEqual(next(c for c in candidates if c["key"] == "claude")["prior"]["class"], "read")
+
 
 class ExcludeModelsTest(Isolated):
     def test_orc_routes_drop_excluded_models_from_their_arms_and_dispatch(self):

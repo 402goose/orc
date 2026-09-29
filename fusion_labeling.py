@@ -494,7 +494,7 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
                 state = acceptance_state(task, result, state_cap(engine.options), engine.state_tokens("acceptance"))
                 group = task.get("parent_task_id") or task.get("trace_id") or run_id
                 record = engine.record_unscored("acceptance", state, ACCEPTANCE_QUESTIONS,
-                                                {"task_id": run_id, "group": group}, source=VERDICT_SOURCE)
+                                                {"task_id": run_id, "group": group, "role": task.get("role")}, source=VERDICT_SOURCE)
             if record["truncated"]:
                 return {"status": "skipped", "decision_id": record["id"],
                         "reason": "No label: the task does not fit the acceptance input whole beside a summary excerpt "
@@ -545,7 +545,7 @@ def record_gate_input(config, workspace, workflow_id, node, result):
     engine = DecisionEngine(workspace, config)
     state = acceptance_state(node, result, state_cap(engine.options), engine.state_tokens("acceptance"))
     return engine.record_unscored("acceptance", state, ACCEPTANCE_QUESTIONS,
-                                  {"task_id": result.get("run_id"), "group": workflow_id}, source=GATE_SOURCE)
+                                  {"task_id": result.get("run_id"), "group": workflow_id, "role": node.get("role")}, source=GATE_SOURCE)
 
 
 def gate_answers(codes, receipts, check_inputs_changed=None):

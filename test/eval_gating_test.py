@@ -6,6 +6,7 @@ import random
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fusion_training_loop as loop
@@ -233,6 +234,75 @@ class GatingTest(unittest.TestCase):
         low = copy.deepcopy(record)
         low["prediction"]["action"] = {"repair": 0.7, "stop": 0.3}
         self.assertFalse(engine.allowed(low, "action"))
+
+    def test_role_buckets_require_independent_qualified_groups(self):
+        path, questions = self.dataset([(0.97, True)] * 90)
+        rows = dataset_rows(path)
+        base = f"recovery:{digest(questions)}"
+        # A qualified role, a tiny holdout, and many answers from only one group.
+        for row in rows:
+            n = int(row["id"])
+            row["role"] = " TRIAGE  Interpret " if n < 60 or n < 120 else "triage-locate" if n < 125 else "implementer"
+            if row["role"] == "implementer":
+                row["group"] = "shared-validation"
+        # Supply train evidence for all roles; only held-out group support differs.
+        for role in ("triage-locate", "implementer"):
+            rows += [{**row, "id": f"{role}-{row['id']}", "role": role} for row in rows[:60]]
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        report = fit_calibration(path, self.workspace / "roles.json", risk={"min_groups": 5})
+        self.assertEqual(set(report["buckets"]), {f"{base}:action", f"{base}:triage-interpret:action"})
+        bucket = report["buckets"][f"{base}:triage-interpret:action"]
+        self.assertTrue(bucket["qualified"])
+        self.assertEqual((bucket["train_groups"], bucket["confident_validation_groups"]), (60, 60))
+        # Enough answers from too few held-out groups must not qualify a role.
+        for row in rows:
+            if row["split"] == "validation" and row["role"].strip().startswith("TRIAGE"):
+                row["group"] = "one-held-out-group"
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        report = fit_calibration(path, self.workspace / "grouped.json", risk={"min_groups": 5})
+        self.assertNotIn(f"{base}:triage-interpret:action", report["buckets"])
+        # Train groups are also required even with enough independent holdouts.
+        for row in rows:
+            if row["role"].strip().startswith("TRIAGE"):
+                row["group"] = "one-train-group" if row["split"] == "train" else row["id"]
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        report = fit_calibration(path, self.workspace / "train-grouped.json", risk={"min_groups": 5})
+        self.assertNotIn(f"{base}:triage-interpret:action", report["buckets"])
+
+    def test_decide_and_allowed_prefer_role_bucket_with_legacy_fallback(self):
+        questions = {"action": {"type": "choice", "instructions": "Next?", "criteria": {"repair": "repair", "stop": "stop"}}}
+        class Backend:
+            def predict(self, state, questions):
+                return {"answers": {"action": {"probabilities": {"repair": .9, "stop": .1}}}, "model_identity": "m"}
+        base = f"recovery:{digest(questions)}"
+        report = {"model_identity": "m", "buckets": {
+            f"{base}:action": {"temperature": 1, "threshold": .85, "qualified": True},
+            f"{base}:triage-interpret:action": {"temperature": 4, "threshold": .85, "qualified": True}}}
+        engine = DecisionEngine(self.workspace, {"decisions": {"mode": "active", "threshold": .85,
+                                                               "auto_actions": ["recovery"]}}, Backend())
+        with patch.object(engine, "calibration", return_value=report):
+            for role in (None, "unknown", "triage-locate", " Triage\tInterpret "):
+                record = engine.decide("recovery", {"role": role}, questions, {"group": str(role)})
+                self.assertEqual(record["status"], "ok")
+                specific = role == " Triage\tInterpret "
+                expected = temperature_scale({"repair": .9, "stop": .1}, 4 if specific else 1)["repair"]
+                self.assertAlmostEqual(record["recommendations"]["action"]["probability"], expected)
+                self.assertEqual(engine.allowed(record, "action"), not specific)
+                if specific:
+                    self.assertEqual(record["context"]["role"], "triage-interpret")
+                    engine.store.label(record["id"], {"action": "repair"}, "Reviewed")
+            exported = self.workspace / "export.jsonl"
+            engine.store.export(exported)
+            self.assertEqual(dataset_rows(exported)[0]["role"], "triage-interpret")
+            # allowed re-reads the current role calibration, just as for legacy buckets.
+            report["buckets"][f"{base}:triage-interpret:action"]["temperature"] = 1
+            self.assertTrue(engine.allowed(record, "action"))
+            report["model_identity"] = "other-model"
+            self.assertFalse(engine.allowed(record, "action"))
+        context = {"role": " IMPLEMENTER "}
+        unscored = engine.record_unscored("recovery", {}, questions, context)
+        self.assertEqual(unscored["context"]["role"], "implementer")
+        self.assertEqual(context["role"], " IMPLEMENTER ")
 
     def test_small_holdout_is_never_qualified(self):
         path, questions = self.dataset([(0.99, True)] * 20)

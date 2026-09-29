@@ -82,6 +82,21 @@ class OutcomeLifecycleTest(unittest.TestCase):
         self.assertEqual(audit[0]['reason'], 'Grader dispute upheld')
         self.assertNotIn('accepted', audit[0])
 
+    def test_review_is_measured_and_latest_append_wins(self):
+        before = self.ranking()
+        self.outcome(True, stage='review', reason='Lead checked the triage claim')
+        self.assertEqual(self.ranking()[0], ('a', 1, 1.0))
+        self.outcome(False, stage='review', reason='Claim points at the wrong file')
+        self.assertIn(('a', 1, 0.0), self.ranking())
+        self.outcome(unmeasured=True, stage='review')
+        self.assertIn(('a', 1, 0.0), self.ranking())
+        self.outcome(True, stage='gate')
+        self.assertEqual(self.ranking()[0], ('a', 1, 1.0))
+        self.outcome(False, stage='review')
+        self.assertIn(('a', 1, 0.0), self.ranking())
+        self.outcome(withdraw=True, stage='review', reason='Invalid spot check')
+        self.assertEqual(self.ranking(), before)
+
     def test_unmeasured_preserves_ranking_and_labels_with_or_without_verdict(self):
         for accepted in (None, True, False):
             if accepted is not None:
@@ -167,6 +182,8 @@ class OutcomeLifecycleTest(unittest.TestCase):
         self.assertNotIn('stage', legacy)
         self.assertEqual(legacy['label']['status'], 'skipped')
         self.assertFalse(self.cli('--rejected', '--stage', 'land', '--reason', 'Land failed')['accepted'])
+        self.assertTrue(self.cli('--accepted', '--stage', 'review')['accepted'])
+        self.assertFalse(self.cli('--rejected', '--stage', 'review')['accepted'])
         self.assertTrue(self.cli('--unmeasured', '--reason', 'Infra failed')['unmeasured'])
         self.assertTrue(self.cli('--withdraw', '--reason', 'Disputed')['withdraw'])
         for flags in (['--accepted', '--withdraw'], ['--accepted', '--stage', 'ship']):
@@ -183,10 +200,11 @@ class OutcomeLifecycleTest(unittest.TestCase):
 
     def test_mcp_schema_and_dispatch(self):
         schema = next(t['inputSchema'] for t in core.tool_definitions() if t['name'] == 'fusion_outcome')
-        self.assertEqual(schema['properties']['stage']['enum'], ['gate', 'verify', 'land'])
+        self.assertEqual(schema['properties']['stage']['enum'], ['gate', 'verify', 'land', 'review'])
         self.assertTrue({'accepted', 'withdraw', 'unmeasured'} <= schema['properties'].keys())
         self.assertNotIn('accepted', schema['required'])
-        for args in ({'accepted': True}, {'accepted': False, 'stage': 'land'},
+        for args in ({'accepted': True}, {'accepted': False, 'stage': 'land'}, {'accepted': True, 'stage': 'review'},
+                     {'accepted': False, 'stage': 'review'},
                      {'unmeasured': True}, {'withdraw': True, 'reason': 'Disputed'}):
             self.assertFalse(self.mcp(args).get('isError'))
         for args in ({}, {'accepted': 'false'}, {'accepted': True, 'withdraw': True},

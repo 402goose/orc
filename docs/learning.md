@@ -32,11 +32,15 @@ or contribute lane priors.
 fusion outcome RUN_ID --accepted --stage gate --reason "The regression check passed"
 fusion outcome RUN_ID --rejected --stage verify --reason "Independent review reproduced the failure"
 fusion outcome RUN_ID --accepted --stage land --reason "Verified the landed change"
+fusion outcome RUN_ID --accepted --stage review --reason "Lead spot-checked the triage claim"
 fusion outcome RUN_ID --withdraw --reason "The grader used the wrong fixture"
 fusion outcome RUN_ID --unmeasured --reason "The grader could not run"
 ```
 
-`--stage gate|verify|land` is metadata: append order, not stage ordering, determines
+`review` records a spot-checked read-only claim, such as a triage answer a lead
+verified, as a measured accepted or rejected verdict.
+
+`--stage gate|verify|land|review` is metadata: append order, not stage ordering, determines
 the latest measured verdict. `--withdraw` requires a reason and removes prior
 external verdicts and their labels, preserving independent gate evidence.
 `--unmeasured` records an unscored attempt without changing ranking or labels.
