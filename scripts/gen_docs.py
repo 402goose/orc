@@ -60,6 +60,22 @@ def mcp_document():
              "Run `fusion --workspace /absolute/path/to/repository mcp-serve` as a stdio",
              "server. The schemas below preserve required fields, defaults, enums and",
              "nested constraints; omission of a default does not imply one.", "",
+             "## Progress and timeouts", "",
+             "For a long `tools/call`, set `params._meta.progressToken` to a string or",
+             "number (including `0`). While work is active, the shared CLI heartbeat",
+             "emits `notifications/progress` about every 10 seconds, with that token,",
+             "`progress` equal to elapsed request seconds, and a `message` containing",
+             "the current activity and latest public worker event. Notifications are",
+             "flushed as JSON-RPC lines before the final response. Without a token,",
+             "no progress notifications are sent. Clients must support progress-based",
+             "timeout renewal for these notifications to extend their request deadline.", "",
+             "`fusion_delegate.timeout_seconds` overrides the configured worker timeout",
+             "for one call: an integer from 60 through 14400 seconds. Omit it to use",
+             "the config default (`timeout_seconds`, normally 3600). The effective value",
+             "is recorded in the run's `task.json` and `result.json`. The CLI equivalent",
+             "is `fusion delegate --timeout SECONDS`. This worker limit is independent",
+             "of the client's request deadline. `fusion_run_start` returns immediately;",
+             "poll `fusion_run_status` for asynchronous workflows.", "",
              "## Tools", ""]
     lines += [f"- [{tool['name']}](#{anchor(tool['name'])})" for tool in definitions]
     for tool in definitions:

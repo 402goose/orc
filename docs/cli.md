@@ -299,8 +299,8 @@ run one bounded sidekick task
 
 ```text
 usage: fusion delegate [-h] [--agent {auto,claude,codex,agy,grok}] [--role ROLE]
-                       [--read-only] [--fresh] [--session-key SESSION_KEY]
-                       [--route ROUTE] [--model MODEL]
+                       [--timeout SECONDS] [--read-only] [--fresh]
+                       [--session-key SESSION_KEY] [--route ROUTE] [--model MODEL]
                        [--reasoning-effort {high,low,max,medium,minimal,none,ultra,xhigh}]
                        [--success SUCCESS] [--constraint CONSTRAINT]
                        task
@@ -313,6 +313,8 @@ options:
   --agent {auto,claude,codex,agy,grok}
                           worker agent; defaults to the named route agent
   --role ROLE
+  --timeout SECONDS       worker timeout for this call (60..14400 seconds); overrides
+                          config
   --read-only             give the worker a read-only workspace
   --fresh                 start a fresh agent session
   --session-key SESSION_KEY
