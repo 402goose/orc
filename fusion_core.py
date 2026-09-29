@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -28,6 +29,23 @@ from fusion_decisions import DEFAULTS as DECISION_DEFAULTS
 import fusion_progress as progress
 from fusion_usage import event_quota
 from fusion_reasoning import EFFORTS, validate_pair
+
+
+MIN_DELEGATE_TIMEOUT = 60
+MAX_DELEGATE_TIMEOUT = 14400
+
+
+def validate_timeout(value):
+    if type(value) is not int or not MIN_DELEGATE_TIMEOUT <= value <= MAX_DELEGATE_TIMEOUT:
+        raise ValueError(f"timeout_seconds must be an integer between {MIN_DELEGATE_TIMEOUT} and {MAX_DELEGATE_TIMEOUT}")
+    return value
+
+
+def cli_timeout(value):
+    try:
+        return validate_timeout(int(value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 SCHEMA = "fusion.v1"
@@ -1155,6 +1173,7 @@ def make_task(
     parent_task_id: str | None = None,
     route: str | None = None,
     settings_overrides: dict[str, Any] | None = None,
+    timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
     return {
@@ -1173,6 +1192,7 @@ def make_task(
         "constraints": constraints,
         "route": route,
         "settings_overrides": settings_overrides or {},
+        **({"timeout_seconds": validate_timeout(timeout_seconds)} if timeout_seconds is not None else {}),
         "created_at": now_ms(),
     }
 
@@ -1814,6 +1834,9 @@ def dispatch(
     run_dir: Path | None = None,
 ) -> dict[str, Any]:
     from fusion_policy import route_task, review_task
+    effective_timeout = (validate_timeout(task["timeout_seconds"]) if "timeout_seconds" in task
+                         else int(config.get("timeout_seconds", 3600)))
+    task["timeout_seconds"] = effective_timeout
     if os.environ.get("FUSION_READ_ONLY") == "1" and task["write"]:
         raise ValueError("this Fusion session permits read-only work only")
     task["workspace"] = str(Path(task["workspace"]).resolve())
@@ -1874,6 +1897,7 @@ def dispatch(
             "blockers": [f"install or expose {argv[0]} before dispatching"],
             "exit_code": 127,
             "duration_ms": 0,
+            "timeout_seconds": effective_timeout,
             "usage": {},
             **session,
             "artifacts": {"run_dir": str(run_dir)},
@@ -1917,7 +1941,7 @@ def dispatch(
                 cwd=task["workspace"],
                 env=env,
                 input=prompt if task["agent"] == "codex" else None,
-                timeout=int(config.get("timeout_seconds", 3600)),
+                timeout=effective_timeout,
                 stdout_path=stdout_path, stderr_path=stderr_path, label=label,
                 plain_output=task["agent"] == "grok" and metadata.get("output_format") == "plain",
             )
@@ -1974,7 +1998,7 @@ def dispatch(
             failure = failure or f"worker exited with code {exit_code}"
     except subprocess.TimeoutExpired as exc:
         summary = "worker timed out"
-        failure = f"timeout after {config.get('timeout_seconds', 3600)} seconds"
+        failure = f"timeout after {effective_timeout} seconds"
         status = "blocked"
         exit_code = 124
     except OSError as exc:
@@ -2010,6 +2034,7 @@ def dispatch(
         "command_evidence": evidence_notes if task["agent"] == "codex" else [],
         "exit_code": exit_code,
         "duration_ms": duration_ms,
+        "timeout_seconds": effective_timeout,
         "usage": usage,
         **session,
         "decisions": task.get("decisions", {}),
@@ -2214,6 +2239,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "write": {"type": "boolean", "default": True},
                     "resume": {"type": "boolean", "default": True},
                     "session_key": {"type": "string"},
+                    "timeout_seconds": {"type": "integer", "minimum": 60, "maximum": 14400, "description": "Worker timeout for this call in seconds; overrides the config default (3600). Recorded on the task and result."},
                     "workspace": {"type": "string", "description": "Optional workspace path for the delegated task."},
                     "route": {"type": "string", "description": "Optional named route such as orc-free or orc-best."},
                     "model": {"type": "string", "description": "Model for this task, overriding the route and agent settings."},
@@ -2302,6 +2328,13 @@ def mcp_error(message: str) -> dict[str, Any]:
 
 def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
     store = RunStore(workspace)
+    stdout_lock = threading.Lock()
+
+    def send(payload):
+        with stdout_lock:
+            sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+
     for raw in sys.stdin:
         try:
             request = json.loads(raw)
@@ -2342,59 +2375,66 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
             name = params.get("name")
             args = params.get("arguments") or {}
             try:
-                if name == "fusion_status":
-                    payload = {"runs": store.recent(int(args.get("limit", 10)))}
-                elif name == "fusion_decisions":
-                    from fusion_decisions import DecisionStore
-                    payload = {"decisions": DecisionStore(store.workspace).records()[-max(1, min(50, int(args.get("limit", 10)))):]}
-                elif name == "fusion_outcome":
-                    if "accepted" in args and not isinstance(args["accepted"], bool):
-                        raise ValueError("accepted must be true or false")
-                    payload = record_outcome(workspace, str(args.get("run_id", "")), args.get("accepted"),
-                                             str(args.get("reason", "")), stage=args.get("stage"),
-                                             withdraw=args.get("withdraw", False), unmeasured=args.get("unmeasured", False))
-                elif name == "fusion_delegate":
-                    agent = args.get("agent")
-                    if agent not in {"auto", "codex", "claude", "agy", "grok"}:
-                        raise ValueError("agent must be auto, codex, claude, agy, or grok")
-                    target = workspace_path(args["workspace"]) if args.get("workspace") else workspace
-                    if target != workspace:
-                        target_config, _ = load_config(target)
-                        target_store = RunStore(target)
+                token = (params.get("_meta") or {}).get("progressToken")
+                def notify(elapsed_seconds, message):
+                    send({"jsonrpc": "2.0", "method": "notifications/progress",
+                          "params": {"progressToken": token, "progress": elapsed_seconds, "message": message}})
+
+                with progress.heartbeat_listener(notify) if token is not None else contextlib.nullcontext():
+                    if name == "fusion_status":
+                        payload = {"runs": store.recent(int(args.get("limit", 10)))}
+                    elif name == "fusion_decisions":
+                        from fusion_decisions import DecisionStore
+                        payload = {"decisions": DecisionStore(store.workspace).records()[-max(1, min(50, int(args.get("limit", 10)))):]}
+                    elif name == "fusion_outcome":
+                        if "accepted" in args and not isinstance(args["accepted"], bool):
+                            raise ValueError("accepted must be true or false")
+                        payload = record_outcome(workspace, str(args.get("run_id", "")), args.get("accepted"),
+                                                 str(args.get("reason", "")), stage=args.get("stage"),
+                                                 withdraw=args.get("withdraw", False), unmeasured=args.get("unmeasured", False))
+                    elif name == "fusion_delegate":
+                        timeout_seconds = validate_timeout(args["timeout_seconds"]) if "timeout_seconds" in args else None
+                        agent = args.get("agent")
+                        if agent not in {"auto", "codex", "claude", "agy", "grok"}:
+                            raise ValueError("agent must be auto, codex, claude, agy, or grok")
+                        target = workspace_path(args["workspace"]) if args.get("workspace") else workspace
+                        if target != workspace:
+                            target_config, _ = load_config(target)
+                            target_store = RunStore(target)
+                        else:
+                            target_config, target_store = config, store
+                        task = make_task(
+                            target,
+                            agent,
+                            str(args.get("task", "")),
+                            str(args.get("role", "implementation")),
+                            [str(item) for item in args.get("success_criteria", [])],
+                            [str(item) for item in args.get("constraints", [])],
+                            args.get("session_key"),
+                            bool(args.get("resume", True)),
+                            bool(args.get("write", True)),
+                            route=args.get("route"),
+                            timeout_seconds=timeout_seconds,
+                            settings_overrides=choice_overrides(args.get("model"), args.get("reasoning_effort")),
+                        )
+                        if not task["task"]:
+                            raise ValueError("task is required")
+                        payload = dispatch(target_config, task, target_store)
                     else:
-                        target_config, target_store = config, store
-                    task = make_task(
-                        target,
-                        agent,
-                        str(args.get("task", "")),
-                        str(args.get("role", "implementation")),
-                        [str(item) for item in args.get("success_criteria", [])],
-                        [str(item) for item in args.get("constraints", [])],
-                        args.get("session_key"),
-                        bool(args.get("resume", True)),
-                        bool(args.get("write", True)),
-                        route=args.get("route"),
-                        settings_overrides=choice_overrides(args.get("model"), args.get("reasoning_effort")),
-                    )
-                    if not task["task"]:
-                        raise ValueError("task is required")
-                    payload = dispatch(target_config, task, target_store)
-                else:
-                    target = workspace if name == "fusion_run_start" else store.workspace
-                    payload = fusion_mcp.dispatch_async_tool(name, args, target)
-                response = mcp_result(payload)
-                if isinstance(payload, dict) and payload.get("workflow_id"):
-                    # Hand back evidence URIs rather than inlining artifacts.
-                    response["content"] = response["content"] + fusion_mcp.evidence_links(
-                        store.workspace, str(payload["workflow_id"])
-                    )
+                        target = workspace if name == "fusion_run_start" else store.workspace
+                        payload = fusion_mcp.dispatch_async_tool(name, args, target)
+                    response = mcp_result(payload)
+                    if isinstance(payload, dict) and payload.get("workflow_id"):
+                        # Hand back evidence URIs rather than inlining artifacts.
+                        response["content"] = response["content"] + fusion_mcp.evidence_links(
+                            store.workspace, str(payload["workflow_id"])
+                        )
             except Exception as exc:  # MCP must return a tool error instead of corrupting stdout.
                 response = mcp_error(str(exc))
         elif method == "ping":
             response = {}
         if response is not None and request_id is not None:
-            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": response}, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
+            send({"jsonrpc": "2.0", "id": request_id, "result": response})
     return 0
 
 
@@ -2624,6 +2664,7 @@ def build_parser() -> argparse.ArgumentParser:
     delegate = sub.add_parser("delegate", help="run one bounded sidekick task")
     delegate.add_argument("--agent", choices=["auto", "claude", "codex", "agy", "grok"], help="worker agent; defaults to the named route agent")
     delegate.add_argument("--role", default="implementation")
+    delegate.add_argument("--timeout", type=cli_timeout, metavar="SECONDS", help="worker timeout for this call (60..14400 seconds); overrides config")
     delegate.add_argument("--read-only", action="store_true", help="give the worker a read-only workspace")
     delegate.add_argument("--fresh", action="store_true", help="start a fresh agent session")
     delegate.add_argument("--session-key", help="persistent lane name; defaults to agent:role")
@@ -2990,6 +3031,7 @@ def _main(args, parser) -> int:
             not args.read_only,
             route=args.route,
             settings_overrides=choice_overrides(args.model, args.reasoning_effort),
+            timeout_seconds=args.timeout,
         )
         result = dispatch(config, task, RunStore(workspace))
         print_result(result, args.json)

@@ -318,6 +318,23 @@ Terminal runs show live progress: Laya startup and recommendations, stage and
 worker selection, public worker updates, acceptance results, and elapsed-time
 heartbeats every ten seconds. Worker stdout/stderr logs are written while the
 worker runs. Progress goes to stderr; `--json` keeps stdout machine-readable.
+MCP clients can opt into the same heartbeat by supplying
+`params._meta.progressToken` (a string or number) on a `tools/call` request.
+While the call has active work, ORC sends `notifications/progress` about every
+10 seconds, with the token, elapsed request seconds as `progress`, and the
+current activity and latest public worker event as `message`. Each notification
+is flushed as a complete JSON-RPC line before the final response. No token
+means no notifications. Clients must support renewing their request timeout on
+progress; the worker timeout is a separate limit. Asynchronous
+`fusion_run_start` returns immediately and uses `fusion_run_status` polling.
+
+For a single delegation, use `fusion delegate --timeout 7200 ...` or set
+`timeout_seconds: 7200` in the MCP `fusion_delegate` arguments. Overrides must
+be integers from 60 through 14400 seconds; invalid values are rejected before
+launching a worker. Omit the override to use the configured `timeout_seconds`
+(default 3600). The effective limit is saved in the run's `task.json` and
+`result.json`, and expiration uses the existing worker timeout failure.
+
 Use `--progress` to force updates when redirecting output, or `--quiet` to
 hide them. Both are global flags, before the subcommand.
 
