@@ -58,6 +58,7 @@ after its name. Aliases and hidden subcommands are included below.
 - [fusion learn schedule](#fusion-learn-schedule)
 - [fusion gym](#fusion-gym)
 - [fusion gym extract](#fusion-gym-extract)
+- [fusion gym interpret-seed](#fusion-gym-interpret-seed)
 - [fusion gym run](#fusion-gym-run)
 - [fusion gym report](#fusion-gym-report)
 - [fusion gym audit](#fusion-gym-audit)
@@ -977,11 +978,12 @@ options:
 replay merged fix PRs as benchmark tasks across lanes
 
 ```text
-usage: fusion gym [-h] {extract,run,report,audit,priors} ...
+usage: fusion gym [-h] {extract,interpret-seed,run,report,audit,priors} ...
 
 positional arguments:
-  {extract,run,report,audit,priors}
+  {extract,interpret-seed,run,report,audit,priors}
     extract               turn squash-merged fix PRs into tasks with FAIL_TO_PASS tests
+    interpret-seed        build read-only evidence tasks from existing gym fix tasks
     run                   run each task on each lane in its own worktree (resumable)
     report                per-lane and per-task results of a gym directory
     audit                 retract negatives from tasks no lane has solved; restore them
@@ -997,14 +999,25 @@ options:
 turn squash-merged fix PRs into tasks with FAIL_TO_PASS tests
 
 ```text
-usage: fusion gym extract [-h] [--repo-path REPO_PATH] --prs PRS [PRS ...] [--out OUT]
-                          [--ref REF] [--github-repo GITHUB_REPO] [--no-gh]
-                          [--timeout TIMEOUT] [--p2p-limit P2P_LIMIT]
+usage: fusion gym extract [-h] [--repo-path REPO_PATH] [--prs PRS [PRS ...]]
+                          [--kind {fix,interpret}] [--tasks TASKS] [--seed SEED]
+                          [--period PERIOD] [--split {all,train,holdout}]
+                          [--trap-templates TRAP_TEMPLATES] [--out OUT] [--ref REF]
+                          [--github-repo GITHUB_REPO] [--no-gh] [--timeout TIMEOUT]
+                          [--p2p-limit P2P_LIMIT]
 
 options:
   -h, --help              show this help message and exit
   --repo-path REPO_PATH   source repository (default: current directory)
   --prs PRS [PRS ...]
+  --kind {fix,interpret}
+  --tasks TASKS           existing fix task JSON file or directory (required for
+                          interpret)
+  --seed SEED             deterministic scenario seed
+  --period PERIOD         holdout rotation seed (default: current ISO week)
+  --split {all,train,holdout}
+  --trap-templates TRAP_TEMPLATES
+                          trap template JSON (default: gym/interpret_traps.json)
   --out OUT               directory for task JSON files and index.json
   --ref REF               history to search for the PR commits (default HEAD)
   --github-repo GITHUB_REPO
@@ -1012,6 +1025,27 @@ options:
   --no-gh                 prompt from the commit subject; no GitHub reads
   --timeout TIMEOUT       seconds per test run
   --p2p-limit P2P_LIMIT
+```
+
+## fusion gym interpret-seed
+
+build read-only evidence tasks from existing gym fix tasks
+
+```text
+usage: fusion gym interpret-seed [-h] --out OUT [--tasks TASKS] [--seed SEED]
+                                 [--period PERIOD] [--split {all,train,holdout}]
+                                 [--trap-templates TRAP_TEMPLATES]
+
+options:
+  -h, --help              show this help message and exit
+  --out OUT               directory for generated interpret tasks
+  --tasks TASKS           existing fix task JSON file or directory (required for
+                          interpret)
+  --seed SEED             deterministic scenario seed
+  --period PERIOD         holdout rotation seed (default: current ISO week)
+  --split {all,train,holdout}
+  --trap-templates TRAP_TEMPLATES
+                          trap template JSON (default: gym/interpret_traps.json)
 ```
 
 ## fusion gym run
@@ -1022,7 +1056,7 @@ run each task on each lane in its own worktree (resumable)
 usage: fusion gym run [-h] --lanes LANES [LANES ...] --workspace GYMDIR
                       [--max-tasks MAX_TASKS] [--budget-usd BUDGET_USD]
                       [--keep-worktrees] [--visible-tests] [--no-interface-hints]
-                      [--kind {fix,localize}]
+                      [--kind {fix,localize,interpret}]
                       tasks
 
 positional arguments:
@@ -1042,9 +1076,10 @@ options:
   --no-interface-hints    hidden mode without the interface section (names and
                           signatures the tests call); results are keyed as mode hidden,
                           hinted runs as hidden+hints
-  --kind {fix,localize}   fix (default): implement the fix, graded by the hidden tests;
+  --kind {fix,localize,interpret}
+                          fix (default): implement the fix, graded by the hidden tests;
                           localize: read-only, name the files and symbols the fix
-                          changes, graded against the fix (no hints)
+                          changes (no hints); interpret: read-only evidence questions
 ```
 
 ## fusion gym report
