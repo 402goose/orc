@@ -53,6 +53,129 @@ class ProgressTest(unittest.TestCase):
             time.sleep(.08)
             self.assertEqual(len(stream.getvalue()), count)
 
+    def test_mcp_heartbeats_arrive_before_result_and_are_request_scoped(self):
+        self.fake_worker("""import json, time
+print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'tests'}}), flush=True)
+time.sleep(1.2)
+print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'STATUS: success\\nSUMMARY: done'}}), flush=True)
+""")
+        requests = []
+        for request_id, token in enumerate(("slow", 0, None), 1):
+            params = {"name": "fusion_delegate", "arguments": {
+                "agent": "codex", "task": "inspect", "write": False, "resume": False,
+                "timeout_seconds": 60}}
+            if token is not None:
+                params["_meta"] = {"progressToken": token}
+            requests.append({"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": params})
+        # The interval is an in-process test seam, not a public CLI option.
+        script = """import sys
+from pathlib import Path
+import fusion_core as core
+core.progress._reporter.interval = .1
+workspace = Path(sys.argv[1])
+config, _ = core.load_config(workspace)
+raise SystemExit(core.run_mcp(workspace, config))
+"""
+        output = self.workspace / "mcp.jsonl"
+        with output.open("w") as out:
+            proc = subprocess.Popen([sys.executable, "-c", script, str(self.workspace)],
+                                    cwd=ROOT, stdin=subprocess.PIPE, stdout=out,
+                                    stderr=subprocess.PIPE, text=True, env=self.env)
+            try:
+                proc.stdin.write("\n".join(json.dumps(r) for r in requests) + "\n")
+                proc.stdin.flush()
+                self.wait_for(lambda: len(output.read_text().splitlines()) >= 3)
+                self.assertIsNone(proc.poll(), "worker must still be running when notifications arrive")
+                early = [json.loads(line) for line in output.read_text().splitlines()]
+                self.assertTrue(all(row.get("method") == "notifications/progress" for row in early))
+                _, errors = proc.communicate(timeout=10)
+                self.assertEqual(proc.returncode, 0, errors)
+                self.assertEqual(errors, "")
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate()
+        rows = [json.loads(line) for line in output.read_text().splitlines()]
+        cursor = 0
+        for request_id, token in enumerate(("slow", 0, None), 1):
+            end = next(i for i in range(cursor, len(rows)) if rows[i].get("id") == request_id)
+            notifications = rows[cursor:end]
+            if token is None:
+                self.assertEqual(notifications, [])
+            else:
+                self.assertGreaterEqual(len(notifications), 5)
+                values = [row["params"]["progress"] for row in notifications]
+                self.assertTrue(all(b > a for a, b in zip(values, values[1:])))
+                self.assertLess(max(b - a for a, b in zip(values, values[1:])), .5)
+                self.assertTrue(all(row["params"]["progressToken"] == token for row in notifications))
+                self.assertTrue(any("last event: tests" in row["params"]["message"] for row in notifications))
+            result = rows[end]["result"]["structuredContent"]
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["timeout_seconds"], 60)
+            task = json.loads((Path(result["artifacts"]["run_dir"]) / "task.json").read_text())
+            self.assertEqual(task["timeout_seconds"], 60)
+            cursor = end + 1
+        self.assertEqual(cursor, len(rows))
+
+    def test_cli_timeout_override_stops_worker_and_records_effective_limit(self):
+        self.fake_worker("import time\ntime.sleep(10)\n")
+        script = "import fusion_core as core; core.MIN_DELEGATE_TIMEOUT = 1; raise SystemExit(core.main())"
+        started = time.monotonic()
+        proc = subprocess.run([sys.executable, "-c", script, "--workspace", str(self.workspace),
+                               "--json", "delegate", "--agent", "codex", "--read-only", "--fresh",
+                               "--timeout", "5", "inspect"], cwd=ROOT, env=self.env,
+                              text=True, capture_output=True, timeout=9)
+        duration = time.monotonic() - started
+        self.assertGreaterEqual(duration, 5)
+        self.assertLess(duration, 8)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["exit_code"], 124)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["provider_failure"], "timeout after 5 seconds")
+        run_dir = Path(result["artifacts"]["run_dir"])
+        for filename in ("task.json", "result.json"):
+            self.assertEqual(json.loads((run_dir / filename).read_text())["timeout_seconds"], 5)
+        self.assertEqual(result["timeout_seconds"], 5)
+
+    def test_delegate_timeout_validation_and_config_fallback(self):
+        self.fake_worker("print('no live model')\n")
+        for value in ("5", "0", "-1", "14401", "1.5", "oops"):
+            with self.subTest(cli=value), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    core.build_parser().parse_args(["delegate", "--agent", "codex", "--timeout", value, "inspect"])
+                self.assertEqual(caught.exception.code, 2)
+        for value in (None, True, False, "60", 60.0, 5, 14401):
+            request = {"id": 1, "method": "tools/call", "params": {"name": "fusion_delegate",
+                       "arguments": {"agent": "codex", "task": "inspect", "timeout_seconds": value}}}
+            output = io.StringIO()
+            with self.subTest(mcp=value), patch("sys.stdin", io.StringIO(json.dumps(request) + "\n")), \
+                    contextlib.redirect_stdout(output), patch.object(core, "dispatch") as dispatch:
+                core.run_mcp(self.workspace, {})
+                self.assertTrue(json.loads(output.getvalue())["result"]["isError"])
+                dispatch.assert_not_called()
+        for value in (60, 14400):
+            self.assertEqual(core.validate_timeout(value), value)
+        config, _ = core.load_config(self.workspace)
+        config["timeout_seconds"] = 17
+        task = core.make_task(self.workspace, "codex", "inspect", "implementation", [], [], None, False, False)
+        with patch.dict(os.environ, self.env):
+            result = core.dispatch(config, task, core.RunStore(self.workspace))
+        self.assertEqual(result["timeout_seconds"], 17)
+        self.assertEqual(task["timeout_seconds"], 17)
+        self.assertEqual(config["timeout_seconds"], 17)
+
+    def test_progress_subscription_is_removed_after_tool_error(self):
+        request = {"id": 1, "method": "tools/call", "params": {"name": "fusion_delegate",
+                   "_meta": {"progressToken": "error"}, "arguments": {"agent": "invalid"}}}
+        with progress.session(False, interval=.01) as reporter, \
+                patch("sys.stdin", io.StringIO(json.dumps(request) + "\n")), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            core.run_mcp(self.workspace, {})
+            self.assertTrue(json.loads(output.getvalue())["result"]["isError"])
+            self.assertEqual(reporter.listeners, {})
+            self.assertFalse(reporter.thread.is_alive())
+
     def test_public_worker_events_exclude_reasoning_commands_and_terminal_escapes(self):
         self.assertIsNone(progress.worker_message(json.dumps({"type": "item.completed", "item": {"type": "reasoning", "text": "private reasoning"}})))
         text = progress.worker_message(json.dumps({"type": "item.started", "item": {"type": "command_execution", "command": "curl -H SECRET"}}))

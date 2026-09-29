@@ -35,12 +35,15 @@ class Reporter:
         self.started = time.monotonic()
         self.lock = threading.RLock()
         self.active = {}
+        self.latest = {}
+        self.listeners = {}
         self.stopped = threading.Event()
         self.cancelled = threading.Event()
         self.thread = None
 
     def start(self):
-        if self.enabled:
+        if (self.enabled or self.listeners) and not (self.thread and self.thread.is_alive()):
+            self.stopped.clear()
             self.thread = threading.Thread(target=self._heartbeat, name="fusion-progress", daemon=True)
             self.thread.start()
 
@@ -50,6 +53,13 @@ class Reporter:
             self.thread.join(timeout=1)
 
     def emit(self, label, message):
+        with self.lock:
+            for key, (active_label, _, _) in self.active.items():
+                if active_label == label:
+                    self.latest[key] = clean(message, 600)
+            self._write(label, message)
+
+    def _write(self, label, message):
         if self.enabled:
             with self.lock:
                 try:
@@ -62,18 +72,47 @@ class Reporter:
         key = uuid.uuid4().hex
         with self.lock:
             self.active[key] = (label, message, time.monotonic())
+            self.latest[key] = message
         self.emit(label, message)
         try:
             yield
         finally:
             with self.lock:
                 self.active.pop(key, None)
+                self.latest.pop(key, None)
+
+    @contextmanager
+    def listen(self, callback):
+        """Subscribe for one request; removal waits for any in-flight callback."""
+        key = uuid.uuid4().hex
+        with self.lock:
+            self.listeners[key] = (callback, time.monotonic())
+            self.start()
+        try:
+            yield
+        finally:
+            with self.lock:
+                self.listeners.pop(key, None)
+                stop = not self.enabled and not self.listeners
+                if stop:
+                    self.stopped.set()
+            if stop and self.thread:
+                self.thread.join()
 
     def _heartbeat(self):
         while not self.stopped.wait(self.interval):
             with self.lock:
-                for label, message, started in self.active.values():
-                    self.emit(label, f"still active ({elapsed(time.monotonic() - started)}) — {message}")
+                now = time.monotonic()
+                messages = []
+                for key, (label, message, started) in self.active.items():
+                    detail = f"still active ({elapsed(now - started)}) — {message}"
+                    if self.latest.get(key) != message:
+                        detail += f"; last event: {self.latest[key]}"
+                    self._write(label, detail)
+                    messages.append(f"{clean(label, 60)} {detail}")
+                if messages:
+                    for callback, started in self.listeners.values():
+                        callback(now - started, "; ".join(messages))
 
 
 _reporter = Reporter()
@@ -108,6 +147,10 @@ def emit(label, message):
 
 def activity(label, message):
     return _reporter.activity(label, message)
+
+
+def heartbeat_listener(callback):
+    return _reporter.listen(callback)
 
 
 class WorkerCancelled(RuntimeError):
