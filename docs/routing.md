@@ -52,6 +52,23 @@ Every eligible lane participates in ranking, including routes late in the
 configuration. After outcome ranking, different-agent preference and quota
 ordering, the first eight candidates become the choice options and routing log.
 
+Task roles form evidence classes by lowercasing and joining whitespace with
+`-`: `Triage Locate` becomes `triage-locate`. For each lane, routing uses that
+role's local checked runs once there are at least `minimum` of them (the integer
+`decisions.rank_by_outcomes`, or `3` by default). Below that threshold it uses
+the existing read/write evidence, pooling all work classes only when that work
+class has no evidence. Gym pseudo-counts do not satisfy the role minimum.
+Each candidate records `evidence_scope: role|work` and its `local_class` in the
+routing log. Missing, empty, unknown, or unseen roles retain work-class behavior.
+
+Laya records the normalized role in decision context and exports it with training
+examples. Calibration retains `kind:schema_hash:question` buckets and additionally
+publishes `kind:schema_hash:role:question` buckets for roles that pass the same
+Learn-then-Test rules: train-only temperature fitting, a certified held-out risk
+threshold, enough held-out answers, and enough independent train and acted
+held-out groups. Both decision scoring and action qualification prefer the role
+bucket, falling back to the role-less bucket when no role bucket exists.
+
 ## Cost tie-breakers
 
 With `decisions.rank_by_outcomes` enabled, optional integer `cost_tier` settings
@@ -165,6 +182,11 @@ them. A missing file contributes no prior; malformed data is rejected.
 ```json
 {"decisions": {"priors": {"weight": 0.5, "cap": 10}}}
 ```
+
+Read-only roles containing `interpret` use the gym's `interpret` prior when
+present for that lane, otherwise `read`. Roles containing `locate` or `localize`
+use `read`; writing tasks always use `write`. Other roles keep their existing
+work class. The selected class is recorded in each candidate's `prior.class`.
 
 Set `decisions.priors` to `false` to disable them, or set its `path` to a different
 export. Priors do not confer permissions or bypass availability, fit or quota

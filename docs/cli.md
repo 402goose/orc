@@ -331,7 +331,7 @@ record the lead's verdict on a delegated run
 
 ```text
 usage: fusion outcome [-h] (--accepted | --rejected | --withdraw | --unmeasured)
-                      [--stage {gate,verify,land}] [--reason REASON]
+                      [--stage {gate,verify,land,review}] [--reason REASON]
                       run_id
 
 positional arguments:
@@ -343,7 +343,7 @@ options:
   --rejected
   --withdraw              withdraw external verdicts and labels; requires --reason
   --unmeasured            record an unscored run without changing routing evidence
-  --stage {gate,verify,land}
+  --stage {gate,verify,land,review}
                           external lifecycle stage; the latest measured verdict wins
   --reason REASON         what you verified; required for the verdict to become an
                           acceptance label

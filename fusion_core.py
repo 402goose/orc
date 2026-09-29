@@ -1772,8 +1772,8 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool | None = None, r
         raise ValueError("withdraw and unmeasured must be true or false")
     if sum((accepted is not None, withdraw, unmeasured)) != 1:
         raise ValueError("choose exactly one of accepted/rejected, withdraw, or unmeasured")
-    if stage is not None and stage not in ("gate", "verify", "land"):
-        raise ValueError("stage must be gate, verify, or land")
+    if stage is not None and stage not in ("gate", "verify", "land", "review"):
+        raise ValueError("stage must be gate, verify, land, or review")
     if withdraw and not str(reason).strip():
         raise ValueError("withdraw requires a reason")
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id or ""):
@@ -2224,8 +2224,8 @@ def tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "fusion_outcome",
-            "outputSchema": {"type": "object", "properties": {"recorded": {"type": "boolean"}, "task_id": {"type": "string"}, "accepted": {"type": "boolean"}, "withdraw": {"type": "boolean"}, "unmeasured": {"type": "boolean"}, "stage": {"type": "string", "enum": ["gate", "verify", "land"]}, "label": {"type": "object"}}, "required": ["recorded"]},
-            "description": "Record a verdict on a run. The latest measured verdict ranks future automatic routes; stages are gate, verify, or land. With a reason, a verdict on a reported success also becomes an acceptance training label. Choose accepted (true/false), withdraw (remove external verdicts and labels, with a reason), or unmeasured (audit a grader failure without changing ranking or labels).",
+            "outputSchema": {"type": "object", "properties": {"recorded": {"type": "boolean"}, "task_id": {"type": "string"}, "accepted": {"type": "boolean"}, "withdraw": {"type": "boolean"}, "unmeasured": {"type": "boolean"}, "stage": {"type": "string", "enum": ["gate", "verify", "land", "review"]}, "label": {"type": "object"}}, "required": ["recorded"]},
+            "description": "Record a verdict on a run. The latest measured verdict ranks future automatic routes; stages are gate, verify, land, or review. With a reason, a verdict on a reported success also becomes an acceptance training label. Choose accepted (true/false), withdraw (remove external verdicts and labels, with a reason), or unmeasured (audit a grader failure without changing ranking or labels).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2233,7 +2233,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "accepted": {"type": "boolean"},
                     "withdraw": {"type": "boolean"},
                     "unmeasured": {"type": "boolean"},
-                    "stage": {"type": "string", "enum": ["gate", "verify", "land"]},
+                    "stage": {"type": "string", "enum": ["gate", "verify", "land", "review"]},
                     "reason": {"type": "string", "description": "What you verified or why you rejected it. Required for the verdict to become a training label."},
                 },
                 "required": ["run_id"],
@@ -2642,7 +2642,7 @@ def build_parser() -> argparse.ArgumentParser:
     verdict.add_argument("--withdraw", action="store_true", help="withdraw external verdicts and labels; requires --reason")
     verdict.add_argument("--unmeasured", action="store_true", help="record an unscored run without changing routing evidence")
     outcome.set_defaults(accepted=None)
-    outcome.add_argument("--stage", choices=("gate", "verify", "land"), help="external lifecycle stage; the latest measured verdict wins")
+    outcome.add_argument("--stage", choices=("gate", "verify", "land", "review"), help="external lifecycle stage; the latest measured verdict wins")
     outcome.add_argument("--reason", default="", help="what you verified; required for the verdict to become an acceptance label")
 
     ultra = sub.add_parser("ultra", help="run a bounded UltraCode-style explore/plan/implement/review pipeline")

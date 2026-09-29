@@ -727,6 +727,7 @@ class DecisionStore:
             rows.append({"schema": "fusion.training.v1", "id": record["id"], "group": group,
                          "group_first_ms": first_seen.get(group),
                          "kind": record["kind"], "state": record["state"], "questions": record["questions"],
+                         "role": normalize_role((record.get("context") or {}).get("role")),
                          "labels": kept, "prediction": record["prediction"],
                          "heuristic": heuristic_answers(record, applications.get(record["id"])),
                          "label_provenance": {key: origin[key] for key in kept if key in origin},
@@ -779,6 +780,21 @@ def temperature_scale(probs, temperature):
     return {key: value / total for key, value in values.items()}
 
 
+def normalize_role(role):
+    """Stable evidence class; absent, empty and unknown roles use legacy evidence."""
+    value = "-".join(role.lower().split()) if isinstance(role, str) else ""
+    return value if value and value != "unknown" else None
+
+
+def calibration_bucket(report, record, question):
+    buckets = report.get("buckets", {})
+    prefix = f"{record['kind']}:{record['schema_hash']}"
+    role = normalize_role((record.get("context") or {}).get("role"))
+    if role and f"{prefix}:{role}:{question}" in buckets:
+        return buckets[f"{prefix}:{role}:{question}"]
+    return buckets.get(f"{prefix}:{question}", {})
+
+
 class DecisionEngine:
     def __init__(self, workspace, config, backend=None):
         self.workspace = Path(workspace)
@@ -822,9 +838,15 @@ class DecisionEngine:
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             return {}
 
-    def new_record(self, kind, questions, context):
+    def new_record(self, kind, questions, context, state=None):
         if kind not in KINDS:
             raise ValueError(f"unknown decision kind: {kind}")
+        context = dict(context or {})
+        role = normalize_role(context.get("role", state.get("role") if isinstance(state, dict) else None))
+        if role:
+            context["role"] = role
+        else:
+            context.pop("role", None)
         return {"id": uuid.uuid4().hex, "kind": kind, "mode": self.options["mode"],
                 "state_version": STATE_VERSION,
                 "context": context or {}, "questions": questions, "schema_hash": digest(questions),
@@ -843,7 +865,7 @@ class DecisionEngine:
         encoded complete input; no prediction, no recommendation, and allowed()
         can never act on it. No model checks its fit, so an input over the
         estimated token budget (exceeds_token_budget) is recorded truncated."""
-        record = {**self.new_record(kind, questions, context), "status": "unscored", "duration_ms": 0, **extra}
+        record = {**self.new_record(kind, questions, context, state), "status": "unscored", "duration_ms": 0, **extra}
         if encoded is None:
             self.encode(record, state)
         else:
@@ -853,7 +875,7 @@ class DecisionEngine:
         return record
 
     def decide(self, kind, state, questions, context=None):
-        record = self.new_record(kind, questions, context)
+        record = self.new_record(kind, questions, context, state)
         if self.options["mode"] == "off":
             return record
         self.encode(record, state)
@@ -874,7 +896,7 @@ class DecisionEngine:
             for key, question in questions.items():
                 probs = distribution(answers.get(key, {}), question)
                 record["prediction"][key] = probs
-                bucket = calibration.get("buckets", {}).get(f"{kind}:{record['schema_hash']}:{key}", {})
+                bucket = calibration_bucket(calibration, record, key)
                 if calibration.get("model_identity") == record["model_identity"]:
                     probs = temperature_scale(probs, float(bucket.get("temperature", 1)))
                 selected = max(probs, key=probs.get)
@@ -898,7 +920,7 @@ class DecisionEngine:
         report = self.calibration()
         if report.get("model_identity") != record.get("model_identity"):
             return False
-        bucket = report.get("buckets", {}).get(f"{record['kind']}:{record['schema_hash']}:{question}", {})
+        bucket = calibration_bucket(report, record, question)
         # A Learn-then-Test threshold certified on held-out groups replaces the
         # fixed decisions.threshold; a report without one keeps the older rule.
         certified = (bucket.get("risk") or {}).get("threshold")
@@ -956,6 +978,7 @@ def fit_calibration(dataset, output, threshold=0.9, risk=None):
         raise ValueError("calibration requires reviewed examples from exactly one model identity")
     groups = {}
     buckets = {}
+    role_buckets = set()
     for row in rows:
         group, split = row["group"], row["split"]
         if split not in {"train", "validation"} or group in groups and groups[group] != split:
@@ -965,10 +988,18 @@ def fit_calibration(dataset, output, threshold=0.9, risk=None):
             probs = row["prediction"][key]
             if label not in probs:
                 raise ValueError("label not present in model probabilities")
-            bucket = buckets.setdefault(f"{row['kind']}:{row['schema_hash']}:{key}", {"train": [], "validation": []})
+            prefix = f"{row['kind']}:{row['schema_hash']}"
+            keys = [f"{prefix}:{key}"]
+            role = normalize_role(row.get("role"))
+            if role:
+                role_key = f"{prefix}:{role}:{key}"
+                keys.append(role_key)
+                role_buckets.add(role_key)
             if any(not isinstance(p, (int, float)) or not math.isfinite(p) or p < 0 or p > 1 for p in probs.values()) or abs(sum(probs.values()) - 1) > 0.02:
                 raise ValueError("invalid stored probabilities")
-            bucket[split].append((probs, label, group))
+            for bucket_key in keys:
+                bucket = buckets.setdefault(bucket_key, {"train": [], "validation": []})
+                bucket[split].append((probs, label, group))
     report = {"schema": "fusion.calibration.v1", "model_identity": next(iter(identities)),
               "dataset_hash": hashlib.sha256(Path(dataset).read_bytes()).hexdigest(), "buckets": {},
               "unscored_examples": unscored, "risk": risk}
@@ -1017,6 +1048,9 @@ def fit_calibration(dataset, output, threshold=0.9, risk=None):
             reasons.append(f"not qualified (train groups {train_groups}<{risk['min_groups']})")
         if gate["threshold"] is not None and len(confident_groups) < risk["min_groups"]:
             reasons.append(f"not qualified (acted held-out groups {len(confident_groups)}<{risk['min_groups']})")
+        # Sparse or uncertified roles retain the role-less fallback.
+        if key in role_buckets and reasons:
+            continue
         report["buckets"][key] = {
             "temperature": temperature, "threshold": acting, "train": len(train), "validation": len(validation),
             "risk": {name: value for name, value in gate.items() if name != "reason"},
