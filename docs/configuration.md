@@ -109,6 +109,43 @@ in the routing log. Needs never move a task off a lane it named.
 `local_server` is the need for binding and calling a server on 127.0.0.1 and
 listing processes, which Codex's restricted sandbox denies.
 
+### Metered lanes and overflow
+
+Claude Code prefers `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`) over the
+subscription login whenever one is in its environment. Fusion removes both
+from every Claude worker unless its agent or route declares
+`"billing": "api"`, even when the parent shell exports a key, and records the
+credential Claude reports using (`api_key_source`) on each result. A
+subscription lane that still ran on a key gets a `billing:` blocker.
+`fusion doctor` warns when either variable is set in the current shell,
+because interactive sessions started from it bill the key too.
+
+A metered lane should get its key from Claude Code's `apiKeyHelper` setting
+in a settings file only that lane passes (`launcher_args: ["--settings", ...]`):
+Claude runs the helper itself, so the key never enters any environment its
+Bash commands or child processes can read, and Claude reports
+`apiKeySource: "apiKeyHelper"`. Keep the helper and key file mode 700/600 and
+outside the worktree. Route settings that keep the lane bounded:
+
+- `requires`: paths that must exist before the lane is a candidate (the key file).
+- `daily_budget_usd`: the lane stops being a candidate once its runs reported
+  that much USD in the last 24 hours.
+- `max_budget_usd`: the per-run cap Claude Code enforces.
+- `account`: a separate account keeps its quota and cooldowns apart from the subscription.
+
+`decisions.overflow_routes` lists automatic lanes that are candidates only when
+no other pooled lane is (for example the subscription lanes are over the quota
+hard limit or cooling down). Routing returns to the primary lanes as soon as
+one is available again.
+
+```json
+{"decisions": {"auto_routes": ["claude-opus-medium", "claude-api-opus-medium"], "overflow_routes": ["claude-api-opus-medium"]},
+ "routes": {"claude-api-opus-medium": {"agent": "claude", "model": "claude-opus-5-5", "reasoning_effort": "medium",
+   "billing": "api", "account": "anthropic-api",
+   "launcher_args": ["--settings", "/Users/you/.config/orc/claude-api-settings.json"],
+   "requires": ["~/.config/orc/anthropic-api-key"], "daily_budget_usd": 150, "max_budget_usd": 15}}}
+```
+
 ## Control workspace
 
 To collect evidence from several checkouts in one controller directory:
