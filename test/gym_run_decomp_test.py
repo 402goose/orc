@@ -131,11 +131,13 @@ class GymRunDecompTest(Isolated):
                        **options)
 
     def test_a_matching_worker_is_matched_and_counted_and_its_brief_names_the_target(self):
-        task_path = self.write_task()
+        task_path = self.write_task(repo="example/decomp")
         result = self.run_gym(["matcher"])
         self.assertEqual((result["status"], result["kind"], result["mode"], result["skipped"]),
                          ("complete", "decomp", "hidden", []))
         [row] = result["runs"]
+        self.assertEqual(row["repo"], "example/decomp")
+        self.assertEqual(gym.read_results(self.gym_dir)[-1]["repo"], "example/decomp")
         self.assertEqual(row["key"], gym.result_key("t-0001", "matcher", "hidden", "decomp"))
         self.assertEqual((row["verdict"], row["completed"], row["tampered"], row["changed"], row["start"]),
                          ("matched", True, [], ["src/u0.c"], "start"))
@@ -172,6 +174,8 @@ class GymRunDecompTest(Isolated):
         self.write_task()
         [row] = self.run_gym(["matcher"], keep_worktrees=True)["runs"]
         self.assertEqual(self.seen("matcher")["files"], ["check.py", "include/u0.h", "src/u0.c"])
+        self.assertIsNone(row["repo"])
+        self.assertEqual(gym.lane_priors(self.gym_dir, now=0)["priors"], {})
         kept = Path(row["worktree"])
         self.assertTrue(kept.is_relative_to(self.gym_dir))
         self.assertEqual(run_git(kept, "ls-tree", "-r", "--name-only", "HEAD").splitlines(),
@@ -191,7 +195,7 @@ class GymRunDecompTest(Isolated):
         [hold] = self.run_gym(["matcher"], tasks=self.tasks / "t-0002" / "task.json")["runs"]
         self.assertEqual((hold["verdict"], hold["fail_reason"], hold["completed"]), ("hold", "infra", True))
         self.assertEqual(decomp.counted(hold), (False, False))
-        value = gym.lane_priors(self.gym_dir, now=0)
+        value = gym.lane_priors(self.gym_dir, now=0, include_unknown=True)
         self.assertEqual(value["excluded"], {"hold": 1})
         self.assertNotIn("decomp:S2", json.dumps(value["priors"]))
 
@@ -201,7 +205,7 @@ class GymRunDecompTest(Isolated):
         self.assertEqual((row["verdict"], row["graded_verdict"], row["completed"]), ("tampered", "matched", True))
         self.assertEqual(row["tampered"], ["check.py", "include/u0.h"])
         self.assertEqual(decomp.counted(row), (False, False))
-        value = gym.lane_priors(self.gym_dir, now=0)
+        value = gym.lane_priors(self.gym_dir, now=0, include_unknown=True)
         self.assertEqual((value["priors"], value["excluded"]), ({}, {"tampered": 1}))
 
     def test_resume_skips_completed_keys_and_the_budget_stops_before_the_next_run(self):
@@ -227,6 +231,7 @@ class GymRunDecompTest(Isolated):
         (source / "src").mkdir(parents=True)
         (source / "src" / "u0.c").write_text(START)
         run_git(source, "init", "-q")
+        run_git(source, "remote", "add", "origin", "https://github.com/example/source.git")
         run_git(source, "add", ".")
         run_git(source, "commit", "-qm", "base")
         base = run_git(source, "rev-parse", "HEAD")
@@ -235,6 +240,7 @@ class GymRunDecompTest(Isolated):
         self.write_task(start=False, prompt=False, base_commit=base)
         [row] = self.run_gym(["idler"], repo_path=source, keep_worktrees=True)["runs"]
         self.assertEqual((row["start"], row["verdict"]), ("repo", "unmatched"))
+        self.assertEqual(row["repo"], "example/source")
         seen = self.seen("idler")
         self.assertEqual(seen["files"], ["check.py", "src/u0.c"])
         self.assertNotIn("Target disassembly", seen["prompt"])
