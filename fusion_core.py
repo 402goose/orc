@@ -3728,6 +3728,8 @@ def build_parser() -> argparse.ArgumentParser:
     gym_parser(sub)
     from fusion_quota import add_parser as quota_parser
     quota_parser(sub)
+    from fusion_outcome import add_parser as outcome_parser
+    outcome_parser(sub)
     sub.add_parser("mcp-serve", help=argparse.SUPPRESS)
     return parser
 
@@ -3783,6 +3785,12 @@ def _main(args, parser) -> int:
         try:
             return gym_command(args, workspace, args.json)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            parser.error(str(exc))
+    if args.command == "outcome-model":
+        from fusion_outcome import command as outcome_command
+        try:
+            return outcome_command(args, control_workspace)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
             parser.error(str(exc))
     config, config_path = load_config(workspace)
     if args.command == "truffle":

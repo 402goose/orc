@@ -74,6 +74,10 @@ after its name. Aliases and hidden subcommands are included below.
 - [fusion quota](#fusion-quota)
 - [fusion quota probe](#fusion-quota-probe)
 - [fusion quota rates](#fusion-quota-rates)
+- [fusion outcome-model](#fusion-outcome-model)
+- [fusion outcome-model build-dataset](#fusion-outcome-model-build-dataset)
+- [fusion outcome-model evaluate](#fusion-outcome-model-evaluate)
+- [fusion outcome-model train](#fusion-outcome-model-train)
 - [fusion mcp-serve](#fusion-mcp-serve)
 
 ## fusion
@@ -81,12 +85,12 @@ after its name. Aliases and hidden subcommands are included below.
 ```text
 usage: fusion [-h] [--workspace WORKSPACE] [--control-workspace CONTROL_WORKSPACE]
               [--json] [--progress | --quiet]
-              {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,telemetry,decisions,learn,gym,quota,mcp-serve} ...
+              {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,telemetry,decisions,learn,gym,quota,outcome-model,mcp-serve} ...
 
 Lead/sidekick orchestration for Claude Code, Codex CLI, and Antigravity CLI
 
 positional arguments:
-  {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,telemetry,decisions,learn,gym,quota,mcp-serve}
+  {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,telemetry,decisions,learn,gym,quota,outcome-model,mcp-serve}
     truffle               scout tractable GitHub issues and queue isolated fixes
     ui                    open the local ORC/Fusion control room in your browser
     lead                  launch an interactive lead agent with the Fusion MCP server
@@ -113,6 +117,8 @@ positional arguments:
     gym                   replay merged fix PRs as benchmark tasks across lanes
     quota                 show what each account has left, probe accounts at reset, and
                           measure quota per run
+    outcome-model         predict verify, kept and landed outcomes from lifecycle
+                          history; read-only
     mcp-serve             ==SUPPRESS==
 
 options:
@@ -1414,6 +1420,87 @@ options:
   -h, --help   show this help message and exit
   --days DAYS
   --json
+```
+
+## fusion outcome-model
+
+predict verify, kept and landed outcomes from lifecycle history; read-only
+
+```text
+usage: fusion outcome-model [-h] {build-dataset,evaluate,train} ...
+
+positional arguments:
+  {build-dataset,evaluate,train}
+    build-dataset         one row per dispatched attempt, with routing and verify-time
+                          features
+    evaluate              held-out metrics against majority and per-lane posteriors
+    train                 fit one label and feature set on every row and save it
+
+options:
+  -h, --help              show this help message and exit
+```
+
+## fusion outcome-model build-dataset
+
+one row per dispatched attempt, with routing and verify-time features
+
+```text
+usage: fusion outcome-model build-dataset [-h] [--tenet-repo PATH] [--no-gh] [--out OUT]
+
+options:
+  -h, --help         show this help message and exit
+  --tenet-repo PATH  a TENET repo whose build journal, verify records and issue PRs to
+                     read; repeatable
+  --no-gh            do not list pull requests; landed stays unknown
+  --out OUT          dataset JSONL (default: .fusion/outcome-model/dataset.jsonl)
+```
+
+## fusion outcome-model evaluate
+
+held-out metrics against majority and per-lane posteriors
+
+```text
+usage: fusion outcome-model evaluate [-h] [--dataset DATASET] [--l2 L2] [--out OUT]
+                                     [--split {time,tail,rolling,all}] [--cutoff CUTOFF]
+                                     [--no-boosting] [--json] [--stop-rule]
+                                     [--thresholds T [T ...]]
+
+options:
+  -h, --help              show this help message and exit
+  --dataset DATASET       dataset JSONL (default: .fusion/outcome-model/dataset.jsonl)
+  --l2 L2                 logistic regression L2 strength (default 5)
+  --out OUT               output JSON (default: .fusion/outcome-model/report.json or
+                          model.json)
+  --split {time,tail,rolling,all}
+                          time: issues first attempted before --cutoff train; tail:
+                          newest 20% of issues test; rolling: five expanding-window
+                          folds over issues, pooled
+  --cutoff CUTOFF
+  --no-boosting
+  --json                  print the full report
+  --stop-rule             instead: replay 'stop an issue before round r when P(kept) <
+                          t' on held-out issues (rolling and tail unless --split names
+                          one)
+  --thresholds T [T ...]  stop-rule thresholds (default 0.10 0.15 0.20 0.30)
+```
+
+## fusion outcome-model train
+
+fit one label and feature set on every row and save it
+
+```text
+usage: fusion outcome-model train [-h] [--dataset DATASET] [--l2 L2] [--out OUT]
+                                  [--label {verify,kept,landed}]
+                                  [--features {routing,verify}]
+
+options:
+  -h, --help              show this help message and exit
+  --dataset DATASET       dataset JSONL (default: .fusion/outcome-model/dataset.jsonl)
+  --l2 L2                 logistic regression L2 strength (default 5)
+  --out OUT               output JSON (default: .fusion/outcome-model/report.json or
+                          model.json)
+  --label {verify,kept,landed}
+  --features {routing,verify}
 ```
 
 ## fusion mcp-serve
