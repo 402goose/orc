@@ -57,9 +57,9 @@ Task roles form evidence classes by lowercasing and joining whitespace with
 `-`: `Triage Locate` becomes `triage-locate`. For each lane, routing uses that
 role's local checked runs once there are at least `minimum` of them (the integer
 `decisions.rank_by_outcomes`, or `3` by default). Below that threshold it uses
-the existing read/write evidence, pooling all work classes only when a read-only
-task's class has no evidence; a writing task never counts read-only runs, in its
-role or its class. Gym pseudo-counts do not satisfy the role minimum.
+the existing read/write evidence, pooling all work classes only when that work
+class has no evidence; a writing task never counts read-only runs, in its role,
+its class or the pool. Gym pseudo-counts do not satisfy the role minimum.
 Each candidate records `evidence_scope: role|work` and its `local_class` in the
 routing log. Missing, empty, unknown, or unseen roles retain work-class behavior.
 

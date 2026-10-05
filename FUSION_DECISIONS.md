@@ -127,9 +127,10 @@ it. Interactive lead sessions use their own provider controls.
    lane's local outcomes are counted for the task's class: spans with
    `write: true` for a writer, `write: false` otherwise. A reader with no
    verified outcome in its class falls back to all its outcomes pooled
-   (spans recorded without `write` join only the pool). A writer never
-   counts read-only runs: a lane with no write evidence has only its prior,
-   so one accepted read-only check cannot stand in for a write record. Each candidate
+   (spans recorded without `write` join only the pool). A writer's pool
+   never holds read-only runs: a lane whose only evidence is read-only has
+   only its prior for writing, so one accepted read-only check cannot stand
+   in for a write record. Each candidate
    carries `checked_runs_local`, `acceptance_rate_local` and `local_class`
    (`write`, `read`, `pooled`, or null with no evidence).
 

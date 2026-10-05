@@ -339,14 +339,14 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None, minim
                     if span.get("run_id") not in untrusted and (span.get("run_id") in outcomes or
                         (span.get("status") == "error" and span.get("failure_class") not in {"quota", "auth", "permission_denied"}))]
         # Read-only and writing work differ: this task's class counts when
-        # it has any evidence. A reader falls back to every class pooled; a
-        # writer never counts read-only runs, so a lane with no writes has
-        # only its prior.
+        # it has any evidence, else every class pooled. A writer never counts
+        # a read-only run, so its pool holds only writes and unknown classes.
+        if work == "write":
+            evidence = [(span, ok) for span, ok in evidence if span.get("write") is not False]
         same = [(span, ok) for span, ok in evidence if "write" in span and bool(span["write"]) == (work == "write")]
-        role_evidence = [(span, ok) for span, ok in evidence if role and normalize_role(span.get("role")) == role
-                         and (work != "write" or span.get("write") is not False)]
+        role_evidence = [(span, ok) for span, ok in evidence if role and normalize_role(span.get("role")) == role]
         evidence_scope = "role" if role and len(role_evidence) >= minimum else "work"
-        counted = role_evidence if evidence_scope == "role" else same if same or work == "write" else evidence
+        counted = role_evidence if evidence_scope == "role" else same or evidence
         result = ([ok for _, ok in counted], evidence_scope, [ok for _, ok in same])
         return (*result, [span for span, _ in counted]) if with_spans else result
 
