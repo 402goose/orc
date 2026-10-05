@@ -771,7 +771,12 @@ reads beside the acceptance questions (the token budget, below):
 - `task` is the job the report is judged against, not the worker's prompt.
   It is the run's `decision_context` when that is a string; Truffle sets one
   ("Truffle scout: shortlist at most N ... in OWNER/REPO ..." or "Truffle
-  survey: grade each of N issues ..."). A stage of a `fusion build` workflow
+  survey: grade each of N issues ..."), and so does a delegation given
+  `--criterion TEXT`, `--criterion-file PATH` or MCP `criterion` (at most
+  20,000 characters). Pass one when the worker prompt is a generic dispatch
+  instruction ("Read AGENT.md ...") and the job lives in a spec: the spec's
+  task section is what acceptance should be judged against. The worker never
+  sees it; routing and review decisions read it too. A stage of a `fusion build` workflow
   gets `{"request", "workflow_kind", "stage", "role"}`: the original request
   without the dependency receipts a run's context also carries. Otherwise it
   is the task text (a delegation brief, a hand-written node's task).

@@ -325,8 +325,8 @@ usage: fusion delegate [-h] [--agent {auto,claude,codex,agy,grok,opencode}]
                        [--fresh] [--session-key SESSION_KEY] [--route ROUTE]
                        [--model MODEL]
                        [--reasoning-effort {high,low,max,medium,minimal,none,ultra,xhigh}]
-                       [--success SUCCESS] [--constraint CONSTRAINT] [--issue ISSUE]
-                       [--override-cap REASON]
+                       [--success SUCCESS] [--criterion TEXT | --criterion-file PATH]
+                       [--constraint CONSTRAINT] [--issue ISSUE] [--override-cap REASON]
                        task
 
 positional arguments:
@@ -351,6 +351,10 @@ options:
   --reasoning-effort {high,low,max,medium,minimal,none,ultra,xhigh}
                           Codex, or Claude Code (low-max); requires --model
   --success SUCCESS
+  --criterion TEXT        what acceptance is judged against, such as the spec's task
+                          section; recorded as the run's decision_context in place of
+                          the task text. The worker is not shown it
+  --criterion-file PATH   read --criterion from this file
   --constraint CONSTRAINT
   --issue ISSUE           target issue as owner/repo#N; recorded on the run so outcomes
                           and reports can count per issue
