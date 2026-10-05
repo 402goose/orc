@@ -453,7 +453,11 @@ checkpoint loaded). It is keyed by interpreter, not by workspace or
 configuration: the device, checkpoint and timeout travel with each request,
 and a different interpreter closes the previous runtime first. The unit
 tests set `FUSION_LAYA_PYTHON=false`, and `make test` fails if any test
-resolves the installed runtime.
+resolves the installed runtime. The runtime's stderr is appended to
+`laya-runtime.log` under ORC_HOME (rotated past 5 MB). When it exits, the
+decision's `error` quotes what it wrote since starting. A runtime that failed
+stays failed for that fusion process, so a broken install is not restarted on
+every decision.
 `FUSION_DECISIONS_MODE=off` disables classification and decision logging.
 `mode: off` in configuration has the same effect. Existing orchestration
 and deterministic automatic routing still work.

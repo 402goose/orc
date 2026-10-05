@@ -537,14 +537,43 @@ def score_unscored(workspace, config, limit=SHADOW_SCORE_BATCH):
     return {"status": "ok", "scored": scored, "remaining": len(pending) - scored}
 
 
+RUNTIME_LOG_BYTES = 5 * 1024 * 1024
+
+
+def runtime_log_path():
+    return Path(os.environ.get("ORC_HOME") or (Path.home() / ".config" / "orc")).expanduser() / "laya-runtime.log"
+
+
 class LayaRuntime:
-    """One resident SDK process; serialized requests, bounded waits, clean stdout."""
+    """One resident SDK process; serialized requests, bounded waits, clean stdout.
+    Its stderr goes to laya-runtime.log under ORC_HOME, and an exit quotes the
+    tail written since the process started."""
     def __init__(self, options):
         self.options = options
         self.process = None
         self.lock = threading.Lock()
         self.error = None
         self.buffer = b""
+        self.log = None
+        self.log_start = 0
+
+    def stderr_tail(self, limit=600):
+        try:
+            with runtime_log_path().open("rb") as stream:
+                stream.seek(self.log_start)
+                text = stream.read().decode("utf-8", "replace").strip()
+        except OSError:
+            return ""
+        return text[-limit:]
+
+    def open_log(self):
+        path = runtime_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > RUNTIME_LOG_BYTES:
+            path.replace(path.with_name(path.name + ".1"))
+        self.log = path.open("ab")
+        self.log_start = self.log.tell()
+        return self.log
 
     def close(self):
         proc, self.process = self.process, None
@@ -559,6 +588,9 @@ class LayaRuntime:
             for stream in (proc.stdin, proc.stdout):
                 if stream:
                     stream.close()
+        if self.log is not None:
+            self.log.close()
+            self.log = None
         self.buffer = b""
 
     def predict(self, state, questions, checkpoint=None, options=None):
@@ -573,7 +605,7 @@ class LayaRuntime:
                     env.update(HF_HUB_OFFLINE="1", TOKENIZERS_PARALLELISM="false")
                     self.process = subprocess.Popen(
                         [runtime_python(self.options), "-u", str(Path(__file__).with_name("fusion_laya.py")), "serve"],
-                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.open_log(), env=env,
                     )
                 request = {"state": state, "questions": questions, "device": options["device"],
                            "model_path": options["model_path"]}
@@ -595,7 +627,11 @@ class LayaRuntime:
                             continue
                         chunk = os.read(self.process.stdout.fileno(), 65536)
                         if not chunk:
-                            raise RuntimeError("Laya runtime exited; run fusion decisions setup")
+                            with contextlib.suppress(subprocess.TimeoutExpired):
+                                self.process.wait(timeout=5)
+                            tail = self.stderr_tail()
+                            raise RuntimeError("Laya runtime exited; run fusion decisions setup"
+                                               + (f" (stderr: {tail})" if tail else ""))
                         self.buffer += chunk
                         if len(self.buffer) > 1_000_000:
                             raise ValueError("Laya response exceeds limit")

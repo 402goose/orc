@@ -167,6 +167,18 @@ class DecisionsTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "timed out"):
             runtime.predict("x", INTAKE_QUESTIONS)
 
+    def test_a_runtime_that_exits_quotes_its_stderr_and_logs_it_under_orc_home(self):
+        helper = self.workspace / "runtime"
+        helper.write_text("#!/bin/sh\necho 'ModuleNotFoundError: No module named torch' >&2\nexit 1\n")
+        helper.chmod(0o755)
+        runtime = LayaRuntime({**DEFAULTS, "python": str(helper), "timeout_seconds": 10})
+        with self.assertRaisesRegex(RuntimeError, "runtime exited.*No module named torch"):
+            runtime.predict("x", INTAKE_QUESTIONS)
+        self.assertIsNone(runtime.process)
+        self.assertIn("No module named torch", (self.workspace / "orc-home" / "laya-runtime.log").read_text())
+        with self.assertRaisesRegex(RuntimeError, "No module named torch"):
+            runtime.predict("x", INTAKE_QUESTIONS)
+
     def test_sweep_fans_out_one_worker_per_dimension(self):
         self.config["decisions"]["mode"] = "off"
         prepared = prepare(self.workspace, self.config, "Audit this service", across=["auth, payments", "data"])
