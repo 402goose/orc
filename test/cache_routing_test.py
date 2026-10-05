@@ -151,7 +151,7 @@ print(json.dumps({{'type': 'turn.completed', 'usage': {{'input_tokens': 1000, 'c
     def test_route_task_uses_warmth_only_with_cache_config_and_shows_it_to_laya(self):
         spans = self.outcome_spans(self.clock.value)
         engine = MagicMock()
-        engine.options = {"mode": "shadow"}
+        engine.options = {"mode": "shadow", "max_state_chars": 2200}
         engine.decide.return_value = {"id": "routing-1"}
         engine.allowed.return_value = False
         chosen = {}
@@ -162,7 +162,7 @@ print(json.dumps({{'type': 'turn.completed', 'usage': {{'input_tokens': 1000, 'c
             chosen[label] = task["agent"]
         self.assertEqual(chosen, {"default": "codex", "cache": "claude"})
         state = engine.decide.call_args.args[1]
-        self.assertTrue(all("warm" in c and "session_idle_s" in c for c in state["candidates"]))
+        self.assertTrue(all("warm" in c and "idle_minutes" in c for c in state["candidates"]))
         self.assertEqual([c["key"] for c in state["candidates"]][:2], ["claude", "codex"])
 
 

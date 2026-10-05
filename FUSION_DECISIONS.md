@@ -286,8 +286,16 @@ tier are equal, and the warm one goes first. Warmth never moves a lane
 past one whose smoothed acceptance is more than `warm_epsilon` better,
 and reviews still prefer a different agent from the implementer. Without a
 `cache` block the order is unchanged. Candidates passed to Laya's routing
-decision include `warm` and `session_idle_s` as shadow state; they add no
+decision include `warm` and `idle_minutes` as shadow state; they add no
 authority.
+
+Laya's routing input is compact so it fits `max_state_chars` whole:
+`{"task", "write", "goal", "budget_remaining_usd", "candidates"}`, where each
+candidate keeps only `key`, `model`, `reasoning_effort`, `cost_tier`, `warm`,
+`acceptance` (2 places), `checked`, `usd`, `minutes`, `idle_minutes` and its
+quota class. `task` is the run's `decision_context` or task text, cut with a
+visible "[…truncated N chars]" marker to the room the candidates leave. The
+routing log keeps the full candidate records.
 
 ## Routing log and exploration
 
@@ -312,8 +320,8 @@ nothing is logged and nothing explores.
  "chosen": "codex", "explored": false}
 ```
 
-`candidates` is the final ranked order with the same evidence fields Laya's
-routing decision sees, local and gym evidence side by side
+`candidates` is the final ranked order with the full evidence behind Laya's
+compact routing input, local and gym evidence side by side
 (`checked_runs_local`, `prior_attempts`, `prior`). `policy.priors` is the
 priors configuration that applied, or `null` when no priors file was
 loaded. `policy.rank_by_outcomes` is the minimum checked
