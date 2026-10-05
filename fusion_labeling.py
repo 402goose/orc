@@ -122,7 +122,7 @@ def council_rule(value="unanimous"):
 def unavailable(member):
     # A bad assessment or abstention is not an unavailable account.
     return member.get("status") in {"error", "unavailable"} and member.get("failure_class") in {
-        "quota", "timeout", "missing_executable", "permission_denied"}
+        "quota", "auth", "timeout", "missing_executable", "permission_denied"}
 
 
 def recent_quota(workspace, config, member):

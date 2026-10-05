@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # set to probe and no entry in the CLI's map. Any other kind missing from
 # either is drift.
 DYNAMIC_KINDS = {"routing"}
-FAILURE_CLASSES = {"quota", "permission_denied", "timeout", "missing_executable", "worker_error"}
+FAILURE_CLASSES = {"quota", "auth", "permission_denied", "timeout", "missing_executable", "worker_error"}
 
 
 def cli_parser():

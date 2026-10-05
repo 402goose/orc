@@ -174,7 +174,7 @@ Or set this in the project's `.fusion.json`:
 The payload contains `schema`, a random per-machine `install_id`, and `spans`.
 Each span sends `trace_id`, `span_id`, `parent_span_id`, agent, role, route,
 model, whether it was a
-write, status, a coarse `failure_class` (`quota` / `permission_denied` /
+write, status, a coarse `failure_class` (`quota` / `auth` / `permission_denied` /
 `timeout` / `missing_executable` / `worker_error` / `coordinator_error` —
 never the raw blocker
 text), `start_time_ms`, `end_time_ms`, `duration_ms`, and normalized token/cost

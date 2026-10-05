@@ -280,7 +280,7 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None, minim
         # account and model, or the whole account when the model is unknown.
         family = (core.lane_key(agent, settings), settings.get("command", agent), settings.get("model") or span.get("model") or "*")
         if key not in seen and 0 <= time.time() * 1000 - span.get("end_time_ms", 0) < core.LANE_COOLDOWN_SECONDS * 1000:
-            if span.get("failure_class") == "quota" or (span.get("failure_class") == "permission_denied"
+            if span.get("failure_class") in {"quota", "auth"} or (span.get("failure_class") == "permission_denied"
                                                         # A denial under full access predicts one under restricted
                                                         # access, not the other way round.
                                                         and not (core.task_execution_mode(config, task) == "yolo"
@@ -290,7 +290,7 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None, minim
                 # Quota belongs to the account behind the command, so every lane on
                 # it cools down. A permission denial is about what that lane's run
                 # tried; other lanes on the same command stay candidates.
-                if span.get("failure_class") == "quota" and family not in seen_commands \
+                if span.get("failure_class") in {"quota", "auth"} and family not in seen_commands \
                         and (Path(str(family[1])).name != "orc" or core.route_account(settings)):
                     unavailable_commands.add(family)
         seen.add(key)
@@ -299,11 +299,11 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None, minim
         """(verified, evidence_scope, same) for these spans, plus the counted
         spans themselves with `with_spans`."""
         # A success is the worker's claim until a gate or lead checks it; an
-        # error is observed. Quota and permission failures are lane health
+        # error is observed. Quota, auth and permission failures are lane health
         # (cooldown), not evidence about quality.
         evidence = [(span, outcomes[span["run_id"]] if span.get("run_id") in outcomes else False) for span in spans
                     if span.get("run_id") not in untrusted and (span.get("run_id") in outcomes or
-                        (span.get("status") == "error" and span.get("failure_class") not in {"quota", "permission_denied"}))]
+                        (span.get("status") == "error" and span.get("failure_class") not in {"quota", "auth", "permission_denied"}))]
         # Read-only and writing work differ: this task's class counts when
         # it has any evidence, else every class pooled.
         same = [(span, ok) for span, ok in evidence if "write" in span and bool(span["write"]) == (work == "write")]
@@ -1237,9 +1237,9 @@ def recovery(config, workspace, workflow_id, node, result, accepted, max_attempt
     engine = DecisionEngine(workspace, config)
     repeated = bool(node.get("repeated_failure"))
     can_retry = node["attempts"] < max_attempts and not repeated
-    actual = "continue" if accepted else "stop" if failure in {"quota", "permission_denied"} or not can_retry else "repair"
+    actual = "continue" if accepted else "stop" if failure in {"quota", "auth", "permission_denied"} or not can_retry else "repair"
     automatic = node["agent"] == "auto" and not node.get("route")
-    if not accepted and failure == "quota" and automatic:
+    if not accepted and failure in {"quota", "auth"} and automatic:
         failed_route = result.get("route") or result.get("agent")
         excluded = node.setdefault("excluded_routes", [])
         if failed_route and failed_route not in excluded:
@@ -1256,7 +1256,7 @@ def recovery(config, workspace, workflow_id, node, result, accepted, max_attempt
     applied = False
     if not accepted and failure != "permission_denied" and engine.allowed(record, "action"):
         suggested = record["recommendations"]["action"]["value"]
-        if suggested in {"ask", "stop"} or (can_retry and suggested == "repair" and failure != "quota"):
+        if suggested in {"ask", "stop"} or (can_retry and suggested == "repair" and failure not in {"quota", "auth"}):
             actual, applied = suggested, True
         elif can_retry and suggested == "switch" and node["agent"] == "auto" and not node.get("route"):
             actual, applied = "switch", True
