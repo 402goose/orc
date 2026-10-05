@@ -47,7 +47,11 @@ class AuthFailureTest(unittest.TestCase):
     def test_a_401_is_classified_as_auth(self):
         result = {"status": "error", "exit_code": 1, "blockers": [REFRESH_REUSED], "provider_failure": REFRESH_REUSED}
         self.assertEqual(core.failure_class(result), "auth")
-        self.assertEqual(core.failure_class({"status": "error", "blockers": ["Not logged in. Please log in"]}), "auth")
+        self.assertEqual(core.failure_class({"status": "error", "provider_failure": "Not logged in. Please log in"}), "auth")
+
+    def test_a_401_quoted_by_the_worker_is_not_auth(self):
+        result = {"status": "error", "exit_code": 1, "blockers": ["test_client fails: expected 200, got 401 Unauthorized"]}
+        self.assertEqual(core.failure_class(result), "worker_error")
 
     def test_an_auth_failure_cools_every_lane_on_the_account(self):
         self.span("A", REFRESH_REUSED)

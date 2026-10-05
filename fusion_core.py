@@ -675,10 +675,8 @@ def quota_failure(result: dict[str, Any]) -> bool:
 
 
 def auth_failure(result: dict[str, Any]) -> bool:
-    if "provider_failure" in result:
-        text = str(result.get("provider_failure") or "").lower()
-    else:
-        text = " ".join(str(item) for item in result.get("blockers", [])).lower()
+    """Only the harness's own failure counts: a worker's blockers can quote an HTTP 401 from the code under test."""
+    text = str(result.get("provider_failure") or "").lower()
     return any(marker in text for marker in AUTH_MARKERS)
 
 
