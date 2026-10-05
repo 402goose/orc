@@ -47,6 +47,20 @@ class QuotaCliTest(unittest.TestCase):
         self.assertFalse(account["probe_due"])
         self.assertIn("seven_day", quota.render_status(view))
 
+    def test_a_newer_reading_of_another_window_does_not_cancel_a_due_probe(self):
+        # The weekly window was spent and read before its reset R; after R only the
+        # five-hour window was read again, so whether the weekly one is back is unknown.
+        reset = NOW - 60
+        self.trace(reset - HOUR, {"seven_day": {"used": 0.99, "resets_at": reset}, "five_hour": {"used": 0.1, "resets_at": NOW + HOUR}})
+        self.trace(reset + 30, {"five_hour": {"used": 0.12, "resets_at": NOW + HOUR}})
+        thresholds = policy.quota_settings(self.config)
+        entry = quota.usage.headroom(self.store.workspace, include_raw=False)[0]
+        self.assertTrue(quota.probe_due(entry, thresholds, reset + 120))
+        # Once the weekly window itself is read after R, nothing is due.
+        self.trace(reset + 90, {"seven_day": {"used": 0.0, "resets_at": NOW + 6 * 24 * HOUR}})
+        entry = quota.usage.headroom(self.store.workspace, include_raw=False)[0]
+        self.assertFalse(quota.probe_due(entry, thresholds, reset + 120))
+
     def test_probe_is_due_only_after_the_spent_window_resets(self):
         windows = {"five_hour": {"used": 0.05, "resets_at": NOW - HOUR}, "seven_day": {"used": 1.0, "resets_at": NOW + HOUR}}
         self.trace(NOW - 2 * HOUR, windows, status="rejected")

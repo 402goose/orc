@@ -78,10 +78,13 @@ def probe_due(entry, thresholds, now):
     """A window read exhausted has since reset and no reading came after the reset.
 
     Only the spent window counts: an account blocked on seven_day is not back
-    because its five_hour window reset."""
-    quota, observed = entry.get("quota") or {}, usage.timestamp(entry.get("observed_at"))
+    because its five_hour window reset, and a newer reading that carried only
+    another window says nothing about it. Each window is judged by its own
+    reading time (windows merge per name), falling back to the account's."""
+    quota, account_observed = entry.get("quota") or {}, usage.timestamp(entry.get("observed_at"))
     for window in (quota.get("windows") or {}).values():
         reset = usage.timestamp(window.get("resets_at"))
+        observed = usage.timestamp(window.get("observed_at")) or account_observed
         used = window.get("used")
         spent = used > thresholds["hard"] if used is not None else quota.get("status") == "rejected"
         if spent and reset and observed and observed < reset and reset.timestamp() <= now:
