@@ -1462,7 +1462,8 @@ held-out metrics against majority and per-lane posteriors
 ```text
 usage: fusion outcome-model evaluate [-h] [--dataset DATASET] [--l2 L2] [--out OUT]
                                      [--split {time,tail,rolling,all}] [--cutoff CUTOFF]
-                                     [--no-boosting] [--json]
+                                     [--no-boosting] [--json] [--stop-rule]
+                                     [--thresholds T [T ...]]
 
 options:
   -h, --help              show this help message and exit
@@ -1477,6 +1478,10 @@ options:
   --cutoff CUTOFF
   --no-boosting
   --json                  print the full report
+  --stop-rule             instead: replay 'stop an issue before round r when P(kept) <
+                          t' on held-out issues (rolling and tail unless --split names
+                          one)
+  --thresholds T [T ...]  stop-rule thresholds (default 0.10 0.15 0.20 0.30)
 ```
 
 ## fusion outcome-model train

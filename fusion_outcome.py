@@ -718,6 +718,101 @@ def evaluate(rows, splits=("time", "tail", "rolling"), cutoff=TIME_CUTOFF, l2=5.
     return results
 
 
+STOP_THRESHOLDS = (0.10, 0.15, 0.20, 0.30)
+
+
+def stop_rule(rows, splits=("rolling", "tail"), thresholds=STOP_THRESHOLDS, cutoff=TIME_CUTOFF, l2=5.0, boosting=True):
+    """Offline round-stop rule: before round r of an issue, stop the issue when the kept·routing P(kept) < t.
+
+    Held-out issues only. A skipped round's cost is its recorded cost, else its lane's mean training
+    cost, else the mean training cost. A land is lost when a landed issue stops at or before its
+    last kept round (its last round when none was kept); `at_risk_unknown` counts the same for
+    issues whose landed label is unknown. The model is the logistic regression unless boosting
+    beats it on held-out log loss and AUC.
+    """
+    report = []
+    for how in splits:
+        scored, ys = [], {"logistic": [], "boosting": []}
+        for train, test in folds(rows, how, cutoff):
+            if len(train) < 10 or len({r["labels"]["kept"] for r in train}) < 2 or not test:
+                continue
+            model = fit_models(train, "kept", "routing", l2, boosting)
+            costs = lane_costs(train)
+            spent = [r["features"]["cost_usd"] for r in train if r["features"].get("cost_usd") is not None]
+            fallback = sum(spent) / len(spent) if spent else 0.0
+            for row in test:
+                cost, source = row["features"].get("cost_usd"), "actual"
+                if cost is None:
+                    cost, source = (costs[row["features"]["lane"]], "lane") if row["features"]["lane"] in costs else (fallback, "global")
+                p = {which: predict(model, row, which) for which in ("logistic", *(("boosting",) if boosting else ()))}
+                scored.append({"row": row, "p": p, "cost": cost, "cost_source": source})
+                for which, value in p.items():
+                    ys[which].append(value)
+        if not scored:
+            report.append({"split": how, "status": "insufficient"})
+            continue
+        truth = [int(s["row"]["labels"]["kept"]) for s in scored]
+        quality = {which: metrics(truth, values) for which, values in ys.items() if values}
+        which = "logistic"
+        if "boosting" in quality and quality["boosting"]["log_loss"] < quality["logistic"]["log_loss"] \
+                and (quality["boosting"]["auc"] or 0) > (quality["logistic"]["auc"] or 0):
+            which = "boosting"
+        groups = defaultdict(list)
+        for s in scored:
+            groups[s["row"]["group"]].append(s)
+        kept_total = sum(truth)
+        entry = {"split": how, "model": which, "rounds": len(scored), "issues": len(groups), "kept": kept_total,
+                 "landed_issues": sum(g[0]["row"]["labels"]["landed"] is True for g in groups.values()),
+                 "kept_auc": quality[which]["auc"]}
+        for s in scored:
+            s["p_stop"] = s["p"][which]
+        entry["thresholds"] = [stop_outcome(groups, t, kept_total) for t in thresholds]
+        report.append(entry)
+    return report
+
+
+def stop_outcome(groups, t, kept_total):
+    """Replay the stop rule at threshold t over {group: [{row, p_stop, cost, cost_source}]}."""
+    out, saved = Counter(), 0.0
+    for items in groups.values():
+        items = sorted(items, key=lambda s: (s["row"]["ts"], s["row"]["id"]))
+        stop = next((i for i, s in enumerate(items) if s["p_stop"] < t), None)
+        if stop is None:
+            continue
+        skipped, landed = items[stop:], items[0]["row"]["labels"]["landed"]
+        kept = [i for i, s in enumerate(items) if s["row"]["labels"]["kept"]]
+        out["issues_stopped"] += 1
+        out["rounds_skipped"] += len(skipped)
+        out["fallback_cost"] += sum(s["cost_source"] != "actual" for s in skipped)
+        out["kept_lost"] += sum(bool(s["row"]["labels"]["kept"]) for s in skipped)
+        saved += sum(s["cost"] for s in skipped)
+        out["stopped_landed"] += landed is True
+        out["stopped_unknown"] += landed is None
+        if stop <= (kept[-1] if kept else len(items) - 1):
+            out["lands_lost"] += landed is True
+            out["at_risk_unknown"] += landed is None
+    return {"t": t, **{k: out[k] for k in ("rounds_skipped", "fallback_cost", "kept_lost", "issues_stopped", "stopped_landed",
+                                         "stopped_unknown", "lands_lost", "at_risk_unknown")},
+            "usd_saved": round(saved, 2), "kept_lost_share": round(out["kept_lost"] / kept_total, 4) if kept_total else None}
+
+
+def format_stop_rule(report):
+    lines = [f"{'split':<8} {'model':<9} {'t':>5} {'skip':>5} {'$saved':>8} {'fallbk':>6} {'keptLost':>8} {'share':>6} "
+             f"{'stopped':>7} {'stopLand':>8} {'landLost':>8} {'riskUnk':>7}"]
+    for entry in report:
+        if entry.get("status") == "insufficient":
+            lines.append(f"{entry['split']:<8} insufficient")
+            continue
+        lines.append(f"{entry['split']:<8} {entry['rounds']} rounds, {entry['issues']} issues, {entry['kept']} kept, "
+                     f"{entry['landed_issues']} landed; kept AUC {entry['kept_auc']}")
+        for row in entry["thresholds"]:
+            lines.append(f"{entry['split']:<8} {entry['model']:<9} {row['t']:>5.2f} {row['rounds_skipped']:>5} "
+                         f"{row['usd_saved']:>8.2f} {row['fallback_cost']:>6} {row['kept_lost']:>8} "
+                         f"{row['kept_lost_share'] if row['kept_lost_share'] is not None else '-':>6} {row['issues_stopped']:>7} "
+                         f"{row['stopped_landed']:>8} {row['lands_lost']:>8} {row['at_risk_unknown']:>7}")
+    return "\n".join(lines)
+
+
 def format_results(results):
     lines = [f"{'label':<7} {'split':<5} {'features':<8} {'model':<9} {'n':>4} {'pos':>5} {'acc':>6} {'bacc':>6} "
              f"{'auc':>6} {'logloss':>7} {'brier':>6}"]
@@ -761,6 +856,11 @@ def add_parser(sub):
     evaluation.add_argument("--cutoff", default=TIME_CUTOFF)
     evaluation.add_argument("--no-boosting", action="store_true")
     evaluation.add_argument("--json", action="store_true", help="print the full report")
+    evaluation.add_argument("--stop-rule", action="store_true",
+                            help="instead: replay 'stop an issue before round r when P(kept) < t' on held-out issues "
+                                 "(rolling and tail unless --split names one)")
+    evaluation.add_argument("--thresholds", type=float, nargs="+", default=list(STOP_THRESHOLDS), metavar="T",
+                            help="stop-rule thresholds (default 0.10 0.15 0.20 0.30)")
     training = commands.choices["train"]
     training.add_argument("--label", choices=LABELS, default="verify")
     training.add_argument("--features", choices=tuple(FEATURE_SETS), default="verify")
@@ -787,6 +887,14 @@ def command(args, control_workspace):
         print(json.dumps({"model": str(out), "n_train": model["n_train"], "top_features": top_features(model)}, indent=2))
         return 0
     splits = ("time", "tail", "rolling") if args.split == "all" else (args.split,)
+    if getattr(args, "stop_rule", False):
+        report = stop_rule(rows, ("rolling", "tail") if args.split == "all" else splits, tuple(args.thresholds),
+                           args.cutoff, args.l2, not args.no_boosting)
+        out = Path(args.out or directory / "stop-rule.json")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(report, indent=2) if args.json else format_stop_rule(report) + f"\nreport: {out}")
+        return 0
     results = evaluate(rows, splits, args.cutoff, args.l2, not args.no_boosting)
     out = Path(args.out or directory / "report.json")
     out.parent.mkdir(parents=True, exist_ok=True)

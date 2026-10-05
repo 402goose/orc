@@ -232,5 +232,39 @@ class SplitAndModelTest(unittest.TestCase):
             self.assertEqual(report["coverage"]["rows"], 64)
 
 
+class StopRuleTest(unittest.TestCase):
+    @staticmethod
+    def scored(group, rounds, landed):
+        return [{"row": {"group": group, "id": f"{group}{i}", "ts": i, "labels": {"kept": kept, "landed": landed}},
+                 "p_stop": p, "cost": 2.0, "cost_source": "actual" if i else "lane"} for i, (p, kept) in enumerate(rounds)]
+
+    def test_stop_accounting_counts_skips_cost_and_lost_lands(self):
+        groups = {"a": self.scored("a", [(0.9, False), (0.05, True), (0.5, False)], True),
+                  "b": self.scored("b", [(0.9, True), (0.05, False)], True),
+                  "c": self.scored("c", [(0.05, True)], None),
+                  "d": self.scored("d", [(0.9, True)], True)}
+        out = outcome.stop_outcome(groups, 0.1, kept_total=4)
+        self.assertEqual({k: out[k] for k in ("rounds_skipped", "kept_lost", "issues_stopped", "stopped_landed",
+                                              "stopped_unknown", "lands_lost", "at_risk_unknown", "fallback_cost")},
+                         {"rounds_skipped": 4, "kept_lost": 2, "issues_stopped": 3, "stopped_landed": 2,
+                          "stopped_unknown": 1, "lands_lost": 1, "at_risk_unknown": 1, "fallback_cost": 1})
+        self.assertEqual((out["usd_saved"], out["kept_lost_share"]), (8.0, 0.5))
+        self.assertEqual(outcome.stop_outcome(groups, 0.01, 4)["rounds_skipped"], 0)
+
+    def test_stop_rule_replays_held_out_issues_per_threshold(self):
+        rows = synthetic_rows(160)
+        for row in rows:
+            row["id"] = f"{row['group']}:{row['ts']}"
+        report = outcome.stop_rule(rows, ("rolling", "tail"), (0.1, 0.5), boosting=False)
+        self.assertEqual([e["split"] for e in report], ["rolling", "tail"])
+        for entry in report:
+            self.assertEqual(entry["model"], "logistic")
+            self.assertEqual([t["t"] for t in entry["thresholds"]], [0.1, 0.5])
+            low, high = entry["thresholds"]
+            self.assertLessEqual(low["rounds_skipped"], high["rounds_skipped"])
+            self.assertLessEqual(high["rounds_skipped"], entry["rounds"])
+        self.assertIn("landLost", outcome.format_stop_rule(report))
+
+
 if __name__ == "__main__":
     unittest.main()

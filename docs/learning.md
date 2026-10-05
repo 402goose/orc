@@ -317,6 +317,14 @@ issues ordered by first round, for labels too sparse for one cut. For routing fe
 self-normalized IPS over rows with logged propensities, the outcome rate of
 picking the candidate with the highest predicted probability per unit cost.
 
+`evaluate --stop-rule [--thresholds T ...]` replays a round-stop rule on
+held-out issues (rolling and tail splits): before round r, stop the issue when
+the kept·routing model's P(kept) < t. Per threshold it reports rounds skipped,
+dollars saved (recorded cost, else the lane's mean training cost), kept rounds
+lost, issues stopped, and lands lost: landed issues stopped at or before their
+last kept round, with the same count for issues whose landed label is unknown.
+The report goes to `.fusion/outcome-model/stop-rule.json`.
+
 ## Gym
 
 `fusion gym` replays merged fix PRs as benchmark tasks: `gym extract` builds
