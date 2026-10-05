@@ -2701,6 +2701,9 @@ def dispatch(
         failure = f"timeout after {effective_timeout} seconds"
         status = "blocked"
         exit_code = 124
+        # The stream up to the timeout still carries the harness version, denials and quota.
+        captured = exc.output if exc.output is not None else exc.stdout
+        worker_stdout = captured.decode(errors="replace") if isinstance(captured, bytes) else captured or ""
     except OSError as exc:
         summary = "could not start worker"
         failure = str(exc)
