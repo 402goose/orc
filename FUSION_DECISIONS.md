@@ -418,6 +418,7 @@ settings):
       "max_class_weight": 4.0
     },
     "verdict_labels": true,
+    "score_verdicts": false,
     "automatic_labels": true,
     "split": "time",
     "risk": {"alpha": 0.05, "delta": 0.1, "min_examples": 30, "min_groups": 20}
@@ -534,6 +535,16 @@ Laya does not run, so `fusion outcome` stays fast and works without a
 checkpoint. An `unscored` decision has no prediction and can never drive an
 automatic action. Calibration skips it and reports it under
 `unscored_examples`; score it with `evaluate` first.
+
+With `"score_verdicts": true`, on a host that runs Laya, that new input is
+scored in shadow before the label attaches. The input never carries the
+verdict, so the prediction can be compared with it (`fusion learn status`
+reports the agreement). The decision is `ok` with a prediction, and it still
+can never drive an automatic action, since nothing waits on it. When the
+input is truncated or the runtime fails, the decision is recorded `unscored`
+as above, with the failure in `shadow_error`. The verdict waits for one
+inference (a cold runtime start included), so leave this off where
+`fusion outcome` must stay fast or no runtime is installed.
 
 Each label is `verified` with `source: "lead_verdict"`, `reviewers:
 [{"agent": "lead", "run_id": ..., "accepted": ...}]` and evidence holding the

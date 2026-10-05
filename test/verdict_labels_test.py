@@ -77,6 +77,37 @@ class VerdictLabelsTest(unittest.TestCase):
         self.assertIn(str(core.RunStore(self.workspace).runs / run_id / "result.json"), label["evidence"])
         self.assertFalse(DecisionEngine(self.workspace, {"decisions": {"mode": "active", "auto_actions": ["acceptance"]}}).allowed(decision, "plausible"))
 
+    def test_score_verdicts_scores_the_input_in_shadow_before_the_label_attaches(self):
+        self.write_config({"decisions": {"mode": "shadow", "score_verdicts": True}})
+        run_id = self.run_dir(parent_task_id="workflow-1")
+        with patch.object(fusion_decisions, "runtime_for", lambda options: Backend({"plausible": "true"})):
+            payload = self.verdict(run_id, False, "Tests cover only the happy path; empty input crashes")
+        self.assertEqual(payload["label"]["status"], "labeled")
+        [decision] = self.events("decision")
+        self.assertEqual((decision["status"], decision["model_identity"], decision["source"]), ("ok", "fixture-model", "lead_verdict"))
+        self.assertEqual(decision["recommendations"]["plausible"]["value"], "true")
+        self.assertNotIn("crashes", decision["state"])
+        self.assertFalse(DecisionEngine(self.workspace, {"decisions": {"mode": "active", "auto_actions": ["acceptance"]}}).allowed(decision, "plausible"))
+        agreement = learning_summary(self.workspace, {"decisions": {"mode": "shadow"}})["agreement"]
+        self.assertEqual((agreement["compared"], agreement["matched"]), (1, 0))
+
+    def test_a_failed_shadow_score_still_records_the_input_and_the_label(self):
+        self.write_config({"decisions": {"mode": "shadow", "score_verdicts": True}})
+        run_id = self.run_dir()
+
+        def broken(options):
+            raise RuntimeError("Laya runtime exited; run fusion decisions setup")
+        with patch.object(fusion_decisions, "runtime_for", broken):
+            payload = self.verdict(run_id, True)
+        self.assertEqual(payload["label"]["status"], "labeled")
+        [decision] = self.events("decision")
+        self.assertEqual((decision["status"], decision["prediction"]), ("unscored", {}))
+        self.assertIn("runtime exited", decision["shadow_error"])
+
+    def test_score_verdicts_must_be_a_boolean(self):
+        with self.assertRaisesRegex(ValueError, "score_verdicts"):
+            fusion_decisions.config_for({"decisions": {"score_verdicts": "yes"}})
+
     def test_rejection_answers_only_plausible_and_a_later_verdict_supersedes_it(self):
         run_id = self.run_dir()
         rejected = self.verdict(run_id, False, "Tests pass but the export drops quoted commas")
