@@ -268,6 +268,18 @@ class ControlRoomTest(unittest.TestCase):
         self.assertIn("--model-path", argv)
         self.assertEqual(argv[argv.index("--model-path") + 1], str(checkpoint.resolve()))
 
+    def export_argv(self, body):
+        with patch("fusion_ui.subprocess.Popen") as spawn:
+            spawn.return_value.poll.return_value = None
+            job = self.app.launch(self.workspace, {"action": "export", **body})
+        return read_json(self.workspace / ".fusion/ui/jobs" / job["id"] / "request.json")["argv"]
+
+    def test_a_learning_round_export_reads_every_repo(self):
+        self.assertIn("--local-training", self.export_argv({"learning_round": "round-1"}))
+
+    def test_a_manual_export_keeps_the_repo_filter(self):
+        self.assertNotIn("--local-training", self.export_argv({}))
+
     def test_launch_still_refuses_a_checkpoint_nothing_declares(self):
         stranger = self.root / "somewhere-else"
         stranger.mkdir()

@@ -1,6 +1,7 @@
 """Personal repos never leave the host: dispatch records the source repo, and
-training exports, curation and gym priors drop excluded and unknown repos
-unless explicitly included. Remote telemetry never carries the repo."""
+exports and gym priors drop excluded and unknown repos unless explicitly
+included. A training round on the host reads every repo. Remote telemetry
+never carries the repo."""
 import contextlib
 import io
 import json
@@ -156,11 +157,28 @@ class ExportTest(Isolated):
         payload, ids = self.export("all.jsonl", "--include-repo", "acme/private-repo", "--include-unknown")
         self.assertEqual((ids, payload["excluded_repos"]), (["orc", "project", "unknown"], {}))
 
-    def test_curation_withholds_excluded_rows_whatever_the_export_allowed(self):
-        raw = self.root / "raw.jsonl"
-        self.store.export(raw, config=EXPORT_CONFIG, include_repos=["acme/private-repo"], include_unknown=True)
-        withheld = loop.repo_exclusions(self.workspace, EXPORT_CONFIG, [json.loads(line) for line in raw.read_text().splitlines()])
-        self.assertEqual(withheld, {"project": "excluded repo acme/private-repo", "unknown": "unknown repo"})
+    def test_a_local_training_export_keeps_every_repo_and_stays_under_fusion(self):
+        payload, ids = self.export(".fusion/rounds/raw.jsonl", "--local-training")
+        self.assertEqual((ids, payload["excluded_repos"]), (["orc", "project", "unknown"], {}))
+        payload, ids = self.export("plain.jsonl")
+        self.assertEqual(ids, ["orc"])
+        with self.assertRaisesRegex(ValueError, ".fusion directory"):
+            self.store.export(self.root / "outside.jsonl", config=EXPORT_CONFIG, local_training=True)
+        with self.assertRaisesRegex(ValueError, ".fusion directory"):
+            self.store.export(self.workspace / ".fusion/../escape.jsonl", config=EXPORT_CONFIG, local_training=True)
+
+    def test_curation_keeps_excluded_and_unknown_rows_because_training_stays_on_host(self):
+        raw = self.workspace / ".fusion/rounds/raw.jsonl"
+        self.store.export(raw, config=EXPORT_CONFIG, local_training=True)
+        rows = [json.loads(line) for line in raw.read_text().splitlines()]
+        for index, row in enumerate(rows):
+            row["split"] = "validation" if index % 2 else "train"
+            row["group"] = row["id"]
+        widened = rows + [{**row, "id": row["id"] + "-b", "group": row["id"] + "-b", "state": row["state"] + " again"} for row in rows]
+        raw.write_text("".join(json.dumps(row) + "\n" for row in widened))
+        result = loop.curate(raw, self.workspace / ".fusion/rounds/dataset.jsonl")
+        self.assertEqual(result["retained_examples"], 6)
+        self.assertNotIn("excluded_repos", result)
 
     def test_empty_exclude_list_exports_named_repos_and_still_drops_unknown(self):
         config = json.loads((self.workspace / ".fusion.json").read_text())

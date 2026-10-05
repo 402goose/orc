@@ -149,8 +149,9 @@ The configured checkpoint is shown separately from candidate models.
 ## Quality and automatic training
 
 Approval feeds automatic training when enabled; manual export, training, and evaluation
-remain available. Exports and automatic training drop rows from repos in
-`export.exclude_repos` and rows whose source repo is unknown; see
+remain available. Exports drop rows from repos in `export.exclude_repos` and
+rows whose source repo is unknown; automatic training rounds stay on the host
+and read every repo; see
 [exports and excluded repos](configuration.md#exports-and-excluded-repos). Choose a checkpoint in project settings after evaluation. Candidate cards
 show held-out accuracy and the shuffled-state control; improvement is reported
 only when the source model was evaluated on the same held-out benchmark. Historical

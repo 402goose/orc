@@ -937,7 +937,7 @@ export reviewed labels, split by workflow group
 ```text
 usage: fusion decisions export [-h] [--split {time,group-hash}]
                                [--exclude-source SOURCE] [--include-repo SLUG]
-                               [--include-unknown]
+                               [--include-unknown] [--local-training]
                                output
 
 positional arguments:
@@ -956,6 +956,9 @@ options:
                           export.exclude_repos lists it; repeatable
   --include-unknown       export rows whose source repo cannot be determined (dropped by
                           default)
+  --local-training        for a training round on this host: export.exclude_repos does
+                          not apply; the output must stay under this workspace's .fusion
+                          directory
 ```
 
 ## fusion decisions routing-report

@@ -748,6 +748,8 @@ class ControlRoom:
             argv += [str(destination)]
             if action == "evaluate":
                 argv += ["--control"]
+            if action == "export" and body.get("learning_round"):
+                argv += ["--local-training"]
             if action in {"train", "evaluate"} and body.get("model_path"):
                 argv += ["--model-path", str(model_path_for(workspace, body["model_path"]))]
         else:

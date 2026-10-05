@@ -48,6 +48,8 @@ def add_parser(sub):
                         help="export rows from this owner/name even though export.exclude_repos lists it; repeatable")
     export.add_argument("--include-unknown", action="store_true",
                         help="export rows whose source repo cannot be determined (dropped by default)")
+    export.add_argument("--local-training", action="store_true",
+                        help="for a training round on this host: export.exclude_repos does not apply; the output must stay under this workspace's .fusion directory")
     routing = commands.add_parser("routing-report", help="per-lane acceptance from logged routing propensities (IPS, ESS); read-only")
     routing.add_argument("--tasks", action="store_true",
                          help="list each routed run instead: chosen model, propensity, posterior, cost, outcome and labels")
@@ -192,7 +194,8 @@ def run(args, workspace, config):
     elif command == "export":
         payload = store.export(args.output, getattr(args, "exclude_source", []),
                                getattr(args, "split", None) or options["split"], config,
-                               getattr(args, "include_repo", []), getattr(args, "include_unknown", False))
+                               getattr(args, "include_repo", []), getattr(args, "include_unknown", False),
+                               getattr(args, "local_training", False))
     else:
         payload = fit_calibration(args.dataset, args.output, args.threshold, options["risk"])
     print(json.dumps(payload, indent=2, ensure_ascii=False))
