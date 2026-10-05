@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0,str(Path(__file__).resolve().parent))
 import fusion_training_loop as loop
 from fusion_decisions import DecisionStore, digest
 from fusion_laya import dataset_rows
@@ -31,9 +32,9 @@ class TrainingLoopTest(unittest.TestCase):
     def seed(self,count,start=0):
         q={'plausible':{'type':'noul','instructions':'Does the work satisfy the task?'}}
         for n in range(start,start+count):
-            key='sample-'+str(n)
+            key='sample-'+str(n);save(self.w/'.fusion/runs'/key/'task.json',{'run_id':key,'repo':'acme/widgets'})
             self.store.append('decision',id=key,kind='acceptance',mode='shadow',status='ok',truncated=False,
-                              state='Outcome '+str(n),questions=q,schema_hash=digest(q),prediction={},context={'group':key})
+                              state='Outcome '+str(n),questions=q,schema_hash=digest(q),prediction={},context={'group':key,'task_id':key})
             self.store.label(key,{'plausible':'true' if n%2 else 'false'},'Verified outcome',replace=True)
 
     def worker(self,workspace,body,**kwargs):

@@ -163,7 +163,9 @@ def import_outcome(exit_code, stdout, task=None):
 
 
 def result_row(task, lane_name, lane_spec, verdict, outcome, key, duration_ms):
+    from fusion_gym import task_source_repo
     return {"schema": "fusion.gym.result.v1", "event": "finished", "key": key, "task": task["task_id"],
+            "repo": task_source_repo(task),
             "kind": KIND, "mode": "hidden", "lane": lane_name, "lane_spec": lane_spec,
             "stratum": task["stratum"], "completed": True, "verdict": verdict,
             "fail_reason": outcome["fail_reason"], "bytes_exact": outcome["bytes_exact"],
@@ -460,6 +462,7 @@ def run_lane(task_path, task, source, name, lane, gym, config, runner, workflow_
         cost = float(outcome.get("spent_usd") or 0)
         tokens_in, tokens_out = _tokens(result)
         row = {"schema": "fusion.gym.result.v1", "event": "finished", "key": key, "task": task["task_id"],
+               "repo": task.get("repo") or core.repo_slug(repo_path),
                "kind": KIND, "mode": "hidden", "lane": name, "lane_spec": lane, "stratum": task["stratum"],
                "workflow_id": outcome.get("workflow_id") or workflow_id, "status": status,
                "start": source[0], "editable": editable,

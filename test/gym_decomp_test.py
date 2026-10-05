@@ -152,10 +152,11 @@ class DecompCliTest(unittest.TestCase):
         return code, json.loads(self.argv.read_text())
 
     def test_a_graded_candidate_becomes_a_gym_row(self):
-        code, argv = self.grade(task(), 1, "p2p:u0", extra=("--cost-usd", "0.25"))
+        code, argv = self.grade(task(repo="example/decomp"), 1, "p2p:u0", extra=("--cost-usd", "0.25"))
         self.assertEqual(code, 1)
         [row] = gym.read_results(self.gym)
         self.assertEqual((row["kind"], row["verdict"], row["stratum"], row["fail_reason"]), ("decomp", "unmatched", "S1", "p2p:u0"))
+        self.assertEqual(row["repo"], "example/decomp")
         self.assertEqual(row["key"], "t-0001:claude-opus-high:hidden:decomp")
         self.assertEqual((row["outcome"]["lane"], row["cost_usd"]), ("claude-opus-high", 0.25))
         self.assertEqual(argv[argv.index("--task") + 1], str(self.root / "tasks" / "t-0001" / "task.json"))
@@ -174,12 +175,12 @@ class DecompCliTest(unittest.TestCase):
         self.assertEqual(gym.read_results(self.gym), [])
 
     def test_priors_are_per_stratum_and_holds_never_count(self):
-        self.grade(task("t-1", "S1"), 0)
-        self.grade(task("t-2", "S1"), 1, "f2p")
-        self.grade(task("t-3", "S2"), 0)
-        self.grade(task("t-4", "S2"), 3, "timeout")
-        self.grade(task("t-1", "S1"), 0, lane="claude-sonnet-high")
-        self.grade(task("t-1", "S1"), 3, "infra", lane="claude-sonnet-high")
+        self.grade(task("t-1", "S1", repo="example/decomp"), 0)
+        self.grade(task("t-2", "S1", repo="example/decomp"), 1, "f2p")
+        self.grade(task("t-3", "S2", repo="example/decomp"), 0)
+        self.grade(task("t-4", "S2", repo="example/decomp"), 3, "timeout")
+        self.grade(task("t-1", "S1", repo="example/decomp"), 0, lane="claude-sonnet-high")
+        self.grade(task("t-1", "S1", repo="example/decomp"), 3, "infra", lane="claude-sonnet-high")
         value = gym.lane_priors(self.gym, now=0)
         opus = value["priors"]["claude:claude-opus-5-5:high"]
         self.assertEqual({k: (v["attempts"], v["successes"]) for k, v in opus.items() if k.startswith("decomp:")},

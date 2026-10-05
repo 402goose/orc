@@ -44,6 +44,10 @@ def add_parser(sub):
                         help="hold out the newest workflow groups (time) or a hash of the group name; default decisions.split")
     export.add_argument("--exclude-source", action="append", default=[], metavar="SOURCE",
                         help="leave out answers approved by this source, for example lead_verdict, structural_gate, gym_grade or user_explicit; repeatable")
+    export.add_argument("--include-repo", action="append", default=[], metavar="SLUG",
+                        help="export rows from this owner/name even though export.exclude_repos lists it; repeatable")
+    export.add_argument("--include-unknown", action="store_true",
+                        help="export rows whose source repo cannot be determined (dropped by default)")
     routing = commands.add_parser("routing-report", help="per-lane acceptance from logged routing propensities (IPS, ESS); read-only")
     routing.add_argument("--tasks", action="store_true",
                          help="list each routed run instead: chosen model, propensity, posterior, cost, outcome and labels")
@@ -187,7 +191,8 @@ def run(args, workspace, config):
                                  by=getattr(args, "by", "lane"))
     elif command == "export":
         payload = store.export(args.output, getattr(args, "exclude_source", []),
-                               getattr(args, "split", None) or options["split"])
+                               getattr(args, "split", None) or options["split"], config,
+                               getattr(args, "include_repo", []), getattr(args, "include_unknown", False))
     else:
         payload = fit_calibration(args.dataset, args.output, args.threshold, options["risk"])
     print(json.dumps(payload, indent=2, ensure_ascii=False))

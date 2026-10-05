@@ -60,6 +60,7 @@ DEFAULTS: dict[str, Any] = {
     "timeout_seconds": 3600,
     "max_result_chars": 12000,
     "quota": {"pace_margin": 0.15, "soft": 0.85, "hard": 0.97},
+    "export": {"exclude_repos": []},
     "telemetry": {
         "enabled": True,
         "include_content": False,
@@ -1241,6 +1242,7 @@ class RunStore:
             "model": metadata.get("model"),
             "reasoning_effort": metadata.get("reasoning_effort"),
             "write": task.get("write", False),
+            **({"repo": task["repo"]} if task.get("repo") else {}),
             "execution_choice": result.get("execution_choice"),
             "usage": result.get("usage") or {},
             **({"quota": result["quota"]} if result.get("quota") is not None else {}),
@@ -2459,6 +2461,60 @@ def validate_issue(issue: Any) -> str | None:
     return issue
 
 
+_REMOTE_SLUG = re.compile(r"^(?:(?:[a-z][a-z0-9+.-]*://(?:[^@/]+@)?[^/:@]+(?::\d+)?/)|(?:[^@/:]+@)?[^/:@]+:)"
+                          r"(?P<path>[^:/][^:]*?)(?:\.git)?/*$", re.I)
+
+
+def remote_slug(url: str) -> str | None:
+    """`owner/name`, lowercased, from an ssh, scp-style or https remote URL; None for a local path or anything else."""
+    match = _REMOTE_SLUG.match(url.strip())
+    parts = [part for part in match.group("path").split("/") if part] if match else []
+    return "/".join(parts[-2:]).lower() if len(parts) >= 2 else None
+
+
+def repo_slug(path: str | Path | None) -> str | None:
+    """The `owner/name` of a checkout's origin remote, or None without a path, git or remote."""
+    if not path or not Path(path).is_dir():
+        return None
+    try:
+        url = subprocess.run(["git", "-C", str(path), "config", "--get", "remote.origin.url"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return remote_slug(url) if url.strip() else None
+
+
+def excluded_repo(config: dict[str, Any] | None, slug: str | None, include=(), include_unknown: bool = False) -> str | None:
+    """Why a record from this repo may not leave the host, or None when it may.
+
+    A repo in export.exclude_repos stays home unless `include` names it; a
+    record whose repo is unknown stays home unless include_unknown. Slugs
+    compare case-insensitively; an absent export section keeps the defaults.
+    """
+    if not slug:
+        return None if include_unknown else "unknown repo"
+    slug = slug.lower()
+    excluded = ((config or {}).get("export") or {}).get("exclude_repos", DEFAULTS["export"]["exclude_repos"])
+    if slug in {str(item).lower() for item in include} or slug not in {str(item).lower() for item in excluded or ()}:
+        return None
+    return f"excluded repo {slug}"
+
+
+def run_repo(store_or_workspace: "RunStore | str | Path", run_id: str | None) -> str | None:
+    """A run's source repo: task.json `repo`, else the slug of its workspace if that still exists, else None."""
+    if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+        return None
+    store = store_or_workspace if isinstance(store_or_workspace, RunStore) else RunStore(Path(store_or_workspace))
+    directory = run_directory(store.workspace, run_id) or store.runs / run_id
+    try:
+        task = json.loads((directory / "task.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(task, dict):
+        return None
+    return str(task["repo"]).lower() if task.get("repo") else repo_slug(task.get("workspace"))
+
+
 def record_outcome(workspace: Path, run_id: str, accepted: bool | None = None, reason: str = "", *,
                    stage: str | None = None, withdraw: bool = False, unmeasured: bool = False,
                    issue: str | None = None, rejection_class: str | None = None,
@@ -2562,6 +2618,8 @@ def dispatch(
     if capped:
         progress.emit(task.get("progress_label", task.get("role", "worker")), capped["summary"])
         return capped
+    if slug := repo_slug(task["workspace"]):
+        task["repo"] = slug
     if store.control_workspace is not None:
         # A shared store must never resume another checkout's conversation.
         suffix = ":workspace=" + hashlib.sha256(task["workspace"].encode()).hexdigest()
@@ -2626,6 +2684,7 @@ def dispatch(
             "schema": SCHEMA,
             "run_id": task["run_id"],
             "workspace": task["workspace"],
+            **({"repo": task["repo"]} if task.get("repo") else {}),
             "status": "error",
             "agent": task["agent"],
             "route": task.get("route"),
@@ -2790,6 +2849,7 @@ def dispatch(
         "schema": SCHEMA,
         "run_id": task["run_id"],
         "workspace": task["workspace"],
+        **({"repo": task["repo"]} if task.get("repo") else {}),
         "status": status,
         "execution_mode": task_execution_mode(config, task),
         "agent": task["agent"],
@@ -3828,7 +3888,7 @@ def _main(args, parser) -> int:
                  "duration_ms", "usage"]
                 if enabled else []
             ),
-            "fields_never_sent": ["changed", "tests", "blockers", "artifacts", "workspace path", "prompt/task text", "model output"],
+            "fields_never_sent": ["changed", "tests", "blockers", "artifacts", "workspace path", "source repo", "prompt/task text", "model output"],
         }
         print(json_text(payload))
         return 0

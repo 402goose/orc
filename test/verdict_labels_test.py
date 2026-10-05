@@ -123,7 +123,7 @@ class VerdictLabelsTest(unittest.TestCase):
 
     def test_a_truffle_scout_sized_verdict_labels_a_marked_summary_excerpt(self):
         prompt = "You are Truffle pig, scouting tractable GitHub issues. " + "Inspect source and tests. " * 80
-        context = "Truffle scout: shortlist at most 3 independent, tractable open issues in hathbanger/orc with checked source quotes. Read-only."
+        context = "Truffle scout: shortlist at most 3 independent, tractable open issues in acme/public-repo with checked source quotes. Read-only."
         summary = "Shortlisted #46 and #51 with checked quotes; skipped 9 issues with reasons.\n" + "- #%d skipped: needs a product decision.\n" * 200
         summary = summary % tuple(range(200))
         self.assertGreater(len(prompt), 2000)
@@ -142,7 +142,7 @@ class VerdictLabelsTest(unittest.TestCase):
 
     def test_a_workflow_stage_verdict_matches_the_gate_input_and_is_labeled(self):
         from fusion_policy import accept_node
-        headline = "Fixes https://github.com/hathbanger/orc/issues/46 — Woodland can show the previous survey"
+        headline = "Fixes https://github.com/acme/public-repo/issues/46 — Woodland can show the previous survey"
         request = headline + "\nSelected from Truffle pig hunt.\n" + json.dumps({"evidence": ["quote " * 40] * 30})
         node_context = {"request": request, "workflow_kind": "debug", "stage": "implement"}
         node = {"id": "implement", "role": "implementation", "task": "Fix the survey id race.",
@@ -263,7 +263,7 @@ class VerdictLabelsTest(unittest.TestCase):
         self.assertEqual((summary["reviewed_decisions"], summary["labeled_questions"]), (6, 9))
         self.assertEqual(len(tokens(rows)), 9)
         self.assertEqual(sum(readiness(rows).values()), 6)
-        exported = self.store.export(self.workspace / "all.jsonl")
+        exported = self.store.export(self.workspace / "all.jsonl", include_unknown=True)
         self.assertEqual((exported["examples"], exported["data_quality"]["approval_sources"]), (6, {"lead_verdict": 9}))
         row = json.loads((self.workspace / "all.jsonl").read_text().splitlines()[0])
         self.assertEqual((row["prediction"], row["model_identity"]), ({}, None))
@@ -282,7 +282,7 @@ class VerdictLabelsTest(unittest.TestCase):
                                ACCEPTANCE_QUESTIONS, {"task_id": "w", "group": "w"})
         self.store.label(scored["id"], {"plausible": "true"}, "Human verified the diff")
         self.verdict(self.run_dir(), True)
-        self.store.export(self.workspace / "mixed.jsonl")
+        self.store.export(self.workspace / "mixed.jsonl", include_unknown=True)
         report = fit_calibration(self.workspace / "mixed.jsonl", self.workspace / "calibration.json")
         self.assertEqual((report["model_identity"], report["unscored_examples"]), ("fixture-model", 1))
 
