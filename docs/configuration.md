@@ -240,8 +240,9 @@ Every dispatch records the `owner/name` of the workspace's `origin` remote as
 `repo` in the run's `task.json`, its result and the local trace span. Remote
 telemetry never sends it (`fusion telemetry status` lists `fields_sent`).
 
-Repos in `export.exclude_repos` never leave the host through a training or
-cross-host export. The default:
+Repos in `export.exclude_repos` never leave the host through an export. The
+filter sits at the host boundary: training rounds on the host read every repo.
+The default:
 
 ```json
 {"export": {"exclude_repos": []}}
@@ -257,17 +258,21 @@ Slugs compare case-insensitively. Exports fail closed: a row whose source repo
 cannot be determined (no recorded `repo` and no surviving workspace with an
 `origin` remote) is dropped too. The filter applies to:
 
-- `fusion decisions export`, which the control room's export job and the
-  automatic training loop run. A row's repo comes from its run
-  (`context.task_id`). The output's `excluded_repos` counts dropped rows by
-  reason.
-- Automatic training curation, which withholds such rows again whatever the
-  export allowed, and counts them in the round's `curation.excluded_repos`.
-- `fusion gym priors`. `gym extract` records `repo` in each task and in
-  `index.json`, and `gym run` copies it onto each result row. Rows from an
-  excluded or unknown repo are counted under `excluded` by reason; the priors
-  file lists the source `repos` it counted. Rows written before repos were
-  recorded are unknown.
+- `fusion decisions export`, including the control room's manual export job.
+  A row's repo comes from its run (`context.task_id`). The output's
+  `excluded_repos` counts dropped rows by reason.
+- `fusion gym priors`. The priors file is copied between hosts, so it counts
+  as an export.
+
+It does not apply to an automatic training round. The round's export job runs
+`fusion decisions export --local-training`, which reads every repo and refuses
+to write outside the workspace's `.fusion` directory, and curation keeps every
+row. The round's dataset, candidate and calibration stay on the host.
+
+For gym priors, `gym extract` records `repo` in each task and in `index.json`,
+and `gym run` copies it onto each result row. Rows from an excluded or unknown
+repo are counted under `excluded` by reason; the priors file lists the source
+`repos` it counted. Rows written before repos were recorded are unknown.
 
 To include one on purpose, pass `--include-repo OWNER/NAME` (repeatable) or
 `--include-unknown` to `fusion decisions export` or `fusion gym priors`. Set
