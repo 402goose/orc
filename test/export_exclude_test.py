@@ -158,7 +158,7 @@ class ExportTest(Isolated):
         self.assertEqual((ids, payload["excluded_repos"]), (["orc", "project", "unknown"], {}))
 
     def test_a_local_training_export_keeps_every_repo_and_stays_under_fusion(self):
-        payload, ids = self.export(".fusion/rounds/raw.jsonl", "--local-training")
+        payload, ids = self.export("control/.fusion/raw.jsonl", "--local-training")
         self.assertEqual((ids, payload["excluded_repos"]), (["orc", "project", "unknown"], {}))
         payload, ids = self.export("plain.jsonl")
         self.assertEqual(ids, ["orc"])
