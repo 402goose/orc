@@ -339,7 +339,10 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None, minim
                     if span.get("run_id") not in untrusted and (span.get("run_id") in outcomes or
                         (span.get("status") == "error" and span.get("failure_class") not in {"quota", "auth", "permission_denied"}))]
         # Read-only and writing work differ: this task's class counts when
-        # it has any evidence, else every class pooled.
+        # it has any evidence, else every class pooled. A writer never counts
+        # a read-only run, so its pool holds only writes and unknown classes.
+        if work == "write":
+            evidence = [(span, ok) for span, ok in evidence if span.get("write") is not False]
         same = [(span, ok) for span, ok in evidence if "write" in span and bool(span["write"]) == (work == "write")]
         role_evidence = [(span, ok) for span, ok in evidence if role and normalize_role(span.get("role")) == role]
         evidence_scope = "role" if role and len(role_evidence) >= minimum else "work"

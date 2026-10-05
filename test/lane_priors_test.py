@@ -248,6 +248,19 @@ class RoutingTest(Isolated):
             pooled = {c["key"]: c for c in route_candidates(self.config, self.task(), runs)}["codex"]
         self.assertEqual((pooled["checked_runs"], pooled["local_class"]), (3, "pooled"))
 
+    def test_a_writer_never_counts_read_only_runs_in_its_class_or_its_role(self):
+        self.config["decisions"]["priors"] = False
+        self.config["decisions"]["rank_by_outcomes"] = 1
+        spans = [{"agent": "codex", "run_id": "smoke", "status": "success", "write": False, "role": "implementation"}]
+        store = DecisionStore(self.workspace)
+        store.append("outcome", task_id="smoke", accepted=True)
+        runs = core.RunStore(self.workspace)
+        with patch.object(runs, "traces", return_value=spans):
+            write = {c["key"]: c for c in route_candidates(self.config, self.task(write=True), runs)}["codex"]
+            read = {c["key"]: c for c in route_candidates(self.config, self.task(), runs)}["codex"]
+        self.assertEqual((write["checked_runs"], write["local_class"]), (0, None))
+        self.assertEqual((read["checked_runs"], read["acceptance_rate"]), (1, 1.0))
+
     def test_role_evidence_ranks_independently_and_falls_back_below_minimum(self):
         self.config["decisions"]["priors"] = False
         self.config["decisions"]["rank_by_outcomes"] = 2
