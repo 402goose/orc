@@ -27,7 +27,7 @@ DEFAULTS = {
     "mode": "shadow", "python": "", "device": "cpu", "model_path": "",
     "timeout_seconds": 120, "auto_actions": [], "threshold": 0.90,
     "calibration_file": "", "max_state_chars": 2200, "verdict_labels": True,
-    "automatic_labels": True, "split": "time",
+    "score_verdicts": False, "automatic_labels": True, "split": "time",
     "risk": {"alpha": 0.05, "delta": 0.1, "min_examples": 30, "min_groups": 20},
 }
 SPLITS = {"time", "group-hash"}
@@ -377,6 +377,8 @@ def config_for(config):
         raise ValueError("decisions.threshold must be in (0, 1]")
     if not isinstance(options["verdict_labels"], bool):
         raise ValueError("decisions.verdict_labels must be true or false")
+    if not isinstance(options["score_verdicts"], bool):
+        raise ValueError("decisions.score_verdicts must be true or false")
     if not isinstance(options["automatic_labels"], bool):
         raise ValueError("decisions.automatic_labels must be true or false")
     if options["split"] not in SPLITS:
@@ -496,6 +498,43 @@ def runtime_python(options):
     configured = options.get("python") or os.environ.get("FUSION_LAYA_PYTHON")
     managed = Path.home() / ".local/share/orc/laya/bin/python"
     return str(configured or (managed if managed.is_file() else sys.executable))
+
+
+INFERENCE_ERRORS = (ImportError, OSError, RuntimeError, ValueError, KeyError, TypeError, ArithmeticError, AttributeError)
+SCORE_FIELDS = ("prediction", "recommendations", "model_identity", "routing", "truncated")
+SHADOW_SCORE_BATCH = 25
+
+
+def merge_shadow_scores(events):
+    """Events with each `shadow_score` folded into its `unscored` decision, which
+    then reads as `ok` with that prediction. The latest score wins."""
+    scores = {event.get("id"): event for event in events if event.get("event") == "shadow_score"}
+    if not scores:
+        return events
+    return [{**event, "status": "ok", **{key: scores[event["id"]][key] for key in SCORE_FIELDS if key in scores[event["id"]]},
+             "shadow_scored_ms": scores[event["id"]].get("time_ms")}
+            if event.get("event") == "decision" and event.get("status") == "unscored" and event.get("id") in scores else event
+            for event in events]
+
+
+def score_unscored(workspace, config, limit=SHADOW_SCORE_BATCH):
+    """With decisions.score_verdicts, score up to `limit` unscored acceptance
+    inputs in shadow, oldest first, each appended as a `shadow_score` event.
+    Stops at the first runtime failure; nothing is appended for it."""
+    engine = DecisionEngine(workspace, config)
+    if not engine.options["score_verdicts"] or engine.options["mode"] == "off":
+        return {"status": "off"}
+    pending = [record for record in engine.store.records()
+               if record.get("kind") == "acceptance" and record.get("status") == "unscored" and labelable_record(record)]
+    scored = 0
+    for record in pending[:limit]:
+        try:
+            payload = engine.shadow_score(record)
+        except INFERENCE_ERRORS as exc:
+            return {"status": "error", "scored": scored, "remaining": len(pending) - scored, "error": str(exc)}
+        engine.store.append("shadow_score", **payload)
+        scored += 1
+    return {"status": "ok", "scored": scored, "remaining": len(pending) - scored}
 
 
 class LayaRuntime:
@@ -668,8 +707,11 @@ class DecisionStore:
             finally:
                 fcntl.flock(stream, fcntl.LOCK_UN)
 
+    def events(self):
+        return merge_shadow_scores(read_jsonl(self.path))
+
     def records(self):
-        return [record for record in read_jsonl(self.path) if record.get("event") == "decision"]
+        return [record for record in self.events() if record.get("event") == "decision"]
 
     def get(self, decision_id):
         for record in reversed(self.records()):
@@ -727,7 +769,7 @@ class DecisionStore:
         workspace = self.root.parent.parent
         if local_training and not Path(destination).resolve().is_relative_to((workspace / ".fusion").resolve()):
             raise ValueError("A local training export stays under the workspace's .fusion directory")
-        events = read_jsonl(self.path)
+        events = self.events()
         labels, exclusions = reviewed_labels(events)
         provenance = label_provenance(events)
         excluded_sources = set(exclude_sources)
@@ -886,6 +928,16 @@ class DecisionEngine:
         record["truncated"] = len(text) > cap or bool(isinstance(state, dict) and state.get("source_truncated"))
         record["source_truncated"] = bool(isinstance(state, dict) and state.get("source_truncated"))
 
+    def shadow_score(self, record):
+        """Score a recorded `unscored` input in shadow: the shadow_score payload
+        (prediction, recommendations, model identity) for merge_shadow_scores to
+        fold into the record. Raises INFERENCE_ERRORS when the runtime fails."""
+        scored = {**record, "prediction": {}, "recommendations": {}}
+        started = time.monotonic()
+        self.infer(scored, record["kind"], record["questions"])
+        return {"id": record["id"], **{key: scored[key] for key in SCORE_FIELDS if key in scored},
+                "duration_ms": round((time.monotonic() - started) * 1000)}
+
     def record_unscored(self, kind, state, questions, context=None, encoded=None, **extra):
         """Record a decision input without inference, so a verified answer can be
         attached to it. Same encoding and truncation as decide(), or an already
@@ -901,6 +953,30 @@ class DecisionEngine:
         self.store.append("decision", **record)
         return record
 
+    def infer(self, record, kind, questions):
+        """Run the model on an encoded record: fills prediction, recommendations
+        and model_identity, or raises."""
+        for key, question in questions.items():
+            if question.get("type") == "choice" and len(question.get("criteria") or {}) < 2:
+                raise ValueError(f"choice question {key} needs at least two options")
+        with progress.activity("laya", f"{kind}: waiting for local classification ({self.options['mode']})"):
+            configured = self.options["checkpoints"].get(kind)
+            prediction = (self.backend or runtime_for(self.options)).predict(
+                record["state"], questions, **({"checkpoint": configured} if configured else {}))
+        answers = prediction.get("answers") or {}
+        record["model_identity"] = prediction["model_identity"]
+        record["routing"] = prediction.get("routing", {})
+        record["truncated"] |= bool(prediction.get("truncated"))
+        calibration = self.calibration()
+        for key, question in questions.items():
+            probs = distribution(answers.get(key, {}), question)
+            record["prediction"][key] = probs
+            bucket = calibration_bucket(calibration, record, key)
+            if calibration.get("model_identity") == record["model_identity"]:
+                probs = temperature_scale(probs, float(bucket.get("temperature", 1)))
+            selected = max(probs, key=probs.get)
+            record["recommendations"][key] = {"value": selected, "probability": probs[selected]}
+
     def decide(self, kind, state, questions, context=None):
         record = self.new_record(kind, questions, context, state)
         if self.options["mode"] == "off":
@@ -908,28 +984,9 @@ class DecisionEngine:
         self.encode(record, state)
         started = time.monotonic()
         try:
-            for key, question in questions.items():
-                if question.get("type") == "choice" and len(question.get("criteria") or {}) < 2:
-                    raise ValueError(f"choice question {key} needs at least two options")
-            with progress.activity("laya", f"{kind}: waiting for local classification ({self.options['mode']})"):
-                configured = self.options["checkpoints"].get(kind)
-                prediction = (self.backend or runtime_for(self.options)).predict(
-                    record["state"], questions, **({"checkpoint": configured} if configured else {}))
-            answers = prediction.get("answers") or {}
-            record["model_identity"] = prediction["model_identity"]
-            record["routing"] = prediction.get("routing", {})
-            record["truncated"] |= bool(prediction.get("truncated"))
-            calibration = self.calibration()
-            for key, question in questions.items():
-                probs = distribution(answers.get(key, {}), question)
-                record["prediction"][key] = probs
-                bucket = calibration_bucket(calibration, record, key)
-                if calibration.get("model_identity") == record["model_identity"]:
-                    probs = temperature_scale(probs, float(bucket.get("temperature", 1)))
-                selected = max(probs, key=probs.get)
-                record["recommendations"][key] = {"value": selected, "probability": probs[selected]}
+            self.infer(record, kind, questions)
             record["status"] = "ok"
-        except (ImportError, OSError, RuntimeError, ValueError, KeyError, TypeError, ArithmeticError, AttributeError) as exc:
+        except INFERENCE_ERRORS as exc:
             record.update(status="unavailable", error=str(exc), recommendations={})
         record["duration_ms"] = round((time.monotonic() - started) * 1000)
         self.store.append("decision", **record)

@@ -16,7 +16,7 @@ def read_object(path):
 
 
 def decision_rows(workspace):
-    events = read_jsonl(DecisionStore(workspace).path)
+    events = DecisionStore(workspace).events()
     answers, excluded = reviewed_labels(events)
     provenance = label_provenance(events)
     rows = {e['id']: {**e, 'applications': [], 'labels': [], 'suggestions': []}

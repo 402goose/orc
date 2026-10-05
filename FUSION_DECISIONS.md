@@ -418,6 +418,7 @@ settings):
       "max_class_weight": 4.0
     },
     "verdict_labels": true,
+    "score_verdicts": false,
     "automatic_labels": true,
     "split": "time",
     "risk": {"alpha": 0.05, "delta": 0.1, "min_examples": 30, "min_groups": 20}
@@ -534,6 +535,16 @@ Laya does not run, so `fusion outcome` stays fast and works without a
 checkpoint. An `unscored` decision has no prediction and can never drive an
 automatic action. Calibration skips it and reports it under
 `unscored_examples`; score it with `evaluate` first.
+
+With `"score_verdicts": true`, on a host that runs Laya, `fusion learn tick`
+scores those inputs afterwards, so the verdict itself never waits on the model.
+Each tick scores up to 25 `unscored` acceptance inputs, oldest first, and
+appends a `shadow_score` event per input. Readers fold the latest score into
+its decision, which then reads as `ok` with that prediction, so agreement and
+exports compare it with the verdict. The input never carries the verdict.
+Nothing waits on a scored decision, so it never drives an automatic action. A
+runtime failure stops the batch and appends nothing; the tick reports it under
+`shadow_scores`.
 
 Each label is `verified` with `source: "lead_verdict"`, `reviewers:
 [{"agent": "lead", "run_id": ..., "accepted": ...}]` and evidence holding the
