@@ -629,8 +629,8 @@ def top_features(model, k=10):
     return {"logistic": [[c, round(w, 4)] for c, w in weights[:k]], "boosting": [[c, round(g, 4)] for c, g in gains[:k]]}
 
 
-def routing_counterfactual(model, test, costs):
-    """Self-normalized IPS of 'pick the candidate with the highest P/cost' on rows with logged propensities."""
+def counterfactual_picks(model, test, costs):
+    """(logged rewards, matched 1/propensity weights, matched rewards) for 'pick the highest P/cost candidate'."""
     logged, weights, rewards = [], [], []
     for row in test:
         routing = row.get("routing") or {}
@@ -651,6 +651,11 @@ def routing_counterfactual(model, test, costs):
         if best[1] == routing["chosen"]:
             weights.append(1 / p)
             rewards.append(y)
+    return logged, weights, rewards
+
+
+def snips(logged, weights, rewards):
+    """Self-normalized IPS on rows with logged propensities; identifiable only with enough matched weight."""
     out = {"rows_with_propensity": len(logged), "matches": len(weights),
            "logged_rate": round(sum(logged) / len(logged), 4) if logged else None}
     if weights:
@@ -660,36 +665,55 @@ def routing_counterfactual(model, test, costs):
     return out
 
 
-def evaluate(rows, splits=("time", "tail"), cutoff=TIME_CUTOFF, l2=5.0, boosting=True):
-    results = []
+def lane_costs(rows):
+    costs = defaultdict(list)
+    for row in rows:
+        if row["features"].get("cost_usd") is not None:
+            costs[row["features"]["lane"]].append(row["features"]["cost_usd"])
+    return {lane: sum(v) / len(v) for lane, v in costs.items()}
+
+
+def folds(rows, how, cutoff=TIME_CUTOFF, k=5):
+    """[(train, test)]. rolling: issues ordered by first attempt in k+1 blocks; block i+1 tests on blocks 0..i."""
+    if how != "rolling":
+        return [split(rows, how, cutoff)]
+    firsts = [group for _, group in sorted({(r["group_first_ts"], r["group"]) for r in rows})]
+    block = {group: i * (k + 1) // max(len(firsts), 1) for i, group in enumerate(firsts)}
+    return [([r for r in rows if block[r["group"]] < i], [r for r in rows if block[r["group"]] == i]) for i in range(1, k + 1)]
+
+
+def evaluate(rows, splits=("time", "tail", "rolling"), cutoff=TIME_CUTOFF, l2=5.0, boosting=True):
+    """Held-out metrics per label, split and feature set; rolling pools the predictions of every fold."""
+    results, kinds = [], ("majority", "lane", "logistic", *(("boosting",) if boosting else ()))
     for label in LABELS:
         known = [r for r in rows if r["labels"][label] is not None]
         for how in splits:
-            train, test = split(known, how, cutoff)
             for feature_set in FEATURE_SETS:
-                entry = {"label": label, "feature_set": feature_set, "split": how,
-                         "n_train": len(train), "n_test": len(test)}
-                classes = {bool(r["labels"][label]) for r in train}
-                if len(train) < 10 or len(classes) < 2 or not test:
+                ys, scores, picks, model, n_train = [], {which: [] for which in kinds}, ([], [], []), None, 0
+                for train, test in folds(known, how, cutoff):
+                    if len(train) < 10 or len({bool(r["labels"][label]) for r in train}) < 2 or not test:
+                        continue
+                    model = fit_models(train, label, feature_set, l2, boosting)
+                    n_train = max(n_train, len(train))
+                    ys += [int(r["labels"][label]) for r in test]
+                    for which in kinds:
+                        scores[which] += [predict(model, r, which) for r in test]
+                    if feature_set == "routing":
+                        for pooled, part in zip(picks, counterfactual_picks(model, test, lane_costs(train))):
+                            pooled += part
+                entry = {"label": label, "feature_set": feature_set, "split": how, "n_train": n_train, "n_test": len(ys)}
+                if not model:
                     results.append({**entry, "status": "insufficient"})
                     continue
-                model = fit_models(train, label, feature_set, l2, boosting)
-                ys = [int(r["labels"][label]) for r in test]
-                scored = {which: metrics(ys, [predict(model, r, which) for r in test])
-                          for which in ("majority", "lane", "logistic", *(("boosting",) if boosting else ()))}
+                scored = {which: metrics(ys, scores[which]) for which in kinds}
                 positives = sum(ys)
-                entry.update({"status": "few" if len(test) < FEW or min(positives, len(ys) - positives) < 5 else "ok",
+                entry.update({"status": "few" if len(ys) < FEW or min(positives, len(ys) - positives) < 5 else "ok",
                               "models": scored, "top_features": top_features(model)})
                 if boosting:
                     lr, gb = scored["logistic"], scored["boosting"]
                     entry["boosting_beats_logistic"] = gb["log_loss"] < lr["log_loss"] and (gb["auc"] or 0) > (lr["auc"] or 0)
                 if feature_set == "routing":
-                    costs = defaultdict(list)
-                    for r in train:
-                        if r["features"].get("cost_usd") is not None:
-                            costs[r["features"]["lane"]].append(r["features"]["cost_usd"])
-                    entry["routing_counterfactual"] = routing_counterfactual(
-                        model, test, {lane: sum(v) / len(v) for lane, v in costs.items()})
+                    entry["routing_counterfactual"] = snips(*picks)
                 results.append(entry)
     return results
 
@@ -731,8 +755,9 @@ def add_parser(sub):
         command.add_argument("--l2", type=float, default=5.0, help="logistic regression L2 strength (default 5)")
         command.add_argument("--out", help="output JSON (default: .fusion/outcome-model/report.json or model.json)")
     evaluation = commands.choices["evaluate"]
-    evaluation.add_argument("--split", choices=("time", "tail", "both"), default="both",
-                            help="time: issues first attempted before --cutoff train; tail: newest 20%% of issues test")
+    evaluation.add_argument("--split", choices=("time", "tail", "rolling", "all"), default="all",
+                            help="time: issues first attempted before --cutoff train; tail: newest 20%% of issues test; "
+                                 "rolling: five expanding-window folds over issues, pooled")
     evaluation.add_argument("--cutoff", default=TIME_CUTOFF)
     evaluation.add_argument("--no-boosting", action="store_true")
     evaluation.add_argument("--json", action="store_true", help="print the full report")
@@ -761,7 +786,7 @@ def command(args, control_workspace):
         out.write_text(json.dumps(model) + "\n", encoding="utf-8")
         print(json.dumps({"model": str(out), "n_train": model["n_train"], "top_features": top_features(model)}, indent=2))
         return 0
-    splits = ("time", "tail") if args.split == "both" else (args.split,)
+    splits = ("time", "tail", "rolling") if args.split == "all" else (args.split,)
     results = evaluate(rows, splits, args.cutoff, args.l2, not args.no_boosting)
     out = Path(args.out or directory / "report.json")
     out.parent.mkdir(parents=True, exist_ok=True)

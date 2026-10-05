@@ -169,6 +169,12 @@ class SplitAndModelTest(unittest.TestCase):
             train, test = outcome.split(rows[:21] + [straddle] + rows[22:], how, cutoff)
             self.assertFalse({r["group"] for r in train} & {r["group"] for r in test}, how)
             self.assertEqual(len(train) + len(test), 40)
+        pairs = outcome.folds(rows, "rolling", k=4)
+        self.assertEqual(len(pairs), 4)
+        self.assertEqual(sum(len(test) for _, test in pairs), 40 - len(pairs[0][0]))
+        for train, test in pairs:
+            self.assertLess(max(r["group_first_ts"] for r in train), min(r["group_first_ts"] for r in test))
+            self.assertFalse({r["group"] for r in train} & {r["group"] for r in test})
         train, test = outcome.split(rows, "time", cutoff)
         self.assertTrue(all(r["group_first_ts"] < outcome.ms(cutoff) for r in train))
         self.assertIn(rows[21]["group"], {r["group"] for r in test})
@@ -199,8 +205,10 @@ class SplitAndModelTest(unittest.TestCase):
         rows = synthetic_rows(120)
         for row in rows:
             row["labels"]["landed"] = None
-        results = outcome.evaluate(rows, ("tail",), boosting=False)
-        verify = next(r for r in results if r["label"] == "verify" and r["feature_set"] == "routing")
+        results = outcome.evaluate(rows, ("tail", "rolling"), boosting=False)
+        verify = next(r for r in results if r["label"] == "verify" and r["feature_set"] == "routing" and r["split"] == "tail")
+        rolling = next(r for r in results if r["label"] == "verify" and r["feature_set"] == "routing" and r["split"] == "rolling")
+        self.assertGreater(rolling["n_test"], verify["n_test"])
         self.assertEqual(set(verify["models"]), {"majority", "lane", "logistic"})
         self.assertEqual(verify["routing_counterfactual"]["rows_with_propensity"], verify["n_test"])
         self.assertTrue(all(r["status"] == "insufficient" for r in results if r["label"] == "landed"))

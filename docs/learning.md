@@ -312,7 +312,8 @@ positive rate, accuracy, balanced accuracy, AUC, log loss, Brier score and a
 five-bin reliability table against a constant majority and a per-lane
 Beta(1,1) posterior mean. Both splits keep an issue's rounds together on the
 side of its first round: `time` cuts at `--cutoff`, `tail` holds out the
-newest 20% of issues. For routing features it also estimates, by
+newest 20% of issues, and `rolling` pools five expanding-window folds over
+issues ordered by first round, for labels too sparse for one cut. For routing features it also estimates, by
 self-normalized IPS over rows with logged propensities, the outcome rate of
 picking the candidate with the highest predicted probability per unit cost.
 

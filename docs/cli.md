@@ -1461,7 +1461,7 @@ held-out metrics against majority and per-lane posteriors
 
 ```text
 usage: fusion outcome-model evaluate [-h] [--dataset DATASET] [--l2 L2] [--out OUT]
-                                     [--split {time,tail,both}] [--cutoff CUTOFF]
+                                     [--split {time,tail,rolling,all}] [--cutoff CUTOFF]
                                      [--no-boosting] [--json]
 
 options:
@@ -1470,9 +1470,10 @@ options:
   --l2 L2                 logistic regression L2 strength (default 5)
   --out OUT               output JSON (default: .fusion/outcome-model/report.json or
                           model.json)
-  --split {time,tail,both}
+  --split {time,tail,rolling,all}
                           time: issues first attempted before --cutoff train; tail:
-                          newest 20% of issues test
+                          newest 20% of issues test; rolling: five expanding-window
+                          folds over issues, pooled
   --cutoff CUTOFF
   --no-boosting
   --json                  print the full report
