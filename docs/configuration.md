@@ -220,7 +220,7 @@ one is available again.
 
 A pin names a model and effort, not an account. When a pinned run's account
 cannot serve it (its quota reading is exhausted, or a run on the same account
-and model hit its quota within the cooldown), Fusion runs it on an overflow
+and model hit its quota or a rejected login within the cooldown), Fusion runs it on an overflow
 route with the same agent, model and effort instead, if that route passes the
 automatic checks (`requires`, `daily_budget_usd`, its own quota). The result and
 the routing log record `quota_twin` (`from`, `to`, `model`, `reasoning_effort`,
@@ -232,6 +232,18 @@ the routing log record `quota_twin` (`from`, `to`, `model`, `reasoning_effort`,
    "billing": "api", "account": "anthropic-api",
    "launcher_args": ["--settings", "/Users/you/.config/orc/claude-api-settings.json"],
    "requires": ["~/.config/orc/anthropic-api-key"], "daily_budget_usd": 150, "max_budget_usd": 15}}}
+```
+
+`decisions.pin_fallback_routes` goes one step further, by choice: when a pinned
+run's account cannot serve it and no same-model overflow route can, the first
+listed route that passes the automatic checks runs it, on that route's own
+model. Use it to name a fallback for fixed roles, for example Sol workers
+falling back to Opus. The result and the routing log record `pin_fallback`
+(`from`, `to`, `from_model`, `to_model`, `reason`). Unset or empty, a pin never
+changes model. A quota probe never moves.
+
+```json
+{"decisions": {"pin_fallback_routes": ["claude-opus-high", "claude-api-opus-high"]}}
 ```
 
 ## Exports and excluded repos
