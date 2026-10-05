@@ -125,9 +125,11 @@ it. Interactive lead sessions use their own provider controls.
    **Evidence per work class.** Read-only and writing work differ (the gym
    shows lanes that localize well and fix poorly, and the reverse), so a
    lane's local outcomes are counted for the task's class: spans with
-   `write: true` for a writer, `write: false` otherwise. A lane with no
-   verified outcome in that class falls back to all its outcomes pooled
-   (spans recorded without `write` join only the pool). Each candidate
+   `write: true` for a writer, `write: false` otherwise. A reader with no
+   verified outcome in its class falls back to all its outcomes pooled
+   (spans recorded without `write` join only the pool). A writer never
+   counts read-only runs: a lane with no write evidence has only its prior,
+   so one accepted read-only check cannot stand in for a write record. Each candidate
    carries `checked_runs_local`, `acceptance_rate_local` and `local_class`
    (`write`, `read`, `pooled`, or null with no evidence).
 
