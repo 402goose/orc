@@ -8,6 +8,7 @@
 - [Quality and automatic training](#quality-and-automatic-training)
 - [Garden and council](#garden-and-council)
 - [Learning without the UI](#learning-without-the-ui)
+- [Outcome predictor](#outcome-predictor)
 - [Gym](#gym)
 
 ## Outcomes and labels
@@ -274,6 +275,46 @@ workspaces (including the current one when it has Laya decisions).
 Scheduling installs a launchd job on macOS; elsewhere it prints a crontab line
 for you to install. The interval defaults to 300 seconds and must be at least 60.
 See [the complete CLI reference](cli.md#fusion-learn).
+
+## Outcome predictor
+
+`fusion outcome-model` predicts real lifecycle outcomes of dispatched attempts
+from history, as a candidate replacement for a text judge. It is read-only and
+changes no routing.
+
+```bash
+fusion --control-workspace ~/work outcome-model build-dataset --tenet-repo ~/src/app
+fusion --control-workspace ~/work outcome-model evaluate        # held-out table
+fusion --control-workspace ~/work outcome-model train --label verify --features verify
+```
+
+`build-dataset` writes one row per build round to
+`.fusion/outcome-model/dataset.jsonl`. ORC supplies the lane (agent + model +
+effort, so a new model is a new lane), the role, the reviewed stages and the
+`routing_log` candidate propensities. `--tenet-repo` adds a TENET repo's build
+journal (joined to runs by the executor run id), its `tenet.verify.v1` records
+and, through `gh`, its `issue/<N>-` pull requests (`--no-gh` skips them).
+
+Labels, in order of trust: `verify` (the run's verify stage, else a verify
+record of the issue between this kept round and the next), `kept` (the gate
+kept the round) and `landed` (the issue's PR merged and was not reverted;
+unknown while a PR is open or the issue's last round is under 48 hours old).
+The `routing` feature set holds only what is known before a lane is picked:
+lane, repo, role, round, prior rounds, failures, rejections and best score on
+the issue, task size, hour and issue age. The `verify` set adds what the
+finished worker reported (score, delta, missing required files, files changed,
+status, cost, duration, blockers) and, for later stages, whether the round
+was kept.
+
+`evaluate` fits an L2 logistic regression with lane interactions (the primary
+model) and a gradient-boosting baseline in plain Python, and reports n,
+positive rate, accuracy, balanced accuracy, AUC, log loss, Brier score and a
+five-bin reliability table against a constant majority and a per-lane
+Beta(1,1) posterior mean. Both splits keep an issue's rounds together on the
+side of its first round: `time` cuts at `--cutoff`, `tail` holds out the
+newest 20% of issues. For routing features it also estimates, by
+self-normalized IPS over rows with logged propensities, the outcome rate of
+picking the candidate with the highest predicted probability per unit cost.
 
 ## Gym
 
