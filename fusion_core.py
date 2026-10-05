@@ -656,6 +656,9 @@ QUOTA_MARKERS = ("usage limit", "session limit", "rate limit", "quota", "credits
 # One vocabulary for permission refusals, shared the same way.
 PERMISSION_MARKERS = ("permission denied", "agy denied", "agy auto-denied", "permission check blocked",
                       "no way to approve")
+# A rejected login belongs to the account, like quota, and says nothing about the model.
+AUTH_MARKERS = ("unauthorized", "(401)", "status=401", "refresh_token", "not logged in", "please log in",
+                "authentication failed", "invalid api key")
 LANE_COOLDOWN_SECONDS = 900
 
 
@@ -669,6 +672,14 @@ def quota_failure(result: dict[str, Any]) -> bool:
         text = " ".join(str(item) for item in result.get("blockers", []))
         text = f"{text} {result.get('summary', '')}".lower()
     return any(marker in text for marker in QUOTA_MARKERS)
+
+
+def auth_failure(result: dict[str, Any]) -> bool:
+    if "provider_failure" in result:
+        text = str(result.get("provider_failure") or "").lower()
+    else:
+        text = " ".join(str(item) for item in result.get("blockers", [])).lower()
+    return any(marker in text for marker in AUTH_MARKERS)
 
 
 BASELINE_TOOLS = frozenset({
@@ -915,6 +926,8 @@ def failure_class(result: dict[str, Any]) -> str | None:
         return None
     if quota_failure(result):
         return "quota"
+    if auth_failure(result):
+        return "auth"
     if result.get("exit_code") == 124 or "timeout" in text:
         return "timeout"
     if "not available on path" in text:
