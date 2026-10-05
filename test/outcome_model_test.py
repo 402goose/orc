@@ -115,6 +115,14 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(self.summary["by_repo"]["widget"]["rows"], 4)
         self.assertEqual(self.summary["by_repo"]["widget"]["propensity"], 1)
 
+    def test_verify_record_labels_the_latest_kept_round_it_measured(self):
+        attempts = [{"repo": "r", "issue": 5, "unit": "u", "round": i, "ts": 1000 * i, "kept": kept}
+                    for i, kept in [(1, True), (2, True), (3, False), (4, True)]]
+        records = {("r", 5): [{"issue": 5, "ts": 3500, "clean": False}, {"issue": 5, "ts": 3600, "clean": True},
+                              {"issue": 5, "ts": 9000, "clean": True}]}
+        rows = outcome.build_rows(attempts, verifies=records, now_ms=10 ** 9)
+        self.assertEqual([r["labels"]["verify"] for r in rows], [None, False, None, True])
+
     def test_routing_features_exclude_post_dispatch_information(self):
         for label in outcome.LABELS:
             names = set(outcome.feature_names("routing", label))

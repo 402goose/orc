@@ -295,8 +295,8 @@ effort, so a new model is a new lane), the role, the reviewed stages and the
 journal (joined to runs by the executor run id), its `tenet.verify.v1` records
 and, through `gh`, its `issue/<N>-` pull requests (`--no-gh` skips them).
 
-Labels, in order of trust: `verify` (the run's verify stage, else a verify
-record of the issue between this kept round and the next), `kept` (the gate
+Labels, in order of trust: `verify` (the run's verify stage, else the first
+verify record of the issue that measured this round as its latest kept round), `kept` (the gate
 kept the round) and `landed` (the issue's PR merged and was not reverted;
 unknown while a PR is open or the issue's last round is under 48 hours old).
 The `routing` feature set holds only what is known before a lane is picked:

@@ -10,8 +10,8 @@ by the executor's run id), `.tenet/verify/<issue>/*.json` and, through `gh`,
 the repo's `issue/<N>-` pull requests.
 
 Labels are ground truth, not a lead's verdict: `verify` (the run's verify
-stage, else a verify record of the issue between this kept round and the
-next), `kept` (the gate kept the round) and `landed` (the issue's PR merged
+stage, else the first verify record of the issue that measured this round as
+the latest kept round), `kept` (the gate kept the round) and `landed` (the issue's PR merged
 and was not reverted; unknown while the issue is open or recent). Two
 feature sets: `routing` holds only what is known before a lane is picked;
 `verify` adds what the finished worker reported, which is known before
@@ -258,7 +258,12 @@ def build_rows(attempts, orc=None, verifies=None, landings=None, now_ms=None):
             landed = False
         else:
             landed = None
-        records = sorted((v for v in verifies.get((repo, issue), []) if v["ts"]), key=lambda v: v["ts"])
+        # A verify record measured the branch head: the latest kept round at or before it.
+        measured = {}
+        for record in sorted((v for v in verifies.get((repo, issue), []) if v["ts"]), key=lambda v: v["ts"]):
+            head = max((i for i, a in enumerate(items) if a["kept"] and a["ts"] <= record["ts"]), default=None)
+            if head is not None:
+                measured.setdefault(head, record["clean"])
         history = []
         for index, attempt in enumerate(items):
             run = orc["runs"].get(attempt.get("run_id")) or {}
@@ -279,14 +284,11 @@ def build_rows(attempts, orc=None, verifies=None, landings=None, now_ms=None):
                         "issue_age_h": round((dispatched - first) / 3_600_000, 3),
                         "duration_s": attempt["duration_ms"] / 1000 if attempt.get("duration_ms") is not None else None,
                         **{key: attempt.get(key) for key in WORKER_FEATURES if key != "duration_s"}}
-            following = items[index + 1]["ts"] if index + 1 < len(items) else None
             verify, verify_source = None, None
             if "verify" in stages:
                 verify, verify_source = stages["verify"]["accepted"], "orc"
-            elif attempt["kept"]:
-                record = next((v for v in records if v["ts"] >= attempt["ts"] and (following is None or v["ts"] < following)), None)
-                if record:
-                    verify, verify_source = record["clean"], "tenet"
+            elif index in measured:
+                verify, verify_source = measured[index], "tenet"
             rows.append({"schema": SCHEMA, "id": f"{repo}:{attempt['unit']}:{attempt.get('round')}:{attempt['ts']}",
                          "source": attempt.get("source"), "repo": repo, "group": f"{repo}:{group}", "issue": issue,
                          "ts": attempt["ts"], "time": iso(attempt["ts"]), "group_first_ts": first,
