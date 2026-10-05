@@ -747,7 +747,7 @@ def rank_by_outcomes(candidates, minimum=3, warm_epsilon=None, explore=True, cos
 
 def quota_blocked(config, task, store):
     """Why the pinned lane's account cannot serve it now: exhausted quota, or a
-    quota failure on the same account and model within the cooldown."""
+    quota or login (auth) failure on the same account and model within the cooldown."""
     import fusion_core as core
     settings = core.agent_settings(config, task)
     key, model = core.lane_key(task["agent"], settings), settings.get("model")
@@ -759,14 +759,44 @@ def quota_blocked(config, task, store):
                 return "; ".join(quota["reasons"])
     now = time.time() * 1000
     for span in store.traces(limit=200):
-        if span.get("failure_class") != "quota" or not 0 <= now - span.get("end_time_ms", 0) < core.LANE_COOLDOWN_SECONDS * 1000:
+        if span.get("failure_class") not in {"quota", "auth"} or not 0 <= now - span.get("end_time_ms", 0) < core.LANE_COOLDOWN_SECONDS * 1000:
             continue
         lane = config.get("routes", {}).get(span.get("route"), {})
         span_settings = core.deep_merge(config.get(span.get("agent"), {}), lane)
         span_model = span_settings.get("model") or span.get("model")
         if core.lane_key(span.get("agent"), span_settings) == key and (not span_model or not model or span_model == model):
-            return f"a run on {key} hit its quota within the last {core.LANE_COOLDOWN_SECONDS // 60} minutes"
+            what = "its quota" if span["failure_class"] == "quota" else "a rejected login"
+            return f"a run on {key} hit {what} within the last {core.LANE_COOLDOWN_SECONDS // 60} minutes"
     return None
+
+
+def pin_fallback(config, task, store):
+    """When a pinned lane's account cannot serve it and no same-model twin can,
+    the first route in decisions.pin_fallback_routes that passes every automatic
+    check runs it instead. Opt-in: this changes the model, which a pin
+    otherwise never does."""
+    import fusion_core as core
+    routes = [name for name in (config.get("decisions") or {}).get("pin_fallback_routes") or [] if name != task.get("route")]
+    if not routes or task.get("quota_probe"):
+        return None
+    reason = quota_blocked(config, task, store)
+    if not reason:
+        return None
+    key = core.lane_key(task["agent"], core.agent_settings(config, task))
+    routes = [name for name in routes if core.lane_key((config.get("routes", {}).get(name) or {}).get("agent"),
+                                                       core.agent_settings(config, {"agent": (config.get("routes", {}).get(name) or {}).get("agent"), "route": name})) != key]
+    if not routes:
+        return None
+    pool = core.deep_merge(config, {"decisions": {"auto_routes": routes, "overflow_routes": []}})
+    probe = {**task, "agent": "auto", "route": None, "settings_overrides": {}}
+    eligible = {c["route"] for c in route_candidates(pool, probe, store)}
+    chosen = next((name for name in routes if name in eligible), None)
+    if not chosen:
+        return None
+    settings = core.agent_settings(config, task)
+    return {"from": task.get("route") or task["agent"], "to": chosen, "from_model": settings.get("model"),
+            "to_model": core.agent_settings(config, {"agent": config["routes"][chosen]["agent"], "route": chosen}).get("model"),
+            "reason": reason}
 
 
 def quota_twin(config, task, store):
@@ -930,6 +960,12 @@ def route_task(config, task, store, rng=None):
             task["session_key"] += ":" + twin["to"]
             engine.store.append("routing_log", **context(task), scope="quota_twin", write=bool(task.get("write")),
                                 chosen=twin["to"], quota_twin=twin)
+        elif (fallback := pin_fallback(config, task, store)):
+            task.update(pin_fallback=fallback, agent=config["routes"][fallback["to"]]["agent"], route=fallback["to"],
+                        settings_overrides={})
+            task["session_key"] += ":" + fallback["to"]
+            engine.store.append("routing_log", **context(task), scope="pin_fallback", write=bool(task.get("write")),
+                                chosen=fallback["to"], pin_fallback=fallback)
     quota_audit, rejected = {}, {}
     if task["agent"] == "auto" and task.get("route"):
         task["agent"] = config.get("routes", {}).get(task["route"], {}).get("agent")
