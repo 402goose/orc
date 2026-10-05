@@ -1386,6 +1386,21 @@ def cli_need(value: str) -> str:
     return value
 
 
+MAX_CRITERION_CHARS = 20000
+
+
+def validate_criterion(value: Any) -> str | None:
+    """The caller's statement of what acceptance is judged against, or None."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("criterion must be text")
+    text = value.strip()
+    if len(text) > MAX_CRITERION_CHARS:
+        raise ValueError(f"criterion is {len(text)} characters; the limit is {MAX_CRITERION_CHARS}")
+    return text or None
+
+
 def make_task(
     workspace: Path,
     agent: str,
@@ -1401,9 +1416,11 @@ def make_task(
     settings_overrides: dict[str, Any] | None = None,
     timeout_seconds: int | None = None,
     needs: list[str] | None = None,
+    criterion: str | None = None,
 ) -> dict[str, Any]:
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
     needs = validate_needs(needs)
+    criterion = validate_criterion(criterion)
     return {
         "schema": SCHEMA,
         "run_id": run_id,
@@ -1422,6 +1439,7 @@ def make_task(
         "settings_overrides": settings_overrides or {},
         **({"timeout_seconds": validate_timeout(timeout_seconds)} if timeout_seconds is not None else {}),
         **({"needs": needs} if needs else {}),
+        **({"decision_context": criterion} if criterion else {}),
         "created_at": now_ms(),
     }
 
@@ -3088,6 +3106,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "issue": {"type": "string", "pattern": "^" + ISSUE_RE.pattern + "$", "description": "Target issue as owner/repo#N, recorded on the run."},
                     "override_cap": {"type": "string", "description": "A reason to run once past decisions.max_rejections_per_issue; logged."},
                     "needs": {"type": "array", "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"}, "description": "Capabilities the task needs from its lane, such as local_server; automatic routing skips lanes whose config `lacks` one."},
+                    "criterion": {"type": "string", "maxLength": 20000, "description": "What acceptance is judged against, such as the spec's task section; recorded as the run's decision_context in place of the task text. The worker is not shown it."},
                 },
                 "required": ["agent", "task"],
             },
@@ -3266,6 +3285,7 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
                             timeout_seconds=timeout_seconds,
                             settings_overrides=choice_overrides(args.get("model"), args.get("reasoning_effort")),
                             needs=args.get("needs"),
+                            criterion=args.get("criterion"),
                         )
                         if not task["task"]:
                             raise ValueError("task is required")
@@ -3586,6 +3606,11 @@ def build_parser() -> argparse.ArgumentParser:
     delegate.add_argument("--model", help="model for this task, overriding the route and agent settings")
     delegate.add_argument("--reasoning-effort", choices=sorted(EFFORTS), help="Codex, or Claude Code (low-max); requires --model")
     delegate.add_argument("--success", action="append", default=[])
+    criterion = delegate.add_mutually_exclusive_group()
+    criterion.add_argument("--criterion", metavar="TEXT",
+                           help="what acceptance is judged against, such as the spec's task section; recorded as the run's "
+                                "decision_context in place of the task text. The worker is not shown it")
+    criterion.add_argument("--criterion-file", metavar="PATH", help="read --criterion from this file")
     delegate.add_argument("--constraint", action="append", default=[])
     delegate.add_argument("--issue", help="target issue as owner/repo#N; recorded on the run so outcomes and reports can count per issue")
     delegate.add_argument("--override-cap", metavar="REASON", help="run once past decisions.max_rejections_per_issue; logged as cap_override")
@@ -4016,6 +4041,12 @@ def _main(args, parser) -> int:
                 parser.error(f"route {args.route} has no agent; specify --agent")
             if args.agent not in {"auto", "claude", "codex", "agy", "grok", "opencode"}:
                 parser.error(f"route {args.route} has an invalid agent: {args.agent}")
+        try:
+            criterion_text = (Path(args.criterion_file).expanduser().read_text(encoding="utf-8")
+                              if args.criterion_file else args.criterion)
+            validate_criterion(criterion_text)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            parser.error(f"criterion: {exc}")
         task = make_task(
             workspace,
             args.agent,
@@ -4030,6 +4061,7 @@ def _main(args, parser) -> int:
             settings_overrides=choice_overrides(args.model, args.reasoning_effort),
             timeout_seconds=args.timeout,
             needs=args.needs,
+            criterion=criterion_text,
         )
         try:
             if validate_issue(args.issue):

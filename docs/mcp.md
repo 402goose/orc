@@ -151,6 +151,11 @@ Delegate a bounded task to the other coding agent and receive a structured hando
       },
       "type": "array"
     },
+    "criterion": {
+      "description": "What acceptance is judged against, such as the spec's task section; recorded as the run's decision_context in place of the task text. The worker is not shown it.",
+      "maxLength": 20000,
+      "type": "string"
+    },
     "issue": {
       "description": "Target issue as owner/repo#N, recorded on the run.",
       "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+$",
