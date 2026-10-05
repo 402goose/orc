@@ -30,7 +30,7 @@ build:
 # is the real macOS Codex sandbox probe when that runtime/profile is unavailable;
 # run_python.py checks its exact test ID and reason, and reports it explicitly.
 test:
-	PYTHONDONTWRITEBYTECODE=1 python3 test/run_python.py
+	env -u FUSION_CONTROL_WORKSPACE PYTHONDONTWRITEBYTECODE=1 python3 test/run_python.py
 
 # Unit tests for the control room's pure logic (fusion_ui_assets/logic.js).
 # No browser, no server: the Playwright checks in test/*_browser.cjs stay the
