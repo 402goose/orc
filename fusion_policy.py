@@ -10,7 +10,7 @@ import random
 import time
 
 from fusion_decisions import (DecisionEngine, DecisionStore, ACCEPTANCE_QUESTIONS, RECOVERY_QUESTIONS, REVIEW_QUESTIONS,
-                              acceptance_state, normalize_role, read_jsonl, state_cap)
+                              _encoded, _marked, acceptance_state, normalize_role, read_jsonl, state_cap)
 import fusion_progress as progress
 import fusion_usage as usage
 
@@ -223,6 +223,40 @@ def overflow_only(config, choices, drop):
         if c["route"] in overflow:
             drop(c["key"], "overflow lane: used only when no primary lane is available")
     return [c for c in choices if c["route"] not in overflow]
+
+
+def routing_candidate(candidate):
+    """The evidence a routing choice rests on, rounded: who the lane is, how
+    often its checked work was accepted, how much, at what cost and time, its
+    session warmth and its quota class."""
+    row = {key: candidate[key] for key in ("key", "model", "reasoning_effort", "cost_tier", "warm") if candidate.get(key) is not None}
+    for name, key, scale, digits in (("acceptance", "acceptance_rate", 1, 2), ("checked", "checked_runs", 1, 1),
+                                     ("usd", "mean_cost_usd", 1, 2), ("minutes", "mean_ms", 60000, 1),
+                                     ("idle_minutes", "session_idle_s", 60, 1)):
+        if isinstance(candidate.get(key), (int, float)):
+            row[name] = round(candidate[key] / scale, digits)
+    quota = (candidate.get("quota") or {}).get("classification")
+    if quota:
+        row["quota"] = quota
+    return row
+
+
+def routing_state(task, config, candidates, cap):
+    """Laya's routing input: the job and every candidate's evidence
+    (routing_candidate), within `cap` encoded characters. The candidates are
+    kept whole; the task is cut, with a visible marker, to the room they leave."""
+    state = {"write": task["write"], "goal": config.get("decisions", {}).get("routing_goal", "quality"),
+             "candidates": [routing_candidate(candidate) for candidate in candidates]}
+    if task.get("budget_remaining_usd") is not None:
+        state["budget_remaining_usd"] = task["budget_remaining_usd"]
+    text = str(task.get("decision_context", task["task"]))
+    keep = len(text)
+    while True:
+        state["task"] = text if keep >= len(text) else _marked(text, keep)
+        over = _encoded(state) - cap
+        if over <= 0 or keep == 0:
+            return state
+        keep = max(0, min(keep, len(text)) - over - 1)
 
 
 def route_candidates(config, task, store, rejected=None, quota_audit=None, minimum=None, pool_models=False):
@@ -953,9 +987,7 @@ def route_task(config, task, store, rng=None):
                                             (f" / {c['reasoning_effort']} effort" if c.get("reasoning_effort") else "") for c in candidates}}}
         if any(c.get("reasoning_effort") for c in candidates):
             questions["route"]["instructions"] = "Choose one model and effort pair for the task. Prioritize correctness; effort names are not comparable across models. Unknown outcomes, latency and cost are unknown."
-        record = engine.decide("routing", {"task": task.get("decision_context", task["task"]), "write": task["write"],
-                                          "goal": config.get("decisions", {}).get("routing_goal", "quality"),
-                                          "budget_remaining_usd": task.get("budget_remaining_usd"), "candidates": candidates}, questions, context(task))
+        record = engine.decide("routing", routing_state(task, config, candidates, state_cap(engine.options)), questions, context(task))
         if automatic and engine.allowed(record, "route"):
             value = record["recommendations"]["route"]["value"]
             selected = next(c for c in candidates if c["key"] == value)
