@@ -768,6 +768,24 @@ def quota_twin(config, task, store):
             "reasoning_effort": effort, "reason": reason}
 
 
+def rework_exclusions(task, store):
+    """Route keys rejected for this automatic task's (issue, normalized role).
+
+    Only each run's effective outcome counts; older outcomes may have been
+    accepted, withdrawn, or invalidated. Legacy outcomes get their role from
+    the trace, as they do for the rejection cap. Explicit pins stay untouched.
+    """
+    issue, role = task.get("issue"), normalize_role(task.get("role"))
+    if (not issue or not role or task.get("agent", "auto") != "auto" or task.get("route")
+            or task.get("model") or (task.get("settings_overrides") or {}).get("model")):
+        return []
+    roles = {span.get("run_id"): span.get("role") for span in store.traces(limit=5000)}
+    outcomes = effective_outcomes(read_jsonl(DecisionStore(store.workspace).path))
+    return sorted({event["route"] for run, event in outcomes.items()
+                   if event.get("accepted") is False and event.get("issue") == issue and event.get("route")
+                   and normalize_role(event.get("role") or roles.get(run)) == role})
+
+
 def rank_automatic(config, task, store, rng=None, rejected=None, quota_audit=None):
     """The ranked automatic candidates for `task`, before any Laya advice or epsilon draw.
 
@@ -787,6 +805,22 @@ def rank_automatic(config, task, store, rng=None, rejected=None, quota_audit=Non
         needs_unmet = True
         candidates = route_candidates(config, {**task, "needs": []}, store, rejected=rejected, quota_audit=quota_audit,
                                       pool_models=sampling)
+    excluded = set(rework_exclusions(task, store))
+    excluded_candidates = [c for c in candidates if (c.get("route") or c["agent"]) in excluded]
+    rework = {}
+    if excluded_candidates:
+        reason = f"rejected on {task['issue']} ({normalize_role(task.get('role'))})"
+        all_rejected = len(excluded_candidates) == len(candidates)
+        if all_rejected:
+            # Rework avoidance cannot make otherwise eligible work unroutable.
+            excluded_candidates = []
+        else:
+            candidates = [c for c in candidates if (c.get("route") or c["agent"]) not in excluded]
+            if rejected is not None:
+                for candidate in excluded_candidates:
+                    rejected[candidate["key"]] = reason
+        rework = {"excluded_lanes": sorted({c.get("route") or c["agent"] for c in excluded_candidates}),
+                  "excluded_reason": reason, **({"all_lanes_rejected": True} if all_rejected else {})}
     if ranking:
         minimum, explore = exploration(ranking, task, candidates)
         candidates = rank_by_outcomes(candidates, minimum, warm_epsilon, explore, cost_epsilon)
@@ -802,7 +836,8 @@ def rank_automatic(config, task, store, rng=None, rejected=None, quota_audit=Non
         candidates, trial = write_trial(config, task, candidates, minimum or (
             int(ranking) if ranking and not isinstance(ranking, bool) else 3))
     return {"candidates": candidates, "minimum": minimum, "explore": explore, "trial": trial, "sampled": sampled,
-            "needs_unmet": needs_unmet, "sampling": sampling}
+            "needs_unmet": needs_unmet, "sampling": sampling, "rework": rework,
+            "excluded_candidates": excluded_candidates}
 
 
 def explain_route(config, task, store, seed=None):
@@ -825,12 +860,14 @@ def explain_route(config, task, store, seed=None):
     fields = ("key", "agent", "route", "model", "reasoning_effort", "cost_tier", "checked_runs", "checked_runs_local",
               "acceptance_rate", "acceptance_rate_local", "evidence_scope", "pooled", "mean_cost_usd")
     return {"schema": "fusion.route_explain.v1",
-            "task": {"role": task.get("role"), "write": bool(task.get("write")), "needs": task.get("needs") or [],
+            "task": {"issue": task.get("issue"), "role": task.get("role"), "write": bool(task.get("write")), "needs": task.get("needs") or [],
                      "gating": gating(task)},
             "chosen": keys[0] if keys else None,
             "candidates": [{**{f: c.get(f) for f in fields if f in c}, "propensity": chances.get(c["key"], 0.0),
-                            "quota": (c.get("quota") or {}).get("classification")} for c in candidates],
+                            "quota": (c.get("quota") or {}).get("classification")}
+                           for c in candidates + ranked["excluded_candidates"]],
             "rejected": rejected,
+            **ranked["rework"],
             "quota": {key: {"classification": q.get("classification"), "reasons": q.get("reasons")} for key, q in quota_audit.items()},
             "policy": {"rank_by_outcomes": ranked["minimum"], "explore": ranked["explore"], "gating_policy": gating_policy(config),
                        "epsilon": effective, "routing_epsilon": epsilon, "seed": seed},
@@ -875,11 +912,13 @@ def route_task(config, task, store, rng=None):
         within_route = False
         minimum = explore = trial = sampled = None
         needs_unmet = False
+        rework, excluded_candidates = {}, []
         sampling = bool(automatic and ranking and gating(task) and gating_policy(config) == "thompson")
         if automatic:
             ranked = rank_automatic(config, task, store, rng, rejected, quota_audit)
             candidates, minimum, explore = ranked["candidates"], ranked["minimum"], ranked["explore"]
             trial, sampled, needs_unmet = ranked["trial"], ranked["sampled"], ranked["needs_unmet"]
+            rework, excluded_candidates = ranked["rework"], ranked["excluded_candidates"]
         else:
             from fusion_reasoning import pair_candidates, pair_key
             settings = core.agent_settings(config, task)
@@ -961,7 +1000,7 @@ def route_task(config, task, store, rng=None):
             reason += (f"; sampled by model posterior ({won['successes']}/{won['attempts']} accepted, "
                        f"{won['p_win']:.0%} chance best)")
         engine.applied(record, selected["key"], applied, reason + ("; epsilon exploration picked this lane" if explored else ""))
-    if scope and (engine.options["mode"] != "off" or quota_audit):
+    if scope and (engine.options["mode"] != "off" or quota_audit or rework):
         keys = [c["key"] for c in candidates]
         chances = propensities(keys, selected["key"], 0.0 if applied or trial else effective)
         if sampled:
@@ -969,6 +1008,7 @@ def route_task(config, task, store, rng=None):
             chances = {key: wins.get(key, 0.0) for key in keys}
         engine.store.append("routing_log", **context(task), decision_id=record["id"] if record else None, scope=scope,
                             write=bool(task.get("write")),
+                            **rework,
                             **({"needs": task["needs"], "needs_unmet": needs_unmet} if task.get("needs") else {}),
                             policy={"rank_by_outcomes": minimum, "explore": explore,
                                     **({"gating_policy": "thompson"} if sampling else {}), "warm_epsilon": warm_epsilon if ranking else None,
@@ -977,8 +1017,12 @@ def route_task(config, task, store, rng=None):
                                     **({"cost_epsilon": cost_epsilon if warm_epsilon is None else max(warm_epsilon, cost_epsilon)}
                                        if ranking and any(c.get("cost_tier") is not None for c in candidates) else {}),
                                     **({"quota": quota_settings(config)} if quota_audit else {})},
-                            **({"quota": quota_audit, "rejected": rejected} if quota_audit else {}),
-                            candidates=[{**c, "propensity": chances[c["key"]]} for c in candidates],
+                            **({"quota": quota_audit} if quota_audit else {}),
+                            **({"rejected": rejected} if quota_audit or rework else {}),
+                            # Excluded lanes remain in the audit with probability
+                            # zero, but never enter sampling or Laya's options.
+                            candidates=[{**c, "propensity": chances.get(c["key"], 0.0)}
+                                        for c in candidates + excluded_candidates],
                             chosen=selected["key"], explored=explored, **({"write_trial": trial} if trial else {}),
                             **({"sampled": sampled} if sampled else {}))
 
