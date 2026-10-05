@@ -975,8 +975,12 @@ def routing_report(events):
     choices has no overlap there, so neither estimate is reported for it."""
     events = list(events)
     logs, outcomes, vetoed, sources = {}, effective_outcomes(events), 0, {}
+    capped = {}  # Rejection-cap refusals: no worker ran, so they are not routing choices.
     for event in events:
-        if event.get("event") == "routing_log" and event.get("task_id"):
+        if event.get("event") == "routing_log" and event.get("scope") == "cap":
+            key = (event.get("issue"), event.get("role"))
+            capped[key] = capped.get(key, 0) + 1
+        elif event.get("event") == "routing_log" and event.get("task_id"):
             logs[event["task_id"]] = event
     lanes = {}
     joined = 0
@@ -1028,6 +1032,7 @@ def routing_report(events):
             "quota_decisions": [{"task_id": task_id, "chosen": log.get("chosen"), "quota": log["quota"],
                                  "rejected": log.get("rejected", {})} for task_id, log in logs.items() if log.get("quota")],
             "vetoed_outcomes_skipped": vetoed, "outcome_sources": sources, "rejections": rejection_counts(outcomes),
+            "capped": [{"issue": issue, "role": role, "count": count} for (issue, role), count in sorted(capped.items(), key=str)],
             "explored": sum(bool(log.get("explored")) for log in logs.values()), "lanes": rows, "warnings": warnings}
 
 
