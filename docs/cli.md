@@ -572,16 +572,18 @@ options:
 preview automatic routing for a task shape; logs and dispatches nothing
 
 ```text
-usage: fusion route [-h] --explain [--write] [--role ROLE] [--needs NAME] [--seed SEED]
+usage: fusion route [-h] --explain [--write] [--role ROLE] [--issue ISSUE]
+                    [--needs NAME] [--seed SEED]
 
 options:
-  -h, --help    show this help message and exit
-  --explain     print the ranked candidates, dropped lanes with reasons, quota classes
-                and propensities
-  --write       a task that writes (default: read-only)
+  -h, --help     show this help message and exit
+  --explain      print the ranked candidates, dropped lanes with reasons, quota classes
+                 and propensities
+  --write        a task that writes (default: read-only)
   --role ROLE
-  --needs NAME  a capability the task needs from its lane (repeatable)
-  --seed SEED   seed for Thompson draws, so a preview is reproducible
+  --issue ISSUE  target issue as owner/repo#N; explain rejected-lane exclusions
+  --needs NAME   a capability the task needs from its lane (repeatable)
+  --seed SEED    seed for Thompson draws, so a preview is reproducible
 ```
 
 ## fusion status

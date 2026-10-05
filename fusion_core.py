@@ -3651,6 +3651,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="print the ranked candidates, dropped lanes with reasons, quota classes and propensities")
     route.add_argument("--write", action="store_true", help="a task that writes (default: read-only)")
     route.add_argument("--role", default="implementation")
+    route.add_argument("--issue", help="target issue as owner/repo#N; explain rejected-lane exclusions")
     route.add_argument("--needs", action="append", type=cli_need, default=[], metavar="NAME",
                        help="a capability the task needs from its lane (repeatable)")
     route.add_argument("--seed", type=int, help="seed for Thompson draws, so a preview is reproducible")
@@ -3780,6 +3781,8 @@ def _main(args, parser) -> int:
         from fusion_policy import explain_route
         task = make_task(workspace, "auto", "routing preview", args.role, [], [], None, False, args.write, needs=args.needs)
         try:
+            if validate_issue(args.issue):
+                task["issue"] = args.issue
             payload = explain_route(config, task, RunStore(workspace), args.seed)
         except ValueError as exc:
             parser.error(str(exc))
@@ -3787,6 +3790,8 @@ def _main(args, parser) -> int:
             print(json_text(payload))
         else:
             print(f"chosen: {payload['chosen'] or 'none'}" + (f" — {payload['no_route']}" if payload.get("no_route") else ""))
+            if payload.get("all_lanes_rejected"):
+                print(f"  all lanes {payload['excluded_reason']}; retaining the full eligible pool")
             for candidate in payload["candidates"]:
                 print(f"  {candidate['key']:<28} p={candidate['propensity']:.3f}  quota={candidate.get('quota') or '-'}  "
                       f"checked={candidate.get('checked_runs_local', candidate.get('checked_runs'))}")

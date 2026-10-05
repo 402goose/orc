@@ -70,6 +70,26 @@ threshold, enough held-out answers, and enough independent train and acted
 held-out groups. Both decision scoring and action qualification prefer the role
 bucket, falling back to the role-less bucket when no role bucket exists.
 
+### Rejection cap
+
+`decisions.max_rejections_per_issue` optionally caps rejected runs for each
+(issue, role). Only each run's latest effective outcome counts; a later
+acceptance or withdrawn lead verdict removes that rejection. See
+[configuration](configuration.md#configuration-files) for settings and `--override-cap`.
+
+### Rework after rejection
+
+For automatic tasks with an issue and role, routing avoids every route that
+has a rejected effective outcome for that same (issue, normalized role).
+Explicit route, model, and agent pins stay unchanged. If every eligible lane
+has been rejected, routing keeps the full pool and records
+`all_lanes_rejected: true` instead of refusing the work.
+
+The `routing_log` and `fusion route --explain --issue owner/repo#N --role ROLE`
+record `excluded_lanes` and `excluded_reason: "rejected on owner/repo#N (ROLE)"`.
+Excluded candidates have propensity zero and appear in the `rejected` map with
+that reason. When the full pool is retained, `excluded_lanes` is empty.
+
 ## Cost tie-breakers
 
 With `decisions.rank_by_outcomes` enabled, optional integer `cost_tier` settings
