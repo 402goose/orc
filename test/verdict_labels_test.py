@@ -77,32 +77,45 @@ class VerdictLabelsTest(unittest.TestCase):
         self.assertIn(str(core.RunStore(self.workspace).runs / run_id / "result.json"), label["evidence"])
         self.assertFalse(DecisionEngine(self.workspace, {"decisions": {"mode": "active", "auto_actions": ["acceptance"]}}).allowed(decision, "plausible"))
 
-    def test_score_verdicts_scores_the_input_in_shadow_before_the_label_attaches(self):
+    def test_the_learn_tick_scores_verdict_inputs_in_shadow_and_the_verdict_never_starts_the_runtime(self):
         self.write_config({"decisions": {"mode": "shadow", "score_verdicts": True}})
         run_id = self.run_dir(parent_task_id="workflow-1")
-        with patch.object(fusion_decisions, "runtime_for", lambda options: Backend({"plausible": "true"})):
-            payload = self.verdict(run_id, False, "Tests cover only the happy path; empty input crashes")
-        self.assertEqual(payload["label"]["status"], "labeled")
+        self.verdict(run_id, False, "Tests cover only the happy path; empty input crashes")
         [decision] = self.events("decision")
-        self.assertEqual((decision["status"], decision["model_identity"], decision["source"]), ("ok", "fixture-model", "lead_verdict"))
-        self.assertEqual(decision["recommendations"]["plausible"]["value"], "true")
-        self.assertNotIn("crashes", decision["state"])
-        self.assertFalse(DecisionEngine(self.workspace, {"decisions": {"mode": "active", "auto_actions": ["acceptance"]}}).allowed(decision, "plausible"))
-        agreement = learning_summary(self.workspace, {"decisions": {"mode": "shadow"}})["agreement"]
+        self.assertEqual(decision["status"], "unscored")
+        config = {"decisions": {"mode": "shadow", "score_verdicts": True}}
+        with patch.object(fusion_decisions, "runtime_for", lambda options: Backend({"plausible": "true"})):
+            self.assertEqual(fusion_decisions.score_unscored(self.workspace, config), {"status": "ok", "scored": 1, "remaining": 0})
+        self.assertEqual(fusion_decisions.score_unscored(self.workspace, config), {"status": "ok", "scored": 0, "remaining": 0})
+        [score] = self.events("shadow_score")
+        self.assertEqual((score["id"], score["model_identity"]), (decision["id"], "fixture-model"))
+        [record] = self.store.records()
+        self.assertEqual((record["status"], record["recommendations"]["plausible"]["value"]), ("ok", "true"))
+        self.assertNotIn("crashes", record["state"])
+        self.assertFalse(DecisionEngine(self.workspace, {"decisions": {"mode": "active", "auto_actions": ["acceptance"]}}).allowed(record, "plausible"))
+        agreement = learning_summary(self.workspace, config)["agreement"]
         self.assertEqual((agreement["compared"], agreement["matched"]), (1, 0))
+        exported = self.workspace / ".fusion" / "export.jsonl"
+        self.store.export(exported, include_unknown=True)
+        [row] = [json.loads(line) for line in exported.read_text().splitlines()]
+        self.assertEqual(max(row["prediction"]["plausible"], key=row["prediction"]["plausible"].get), "true")
 
-    def test_a_failed_shadow_score_still_records_the_input_and_the_label(self):
+    def test_scoring_stops_at_a_runtime_failure_and_records_nothing_for_it(self):
         self.write_config({"decisions": {"mode": "shadow", "score_verdicts": True}})
-        run_id = self.run_dir()
+        self.verdict(self.run_dir(), True)
 
         def broken(options):
             raise RuntimeError("Laya runtime exited; run fusion decisions setup")
         with patch.object(fusion_decisions, "runtime_for", broken):
-            payload = self.verdict(run_id, True)
-        self.assertEqual(payload["label"]["status"], "labeled")
-        [decision] = self.events("decision")
-        self.assertEqual((decision["status"], decision["prediction"]), ("unscored", {}))
-        self.assertIn("runtime exited", decision["shadow_error"])
+            result = fusion_decisions.score_unscored(self.workspace, {"decisions": {"mode": "shadow", "score_verdicts": True}})
+        self.assertEqual((result["status"], result["scored"], result["remaining"]), ("error", 0, 1))
+        self.assertIn("runtime exited", result["error"])
+        self.assertEqual(self.events("shadow_score"), [])
+        self.assertEqual(self.store.records()[0]["status"], "unscored")
+
+    def test_scoring_is_off_by_default(self):
+        self.verdict(self.run_dir(), True)
+        self.assertEqual(fusion_decisions.score_unscored(self.workspace, {"decisions": {"mode": "shadow"}}), {"status": "off"})
 
     def test_score_verdicts_must_be_a_boolean(self):
         with self.assertRaisesRegex(ValueError, "score_verdicts"):

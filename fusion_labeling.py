@@ -508,15 +508,15 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
                          and not over_token_budget("acceptance", e["state"], e.get("state_tokens"))), None)
             engine = DecisionEngine(workspace, config)
             if gate:
-                record = engine.shadow_score("acceptance", None, gate["questions"], gate.get("context"),
-                                             encoded=gate["state"], source=VERDICT_SOURCE,
-                                             state_version=gate.get("state_version", 0),
-                                             source_truncated=gate.get("source_truncated", False))
+                record = engine.record_unscored("acceptance", None, gate["questions"], gate.get("context"),
+                                                encoded=gate["state"], source=VERDICT_SOURCE,
+                                                state_version=gate.get("state_version", 0),
+                                                source_truncated=gate.get("source_truncated", False))
             else:
                 state = acceptance_state(task, result, state_cap(engine.options), engine.state_tokens("acceptance"))
                 group = task.get("parent_task_id") or task.get("trace_id") or run_id
-                record = engine.shadow_score("acceptance", state, ACCEPTANCE_QUESTIONS,
-                                             {"task_id": run_id, "group": group, "role": task.get("role")}, source=VERDICT_SOURCE)
+                record = engine.record_unscored("acceptance", state, ACCEPTANCE_QUESTIONS,
+                                                {"task_id": run_id, "group": group, "role": task.get("role")}, source=VERDICT_SOURCE)
             if record["truncated"]:
                 return {"status": "skipped", "decision_id": record["id"],
                         "reason": "No label: the task does not fit the acceptance input whole beside a summary excerpt "

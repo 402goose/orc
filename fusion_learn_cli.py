@@ -125,11 +125,18 @@ def report(app, workspace, detail=False):
 
 
 def tick(app, workspaces):
+    import fusion_core as core
+    from fusion_decisions import score_unscored
     before = {w: {j["id"] for j in app.jobs(w, limit=None)} for w in workspaces}
     app.garden_tick(workspaces)
     results = []
     for workspace in workspaces:
-        value = {"at_ms": int(time.time() * 1000), **report(app, workspace)}
+        try:
+            config, _ = core.load_config(workspace)
+            scores = score_unscored(workspace, config)
+        except (OSError, ValueError, KeyError, TypeError, SystemExit) as exc:
+            scores = {"status": "error", "error": str(exc)}
+        value = {"at_ms": int(time.time() * 1000), **report(app, workspace), "shadow_scores": scores}
         launched = [brief(j) for j in app.jobs(workspace, limit=None) if j["id"] not in before[workspace]]
         value["launched"] = launched
         if app.garden_errors.get(str(workspace)):

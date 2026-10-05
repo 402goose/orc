@@ -501,6 +501,40 @@ def runtime_python(options):
 
 
 INFERENCE_ERRORS = (ImportError, OSError, RuntimeError, ValueError, KeyError, TypeError, ArithmeticError, AttributeError)
+SCORE_FIELDS = ("prediction", "recommendations", "model_identity", "routing", "truncated")
+SHADOW_SCORE_BATCH = 25
+
+
+def merge_shadow_scores(events):
+    """Events with each `shadow_score` folded into its `unscored` decision, which
+    then reads as `ok` with that prediction. The latest score wins."""
+    scores = {event.get("id"): event for event in events if event.get("event") == "shadow_score"}
+    if not scores:
+        return events
+    return [{**event, "status": "ok", **{key: scores[event["id"]][key] for key in SCORE_FIELDS if key in scores[event["id"]]},
+             "shadow_scored_ms": scores[event["id"]].get("time_ms")}
+            if event.get("event") == "decision" and event.get("status") == "unscored" and event.get("id") in scores else event
+            for event in events]
+
+
+def score_unscored(workspace, config, limit=SHADOW_SCORE_BATCH):
+    """With decisions.score_verdicts, score up to `limit` unscored acceptance
+    inputs in shadow, oldest first, each appended as a `shadow_score` event.
+    Stops at the first runtime failure; nothing is appended for it."""
+    engine = DecisionEngine(workspace, config)
+    if not engine.options["score_verdicts"] or engine.options["mode"] == "off":
+        return {"status": "off"}
+    pending = [record for record in engine.store.records()
+               if record.get("kind") == "acceptance" and record.get("status") == "unscored" and labelable_record(record)]
+    scored = 0
+    for record in pending[:limit]:
+        try:
+            payload = engine.shadow_score(record)
+        except INFERENCE_ERRORS as exc:
+            return {"status": "error", "scored": scored, "remaining": len(pending) - scored, "error": str(exc)}
+        engine.store.append("shadow_score", **payload)
+        scored += 1
+    return {"status": "ok", "scored": scored, "remaining": len(pending) - scored}
 
 
 class LayaRuntime:
@@ -673,8 +707,11 @@ class DecisionStore:
             finally:
                 fcntl.flock(stream, fcntl.LOCK_UN)
 
+    def events(self):
+        return merge_shadow_scores(read_jsonl(self.path))
+
     def records(self):
-        return [record for record in read_jsonl(self.path) if record.get("event") == "decision"]
+        return [record for record in self.events() if record.get("event") == "decision"]
 
     def get(self, decision_id):
         for record in reversed(self.records()):
@@ -732,7 +769,7 @@ class DecisionStore:
         workspace = self.root.parent.parent
         if local_training and not Path(destination).resolve().is_relative_to((workspace / ".fusion").resolve()):
             raise ValueError("A local training export stays under the workspace's .fusion directory")
-        events = read_jsonl(self.path)
+        events = self.events()
         labels, exclusions = reviewed_labels(events)
         provenance = label_provenance(events)
         excluded_sources = set(exclude_sources)
@@ -891,30 +928,15 @@ class DecisionEngine:
         record["truncated"] = len(text) > cap or bool(isinstance(state, dict) and state.get("source_truncated"))
         record["source_truncated"] = bool(isinstance(state, dict) and state.get("source_truncated"))
 
-    def shadow_score(self, kind, state, questions, context=None, encoded=None, **extra):
-        """Record a decision input for a verdict to label, scored in shadow first
-        so the model's answer can be compared with the verdict. The state never
-        carries the verdict. When scoring is off, the input is truncated, or the
-        runtime fails, the input is recorded unscored (the failure is kept as
-        `shadow_error`). allowed() never acts on it: nothing is waiting on it."""
-        if not self.options["score_verdicts"]:
-            return self.record_unscored(kind, state, questions, context, encoded, **extra)
-        record = {**self.new_record(kind, questions, context, state), "status": "unscored", **extra}
-        if encoded is None:
-            self.encode(record, state)
-        else:
-            record.update(state=encoded, truncated=False)
-        record["truncated"] = record["truncated"] or exceeds_token_budget(record)
+    def shadow_score(self, record):
+        """Score a recorded `unscored` input in shadow: the shadow_score payload
+        (prediction, recommendations, model identity) for merge_shadow_scores to
+        fold into the record. Raises INFERENCE_ERRORS when the runtime fails."""
+        scored = {**record, "prediction": {}, "recommendations": {}}
         started = time.monotonic()
-        if not record["truncated"]:
-            try:
-                self.infer(record, kind, questions)
-                record["status"] = "ok"
-            except INFERENCE_ERRORS as exc:
-                record.update(shadow_error=str(exc), prediction={}, recommendations={})
-        record["duration_ms"] = round((time.monotonic() - started) * 1000)
-        self.store.append("decision", **record)
-        return record
+        self.infer(scored, record["kind"], record["questions"])
+        return {"id": record["id"], **{key: scored[key] for key in SCORE_FIELDS if key in scored},
+                "duration_ms": round((time.monotonic() - started) * 1000)}
 
     def record_unscored(self, kind, state, questions, context=None, encoded=None, **extra):
         """Record a decision input without inference, so a verified answer can be
