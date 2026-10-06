@@ -2498,13 +2498,32 @@ def codex_browser_env(settings: dict[str, Any], env: dict[str, str]) -> None:
 
 
 def codex_reader_browser_args() -> list[str]:
-    """Read-only plus what a browser test needs: a writable system temp
-    directory for the profile and loopback binding through the managed proxy
-    with no allowed domains, so nothing leaves the host."""
+    """Read-only plus what a browser test needs: a writable temp directory for
+    the profile and loopback binding through the managed proxy with no allowed
+    domains, so nothing leaves the host. Codex resolves `:tmpdir` from the
+    worker's TMPDIR, which a browser reader gets pointed at its own per-run
+    directory (codex_reader_tmpdir), so this grants that directory alone."""
     network = {"enabled": True, "allow_local_binding": True, "mode": "limited", "domains": {}}
     profile = '{extends=":read-only",filesystem={":tmpdir"="write"},network=' + toml_inline(network) + '}'
     return ["--strict-config", "-c", "features.network_proxy=true", "-c", 'default_permissions="fusion_read_browser"',
             "-c", "permissions.fusion_read_browser=" + profile]
+
+
+def codex_reader_tmpdir(env: dict[str, str]) -> str:
+    """A fresh private temp directory for one Codex browser reader, set as its
+    TMPDIR, TMP and TEMP. The shared per-user temp directory holds other runs'
+    files and grading trees, and /tmp holds writer worktrees, so a reader must
+    write neither. The path stays short for Chromium's sockets; the caller
+    removes it when the run ends."""
+    directory = tempfile.mkdtemp(prefix="orc-", dir=Path("/tmp").resolve())
+    env.update(TMPDIR=directory + "/", TMP=directory, TEMP=directory)
+    return directory
+
+
+def codex_browser_reader(config: dict[str, Any], task: dict[str, Any], settings: dict[str, Any]) -> bool:
+    """Whether a run is a sandboxed Codex reader with `codex.browser` on."""
+    return (task["agent"] == "codex" and not task["write"] and task_execution_mode(config, task) != "yolo"
+            and codex_browser(settings) is not None)
 
 
 def codex_permission_args(workspace: Path, settings: dict[str, Any], write: bool) -> list[str]:
@@ -3221,6 +3240,8 @@ def dispatch(
         with contextlib.ExitStack() as stack:
             with progress.activity(label, "acquiring workspace writer lock" if task["write"] else "preparing read-only worker"):
                 stack.enter_context(writer_lock(Path(task["workspace"]), task["write"], store.control_workspace))
+            if codex_browser_reader(config, task, resolved_settings):
+                stack.callback(shutil.rmtree, codex_reader_tmpdir(env), True)
             store.event(run_dir, "worker.started", {"argv": argv, "resumed_session": bool(session_id), **session})
             if metadata.get("execution_choice"):
                 metadata["execution_choice"]["dispatch"] = {"status": "attempted", "argv": argv}
@@ -3909,6 +3930,12 @@ def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str |
             env["FUSION_READ_ONLY"] = "1"
         if not yolo:
             codex_browser_env(settings, env)
+        if read_only and not yolo and codex_browser(settings) is not None:
+            directory = codex_reader_tmpdir(env)
+            try:
+                return subprocess.run(argv, cwd=workspace, env=env, check=False).returncode
+            finally:
+                shutil.rmtree(directory, True)
         return subprocess.run(argv, cwd=workspace, env=env, check=False).returncode
     if agent == "opencode":
         settings = config.get("opencode", {})
