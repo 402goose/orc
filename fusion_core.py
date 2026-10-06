@@ -483,12 +483,16 @@ def is_review_task(task: dict[str, Any]) -> bool:
 
 
 def review_verdict(result: dict[str, Any]) -> str | None:
-    """What a completed review concluded: approve (no blockers) or changes_requested.
-    None when the review did not complete (error, timeout, quota, permissions). Results
-    saved before this field existed are judged the same way from their status and blockers."""
+    """What a completed review concluded: its `VERDICT:` line when it gave one (approve, or
+    changes as changes_requested), otherwise approve when it listed no blockers. None when the
+    review did not complete (error, timeout, quota, permissions, verdict_missing). Results saved
+    before this field existed are judged the same way from their status, verdict and blockers."""
     verdict = result.get("verdict") or classify_verdict(result)["verdict"]
     if verdict != "ok":
         return None
+    reported = result.get("reported_verdict")
+    if reported in REVIEW_VERDICTS:
+        return "approve" if reported == "approve" else "changes_requested"
     return "changes_requested" if result.get("blockers") else "approve"
 
 

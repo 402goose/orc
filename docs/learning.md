@@ -47,9 +47,12 @@ external verdicts and their labels, preserving independent gate evidence.
 Choose exactly one of accepted, rejected, withdraw, or unmeasured.
 
 A read-only review run (a role containing `review`) saves `review_verdict` in its
-result: `approve` when it completed with no blockers, `changes_requested` when it
-listed blockers, and null when it did not complete (error, timeout, quota or a
-permission denial).
+result. Its `VERDICT:` line decides: `approve`, or `changes` saved as
+`changes_requested`, even when it also listed blockers (an approval with nits stays an
+approval). A result without a VERDICT line, saved before review delegations required
+one, falls back to `approve` with no blockers and `changes_requested` with blockers. It
+is null when the review did not complete (error, timeout, quota, a permission denial, or
+`verdict_missing`).
 
 An accepted `--stage land` verdict that carries an issue (`--issue`, or the issue the
 run was delegated with) also grades the reviews of that issue that have no outcome

@@ -31,15 +31,16 @@ class ReviewOutcomesTest(unittest.TestCase):
                                       "FUSION_PROGRESS": "0", "FUSION_TELEMETRY": "0", "FUSION_DECISIONS_MODE": "off"})
         env.start()
         self.addCleanup(env.stop)
-        self.workers = {name: self.worker(name, blockers) for name, blockers in
-                        (("approve", "none"), ("block", "the output file loses its annotation"))}
+        self.workers = {name: self.worker(name, verdict, blockers) for name, verdict, blockers in
+                        (("approve", "approve", "none"), ("block", "changes", "the output file loses its annotation"),
+                         ("nits", "approve", "rename the helper"))}
         self.use("approve")
 
-    def worker(self, name, blockers):
+    def worker(self, name, verdict, blockers):
         path = self.root / f"claude-{name}"
         path.write_text(f"#!{sys.executable}\nimport json\n"
                         "print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':'s',"
-                        f"'result':'STATUS: success\\nSUMMARY: reviewed\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: {blockers}'}}))\n")
+                        f"'result':'STATUS: success\\nSUMMARY: reviewed\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: {blockers}\\nVERDICT: {verdict}'}}))\n")
         path.chmod(0o755)
         return path
 
@@ -90,6 +91,12 @@ class ReviewOutcomesTest(unittest.TestCase):
     def test_a_review_that_did_not_complete_has_no_verdict(self):
         self.assertIsNone(core.review_verdict({"status": "error", "exit_code": 1, "blockers": ["timeout after 1800 seconds"]}))
         self.assertEqual(core.review_verdict({"status": "partial", "blockers": ["x"]}), "changes_requested")
+        self.assertIsNone(core.review_verdict({"status": "verdict_missing", "blockers": ["verdict missing"]}))
+
+    def test_a_reported_verdict_outranks_the_blockers_list(self):
+        self.assertEqual(self.saved(self.review("nits", 0))["review_verdict"], "approve")
+        self.assertEqual(core.review_verdict({"status": "success", "blockers": [], "reported_verdict": "changes"}),
+                         "changes_requested")
 
     def test_a_land_grades_only_the_reviews_it_settles(self):
         first_block = self.review("block", 0)
