@@ -133,6 +133,7 @@ DEFAULTS: dict[str, Any] = {
         "read_only_allowed_tools": [],
         "narrow_home_deny": False,
         "narrow_home_deny_versions": ["2.1.291"],
+        "user_hooks": False,
         "max_bash_denials": 6,
         "max_baseline_denials": 2,
     },
@@ -961,6 +962,41 @@ def claude_workspace_settings(launcher_args: list[str], workspace: str) -> list[
     scoped += [f"{kind}(/{path}/.claude/**)" for kind, path in sorted(changed)]
     text = json_text({**settings, "permissions": {**permissions, "deny": scoped}}) + "\n"
     out = path.with_name(f".{path.stem}.workspace-{hashlib.sha256(text.encode()).hexdigest()[:16]}.json")
+    if not out.exists():
+        temp = out.with_suffix(f".{os.getpid()}.tmp")
+        temp.write_text(text, encoding="utf-8")
+        temp.replace(out)
+    return [*launcher_args[:at], str(out), *launcher_args[at + 1:]]
+
+
+def claude_hooks_off(launcher_args: list[str]) -> list[str]:
+    """Launcher args whose settings turn off every Claude Code hook (`disableAllHooks`).
+
+    User- and project-level hooks run inside a worker as side effects ORC cannot see or grade, such
+    as a session hook committing the worker's output. A `--settings` file is copied beside itself
+    with the key added, named by its content, so relative rules keep their meaning; inline JSON gets
+    the key; without `--settings` an inline one is appended."""
+    if "--settings" not in launcher_args or launcher_args.index("--settings") + 1 >= len(launcher_args):
+        return [*launcher_args, "--settings", json.dumps({"disableAllHooks": True}, separators=(",", ":"))]
+    at = launcher_args.index("--settings") + 1
+    source = launcher_args[at]
+    if source.lstrip().startswith("{"):
+        try:
+            inline = json.loads(source)
+        except ValueError:
+            return launcher_args
+        if not isinstance(inline, dict):
+            return launcher_args
+        return [*launcher_args[:at], json.dumps({**inline, "disableAllHooks": True}, separators=(",", ":")), *launcher_args[at + 1:]]
+    path = Path(source).expanduser()
+    try:
+        settings = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return launcher_args
+    if not isinstance(settings, dict) or settings.get("disableAllHooks") is True:
+        return launcher_args
+    text = json_text({**settings, "disableAllHooks": True}) + "\n"
+    out = path.with_name(f".{path.stem.lstrip('.')}.hooks-off-{hashlib.sha256(text.encode()).hexdigest()[:16]}.json")
     if not out.exists():
         temp = out.with_suffix(f".{os.getpid()}.tmp")
         temp.write_text(text, encoding="utf-8")
@@ -2683,6 +2719,9 @@ def agent_command(
         command_name = Path(command).name
         launcher_args = (claude_workspace_plan(settings, task)[0] if task["write"] and not yolo
                          else [str(item) for item in settings.get("launcher_args", [])])
+        hooks_off = not settings.get("user_hooks")
+        if hooks_off and ("--settings" in launcher_args or not yolo):
+            launcher_args = claude_hooks_off(launcher_args)
         profile = str(settings.get("profile", ""))
         if command_name == "orc" and profile:
             launcher_args.append(profile if profile.startswith("@") else f"@{profile}")
@@ -2699,7 +2738,8 @@ def agent_command(
             argv += ["-m", selected_model]
         argv += ["-p", "--output-format", "stream-json", "--verbose"]
         if yolo:
-            argv += ["--dangerously-skip-permissions", "--settings", '{"sandbox":{"enabled":false}}']
+            argv += ["--dangerously-skip-permissions", "--settings",
+                     json.dumps({"sandbox": {"enabled": False}, **({"disableAllHooks": True} if hooks_off else {})}, separators=(",", ":"))]
             if command_name == "orc":
                 env["ORC_MODE"] = "yolo"
         else:

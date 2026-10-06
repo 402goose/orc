@@ -454,6 +454,26 @@ stay in `plan`. The sandbox covers Bash only, so deny `Edit(...)` on paths a
 writer must never change (for example `Edit(//Users/<you>/**)` when worktrees
 live under `/tmp`) and on evaluation files a worker could game.
 
+**Hooks are off in workers.** User- and project-level Claude Code hooks (from
+`~/.claude/settings.json`, or a project's `.claude/settings.json` inside the
+worktree) would run inside every worker as side effects ORC cannot see or grade.
+For example, a session-end hook that commits erases the change a node's checks
+look for. So every Claude worker runs with `disableAllHooks: true`.
+
+- **A `--settings` file:** when `claude.launcher_args` passes one, ORC copies it next
+  to itself as `.<name>.hooks-off-<hash>.json` with the key added. Relative rules
+  keep their meaning and the deny rules are unchanged.
+- **Inline JSON:** the key is added to it.
+- **No `--settings`:** ORC appends an inline one.
+- **Yolo writers:** their inline settings carry the key alongside the sandbox switch.
+
+ORC itself uses no hooks: its controls are deny rules, the Bash sandbox,
+`--strict-mcp-config`, and the denial guard. Checked on Claude Code 2.1.292: the
+key, from a file or inline, suppressed both user-level and project-level hooks. A
+route that deliberately wants the user's hooks sets `claude.user_hooks: true`
+(default `false`). Interactive leads (`fusion run`) are the user's own session
+and keep their hooks.
+
 **Writers whose workspace is under a home deny.** Claude Code's deny rules beat
 any allow, so `Edit(//Users/<you>/**)` also refuses a writer whose workspace is
 under `$HOME`. The preferred setup fails closed: run writers in a git worktree
