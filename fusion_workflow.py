@@ -1457,7 +1457,7 @@ BLOCKERS: unresolved issues, or none
         write = bool(node.get("write", False))
         settings = {key: node[key] for key in (
             "command", "model", "reasoning_effort", "allow_native_delegation", "model_selector", "profile", "launcher_args",
-            "max_budget_usd", "permission_mode", "permission_prompts", "allowed_tools",
+            "max_budget_usd", "permission_mode", "permission_prompts", "allowed_tools", "read_only_allowed_tools",
             "allow_untested",
         ) if key in node}
         task = core.make_task(
@@ -1974,7 +1974,8 @@ def reroute_resume_spec(manifest: dict[str, Any], config: dict[str, Any], node_i
                 continue
             if agent is not None or route is not None:
                 for key in ("route", "command", "model", "model_selector", "profile", "launcher_args",
-                            "max_budget_usd", "permission_mode", "permission_prompts", "allowed_tools", "allow_untested"):
+                            "max_budget_usd", "permission_mode", "permission_prompts", "allowed_tools",
+                            "read_only_allowed_tools", "allow_untested"):
                     node.pop(key, None)
                 node["agent"] = agent or "auto"
                 if route:

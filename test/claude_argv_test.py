@@ -65,5 +65,15 @@ class ClaudeArgvTest(unittest.TestCase):
                         if command == "claude":
                             self.assertEqual(self.parse_fixture(argv).prompt, core.brief_for(task))
 
+    def test_read_only_tools_are_allowed_only_on_tasks_that_do_not_write(self):
+        reads = ["mcp__tenet-context__context_status", "mcp__tenet-context__memory_status"]
+        for write in (False, True):
+            with self.subTest(write=write):
+                task = core.make_task(Path("/tmp/fixture"), "claude", "Answer from the record.", "review", [], [], None, False,
+                                      write, settings_overrides={"allowed_tools": ["Read"], "read_only_allowed_tools": reads})
+                parsed = self.parse_fixture(core.agent_command(core.DEFAULTS, task, None)[0])
+                self.assertEqual(parsed.allowedTools, ["Read"] if write else ["Read", *reads])
+                self.assertEqual(parsed.prompt, core.brief_for(task))
+
 if __name__ == "__main__":
     unittest.main()
