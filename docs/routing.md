@@ -75,13 +75,26 @@ bucket, falling back to the role-less bucket when no role bucket exists.
 
 `decisions.max_rejections_per_issue` optionally caps rejected runs for each
 (issue, role). Only each run's latest effective outcome counts; a later
-acceptance or withdrawn lead verdict removes that rejection. See
+acceptance or withdrawn lead verdict removes that rejection. Every rejection
+counts here, whatever its class: the cap stops blind retries, not bad lanes. See
 [configuration](configuration.md#configuration-files) for settings and `--override-cap`.
+
+### Rejection classes
+
+A rejection's `rejection_class` decides whether it is evidence about the lane.
+`suite_red`, `no_diff`, `out_of_scope` and `review_changes` are quality failures and
+count against the lane. `land_conflict`, `eval_unmeasured` and `other` are harness
+problems: ranking, the Thompson posterior and rework exclusion treat them as if no
+verdict was recorded. The run's own status still counts, so a worker that errored counts
+against the lane exactly as it would with no outcome. A rejection with no class counts. `fusion decisions routing-report`
+skips excluded outcomes in its estimates, counts them in `excluded_by_class`, and
+still lists them under `rejections` with `counts_against_lane: false`.
 
 ### Rework after rejection
 
 For automatic tasks with an issue and role, routing avoids every route that
-has a rejected effective outcome for that same (issue, normalized role).
+has a rejected effective outcome for that same (issue, normalized role) that
+counts against the lane (see [rejection classes](#rejection-classes)).
 Explicit route, model, and agent pins stay unchanged. If every eligible lane
 has been rejected, routing keeps the full pool and records
 `all_lanes_rejected: true` instead of refusing the work.

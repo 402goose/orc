@@ -51,7 +51,8 @@ class RoutingTasksTest(unittest.TestCase):
         self.assertEqual((first["chosen"], first["model"], first["propensity"], first["cost_usd"]), ("lane-a", "model-a", .6, 5.0))
         self.assertEqual(first["posterior"], {"successes": 5, "attempts": 8, "p_win": .55, "cost_per_accepted": 8.0,
                                               "lanes": ["lane-a", "lane-a-api"]})
-        self.assertEqual(first["outcome"], {"accepted": True, "source": "lead", "stage": "verify", "reason": "landed"})
+        self.assertEqual(first["outcome"], {"accepted": True, "source": "lead", "stage": "verify", "reason": "landed",
+                                            "rejection_class": None, "counts_against_lane": True})
         self.assertEqual(first["labels"], [{"decision_id": "gate-1", "kind": "acceptance", "labeled": True, "source": "lead_verdict",
                                             "answers": {"failed_task": "false"}, "verified": True}])
         self.assertEqual((first["run_dir"], first["result"]), (".fusion/runs/run-1", ".fusion/runs/run-1/result.json"))
@@ -66,8 +67,10 @@ class RoutingTasksTest(unittest.TestCase):
 
     def test_models_are_summarized_and_filterable(self):
         value = routing_tasks(EVENTS, SPANS)
-        self.assertEqual(value["models"]["model-a"], {"picks": 2, "accepted": 1, "rejected": 0, "pending": 1, "cost_usd": 5.0})
-        self.assertEqual(value["models"]["model-b"], {"picks": 1, "accepted": 0, "rejected": 1, "pending": 0, "cost_usd": 1.5})
+        self.assertEqual(value["models"]["model-a"], {"picks": 2, "accepted": 1, "rejected": 0, "excluded": 0, "pending": 1,
+                                                        "cost_usd": 5.0})
+        self.assertEqual(value["models"]["model-b"], {"picks": 1, "accepted": 0, "rejected": 1, "excluded": 0, "pending": 0,
+                                                        "cost_usd": 1.5})
         filtered = routing_tasks(EVENTS, SPANS, model="MODEL-B")
         self.assertEqual([r["run"] for r in filtered["rows"]], ["run-2"])
         self.assertEqual(list(filtered["models"]), ["model-b"])

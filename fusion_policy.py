@@ -286,8 +286,8 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None, minim
     headroom = {entry["lane_key"]: quota_assessment(entry, thresholds, now / 1000)
                 for entry in usage.headroom(store.workspace, include_raw=False) if entry.get("lane_key") and entry.get("quota")}
     history = defaultdict(list)
-    outcomes = {run_id: event["accepted"] for run_id, event in
-                effective_outcomes(read_jsonl(DecisionStore(store.workspace).path)).items()}
+    measured = effective_outcomes(read_jsonl(DecisionStore(store.workspace).path))
+    outcomes = {run_id: event["accepted"] for run_id, event in measured.items() if counts_against_lane(event)}
     unhealthy = set(task.get("excluded_routes", []))
     unavailable_commands = set()
     for excluded in unhealthy:
@@ -336,6 +336,8 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None, minim
         # error is observed. Quota, auth and permission failures are lane health
         # (cooldown), not evidence about quality. A review that never gave its
         # VERDICT decided nothing, so it counts neither way, even with an outcome.
+        # A rejection classed as a harness problem is treated as no verdict at
+        # all, so the run's own status still counts as it would without one.
         evidence = [(span, outcomes[span["run_id"]] if span.get("run_id") in outcomes else False) for span in spans
                     if span.get("run_id") not in untrusted and span.get("status") != "verdict_missing" and (span.get("run_id") in outcomes or
                         (span.get("status") == "error" and span.get("failure_class") not in {"quota", "auth", "permission_denied"}))]
@@ -850,7 +852,7 @@ def rework_exclusions(task, store):
     roles = {span.get("run_id"): span.get("role") for span in store.traces(limit=5000)}
     outcomes = effective_outcomes(read_jsonl(DecisionStore(store.workspace).path))
     return sorted({event["route"] for run, event in outcomes.items()
-                   if event.get("accepted") is False and event.get("issue") == issue and event.get("route")
+                   if event.get("accepted") is False and counts_against_lane(event) and event.get("issue") == issue and event.get("route")
                    and normalize_role(event.get("role") or roles.get(run)) == role})
 
 
@@ -1099,6 +1101,23 @@ def route_task(config, task, store, rng=None):
                             **({"sampled": sampled} if sampled else {}))
 
 
+HARNESS_REJECTION_CLASSES = frozenset({"land_conflict", "eval_unmeasured", "other"})
+QUALITY_REJECTION_CLASSES = frozenset({"suite_red", "no_diff", "out_of_scope", "review_changes"})
+
+
+def counts_against_lane(outcome):
+    """Whether a measured outcome is evidence about its lane's quality. An acceptance
+    always is. A rejection is too, unless its caller classed it as a harness problem
+    (land_conflict, eval_unmeasured, other): that verdict says nothing about the work,
+    so it is treated as if no verdict was recorded, in ranking, the posterior and
+    rework. The run's own status still counts: a worker that errored counts against
+    the lane exactly as it would with no outcome. A rejection with no class is the
+    caller's verdict and counts. The rejection cap
+    per issue and role guards against blind retries, not lane quality, and counts
+    every rejection."""
+    return not (outcome.get("accepted") is False and outcome.get("rejection_class") in HARNESS_REJECTION_CLASSES)
+
+
 def effective_outcomes(events):
     """One measured outcome per run, in append order, excluding withdrawn leads.
 
@@ -1134,14 +1153,16 @@ def effective_outcomes(events):
 
 
 def rejection_counts(outcomes):
-    """[{issue, rejection_class, count}] over runs whose latest measured outcome is a rejection
-    that names an issue; withdrawn verdicts are already gone from `outcomes`."""
+    """[{issue, rejection_class, count, counts_against_lane}] over runs whose latest measured
+    outcome is a rejection that names an issue; withdrawn verdicts are already gone from
+    `outcomes`. Harness-class rejections are listed with counts_against_lane false."""
     counts = {}
     for event in outcomes.values():
         if event.get("accepted") is False and event.get("issue"):
             key = (event["issue"], event.get("rejection_class"))
             counts[key] = counts.get(key, 0) + 1
-    return [{"issue": issue, "rejection_class": cls, "count": count}
+    return [{"issue": issue, "rejection_class": cls, "count": count,
+             "counts_against_lane": cls not in HARNESS_REJECTION_CLASSES}
             for (issue, cls), count in sorted(counts.items(), key=lambda item: (item[0][0], str(item[0][1])))]
 
 
@@ -1184,6 +1205,9 @@ def routing_report(events, since=None, policy=None, by="lane"):
     lane) / available, `snips_acceptance` normalises by the summed weights, and
     `ess` is (sum w)^2 / sum w^2. A lane given propensity 0 in any of those
     choices has no overlap there, so neither estimate is reported for it.
+    Rejections classed as harness problems (`counts_against_lane`) are skipped
+    like vetoed ones and counted in `excluded_by_class`; `rejections` still
+    lists them, with counts_against_lane false.
 
     Which estimate is identified depends on the logging policy. `since` (epoch
     ms) and `policy` ("thompson": gating picks sampled from model posteriors;
@@ -1198,6 +1222,7 @@ def routing_report(events, since=None, policy=None, by="lane"):
         raise ValueError("by must be lane or family")
     events = list(events)
     logs, outcomes, vetoed, sources = {}, effective_outcomes(events), 0, {}
+    excluded = 0  # Harness-class rejections: they say nothing about the lane, so no estimate uses them.
     controlled = 0  # Operator-pause refusals: no worker ran, so they are not routing choices.
     capped = {}  # Rejection-cap refusals: no worker ran, so they are not routing choices.
     for event in events:
@@ -1220,6 +1245,9 @@ def routing_report(events, since=None, policy=None, by="lane"):
             continue
         if outcome.get("laya_veto"):
             vetoed += 1
+            continue
+        if not counts_against_lane(outcome):
+            excluded += 1
             continue
         joined += 1
         source = outcome.get("source") or "gate"
@@ -1273,8 +1301,8 @@ def routing_report(events, since=None, policy=None, by="lane"):
         if len(logs) > ineligible and not epsilon:
             text += " Set decisions.routing_epsilon above 0 to explore read-only work."
         warnings.append(text)
-    if len(logs) - joined - vetoed:
-        warnings.append(f"{len(logs) - joined - vetoed} logged routing choices have no outcome yet")
+    if len(logs) - joined - vetoed - excluded:
+        warnings.append(f"{len(logs) - joined - vetoed - excluded} logged routing choices have no outcome yet")
     return {"schema": "fusion.routing_report.v1", "logged_choices": len(logs), "with_outcome": joined,
             "filters": {"since": since, "policy": policy, "by": by},
             "routing_policies": [{"task_id": task_id, "policy": log.get("policy", {}),
@@ -1282,7 +1310,7 @@ def routing_report(events, since=None, policy=None, by="lane"):
                                  for task_id, log in logs.items()],
             "quota_decisions": [{"task_id": task_id, "chosen": log.get("chosen"), "quota": log["quota"],
                                  "rejected": log.get("rejected", {})} for task_id, log in logs.items() if log.get("quota")],
-            "vetoed_outcomes_skipped": vetoed, "outcome_sources": sources, "control_refusals": controlled,
+            "vetoed_outcomes_skipped": vetoed, "excluded_by_class": excluded, "outcome_sources": sources, "control_refusals": controlled,
             "rejections": rejection_counts(outcomes),
             "capped": [{"issue": issue, "role": role, "count": count} for (issue, role), count in sorted(capped.items(), key=str)],
             "explored": sum(exploration.values()), "exploration": exploration, "epsilon_ineligible": ineligible,

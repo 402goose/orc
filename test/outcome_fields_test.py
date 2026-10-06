@@ -89,7 +89,8 @@ class OutcomeFieldsTest(unittest.TestCase):
         self.cli("outcome", runs[0], "--withdraw", "--reason", "graded the wrong tree")
         self.cli("outcome", runs[1], "--accepted", "--reason", "green on re-grade")
         report = routing_report(read_jsonl(DecisionStore(self.workspace).path))
-        self.assertEqual(report["rejections"], [{"issue": "o/r#7", "rejection_class": "suite_red", "count": 2}])
+        self.assertEqual(report["rejections"], [{"issue": "o/r#7", "rejection_class": "suite_red", "count": 2,
+                                                "counts_against_lane": True}])
 
     def test_withdraw_still_removes_a_verdict_with_the_new_fields(self):
         run = self.delegate()["run_id"]
