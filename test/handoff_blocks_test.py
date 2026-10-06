@@ -140,6 +140,33 @@ none
             with self.subTest(blocker=blocker):
                 self.assertTrue(core.parse_handoff("BLOCKERS: " + blocker)["blockers"])
 
+    def test_declared_no_blocker_moves_caveats_to_limitations(self):
+        caveat = ("No blocker to this verification. Runtime memory and crash behavior remain unverified. "
+                  "Read-only permissions prevented updating the status file; this handoff is the record.")
+        parsed = core.parse_handoff("STATUS: success\nSUMMARY: verified\nBLOCKERS: " + caveat)
+        self.assertEqual(parsed["blockers"], [])
+        self.assertEqual(len(parsed["limitations"]), 1)
+        self.assertIn("remain unverified", parsed["limitations"][0])
+        for clear in ("none blocking", "None blocking.", "No blockers", "no blocking issues", "Nothing blocking",
+                      "Non-blocking: the docs page was not re-rendered."):
+            with self.subTest(clear=clear):
+                self.assertEqual(core.parse_handoff("BLOCKERS: " + clear)["blockers"], [])
+
+    def test_limitations_field_never_becomes_a_blocker(self):
+        parsed = core.parse_handoff("STATUS: success\nSUMMARY: read\nBLOCKERS: none\n"
+                                    "LIMITATIONS: the load test was not run\n- memory use is unverified")
+        self.assertEqual(parsed["blockers"], [])
+        self.assertEqual(parsed["limitations"], ["the load test was not run", "memory use is unverified"])
+        self.assertEqual(core.parse_handoff("BLOCKERS: none\nLIMITATIONS: none")["limitations"], [])
+
+    def test_real_blockers_still_gate_beside_limitations(self):
+        for blocker in ("tests fail", "No blockers, but the suite still fails on CI.",
+                        "none. The result is unverified", "Production verification was denied."):
+            with self.subTest(blocker=blocker):
+                parsed = core.parse_handoff("BLOCKERS: " + blocker + "\nLIMITATIONS: memory use is unverified")
+                self.assertTrue(parsed["blockers"])
+                self.assertEqual(parsed["limitations"], ["memory use is unverified"])
+
     def test_fenced_handoff_and_separate_acceptance_contract(self):
         parsed = core.parse_handoff("""```text
 STATUS: success

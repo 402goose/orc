@@ -377,6 +377,14 @@ lookups, and tests run before a fix do not become permanent blockers. Unresolved
 handoff blockers, provider errors, required evidence, and configured acceptance
 checks still determine whether a stage passes.
 
+Caveats that do not block go under the handoff's `LIMITATIONS:` label, which the
+result keeps as `limitations` and no gate reads. A `BLOCKERS:` value that opens by
+declaring nothing blocks ("none blocking", "No blocker to this check.",
+"Non-blocking: …") is treated as empty, and the rest of it moves to
+`limitations`. The exception is a contrast word (but, however, except, although,
+though, yet): "No blockers, but the suite fails" still gates. A bare "none." followed by
+a failure word ("none. The result is unverified") also still gates.
+
 ## Ultra without the token fire
 
 Ultra is an explicit bounded pipeline modeled after the useful part of

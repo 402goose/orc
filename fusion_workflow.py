@@ -882,7 +882,8 @@ STATUS: success | partial | blocked | error
 SUMMARY: what you did and the current result
 CHANGED: comma-separated paths, or none
 TESTS: commands run and their outcome, or none
-BLOCKERS: unresolved issues, or none
+BLOCKERS: unresolved issues that block acceptance, or none
+LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or none
 """
 
     def _contract_from(self, result: dict[str, Any]) -> dict[str, Any]:

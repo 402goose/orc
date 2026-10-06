@@ -294,6 +294,10 @@ def _reads_as_prose(value: str) -> bool:
 
 
 NONE_ANSWERS = {"none", "n/a", "na", "nil", "nothing", "-", "—"}
+NO_BLOCKERS_DECLARED = re.compile(
+    r"(?:no\s+block(?:ers?|ing\s+(?:issues?|problems?))|nothing\s+(?:is\s+)?blocking|none\s+(?:are\s+)?blocking"
+    r"|non-?blocking)\b[^.;:\n]*[.;:,—-]?\s*(.*)\Z", re.I | re.S)
+CONTRAST = re.compile(r"\b(?:but|however|except|although|though|yet)\b", re.I)
 
 # A delegated review answers with one of these on a `VERDICT:` line.
 REVIEW_VERDICTS = ("approve", "changes")
@@ -318,7 +322,7 @@ def parse_handoff(text: str) -> dict[str, Any]:
     blocks: dict[str, list[str]] = {}
     # Models decorate labels: **STATUS:** success, **STATUS**: success, ## STATUS: success.
     label_pattern = re.compile(
-        r"^(?:#{1,6}\s+)?([*_]{0,3})(STATUS|SUMMARY|CHANGED|TESTS|BLOCKERS)\1?\s*:\s*\1?\s*(.*)$", re.I)
+        r"^(?:#{1,6}\s+)?([*_]{0,3})(STATUS|SUMMARY|CHANGED|TESTS|BLOCKERS|LIMITATIONS)\1?\s*:\s*\1?\s*(.*)$", re.I)
     active: str | None = None
     fence: str | None = None
     handoff_fence = False
@@ -359,6 +363,10 @@ def parse_handoff(text: str) -> dict[str, Any]:
         elif active:
             blocks[active].append(line)
     fields = {label: "\n".join(value).strip() for label, value in blocks.items()}
+    declared = NO_BLOCKERS_DECLARED.match(fields.get("BLOCKERS", ""))
+    if declared and not CONTRAST.search(fields["BLOCKERS"]):
+        fields["BLOCKERS"] = ""
+        fields["LIMITATIONS"] = "\n\n".join(part for part in (fields.get("LIMITATIONS", ""), declared[1].strip()) if part)
 
     def list_field(name: str) -> list[str]:
         value = fields.get(name, "").strip()
@@ -437,6 +445,7 @@ def parse_handoff(text: str) -> dict[str, Any]:
         "changed": list_field("CHANGED"),
         "tests": list_field("TESTS"),
         "blockers": list_field("BLOCKERS"),
+        "limitations": list_field("LIMITATIONS"),
     }
 
 
@@ -1727,7 +1736,8 @@ Return a compact handoff with these exact labels:
 SUMMARY: what you did and the current result
 CHANGED: comma-separated paths, or none
 TESTS: commands run and their outcome, or none
-BLOCKERS: unresolved issues, or none
+BLOCKERS: unresolved issues that block acceptance, or none
+LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or none
 """
 
 
@@ -3302,6 +3312,7 @@ def dispatch(
         "changed": handoff.get("changed", []),
         "tests": handoff.get("tests", []),
         "blockers": blockers,
+        "limitations": handoff.get("limitations", []),
         "provider_failure": failure,
         "denied_tools": denied_tools or blocker_denied_tools(blockers),
         "denied": denied,
@@ -3431,7 +3442,7 @@ Stage assignment:
 Prior stage artifacts (JSON handoffs; read them from disk when present):
 {context_lines}
 
-The lead controls the final decision. Do not broaden the task. Return the exact STATUS, SUMMARY, CHANGED, TESTS, and BLOCKERS handoff labels."""
+The lead controls the final decision. Do not broaden the task. Return the exact STATUS, SUMMARY, CHANGED, TESTS, BLOCKERS, and LIMITATIONS handoff labels."""
         stage_settings = stage
         if harness:
             stage_settings = stage.get(harness, {}) if isinstance(stage.get(harness), dict) else {}
