@@ -129,6 +129,7 @@ DEFAULTS: dict[str, Any] = {
         "permission_prompts": "none",
         "model": "",
         "allowed_tools": [],
+        "read_only_allowed_tools": [],
         "max_bash_denials": 6,
         "max_baseline_denials": 2,
     },
@@ -734,6 +735,22 @@ CLAUDE_DENIAL_TEXT = re.compile(r"\A\s*(?:<tool_use_error>\s*)?(?:Permission to 
 # A deny rule refusing a protected path is policy working as configured, not a
 # lane that can't do its job; it is recorded but never stops a run.
 CLAUDE_DENY_RULE_TEXT = re.compile(r"denied by your permission settings", re.IGNORECASE)
+CLAUDE_FILE_TOOLS = frozenset({"write", "edit", "multiedit"})
+
+
+def claude_plan_file(tool: Any, tool_input: Any) -> bool:
+    """Whether a denied call was Claude Code writing its own plan file (~/.claude/plans/, or
+    $CLAUDE_CONFIG_DIR/plans/). Plan mode writes one on its own; a home-path deny refusing it
+    says nothing about the task, so it is neither a denial nor a blocker."""
+    names = normalize_tools([tool])
+    if not names or _tool_key(names[0]) not in CLAUDE_FILE_TOOLS or not isinstance(tool_input, dict):
+        return False
+    path = tool_input.get("file_path")
+    if not isinstance(path, str) or not path.strip():
+        return False
+    plans = (Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser() / "plans").resolve()
+    target = Path(path).expanduser().resolve()
+    return target != plans and target.is_relative_to(plans)
 
 
 def _claude_events(stdout: str):
@@ -788,6 +805,8 @@ def claude_stream_denials(stdout: str) -> list[dict[str, str]]:
     result = []
     for key, entry in denials.items():
         tool_input = uses.get(key, (None, None))[1]
+        if claude_plan_file(entry["tool"], tool_input):
+            continue
         head = json.dumps(tool_input, ensure_ascii=False, separators=(",", ":")) if isinstance(tool_input, (dict, list)) else str(tool_input or "")
         names = normalize_tools([entry["tool"]])
         if names:
@@ -804,12 +823,14 @@ def claude_denial_guard(max_bash: int, max_baseline: int = 2):
     working). Bash denials stop it once `max_bash` come in a row; a successful
     Bash call in between resets the count, so a worker that works around a
     denied command keeps going. 0 disables either limit."""
-    state = {"uses": {}, "seen": set(), "bash": 0, "baseline": 0}
+    state = {"uses": {}, "inputs": {}, "seen": set(), "bash": 0, "baseline": 0}
 
     def judge(key: str, tool: str, message: str) -> str | None:
         if key in state["seen"]:
             return None
         state["seen"].add(key)
+        if claude_plan_file(tool, state["inputs"].get(key)):
+            return None
         names = normalize_tools([tool])
         name = names[0] if names else tool
         detail = f" ({message[:160]})" if message else ""
@@ -837,6 +858,7 @@ def claude_denial_guard(max_bash: int, max_baseline: int = 2):
         if event.get("type") == "assistant":
             for block in _claude_blocks(event, "tool_use"):
                 state["uses"][str(block.get("id"))] = str(block.get("name") or "tool")
+                state["inputs"][str(block.get("id"))] = block.get("input")
         elif event.get("type") == "system" and event.get("subtype") == "permission_denied":
             key = str(event.get("tool_use_id"))
             return judge(key, str(event.get("tool_name") or state["uses"].get(key, "tool")), str(event.get("message") or ""))
@@ -869,9 +891,9 @@ def provider_denials(agent: str, stdout: str) -> list[dict[str, str]]:
         denied = []
         for item in items:
             names = normalize_tools([_denial_name(item)])
-            if not names:
-                continue
             tool_input = item.get("tool_input")
+            if not names or claude_plan_file(names[0], tool_input):
+                continue
             head = json.dumps(tool_input, ensure_ascii=False, separators=(",", ":")) if isinstance(tool_input, (dict, list)) else str(tool_input or "")
             seen = by_id.get(str(item.get("tool_use_id"))) or {}
             denied.append({"tool": names[0], "input_head": head[:120], **{k: seen[k] for k in ("reason_type", "message") if k in seen}})
@@ -1688,7 +1710,8 @@ def parse_claude_output(stdout: str) -> tuple[str | None, str, str | None, dict[
         if isinstance(model_usage, dict) and model_usage:
             model = next(iter(model_usage))
     denials = value.get("permission_denials")
-    denial_notes = [f"permission denied: {_denial_note(item)}" for item in denials] if isinstance(denials, list) and denials else []
+    denial_notes = [f"permission denied: {_denial_note(item)}" for item in (denials if isinstance(denials, list) else [])
+                    if not (isinstance(item, dict) and claude_plan_file(_denial_name(item), item.get("tool_input")))]
     return session_id, text, failure, usage, model, denial_notes
 
 
@@ -2404,6 +2427,7 @@ def agent_command(
             # spend is zero; it would only sabotage cheap lanes.
             argv += ["--max-budget-usd", str(max_budget)]
         allowed = [*(settings.get("allowed_tools") or []),
+                   *([] if task["write"] else settings.get("read_only_allowed_tools") or []),
                    *(f"Bash({shlex.join(argv)}:*)" for argv in task.get("verification_argv") or [])]
         if allowed and not yolo:
             argv += ["--allowedTools", *allowed]

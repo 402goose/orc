@@ -412,6 +412,33 @@ stay in `plan`. The sandbox covers Bash only, so deny `Edit(...)` on paths a
 writer must never change (for example `Edit(//Users/<you>/**)` when worktrees
 live under `/tmp`) and on evaluation files a worker could game.
 
+Readers in `plan` mode have two consequences:
+
+- **The plan file.** Claude Code's plan mode writes its own plan file under
+  `~/.claude/plans/` (or `$CLAUDE_CONFIG_DIR/plans/`). A home-path deny such as
+  `Edit(//Users/<you>/**)` refuses that write. That refusal says nothing about the
+  task, so ORC drops it: it is not in `denied`, is not a blocker, does not count
+  toward the denial guard, and does not turn a run into an error. Every other
+  denied Write or Edit is still recorded and still counts.
+- **MCP tools.** Plan mode asks before any MCP tool, and nobody can answer in a
+  headless run, so read-only MCP calls (status and search tools, for example)
+  are denied. List them in `claude.read_only_allowed_tools` (default `[]`; it also
+  works on a route or a workflow node). These go to `--allowedTools` only on tasks
+  that do not write, alongside `claude.allowed_tools`. List read tools only, by
+  exact name. A server-wide rule such as `mcp__server` would also allow that
+  server's write tools.
+
+```json
+{"claude": {"read_only_allowed_tools": ["mcp__tenet-context__context_status", "mcp__tenet-context__memory_status",
+                                        "mcp__tenet-context__context_search", "mcp__tenet-context__memory_search"]}}
+```
+
+A reader's network is whatever the worker's settings allow
+(`sandbox.network.allowedDomains`). To let readers clone public GitHub
+repositories, add `github.com`, `codeload.github.com`,
+`objects.githubusercontent.com` and `raw.githubusercontent.com`. That setting
+applies to writers too.
+
 ## Antigravity settings
 
 In restricted mode, Fusion launches `agy` with `--sandbox` and uses `plan` for

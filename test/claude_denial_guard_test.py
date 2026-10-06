@@ -51,6 +51,22 @@ def read_needing_approval(n):
     return [use, event, done]
 
 
+def deny_rule_write(n, path):
+    """A Write refused by a deny rule, as Claude Code reports a home-path deny."""
+    use = {"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": f"toolu_write_{n}", "name": "Write", "input": {"file_path": path, "content": "# plan"}}]}}
+    done = {"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": f"toolu_write_{n}", "is_error": True,
+         "content": "<tool_use_error>File is in a directory that is denied by your permission settings.</tool_use_error>"}]}}
+    return [use, done]
+
+
+def answer(status, denials):
+    text = f"STATUS: {status}\nSUMMARY: answered the question\nCHANGED: none\nTESTS: none\nBLOCKERS: none"
+    return {"type": "result", "subtype": "success", "is_error": False, "session_id": "s", "result": text,
+            "permission_denials": denials}
+
+
 def result(denials):
     return {"type": "result", "subtype": "success", "is_error": False, "session_id": "s", "result": HANDOFF,
             "permission_denials": denials}
@@ -64,11 +80,11 @@ class ClaudeDenialGuardTest(unittest.TestCase):
         self.workspace = self.root / "ws"
         self.workspace.mkdir()
         env = patch.dict(os.environ, {"ORC_HOME": str(self.root / "orc"), "FUSION_PROGRESS": "0", "FUSION_TELEMETRY": "0",
-                                      "FUSION_DECISIONS_MODE": "off"})
+                                      "FUSION_DECISIONS_MODE": "off", "CLAUDE_CONFIG_DIR": str(self.root / "claude-config")})
         env.start()
         self.addCleanup(env.stop)
 
-    def run_stream(self, events, hang=True, **claude):
+    def run_stream(self, events, hang=True, write=True, **claude):
         """Run a fake `claude` that prints `events` and then hangs (as a stuck run would) or exits 0."""
         stream = self.root / "stream.jsonl"
         stream.write_text("\n".join(json.dumps(e) for e in events) + "\n")
@@ -78,7 +94,7 @@ class ClaudeDenialGuardTest(unittest.TestCase):
                           + ("time.sleep(60)\n" if hang else ""))
         worker.chmod(0o755)
         config = core.deep_merge(core.DEFAULTS, {"decisions": {"mode": "off"}, "claude": {"command": str(worker), **claude}})
-        task = core.make_task(self.workspace, "claude", "x", "implementation", [], [], None, False, True)
+        task = core.make_task(self.workspace, "claude", "x", "implementation" if write else "review", [], [], None, False, write)
         started = time.monotonic()
         value = core.dispatch(config, task, core.RunStore(self.workspace))
         return value, time.monotonic() - started
@@ -146,6 +162,32 @@ class ClaudeDenialGuardTest(unittest.TestCase):
                   result([{"tool_name": "Bash", "tool_use_id": f"toolu_bash_denied_{n}", "tool_input": {}} for n in range(8)])]
         value, _ = self.run_stream(events, hang=False, max_bash_denials=0)
         self.assertEqual(value["status"], "partial")
+
+    def test_a_denied_plan_file_write_in_a_read_only_run_is_not_a_denial(self):
+        init = fixture("claude_denial_bash.jsonl")[0]
+        plan = str(self.root / "claude-config" / "plans" / "you-are-the-read-only-lively-teacup.md")
+        events = [init, *deny_rule_write("plan", plan), *deny_rule_write("plan2", plan),
+                  answer("success", [{"tool_name": "Write", "tool_use_id": f"toolu_write_{n}",
+                                       "tool_input": {"file_path": plan, "content": "# plan"}} for n in ("plan", "plan2")])]
+        value, _ = self.run_stream(events, hang=False, write=False)
+        self.assertEqual((value["status"], value["exit_code"]), ("success", 0))
+        self.assertEqual((value["denied"], value["denied_tools"], value["denied_count"]), ([], [], 0))
+        self.assertFalse([b for b in value["blockers"] if "permission denied" in b])
+        self.assertIsNone(core.failure_class(value))
+        self.assertEqual(core.classify_verdict(value)["verdict"], "ok")
+
+    def test_other_denied_writes_still_count_in_a_read_only_run(self):
+        init = fixture("claude_denial_bash.jsonl")[0]
+        plans = self.root / "claude-config" / "plans"
+        for path in (str(self.root / "notes.md"), str(plans / ".." / "settings.json"), str(plans)):
+            with self.subTest(path=path):
+                events = [init, *deny_rule_write("other", path),
+                          answer("success", [{"tool_name": "Write", "tool_use_id": "toolu_write_other",
+                                               "tool_input": {"file_path": path, "content": "x"}}])]
+                value, _ = self.run_stream(events, hang=False, write=False)
+                self.assertEqual(value["status"], "error")
+                self.assertEqual(value["denied_tools"], ["Write"])
+                self.assertEqual(core.failure_class(value), "permission_denied")
 
     def test_a_bad_limit_is_refused(self):
         with self.assertRaisesRegex(ValueError, "max_bash_denials"):
