@@ -387,6 +387,38 @@ On macOS, `allow_local_binding` opens every localhost port, including other
 services on the host, not just the worker's own server; Codex offers no
 per-port rule. `ps` stays denied inside the sandbox.
 
+#### Browser tests in the Codex sandbox
+
+A Codex worker that launches Chromium itself (a Playwright or Puppeteer suite,
+not the Playwright MCP server) fails on macOS: Chromium's multi-process launcher
+registers a Mach bootstrap service (`MachPortRendezvousServer`), the seatbelt
+denies `mach-register`, and the browser aborts with `bootstrap_check_in ...
+Permission denied (1100)`. Codex has no setting that allows that service, and
+ORC does not loosen the sandbox for it. `codex.browser` runs Chromium as a
+single process instead, which needs no extra sandbox rule:
+
+```json
+{"codex": {"browser": true}}
+```
+
+For sandboxed Codex workers (writers in restricted mode and every reader), ORC then:
+
+- adds `--require fusion_browser_preload.cjs` to `NODE_OPTIONS` and sets
+  `FUSION_CHROMIUM_ARGS` (a JSON list, default `["--single-process"]`). The
+  preload appends those arguments to every Chromium a Node CDP driver spawns, so
+  test harnesses keep calling `chromium.launch()` unchanged. Override the list
+  with `{"browser": {"chromium_args": [...]}}`.
+- runs readers under the `fusion_read_browser` profile instead of `-s read-only`:
+  read-only plus writes to the system temp directory (the browser profile) and
+  loopback binding through the managed proxy with an empty domain list. Readers
+  still cannot write the workspace and reach no outside host.
+
+Writers keep `fusion_git_write` unchanged; give them `codex.network` with
+`allow_local_binding` to serve a page on 127.0.0.1. YOLO writers have no sandbox
+and get no preload. Single-process Chromium is fine for headless checks but is
+not Chromium's supported production mode; a suite that needs site isolation or
+crash recovery should run on the host.
+
 ### Claude denial guard
 
 A Claude worker that Claude Code keeps refusing is stopped (exit 125) instead of
