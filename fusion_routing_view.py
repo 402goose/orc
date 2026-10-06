@@ -24,9 +24,10 @@ def routing_tasks(events, spans=(), model=None, limit=200):
     `model` keeps rows whose chosen lane key or model contains it (case
     insensitive). Rows are newest first; `limit` bounds them after
     filtering. `models` summarizes the filtered rows per chosen model:
-    picks, accepted, rejected, pending (no outcome yet) and reported cost
-    (None when no run reported one)."""
-    from fusion_policy import effective_outcomes
+    picks, accepted, rejected, excluded (rejections classed as harness problems,
+    which routing does not count against the lane), pending (no outcome yet)
+    and reported cost (None when no run reported one)."""
+    from fusion_policy import counts_against_lane, effective_outcomes
     events = list(events)
     outcomes = effective_outcomes(events)
     logs, decisions, labels = {}, {}, {}
@@ -72,17 +73,21 @@ def routing_tasks(events, spans=(), model=None, limit=200):
                      "cost_usd": _cost(span), "status": (span or {}).get("status"),
                      "duration_ms": (span or {}).get("duration_ms"),
                      "outcome": ({"accepted": outcome.get("accepted"), "source": outcome.get("source") or "gate",
-                                  "stage": outcome.get("stage"), "reason": outcome.get("reason")} if outcome else None),
+                                  "stage": outcome.get("stage"), "reason": outcome.get("reason"),
+                                  "rejection_class": outcome.get("rejection_class"),
+                                  "counts_against_lane": counts_against_lane(outcome)} if outcome else None),
                      "labels": run_labels, "routing_decision": log.get("decision_id"),
                      "run_dir": f".fusion/runs/{run}", "result": f".fusion/runs/{run}/result.json"})
     rows.sort(key=lambda row: row["time_ms"] or 0, reverse=True)
     summary = {}
     for row in rows:
         entry = summary.setdefault(row["model"] or row["chosen"], {"picks": 0, "accepted": 0, "rejected": 0,
-                                                                   "pending": 0, "cost_usd": None})
+                                                                   "excluded": 0, "pending": 0, "cost_usd": None})
         entry["picks"] += 1
-        accepted = (row["outcome"] or {}).get("accepted")
-        entry["accepted" if accepted is True else "rejected" if accepted is False else "pending"] += 1
+        outcome = row["outcome"] or {}
+        accepted = outcome.get("accepted")
+        entry["accepted" if accepted is True else "pending" if accepted is not False
+              else "rejected" if outcome.get("counts_against_lane") else "excluded"] += 1
         if row["cost_usd"] is not None:
             entry["cost_usd"] = round((entry["cost_usd"] or 0) + row["cost_usd"], 4)
     return {"rows": rows[:max(0, int(limit))], "total": len(rows),
