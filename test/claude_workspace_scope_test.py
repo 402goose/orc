@@ -114,6 +114,43 @@ class ClaudeWorkspaceScopeTest(unittest.TestCase):
         argv, _, _ = core.agent_command(core.DEFAULTS, task, None)
         return argv[argv.index("--settings") + 1], argv
 
+    def launched(self, workspace, **overrides):
+        args = ["--settings", str(self.settings), "--append-system-prompt", "sandboxed"]
+        task = core.make_task(Path(workspace), "claude", "Write the report.", "implementation", [], [], None, False, True,
+                              settings_overrides={"launcher_args": args, "narrow_home_deny": True, **overrides})
+        argv, _, _ = core.agent_command(core.DEFAULTS, task, None)
+        self.assertEqual(argv.count("--settings"), 1)
+        path = Path(argv[argv.index("--settings") + 1])
+        return path, json.loads(path.read_text())
+
+    def test_narrowing_and_hooks_off_compose_in_the_file_the_worker_gets(self):
+        original = self.settings.read_text()
+        narrowed, _ = self.scoped(self.workspace)
+        narrowed_deny = json.loads(Path(narrowed).read_text())["permissions"]["deny"]
+        self.assertNotIn(self.home_rule, narrowed_deny)
+        path, final = self.launched(self.workspace)
+        self.assertIn(".hooks-off-", path.name)
+        self.assertTrue(final["disableAllHooks"])
+        self.assertEqual(final["permissions"]["deny"], narrowed_deny)
+        self.assertEqual(final["permissions"]["additionalDirectories"], ["/tmp/scratch"])
+        self.assertEqual(self.launched(self.workspace), (path, final))
+        self.assertEqual(self.settings.read_text(), original)
+
+    def test_hooks_stay_off_when_narrowing_keeps_the_original_deny(self):
+        for workspace, overrides in ((self.home, {}), (self.workspace, {"narrow_home_deny": False})):
+            with self.subTest(workspace=str(workspace), **overrides):
+                path, final = self.launched(workspace, **overrides)
+                self.assertTrue(final["disableAllHooks"])
+                self.assertIn(self.home_rule, final["permissions"]["deny"])
+
+    def test_settings_that_already_turn_hooks_off_are_narrowed_without_losing_it(self):
+        settings = json.loads(self.settings.read_text())
+        self.settings.write_text(json.dumps({**settings, "disableAllHooks": True}))
+        path, final = self.launched(self.workspace)
+        self.assertIn(".workspace-", path.name)
+        self.assertTrue(final["disableAllHooks"])
+        self.assertNotIn(self.home_rule, final["permissions"]["deny"])
+
     def deny(self, workspace=None):
         path, _ = self.scoped(workspace or self.workspace)
         return json.loads(Path(path).read_text())["permissions"]["deny"]
