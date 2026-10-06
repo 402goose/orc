@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fusion_core as core
 import fusion_policy as policy
 from fusion_decisions import DecisionStore
-from fusion_policy import counts_against_lane, route_candidates, routing_report
+from fusion_policy import route_candidates, routing_report
 
 QUALITY = ("suite_red", "no_diff", "out_of_scope", "review_changes")
 HARNESS = ("land_conflict", "eval_unmeasured", "other")
@@ -41,7 +41,7 @@ class RejectionClassRoutingTest(unittest.TestCase):
         task["issue"] = issue
         return task
 
-    def run(self, lane, accepted, rejection_class=None, status="success", issue="o/r#1"):
+    def record(self, lane, accepted, rejection_class=None, status="success", issue="o/r#1"):
         run_id = f"{lane}-{len(self.spans)}"
         self.spans.append({"agent": "claude", "route": lane, "run_id": run_id, "status": status, "write": True,
                            "role": "implementation"})
@@ -60,16 +60,16 @@ class RejectionClassRoutingTest(unittest.TestCase):
 
     def test_harness_class_rejections_leave_a_lane_as_if_it_had_none(self):
         before = self.candidates()["A"]
-        self.run("A", False, "other")
-        self.run("A", False, "land_conflict")
-        self.run("A", False, "eval_unmeasured")
+        self.record("A", False, "other")
+        self.record("A", False, "land_conflict")
+        self.record("A", False, "eval_unmeasured")
         after = self.candidates()["A"]
         self.assertEqual((after["checked_runs_local"], after["acceptance_rate_local"]),
                          (before["checked_runs_local"], before["acceptance_rate_local"]))
         self.assertEqual(after["checked_runs_local"], 0)
 
     def test_an_excluded_rejection_of_an_errored_run_is_not_counted_as_its_error(self):
-        self.run("A", False, "land_conflict", status="error")
+        self.record("A", False, "land_conflict", status="error")
         self.assertEqual(self.candidates()["A"]["checked_runs_local"], 0)
 
     def test_each_quality_class_counts_against_the_lane(self):
@@ -77,29 +77,29 @@ class RejectionClassRoutingTest(unittest.TestCase):
             with self.subTest(rejection_class=name):
                 self.spans.clear()
                 self.decisions.path.unlink(missing_ok=True)
-                self.run("A", False, name)
+                self.record("A", False, name)
                 lane = self.candidates()["A"]
                 self.assertEqual((lane["checked_runs_local"], lane["acceptance_rate_local"]), (1, 0.0))
 
     def test_a_rejection_without_a_class_still_counts(self):
-        self.run("A", True)
-        self.run("A", False)
+        self.record("A", True)
+        self.record("A", False)
         lane = self.candidates()["A"]
         self.assertEqual((lane["checked_runs_local"], lane["acceptance_rate_local"]), (2, 0.5))
 
     def test_the_thompson_posterior_ignores_excluded_classes(self):
-        self.run("A", True)
-        self.run("A", False, "land_conflict")
-        self.run("A", False, "other")
-        self.run("A", False, "suite_red")
+        self.record("A", True)
+        self.record("A", False, "land_conflict")
+        self.record("A", False, "other")
+        self.record("A", False, "suite_red")
         pooled = self.candidates(pool_models=True)["A"]["pooled"]
         self.assertEqual((pooled["successes"], pooled["attempts"]), (1, 2))
 
     def test_rework_avoids_a_lane_only_for_quality_or_unclassed_rejections(self):
-        self.run("A", False, "land_conflict")
-        self.run("B", False, "eval_unmeasured")
+        self.record("A", False, "land_conflict")
+        self.record("B", False, "eval_unmeasured")
         self.assertEqual(policy.rework_exclusions(self.task(), self.store), [])
-        self.run("B", False, "no_diff")
+        self.record("B", False, "no_diff")
         self.assertEqual(policy.rework_exclusions(self.task(), self.store), ["B"])
 
     def test_the_routing_report_skips_excluded_outcomes_but_still_lists_them(self):
@@ -119,9 +119,9 @@ class RejectionClassRoutingTest(unittest.TestCase):
         self.assertFalse(any("no outcome yet" in warning for warning in report["warnings"]))
 
     def test_only_a_harness_classed_rejection_is_excluded(self):
-        self.assertTrue(counts_against_lane({"accepted": True, "rejection_class": "other"}))
-        self.assertTrue(counts_against_lane({"accepted": False}))
-        self.assertFalse(counts_against_lane({"accepted": False, "rejection_class": "other"}))
+        self.assertTrue(policy.counts_against_lane({"accepted": True, "rejection_class": "other"}))
+        self.assertTrue(policy.counts_against_lane({"accepted": False}))
+        self.assertFalse(policy.counts_against_lane({"accepted": False, "rejection_class": "other"}))
 
 
 if __name__ == "__main__":
