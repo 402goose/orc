@@ -208,7 +208,23 @@ def parse_acceptance_contract(answer: str) -> dict[str, Any]:
     return contract
 
 
+def _artifact_files(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    if not path.is_dir():
+        return []
+    return sorted(item for item in path.rglob("*") if item.is_file() and ".git" not in item.relative_to(path).parts)
+
+
 def _fingerprint(path: Path) -> dict[str, Any]:
+    if path.is_dir():
+        files = _artifact_files(path)
+        if not files:
+            return {"exists": False}
+        digest = hashlib.sha256()
+        for item in files:
+            digest.update(item.relative_to(path).as_posix().encode() + b"\0" + _fingerprint(item)["sha256"].encode() + b"\0")
+        return {"exists": True, "files": len(files), "sha256": digest.hexdigest()}
     if not path.is_file():
         return {"exists": False}
     digest = hashlib.sha256()
@@ -1378,7 +1394,7 @@ BLOCKERS: unresolved issues, or none
             problem("worker_blockers", "worker reported unresolved blockers")
         for relative in node.get("required_files", []):
             path = self.workspace / relative
-            if not path.is_file():
+            if not _artifact_files(path):
                 problem("required_file_missing", f"required artifact is missing: {relative}", path=relative)
             else:
                 baseline = (node.get("_artifact_baseline") or {}).get(relative)
@@ -1706,7 +1722,7 @@ BLOCKERS: unresolved issues, or none
         acceptance = self.spec.get("acceptance") or {}
         for relative in acceptance.get("required_files", []):
             path = self.workspace / relative
-            if not path.is_file():
+            if not _artifact_files(path):
                 problems.append(f"required workflow artifact is missing: {relative}")
             elif relative in self.workflow_baseline and _fingerprint(path) == self.workflow_baseline[relative]:
                 problems.append(f"required workflow artifact did not change during run: {relative}")
