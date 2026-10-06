@@ -478,6 +478,40 @@ route that deliberately wants the user's hooks sets `claude.user_hooks: true`
 (default `false`); ORC then passes its settings through unread, as before. Interactive leads (`fusion run`) are the user's own session
 and keep their hooks.
 
+**Readers are read-only by construction.** Plan mode alone is a model-mediated
+guard: a reader that decides to write can. With the worker settings ORC ships, a
+reader's sandboxed Bash could write its workspace and the shared `/tmp/claude-<uid>`,
+which holds other sessions' scratchpads and worktrees. So a task that does not
+write gets settings that make writing structurally impossible, whatever the model
+decides:
+
+- **File-edit tools denied:** `Edit`, `Write`, `MultiEdit` and `NotebookEdit` are
+  added to `permissions.deny`.
+- **Bash stays sandboxed:** `sandbox.enabled` is true and `allowUnsandboxedCommands`
+  false. `sandbox.filesystem.allowWrite` is emptied (the cache paths granted for
+  writers are not granted to readers), and the workspace is added to
+  `sandbox.filesystem.denyWrite`.
+- **No shared scratch:** `/tmp/claude-<uid>` and `/private/tmp/claude-<uid>` are dropped
+  from `permissions.additionalDirectories`.
+- **Its own scratch:** each reader run gets a fresh `/tmp/orc-<id>`, created `0700` by
+  dispatch and removed when the run ends. It is set as `CLAUDE_CODE_TMPDIR`, `TMPDIR`,
+  `TMP` and `TEMP`. Claude Code then gives sandboxed Bash `<it>/claude-<uid>` as
+  `TMPDIR`, and that is the only path a reader can write. The appended system prompt
+  names it in place of `/tmp/claude-<uid>` and says the run is read-only.
+
+The derived file is a copy named `.<name>.reader-<hash>.json`, written after the
+hooks-off copy, so both changes reach the one file passed to `--settings`. Settings
+that cannot be read refuse a reader before it starts (`settings_unreadable`), even on
+a route with `claude.user_hooks`. Writers and yolo runs are unchanged. A reader that
+runs a test suite cannot write caches such as `node_modules/.vite` or
+`.pytest_cache`; tools that honour `TMPDIR` can write there instead.
+
+Checked on Claude Code 2.1.292 with real sandboxed `touch` calls. With these settings,
+`<run tmp>/claude-<uid>` was writable and the run tmp root, the workspace, a
+`/tmp/claude-<uid>` sibling, a `/private/tmp/tenet-round-*` holder and a sibling in the
+shared `$TMPDIR` were all denied. With the previous settings, the workspace and the
+`/tmp/claude-<uid>` sibling were writable. Re-probe on Claude Code upgrades.
+
 **Writers whose workspace is under a home deny.** Claude Code's deny rules beat
 any allow, so `Edit(//Users/<you>/**)` also refuses a writer whose workspace is
 under `$HOME`. The preferred setup fails closed: run writers in a git worktree

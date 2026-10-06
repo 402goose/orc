@@ -56,7 +56,7 @@ class ClaudeHooksTest(unittest.TestCase):
     def test_hooks_are_off_by_default_and_deny_rules_still_reach_the_worker(self):
         for launcher in ([], ["--settings", str(self.settings_file)], ["--settings", '{"sandbox":{"enabled":true}}']):
             with self.subTest(launcher=launcher):
-                argv, _, _ = core.agent_command(core.DEFAULTS, self.task(launcher_args=launcher), None)
+                argv, _, _ = core.agent_command(core.DEFAULTS, self.task(write=True, launcher_args=launcher), None)
                 sources = settings_sources(argv)
                 self.assertTrue(sources and all(item.get("disableAllHooks") is True for item in sources))
                 if launcher[1:] == [str(self.settings_file)]:
@@ -66,7 +66,7 @@ class ClaudeHooksTest(unittest.TestCase):
                     self.assertTrue(sources[0]["sandbox"]["enabled"])
 
     def test_a_route_that_opts_in_keeps_user_hooks(self):
-        argv, _, _ = core.agent_command(core.DEFAULTS, self.task(user_hooks=True, launcher_args=["--settings", str(self.settings_file)]), None)
+        argv, _, _ = core.agent_command(core.DEFAULTS, self.task(write=True, user_hooks=True, launcher_args=["--settings", str(self.settings_file)]), None)
         self.assertEqual(settings_sources(argv), [json.loads(self.settings_file.read_text())])
 
     def test_yolo_settings_carry_both_sandbox_off_and_hooks_off(self):
@@ -78,7 +78,7 @@ class ClaudeHooksTest(unittest.TestCase):
                 argv, _, _ = core.agent_command(config, task, None)
                 self.assertEqual(settings_sources(argv), [expected])
 
-    def dispatch_with(self, launcher, **claude):
+    def dispatch_with(self, launcher, write=False, **claude):
         started = self.root / "worker-started"
         started.unlink(missing_ok=True)
         fake = self.root / "claude-start-only"
@@ -88,7 +88,7 @@ class ClaudeHooksTest(unittest.TestCase):
         fake.chmod(0o755)
         config = core.deep_merge(core.DEFAULTS, {"decisions": {"mode": "off"}, "claude": {
             "command": str(fake), "launcher_args": launcher, **claude}})
-        task = core.make_task(self.workspace, "claude", "look at it", "triage-locate", [], [], None, False, False)
+        task = core.make_task(self.workspace, "claude", "look at it", "triage-locate", [], [], None, False, write)
         env = {"ORC_HOME": str(self.root / "orc"), "FUSION_PROGRESS": "0", "FUSION_TELEMETRY": "0", "FUSION_DECISIONS_MODE": "off"}
         with patch.dict(os.environ, env), contextlib.redirect_stderr(io.StringIO()):
             value = core.dispatch(config, task, core.RunStore(self.workspace))
@@ -114,10 +114,15 @@ class ClaudeHooksTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     core.claude_hooks_off(launcher)
 
-    def test_a_route_that_keeps_user_hooks_passes_its_settings_through_unread(self):
-        value, ran = self.dispatch_with(["--settings", str(self.root / "absent-settings.json")], user_hooks=True)
+    def test_a_writer_route_that_keeps_user_hooks_passes_its_settings_through_unread(self):
+        value, ran = self.dispatch_with(["--settings", str(self.root / "absent-settings.json")], write=True, user_hooks=True)
         self.assertTrue(ran)
         self.assertNotEqual(value.get("provider_failure"), "settings_unreadable")
+
+    def test_a_reader_with_unreadable_settings_is_refused_even_when_its_route_keeps_user_hooks(self):
+        value, ran = self.dispatch_with(["--settings", str(self.root / "absent-settings.json")], user_hooks=True)
+        self.assertFalse(ran)
+        self.assertEqual(value["provider_failure"], "settings_unreadable")
 
     def run_worker(self, user_hooks):
         config_dir = self.root / f"claude-config-{user_hooks}"
@@ -145,7 +150,7 @@ class ClaudeHooksTest(unittest.TestCase):
     def test_a_user_stop_hook_does_not_run_inside_a_worker(self):
         ran, seen = self.run_worker(False)
         self.assertFalse(ran)
-        self.assertEqual(seen[0]["permissions"]["deny"], ["Bash(rm:*)"])
+        self.assertIn("Bash(rm:*)", seen[0]["permissions"]["deny"])
         ran, _ = self.run_worker(True)
         self.assertTrue(ran)
 

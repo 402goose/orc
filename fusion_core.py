@@ -1024,6 +1024,78 @@ def claude_hooks_off(launcher_args: list[str]) -> list[str]:
     return [*launcher_args[:at], str(out), *launcher_args[at + 1:]]
 
 
+CLAUDE_READER_DENIED_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+CLAUDE_SHARED_TMP = re.compile(r"(?:/private)?/tmp/claude-\d+")
+
+
+def claude_reader_tmpdir(env: dict[str, str]) -> str:
+    """A fresh private temp directory path for one read-only Claude worker, set as CLAUDE_CODE_TMPDIR
+    (Claude Code's own temp root; sandboxed Bash gets `<it>/claude-<uid>` as TMPDIR) and as TMPDIR,
+    TMP and TEMP. The shared /tmp/claude-<uid> holds other sessions' scratchpads and worktrees, so a
+    reader must not write it. The path is only chosen here; dispatch creates it (0700) for the run
+    and removes it when the run ends."""
+    directory = str(Path("/tmp").resolve() / f"orc-{uuid.uuid4().hex[:12]}")
+    env.update(CLAUDE_CODE_TMPDIR=directory, TMPDIR=directory + "/", TMP=directory, TEMP=directory)
+    return directory
+
+
+def claude_reader_settings(launcher_args: list[str], workspace: str) -> list[str]:
+    """Launcher args whose settings make a read-only worker read-only by construction, not by
+    plan mode alone: Edit, Write, MultiEdit and NotebookEdit are denied outright; the Bash sandbox
+    is on with no unsandboxed retry, writes nothing it was granted for writers (`allowWrite` is
+    emptied) and is denied the workspace itself; and the shared /tmp/claude-<uid> is dropped from
+    `additionalDirectories`. What is left writable is the run's own sandbox temp directory,
+    `<claude_reader_tmpdir>/claude-<uid>`. A `--settings` file is copied beside itself, named by its content;
+    inline JSON is rewritten; without `--settings` an inline one is appended. Settings that cannot be
+    read as a JSON object raise ValueError (dispatch refuses such a run first)."""
+    if "--settings" not in launcher_args:
+        launcher_args = [*launcher_args, "--settings", "{}"]
+    problem = claude_settings_problem(launcher_args)
+    if problem:
+        raise ValueError(problem)
+    at = launcher_args.index("--settings") + 1
+    source = launcher_args[at]
+    inline = source.lstrip().startswith("{")
+    path = None if inline else Path(source).expanduser()
+    settings = json.loads(source if inline else path.read_text(encoding="utf-8"))
+    permissions = dict(settings.get("permissions") or {})
+    deny = list(permissions.get("deny") or [])
+    permissions["deny"] = [*deny, *(tool for tool in CLAUDE_READER_DENIED_TOOLS if tool not in deny)]
+    permissions["additionalDirectories"] = [entry for entry in permissions.get("additionalDirectories") or []
+                                            if not CLAUDE_SHARED_TMP.fullmatch(str(entry).rstrip("/"))]
+    sandbox = dict(settings.get("sandbox") or {})
+    filesystem = dict(sandbox.get("filesystem") or {})
+    target = os.path.abspath(Path(workspace).expanduser())
+    denied = list(filesystem.get("denyWrite") or [])
+    filesystem["denyWrite"] = [*denied, *(entry for entry in dict.fromkeys((target, os.path.realpath(target)))
+                                          if entry not in denied)]
+    filesystem["allowWrite"] = []
+    sandbox.update(enabled=True, allowUnsandboxedCommands=False, filesystem=filesystem)
+    derived = {**settings, "permissions": permissions, "sandbox": sandbox}
+    if inline:
+        return [*launcher_args[:at], json.dumps(derived, separators=(",", ":")), *launcher_args[at + 1:]]
+    text = json_text(derived) + "\n"
+    out = path.with_name(f".{path.stem.lstrip('.')}.reader-{hashlib.sha256(text.encode()).hexdigest()[:16]}.json")
+    if not out.exists():
+        temp = out.with_suffix(f".{os.getpid()}.tmp")
+        temp.write_text(text, encoding="utf-8")
+        temp.replace(out)
+    return [*launcher_args[:at], str(out), *launcher_args[at + 1:]]
+
+
+def claude_reader_prompt(launcher_args: list[str], directory: str) -> list[str]:
+    """Launcher args whose appended system prompt names the reader's own sandbox temp directory
+    (`<directory>/claude-<uid>`, which Claude Code gives sandboxed Bash as TMPDIR) where it named the
+    shared /tmp/claude-<uid>, and says the run is read-only; one is added if there is none."""
+    scratch = os.path.join(directory, f"claude-{os.getuid()}")
+    note = f"This run is read-only: the working directory is not writable; write scratch files only under {scratch}."
+    if "--append-system-prompt" not in launcher_args or launcher_args.index("--append-system-prompt") + 1 >= len(launcher_args):
+        return [*launcher_args, "--append-system-prompt", note]
+    at = launcher_args.index("--append-system-prompt") + 1
+    text = CLAUDE_SHARED_TMP.sub(scratch, launcher_args[at])
+    return [*launcher_args[:at], f"{text} {note}", *launcher_args[at + 1:]]
+
+
 def claude_expected_denial(tool: Any, tool_input: Any, read_only: bool) -> bool:
     """A denial that is the task's contract working, not a lane failing: the plan-file write, and
     on a task that does not write, any refused Write or Edit (a reader that tried a scratch file
@@ -2742,6 +2814,11 @@ def agent_command(
         hooks_off = not settings.get("user_hooks")
         if hooks_off and ("--settings" in launcher_args or not yolo):
             launcher_args = claude_hooks_off(launcher_args)
+        reader_tmpdir = None
+        if not task["write"]:
+            launcher_args = claude_reader_settings(launcher_args, task["workspace"])
+            reader_tmpdir = claude_reader_tmpdir(env)
+            launcher_args = claude_reader_prompt(launcher_args, reader_tmpdir)
         profile = str(settings.get("profile", ""))
         if command_name == "orc" and profile:
             launcher_args.append(profile if profile.startswith("@") else f"@{profile}")
@@ -2795,7 +2872,8 @@ def agent_command(
         # explicitly so a fresh task's prompt cannot be swallowed as a tool.
         argv += ["--", brief_for(task)]
         return argv, env, {"command": command, "model": selected_model,
-                           **({"execution_choice": choice} if choice else {})}
+                           **({"execution_choice": choice} if choice else {}),
+                           **({"reader_tmpdir": reader_tmpdir} if reader_tmpdir else {})}
     raise ValueError(f"unsupported agent: {agent}")
 
 
@@ -3203,7 +3281,7 @@ def dispatch(
         review_task(config, task, store)
     claude_settings = agent_settings(config, task) if task["agent"] == "claude" else {}
     refusal = failure = None
-    if claude_settings and not claude_settings.get("user_hooks"):
+    if claude_settings and (not claude_settings.get("user_hooks") or not task["write"]):
         refusal = claude_settings_problem([str(item) for item in claude_settings.get("launcher_args", [])])
         failure = "settings_unreadable"
     if not refusal and claude_settings and task["write"] and execution_mode(config) != "yolo":
@@ -3307,6 +3385,9 @@ def dispatch(
                 stack.enter_context(writer_lock(Path(task["workspace"]), task["write"], store.control_workspace))
             if codex_browser_reader(config, task, resolved_settings):
                 stack.callback(shutil.rmtree, codex_reader_tmpdir(env), True)
+            if metadata.get("reader_tmpdir"):
+                os.mkdir(metadata["reader_tmpdir"], 0o700)
+                stack.callback(shutil.rmtree, metadata["reader_tmpdir"], True)
             store.event(run_dir, "worker.started", {"argv": argv, "resumed_session": bool(session_id), **session})
             if metadata.get("execution_choice"):
                 metadata["execution_choice"]["dispatch"] = {"status": "attempted", "argv": argv}
