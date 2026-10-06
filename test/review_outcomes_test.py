@@ -104,7 +104,7 @@ class ReviewOutcomesTest(unittest.TestCase):
         self.assertEqual(derived, {first_block, final_a, final_b})
         [event] = self.outcomes(first_block)
         self.assertEqual((event["accepted"], event["stage"], event["reporter"], event["source"], event["issue"]),
-                         (True, "review", "orc-land", "lead", "o/r#7"))
+                         (True, "review", "orc-land", "land_derived", "o/r#7"))
         self.assertEqual(self.outcomes(first_approve), [])
         self.assertEqual(self.outcomes(other_issue), [])
 
