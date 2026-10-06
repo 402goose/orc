@@ -412,14 +412,31 @@ stay in `plan`. The sandbox covers Bash only, so deny `Edit(...)` on paths a
 writer must never change (for example `Edit(//Users/<you>/**)` when worktrees
 live under `/tmp`) and on evaluation files a worker could game.
 
-Readers in `plan` mode have two consequences:
+A writer's own workspace is never covered by such a deny. Claude Code's deny
+rules beat any allow, so `Edit(//Users/<you>/**)` would also refuse a writer whose
+workspace or worktree is under `$HOME`. For a task that writes, ORC reads the
+`--settings` file in `claude.launcher_args`. Each `Edit(...)` or `Write(...)` tree
+rule (`//path/**` or `~/path/**`) that covers the workspace is replaced by rules
+for everything beside the path down to it: each sibling file and directory at
+every level. The narrowed copy is written next to the original as
+`.<name>.workspace-<hash>.json`, so relative rules keep their meaning, and that
+copy is what the worker gets. Readers, inline `--settings` JSON and workspaces
+outside the rule are left unchanged. Files or directories created beside that
+path after launch are not covered. The Bash sandbox still bounds Bash writes.
+
+Readers in `plan` mode have three consequences:
 
 - **The plan file.** Claude Code's plan mode writes its own plan file under
   `~/.claude/plans/` (or `$CLAUDE_CONFIG_DIR/plans/`). A home-path deny such as
   `Edit(//Users/<you>/**)` refuses that write. That refusal says nothing about the
-  task, so ORC drops it: it is not in `denied`, is not a blocker, does not count
-  toward the denial guard, and does not turn a run into an error. Every other
-  denied Write or Edit is still recorded and still counts.
+  task, so ORC drops it, in any mode: it is not in `denied`, is not a blocker,
+  does not count toward the denial guard, and does not turn a run into an error.
+- **Other refused writes.** A task that does not write may still try a Write or
+  Edit (a scratch script, a notes file), and plan mode or a deny rule refuses it.
+  That is the read-only contract working, not a lane failing. ORC keeps the
+  refusal in `denied` as evidence, but it is not a blocker, does not count toward
+  the denial guard, and the run keeps the status its handoff reports. On a task
+  that writes, a denied Write or Edit still counts.
 - **MCP tools.** Plan mode asks before any MCP tool, and nobody can answer in a
   headless run, so read-only MCP calls (status and search tools, for example)
   are denied. List them in `claude.read_only_allowed_tools` (default `[]`; it also

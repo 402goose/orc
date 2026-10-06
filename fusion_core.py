@@ -735,7 +735,7 @@ CLAUDE_DENIAL_TEXT = re.compile(r"\A\s*(?:<tool_use_error>\s*)?(?:Permission to 
 # A deny rule refusing a protected path is policy working as configured, not a
 # lane that can't do its job; it is recorded but never stops a run.
 CLAUDE_DENY_RULE_TEXT = re.compile(r"denied by your permission settings", re.IGNORECASE)
-CLAUDE_FILE_TOOLS = frozenset({"write", "edit", "multiedit"})
+CLAUDE_FILE_TOOLS = frozenset({"write", "edit", "multiedit", "notebookedit"})
 
 
 def claude_plan_file(tool: Any, tool_input: Any) -> bool:
@@ -751,6 +751,83 @@ def claude_plan_file(tool: Any, tool_input: Any) -> bool:
     plans = (Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser() / "plans").resolve()
     target = Path(path).expanduser().resolve()
     return target != plans and target.is_relative_to(plans)
+
+
+CLAUDE_TREE_RULE = re.compile(r"(Edit|Write)\((//|~/)(.*?)/?\*\*\)")
+
+
+def _rule_base(root: str, rest: str) -> Path:
+    return Path("/" + rest) if root == "//" else Path.home() / rest
+
+
+def _outside_rules(kind: str, base: Path, target: Path) -> list[str]:
+    rules, current = [], base
+    for part in target.relative_to(base).parts:
+        try:
+            names = sorted(os.listdir(current))
+        except OSError:
+            names = []
+        for name in names:
+            if name != part:
+                child = current / name
+                rules.append(f"{kind}(/{child}/**)" if child.is_dir() else f"{kind}(/{child})")
+        current = current / part
+    return rules
+
+
+def claude_workspace_settings(launcher_args: list[str], workspace: str) -> list[str]:
+    """Launcher args whose `--settings` file no longer denies edits inside the workspace.
+
+    Claude Code's deny rules beat any allow, so a home-path deny such as `Edit(//Users/<you>/**)`
+    also refuses a writer whose workspace is under $HOME. An Edit or Write tree rule that covers the
+    workspace is replaced by rules for everything beside the path down to it (each sibling at every
+    level), and the result is written beside the original file, named by its content, so relative
+    rules keep their meaning. Entries created beside that path after launch are not covered."""
+    if "--settings" not in launcher_args or launcher_args.index("--settings") + 1 >= len(launcher_args):
+        return launcher_args
+    at = launcher_args.index("--settings") + 1
+    source = launcher_args[at]
+    if source.lstrip().startswith("{"):
+        return launcher_args
+    path = Path(source).expanduser()
+    try:
+        settings = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return launcher_args
+    permissions = settings.get("permissions") if isinstance(settings, dict) else None
+    deny = permissions.get("deny") if isinstance(permissions, dict) else None
+    if not isinstance(deny, list):
+        return launcher_args
+    target, changed, scoped = Path(os.path.abspath(Path(workspace).expanduser())), False, []
+    for rule in deny:
+        match = CLAUDE_TREE_RULE.fullmatch(rule) if isinstance(rule, str) else None
+        base = _rule_base(match.group(2), match.group(3)) if match else None
+        if base is not None and target.is_relative_to(base):
+            scoped += _outside_rules(match.group(1), base, target)
+        elif base is not None and target.resolve().is_relative_to(base.resolve()):
+            scoped += _outside_rules(match.group(1), base.resolve(), target.resolve())
+        else:
+            scoped.append(rule)
+            continue
+        changed = True
+    if not changed:
+        return launcher_args
+    text = json_text({**settings, "permissions": {**permissions, "deny": scoped}}) + "\n"
+    out = path.with_name(f".{path.stem}.workspace-{hashlib.sha256(text.encode()).hexdigest()[:16]}.json")
+    if not out.exists():
+        temp = out.with_suffix(f".{os.getpid()}.tmp")
+        temp.write_text(text, encoding="utf-8")
+        temp.replace(out)
+    return [*launcher_args[:at], str(out), *launcher_args[at + 1:]]
+
+
+def claude_expected_denial(tool: Any, tool_input: Any, read_only: bool) -> bool:
+    """A denial that is the task's contract working, not a lane failing: the plan-file write, and
+    on a task that does not write, any refused Write or Edit (a reader that tried a scratch file
+    and answered anyway). It stays in `denied` as evidence but is not a blocker and never counts
+    toward the denial guard."""
+    names = normalize_tools([tool])
+    return claude_plan_file(tool, tool_input) or bool(read_only and names and _tool_key(names[0]) in CLAUDE_FILE_TOOLS)
 
 
 def _claude_events(stdout: str):
@@ -815,7 +892,7 @@ def claude_stream_denials(stdout: str) -> list[dict[str, str]]:
     return result
 
 
-def claude_denial_guard(max_bash: int, max_baseline: int = 2):
+def claude_denial_guard(max_bash: int, max_baseline: int = 2, read_only: bool = False):
     """Stop a Claude run that can't do its job instead of letting it run to exit.
 
     Baseline-tool denials (Read, Edit, Write ...) stop it once `max_baseline`
@@ -829,7 +906,7 @@ def claude_denial_guard(max_bash: int, max_baseline: int = 2):
         if key in state["seen"]:
             return None
         state["seen"].add(key)
-        if claude_plan_file(tool, state["inputs"].get(key)):
+        if claude_expected_denial(tool, state["inputs"].get(key), read_only):
             return None
         names = normalize_tools([tool])
         name = names[0] if names else tool
@@ -891,8 +968,10 @@ def provider_denials(agent: str, stdout: str) -> list[dict[str, str]]:
         denied = []
         for item in items:
             names = normalize_tools([_denial_name(item)])
+            if not names:
+                continue
             tool_input = item.get("tool_input")
-            if not names or claude_plan_file(names[0], tool_input):
+            if claude_plan_file(names[0], tool_input):
                 continue
             head = json.dumps(tool_input, ensure_ascii=False, separators=(",", ":")) if isinstance(tool_input, (dict, list)) else str(tool_input or "")
             seen = by_id.get(str(item.get("tool_use_id"))) or {}
@@ -1689,7 +1768,7 @@ def claude_session_tokens(model_usage: Any) -> dict[str, int]:
     return totals
 
 
-def parse_claude_output(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None, list[str]]:
+def parse_claude_output(stdout: str, read_only: bool = False) -> tuple[str | None, str, str | None, dict[str, Any], str | None, list[str]]:
     value = claude_result(stdout)
     if not isinstance(value, dict):
         return None, stdout.strip(), None, {}, None, []
@@ -1711,7 +1790,7 @@ def parse_claude_output(stdout: str) -> tuple[str | None, str, str | None, dict[
             model = next(iter(model_usage))
     denials = value.get("permission_denials")
     denial_notes = [f"permission denied: {_denial_note(item)}" for item in (denials if isinstance(denials, list) else [])
-                    if not (isinstance(item, dict) and claude_plan_file(_denial_name(item), item.get("tool_input")))]
+                    if not (isinstance(item, dict) and claude_expected_denial(_denial_name(item), item.get("tool_input"), read_only))]
     return session_id, text, failure, usage, model, denial_notes
 
 
@@ -2385,6 +2464,8 @@ def agent_command(
         command = settings.get("command", "claude")
         command_name = Path(command).name
         launcher_args = [str(item) for item in settings.get("launcher_args", [])]
+        if task["write"] and not yolo:
+            launcher_args = claude_workspace_settings(launcher_args, task["workspace"])
         profile = str(settings.get("profile", ""))
         if command_name == "orc" and profile:
             launcher_args.append(profile if profile.startswith("@") else f"@{profile}")
@@ -2946,7 +3027,7 @@ def dispatch(
                 stdout_path=stdout_path, stderr_path=stderr_path, label=label,
                 plain_output=task["agent"] == "grok" and metadata.get("output_format") == "plain",
                 abort_on=(opencode_empty_step_guard(metadata["empty_step_limit"]) if metadata.get("empty_step_limit") else
-                          claude_denial_guard(bash_limit, baseline_limit) if task["agent"] == "claude" else None),
+                          claude_denial_guard(bash_limit, baseline_limit, not task["write"]) if task["agent"] == "claude" else None),
             )
         exit_code, worker_stdout = completed.returncode, completed.stdout
         if metadata.get("execution_choice"):
@@ -2965,7 +3046,7 @@ def dispatch(
             if exit_code != 0 and completed.stderr.strip():
                 failure = failure or compact(progress.clean(completed.stderr), 1500)
         else:
-            new_session, summary, failure, usage, event_model, evidence_notes = parse_claude_output(completed.stdout)
+            new_session, summary, failure, usage, event_model, evidence_notes = parse_claude_output(completed.stdout, not task["write"])
         # Preserve the public deliverable outside the compact receipt and trace.
         if summary.strip():
             answer_path = run_dir / "answer.md"
