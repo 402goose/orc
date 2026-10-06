@@ -1388,6 +1388,22 @@ print(json.dumps({{'type':'result','subtype':'success','is_error':False,'session
         self.assertEqual(stale["status"], "failed")
         self.assertIn("did not change", " ".join(stale["nodes"][0]["result"]["blockers"]))
 
+    def test_symlinks_under_a_required_directory_are_skipped(self):
+        import fusion_workflow
+        outside = Path(self.temp.name) / "outside.md"
+        outside.write_text("one", encoding="utf-8")
+        required = self.workspace / "corpus"
+        required.mkdir()
+        (required / "link.md").symlink_to(outside)
+        (required / "linked-dir").symlink_to(Path(self.temp.name))
+        self.assertEqual(fusion_workflow._artifact_files(required), [])
+        self.assertEqual(fusion_workflow._fingerprint(required), {"exists": False})
+        (required / "real.md").write_text("real", encoding="utf-8")
+        before = fusion_workflow._fingerprint(required)
+        outside.write_text("two", encoding="utf-8")
+        self.assertEqual(fusion_workflow._fingerprint(required), before)
+        self.assertEqual(before["files"], 1)
+
     def test_a_worker_that_commits_its_own_output_still_changed_it(self):
         result = self.required_artifact_run(
             "commit-claude",

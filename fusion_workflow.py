@@ -209,11 +209,20 @@ def parse_acceptance_contract(answer: str) -> dict[str, Any]:
 
 
 def _artifact_files(path: Path) -> list[Path]:
+    """The regular files a required artifact stands for: the file itself, or every file under a
+    directory. Symlinks under a directory are skipped (links to files and to directories alike), so
+    a link never makes a directory present and its target, which may lie outside the workspace, is
+    never read. A directory is listed and hashed in full on every check, which is fine at today's
+    artifact sizes."""
     if path.is_file():
         return [path]
     if not path.is_dir():
         return []
-    return sorted(item for item in path.rglob("*") if item.is_file() and ".git" not in item.relative_to(path).parts)
+    files = []
+    for root, dirs, names in os.walk(path, followlinks=False):
+        dirs[:] = [name for name in dirs if name != ".git" and not os.path.islink(os.path.join(root, name))]
+        files += [Path(root) / name for name in names if not os.path.islink(os.path.join(root, name))]
+    return sorted(item for item in files if item.is_file())
 
 
 def _fingerprint(path: Path) -> dict[str, Any]:
