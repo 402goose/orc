@@ -2547,6 +2547,10 @@ def run_repo(store_or_workspace: "RunStore | str | Path", run_id: str | None) ->
     return str(task["repo"]).lower() if task.get("repo") else repo_slug(task.get("workspace"))
 
 
+class RunNotFound(ValueError):
+    """The run id is well formed but no completed run has it in this workspace."""
+
+
 def record_outcome(workspace: Path, run_id: str, accepted: bool | None = None, reason: str = "", *,
                    stage: str | None = None, withdraw: bool = False, unmeasured: bool = False,
                    issue: str | None = None, rejection_class: str | None = None,
@@ -2556,7 +2560,7 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool | None = None, r
     Delegations have no coordinator gate, so without this their only signal is
     the worker's own claim. Outcomes feed decisions.rank_by_outcomes; the
     latest verdict for a run wins. A verdict with a reason on a reported
-    success also becomes an acceptance label (fusion_labeling.verdict_label).
+    success or partial run also becomes an acceptance label (fusion_labeling.verdict_label).
     A run found in a workflow worktree is recorded here, in this workspace's
     decision store, with evidence pointing at its worktree path.
 
@@ -2595,7 +2599,7 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool | None = None, r
     try:
         result = json.loads(result_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise ValueError(f"no completed Fusion run {run_id} in this workspace") from exc
+        raise RunNotFound(f"no completed Fusion run {run_id} in this workspace") from exc
     event = {"task_id": run_id, "group": result.get("trace_id") or run_id,
              "status": result.get("status"), "source": "lead", "reason": str(reason)[:2000], "role": result.get("role"),
              "route": result.get("route"), "agent": result.get("agent"), "model": result.get("model"),
@@ -3253,7 +3257,7 @@ def tool_definitions() -> list[dict[str, Any]]:
         {
             "name": "fusion_outcome",
             "outputSchema": {"type": "object", "properties": {"recorded": {"type": "boolean"}, "task_id": {"type": "string"}, "accepted": {"type": "boolean"}, "withdraw": {"type": "boolean"}, "unmeasured": {"type": "boolean"}, "stage": {"type": "string", "enum": ["gate", "verify", "land", "review"]}, "label": {"type": "object"}}, "required": ["recorded"]},
-            "description": "Record a verdict on a run. The latest measured verdict ranks future automatic routes; stages are gate, verify, land, or review. With a reason, a verdict on a reported success also becomes an acceptance training label. Choose accepted (true/false), withdraw (remove external verdicts and labels, with a reason), or unmeasured (audit a grader failure without changing ranking or labels).",
+            "description": "Record a verdict on a run. The latest measured verdict ranks future automatic routes; stages are gate, verify, land, or review. With a reason, a verdict on a run that delivered work (success or partial) also becomes an acceptance training label. Choose accepted (true/false), withdraw (remove external verdicts and labels, with a reason), or unmeasured (audit a grader failure without changing ranking or labels).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3756,8 +3760,11 @@ def build_parser() -> argparse.ArgumentParser:
     delegate.add_argument("task")
 
     outcome = sub.add_parser("outcome", help="record the lead's verdict on a delegated run",
-                             description="Record the lead's verdict on a delegated run. An invalid run id, issue, rejection "
-                                         "class or reporter exits 2 and records nothing.")
+                             description="Record the lead's verdict on a delegated run. Exit codes: 0 recorded (or listed, "
+                                         "with --pending); 2 usage or validation error (an invalid run id, issue, rejection "
+                                         "class or reporter), nothing recorded; 4 run not found (a well-formed run id with "
+                                         "no completed run in the workspace), nothing recorded, and stderr names the "
+                                         "workspace searched and where it came from.")
     outcome.add_argument("run_id", nargs="?")
     verdict = outcome.add_mutually_exclusive_group()
     verdict.add_argument("--accepted", dest="accepted", action="store_true")
@@ -4180,6 +4187,11 @@ def _main(args, parser) -> int:
             payload = record_outcome(workspace, args.run_id, args.accepted, args.reason, stage=args.stage,
                                      withdraw=args.withdraw, unmeasured=args.unmeasured, issue=args.issue,
                                      rejection_class=args.rejection_class, reporter=args.reporter)
+        except RunNotFound as exc:
+            source = ("--control-workspace" if args.control_workspace else
+                      "FUSION_CONTROL_WORKSPACE" if os.environ.get("FUSION_CONTROL_WORKSPACE") else "--workspace")
+            print(f"fusion: {exc}; searched {RunStore(workspace).workspace} (from {source})", file=sys.stderr)
+            return 4
         except ValueError as exc:
             parser.error(str(exc))
         print(json_text(payload))

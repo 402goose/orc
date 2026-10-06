@@ -164,6 +164,20 @@ class ReviewOutcomesTest(unittest.TestCase):
         self.assertEqual(self.cli("outcome", "--pending", "--accepted")[0], 2)
         self.assertEqual(self.outcomes(run), [])
 
+    def test_an_unknown_run_exits_4_and_names_the_workspace_searched(self):
+        code, _, err = self.cli("outcome", "20990101-000000-deadbeef", "--accepted")
+        self.assertEqual(code, 4)
+        self.assertIn(str(self.workspace.resolve()), err)
+        self.assertIn("(from --workspace)", err)
+        control = self.root / "control"
+        control.mkdir()
+        code, _, err = self.cli("--control-workspace", str(control), "outcome", "20990101-000000-deadbeef", "--accepted")
+        self.assertEqual(code, 4)
+        self.assertIn(f"{control.resolve()} (from --control-workspace)", err)
+        self.assertEqual(self.cli("outcome", "not a run id!", "--accepted")[0], 2)
+        with self.assertRaises(ValueError):
+            core.record_outcome(self.workspace, "20990101-000000-deadbeef", True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -445,6 +445,11 @@ def read_run_task(directory):
     return task if isinstance(task, dict) else {}
 
 
+# A partial run exited 0 with delivered work (a worked-around denial or the
+# worker's own partial report), so the lead's verdict on it is as informative.
+VERDICT_LABEL_STATUSES = frozenset({"success", "partial"})
+
+
 def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_path):
     """Turn the lead's verdict on a run into a provenance-tagged acceptance label.
 
@@ -461,6 +466,9 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
     tokens may exceed what Laya reads (fusion_decisions.exceeds_token_budget).
     It is no longer labelable; a new verdict retracts the verdict labels on
     it and labels a freshly built input instead.
+
+    Only runs that delivered work are labeled: status success or partial
+    (VERDICT_LABEL_STATUSES). Error, blocked and quota runs are skipped.
     """
     from fusion_decisions import (ACCEPTANCE_QUESTIONS, DecisionEngine, acceptance_state, config_for,
                                   exceeds_token_budget, over_token_budget, reviewed_labels, state_cap)
@@ -491,8 +499,8 @@ def verdict_label(workspace, config, run_id, result, accepted, reason, evidence_
             return {"status": "preserved", "decision_id": record["id"], "reason": "Another reviewer's labels on this decision were kept"}
         task = read_run_task(Path(evidence_path).parent)
         skip = ("the verdict has no --reason" if not reason else
-                f"the run ended with status {result.get('status')!r}; acceptance is only asked of a reported success"
-                if result.get("status") != "success" else
+                f"the run ended with status {result.get('status')!r}; acceptance is only asked of a run that delivered work"
+                if result.get("status") not in VERDICT_LABEL_STATUSES else
                 "the run's task.json is missing" if record is None and not task.get("task") else None)
         if skip:
             if record and any(e.get("event") == "label" and e.get("source") == VERDICT_SOURCE for e in own) \

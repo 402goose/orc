@@ -15,8 +15,8 @@
 Record an outcome after checking a delegated run's evidence. Direct delegations
 have no workflow coordinator gate; the worker's status alone is not a verified
 outcome. The latest measured external verdict for a run feeds outcome ranking.
-A verdict with a reason on a reported success can also produce an acceptance
-training label. Acceptance does not prove that the selected lane was optimal.
+A verdict with a reason on a run that delivered work (status `success` or
+`partial`) can also produce an acceptance training label. Acceptance does not prove that the selected lane was optimal.
 
 Write workflows fingerprint existing acceptance inputs before the first attempt.
 If a worker changes or deletes one, `check_inputs_changed` marks the receipts and
