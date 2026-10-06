@@ -1087,7 +1087,7 @@ print(json.dumps({
             """
 import json
 print(json.dumps({'type':'thread.started','thread_id':'mcp-thread'}))
-print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'STATUS: success\\nSUMMARY: delegated\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}}))
+print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'VERDICT: approve\\nSTATUS: success\\nSUMMARY: delegated\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}}))
 print(json.dumps({'type':'turn.completed','usage':{}}))
 """,
         )
@@ -1123,12 +1123,14 @@ print(json.dumps({'type':'turn.completed','usage':{}}))
         result = response["result"]["structuredContent"]
         self.assertEqual(result["status"], "success", response)
         self.assertEqual(result["summary"], "delegated")
+        self.assertEqual(result["reported_verdict"], "approve")
         task_files = list((self.workspace / ".fusion" / "runs").glob("*/task.json"))
         self.assertEqual(len(task_files), 1)
         task = json.loads(task_files[0].read_text())
         self.assertEqual(task["task"], "review the change")
         self.assertEqual(task["role"], "reviewer")
         self.assertEqual(task["constraints"], ["do not edit files"])
+        self.assertTrue(task["requires_verdict"])
 
     def test_delegate_pins_model_and_effort_from_mcp_and_cli(self):
         argv_log = self.workspace / "argv.jsonl"

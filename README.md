@@ -231,6 +231,11 @@ wins. Withdrawal removes external verdicts and their labels, preserving independ
 gate evidence. Unmeasured outcomes leave ranking and labels unchanged. A reasoned
 verdict on a reported success can become an acceptance label.
 
+A delegated review (a role containing `review`) must answer `VERDICT: approve`
+or `VERDICT: changes`. Without that line the run ends `verdict_missing`: no
+routing evidence, no label, and `fusion delegate` exits 5. See
+[review verdicts](FUSION_DECISIONS.md).
+
 Laya starts in **shadow** mode: advice is recorded without applying learned
 actions. Active decisions need explicit activation and matching calibration;
 missing models and uncertain/truncated input fall back to deterministic policies.
