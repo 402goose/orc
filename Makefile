@@ -26,9 +26,9 @@ refresh-quality:
 build:
 	./build.sh
 
-# Unexpected skips and expected failures fail the suite. The only allowed skip
-# is the real macOS Codex sandbox probe when that runtime/profile is unavailable;
-# run_python.py checks its exact test ID and reason, and reports it explicitly.
+# Unexpected skips and expected failures fail the suite. The only allowed skips
+# are the real macOS Codex sandbox probes when that runtime/profile is unavailable;
+# run_python.py checks their exact test IDs and reason, and reports them explicitly.
 test:
 	env -u FUSION_CONTROL_WORKSPACE PYTHONDONTWRITEBYTECODE=1 python3 test/run_python.py
 
