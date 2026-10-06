@@ -9,7 +9,7 @@ from pathlib import Path
 import random
 import time
 
-from fusion_decisions import (DecisionEngine, DecisionStore, ACCEPTANCE_QUESTIONS, RECOVERY_QUESTIONS, REVIEW_QUESTIONS,
+from fusion_decisions import (LAND_DERIVED_SOURCE, DecisionEngine, DecisionStore, ACCEPTANCE_QUESTIONS, RECOVERY_QUESTIONS, REVIEW_QUESTIONS,
                               _encoded, _marked, acceptance_state, normalize_role, read_jsonl, state_cap)
 import fusion_progress as progress
 import fusion_usage as usage
@@ -1104,8 +1104,11 @@ def effective_outcomes(events):
     Keep independent gate evidence so withdrawing the external lifecycle restores
     it, without reviving an earlier external stage. Unmeasured events are audit-only.
     Changed check inputs exclude the run, including previously recorded successes.
+    A land_derived outcome (a review graded from its issue's land) ranks below both:
+    it stands only while the run has no lead or gate outcome, and a lead withdrawal
+    removes it too.
     """
-    independent, external = {}, {}
+    independent, external, derived = {}, {}, {}
     untrusted = set()
     for index, event in enumerate(events):
         run_id = event.get("task_id")
@@ -1116,12 +1119,17 @@ def effective_outcomes(events):
             independent.pop(run_id, None)
         elif event.get("event") == "outcome_withdraw" and event.get("source") == "lead":
             external.pop(run_id, None)
+            derived.pop(run_id, None)
         elif event.get("event") == "outcome" and isinstance(event.get("accepted"), bool):
-            target = external if event.get("source") == "lead" else independent
+            source = event.get("source")
+            target = external if source == "lead" else derived if source == LAND_DERIVED_SOURCE else independent
             target[run_id] = (index, event)
-    return {run_id: max((table[run_id] for table in (independent, external) if run_id in table),
-                        key=lambda item: item[0])[1]
-            for run_id in independent.keys() | external.keys() if run_id not in untrusted}
+    measured = {run_id: max((table[run_id] for table in (independent, external) if run_id in table),
+                            key=lambda item: item[0])[1]
+                for run_id in independent.keys() | external.keys() if run_id not in untrusted}
+    measured.update({run_id: item[1] for run_id, item in derived.items()
+                     if run_id not in measured and run_id not in untrusted})
+    return measured
 
 
 def rejection_counts(outcomes):

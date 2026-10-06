@@ -149,14 +149,23 @@ class VerdictLabelsTest(unittest.TestCase):
         [row] = decision_rows(self.workspace)
         self.assertNotEqual(row["garden_state"], "approved")
 
-    def test_only_reported_successes_with_a_known_task_are_labeled(self):
-        failed = self.run_dir("run-failed", status="error")
-        self.assertEqual(self.verdict(failed, False)["label"]["status"], "skipped")
+    def test_only_runs_that_delivered_work_with_a_known_task_are_labeled(self):
+        for status in ("error", "blocked"):
+            with self.subTest(status=status):
+                failed = self.run_dir(f"run-{status}", status=status)
+                self.assertEqual(self.verdict(failed, False)["label"]["status"], "skipped")
         orphan = core.RunStore(self.workspace).runs / "run-orphan"
         orphan.mkdir(parents=True)
         (orphan / "result.json").write_text(json.dumps({"status": "success", "summary": "done"}))
         self.assertIn("task.json", self.verdict("run-orphan", True)["label"]["reason"])
         self.assertEqual(self.events("decision"), [])
+
+    def test_a_rejected_partial_run_produces_a_plausible_false_label(self):
+        run_id = self.run_dir("run-partial", status="partial")
+        payload = self.verdict(run_id, False)
+        self.assertEqual((payload["label"]["status"], payload["label"]["answers"]), ("labeled", {"plausible": "false"}))
+        [label] = self.events("label")
+        self.assertEqual((label["source"], label["answers"]), ("lead_verdict", {"plausible": "false"}))
 
     def test_long_briefs_are_recorded_truncated_and_left_unlabeled(self):
         run_id = self.run_dir(task="x" * 5000)

@@ -15,8 +15,8 @@
 Record an outcome after checking a delegated run's evidence. Direct delegations
 have no workflow coordinator gate; the worker's status alone is not a verified
 outcome. The latest measured external verdict for a run feeds outcome ranking.
-A verdict with a reason on a reported success can also produce an acceptance
-training label. Acceptance does not prove that the selected lane was optimal.
+A verdict with a reason on a run that delivered work (status `success` or
+`partial`) can also produce an acceptance training label. Acceptance does not prove that the selected lane was optimal.
 
 Write workflows fingerprint existing acceptance inputs before the first attempt.
 If a worker changes or deletes one, `check_inputs_changed` marks the receipts and
@@ -45,6 +45,35 @@ the latest measured verdict. `--withdraw` requires a reason and removes prior
 external verdicts and their labels, preserving independent gate evidence.
 `--unmeasured` records an unscored attempt without changing ranking or labels.
 Choose exactly one of accepted, rejected, withdraw, or unmeasured.
+
+A read-only review run (a role containing `review`) saves `review_verdict` in its
+result: `approve` when it completed with no blockers, `changes_requested` when it
+listed blockers, and null when it did not complete (error, timeout, quota or a
+permission denial).
+
+An accepted `--stage land` verdict that carries an issue (`--issue`, or the issue the
+run was delegated with) also grades the reviews of that issue that have no outcome
+yet. Issues match with owner/repo compared case-insensitively. Reviews started within
+10 minutes of each other form one round. Two cases are recorded as accepted
+`review`-stage outcomes with source `land_derived` and reporter `orc-land`: an approval
+in the final round when no reviewer in that round asked for changes, and a request for
+changes in an earlier round, since another round followed. Every other review is left
+for the lead. The land's output lists what it recorded under `derived_reviews`.
+Without an issue on the land verdict nothing is derived.
+
+A `land_derived` outcome is an inference, not a verdict. It feeds routing evidence
+only while the run has no lead or gate outcome: any lead verdict on the run, earlier
+or later, replaces it, and a lead withdrawal removes it. It never produces a label,
+so it never reaches training, calibration or bucket qualification.
+
+```sh
+fusion outcome --pending                    # runs still owed a verdict
+fusion --json outcome --pending --role review --hours 24
+```
+
+`--pending` records nothing. It lists completed runs with no measured verdict,
+newest first, split into `unreported` (no outcome event at all) and `unmeasured`
+(only `--unmeasured` outcomes, with the latest reason), with per-role counts.
 
 The [decision and evidence design](../FUSION_DECISIONS.md) explains label provenance,
 qualification and executed verification. The [learning roadmap](learning-roadmap.md)

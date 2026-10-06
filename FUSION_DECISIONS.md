@@ -535,8 +535,9 @@ done in an unacceptable way, or the brief may have been wrong. So
 `failed_task` stays unlabeled.
 
 No label is written when the verdict has no `--reason` (the outcome is still
-recorded for route ranking), when the run did not report `success` (acceptance
-is only asked of a reported success), when the run's `task.json` is missing,
+recorded for route ranking), when the run did not deliver work (status other
+than `success` or `partial`: error, blocked and quota runs are skipped; a partial run
+exited 0 with work the lead judged), when the run's `task.json` is missing,
 or when the task cannot be shown whole within the token budget (below; the
 record is kept, marked truncated). `mode: off` or `"verdict_labels": false` turn verdict labels off.
 
@@ -605,6 +606,10 @@ and every exported answer names its source in `label_provenance`:
 `mode: off` turns all of them off; `"automatic_labels": false` turns off
 `structural_gate`, `gym_grade` (it labels the input the gate records) and
 `user_explicit`.
+
+Review grades ORC infers from an issue's land (outcome source `land_derived`,
+see [learning](docs/learning.md)) are not a label source: they write no label
+of any kind and rank below every lead and gate outcome.
 
 #### Structural gate labels
 

@@ -885,6 +885,11 @@ def temperature_scale(probs, temperature):
     return {key: value / total for key, value in values.items()}
 
 
+# Outcome source of a verdict ORC inferred from a land rather than one a lead gave:
+# routing evidence below lead and gate outcomes, never a label.
+LAND_DERIVED_SOURCE = "land_derived"
+
+
 def normalize_role(role):
     """Stable evidence class; absent, empty and unknown roles use legacy evidence."""
     value = "-".join(role.lower().split()) if isinstance(role, str) else ""
