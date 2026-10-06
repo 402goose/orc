@@ -2423,10 +2423,56 @@ def codex_network(settings: dict[str, Any]) -> tuple[str, list[str]]:
     return ",network=" + toml_inline(network), (["-c", "features.network_proxy=true"] if network.get("mode") == "limited" else [])
 
 
+CODEX_BROWSER_ARGS = ["--single-process"]
+CODEX_BROWSER_PRELOAD = Path(__file__).resolve().parent / "fusion_browser_preload.cjs"
+
+
+def codex_browser(settings: dict[str, Any]) -> list[str] | None:
+    """Chromium arguments for `codex.browser` (`true`, or a table with
+    `chromium_args`), or None when browser support is off.
+
+    The Codex seatbelt denies the Mach service Chromium's multi-process
+    launcher registers, so the default runs Chromium as one process."""
+    browser = settings.get("browser")
+    if browser is None or browser is False:
+        return None
+    if browser is True:
+        return list(CODEX_BROWSER_ARGS)
+    if isinstance(browser, dict):
+        args = browser.get("chromium_args", CODEX_BROWSER_ARGS)
+        if isinstance(args, list) and all(isinstance(arg, str) and arg for arg in args):
+            return list(args)
+    raise ValueError("codex.browser must be true or a table with a chromium_args list of strings")
+
+
+def codex_browser_env(settings: dict[str, Any], env: dict[str, str]) -> None:
+    """Preload ORC's Node hook so every Chromium a Node driver (Playwright,
+    Puppeteer) spawns gets the `codex.browser` arguments."""
+    args = codex_browser(settings)
+    if args is None:
+        return
+    preload = "--require " + json.dumps(str(CODEX_BROWSER_PRELOAD))
+    env["NODE_OPTIONS"] = " ".join(part for part in (env.get("NODE_OPTIONS", "").strip(), preload) if part)
+    env["FUSION_CHROMIUM_ARGS"] = json.dumps(args)
+
+
+def codex_reader_browser_args() -> list[str]:
+    """Read-only plus what a browser test needs: a writable system temp
+    directory for the profile and loopback binding through the managed proxy
+    with no allowed domains, so nothing leaves the host."""
+    network = {"enabled": True, "allow_local_binding": True, "mode": "limited", "domains": {}}
+    profile = '{extends=":read-only",filesystem={":tmpdir"="write"},network=' + toml_inline(network) + '}'
+    return ["--strict-config", "-c", "features.network_proxy=true", "-c", 'default_permissions="fusion_read_browser"',
+            "-c", "permissions.fusion_read_browser=" + profile]
+
+
 def codex_permission_args(workspace: Path, settings: dict[str, Any], write: bool) -> list[str]:
     """Allow repository Git operations for writers without unrestricted access.
     An optional `network` table (Codex's permission-profile keys) applies to
-    writers only; readers stay read-only with no network."""
+    writers only; readers stay read-only with no network, unless `codex.browser`
+    gives them temp writes and loopback only."""
+    if not write and codex_browser(settings) is not None:
+        return codex_reader_browser_args()
     sandbox = settings.get("sandbox", "workspace-write") if write else "read-only"
     if sandbox != "workspace-write" or not settings.get("git_write", True):
         return ["-s", sandbox]
@@ -2483,6 +2529,8 @@ def agent_command(
         permissions = ["--dangerously-bypass-approvals-and-sandbox"] if yolo else [
             *codex_permission_args(Path(task["workspace"]), settings, task["write"]),
             "-a", settings.get("approval", "never") if task["write"] else "never"]
+        if not yolo:
+            codex_browser_env(settings, env)
         argv = [command, "-C", task["workspace"], *permissions]
         if settings.get("reasoning_effort") is not None:
             argv += ["-c", "model_reasoning_effort=" + json.dumps(settings["reasoning_effort"])]
@@ -3805,6 +3853,8 @@ def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str |
             env["FUSION_CONTROL_WORKSPACE"] = str(control)
         if read_only:
             env["FUSION_READ_ONLY"] = "1"
+        if not yolo:
+            codex_browser_env(settings, env)
         return subprocess.run(argv, cwd=workspace, env=env, check=False).returncode
     if agent == "opencode":
         settings = config.get("opencode", {})
