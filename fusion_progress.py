@@ -211,32 +211,75 @@ def worker_message(line):
     return None
 
 
+STOP_GRACE_SECONDS = 3
+
+
+def _descendants(roots):
+    """Every live process below `roots`, found by walking parent links.
+
+    A worker's process group is not its whole tree: a CLI that runs commands in
+    their own session (codex does, and so do the servers and validators those
+    commands start) moves them out of the group, and killpg never reaches them.
+    """
+    try:
+        listing = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    children = {}
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0].isdigit() and fields[1].isdigit():
+            children.setdefault(int(fields[1]), []).append(int(fields[0]))
+    found, frontier = set(), list(roots)
+    while frontier:
+        for pid in children.get(frontier.pop(), ()):
+            if pid not in found and pid != os.getpid():
+                found.add(pid)
+                frontier.append(pid)
+    return found
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _signal_tree(proc, tree, sig, fallback):
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        with suppress(OSError):
+            fallback()
+    for pid in tree:
+        with suppress(OSError):
+            os.kill(pid, sig)
+
+
 def _stop_process(proc):
-    # Workers start their own session so Ctrl-C/timeout also cleans up CLI children.
-    # Teardown is best effort. Between the timeout and the kill a group can stop
-    # being signalable by us — the leader is already reaped, or its pid was
-    # recycled into a group we do not own — and the OS reports that as EPERM, not
-    # ESRCH. Raising here would turn a handled timeout into a crash for the
-    # caller, so fall back to signalling the child directly and give up quietly.
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    except PermissionError:
-        with suppress(OSError):
-            proc.terminate()
-    try:
-        proc.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        pass
-    # Still signal the group after a clean wait: descendants outlive the leader.
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        with suppress(OSError):
-            proc.kill()
+    # Workers start their own session so Ctrl-C/timeout also cleans up CLI children,
+    # and descendants that left that session are found by parentage and signalled
+    # one by one. SIGTERM first, a short grace, then SIGKILL. Teardown is best
+    # effort. Between the timeout and the kill a group can stop being signalable
+    # by us — the leader is already reaped, or its pid was recycled into a group
+    # we do not own — and the OS reports that as EPERM, not ESRCH. Raising here
+    # would turn a handled timeout into a crash for the caller, so fall back to
+    # signalling the child directly and give up quietly.
+    tree = _descendants([proc.pid])
+    _signal_tree(proc, tree, signal.SIGTERM, proc.terminate)
+    deadline = time.monotonic() + STOP_GRACE_SECONDS
+    while time.monotonic() < deadline and (proc.poll() is None or any(_alive(pid) for pid in tree)):
+        time.sleep(.05)
+    # Still signal the group after a clean exit: descendants outlive the leader,
+    # and ones that forked while stopping are found below the tree already known.
+    tree |= _descendants([proc.pid, *tree])
+    _signal_tree(proc, tree, signal.SIGKILL, proc.kill)
     proc.wait()
 
 
