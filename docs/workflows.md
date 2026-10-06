@@ -41,6 +41,11 @@ A run moves left to right, and nothing advances on a worker's say-so alone:
 
 `STATUS: success` from a worker is a self-report. A stage is accepted only when
 its declared `required_files` exist (and differ from their baseline when one is recorded),
+— an entry may name a directory, which counts as present when it holds at least one file and
+as changed when any file under it was added or edited; the comparison is by content, so a worker
+(or a hook in its environment) committing its own output does not hide the change; symlinks
+under a required directory are skipped, so a link never makes it present and its target is never
+read; a directory is hashed in full on every check —
 its acceptance commands exit zero, and — for
 a node that may write — the repository actually changed. Structural signals
 (`turn.failed`, `is_error`) override a "success" claim. Individual nonzero

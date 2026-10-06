@@ -1354,6 +1354,68 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_
         self.assertEqual(result["status"], "failed")
         self.assertIn("did not change", " ".join(result["nodes"][0]["result"]["blockers"]))
 
+    def required_artifact_run(self, name, action, required, before=None, git=False):
+        claude = self.write_agent(name, f"""
+import json, os, pathlib, subprocess
+{action}
+print(json.dumps({{'type':'result','subtype':'success','is_error':False,'session_id':'{name}','result':'STATUS: success\\nSUMMARY: wrote it\\nCHANGED: out\\nTESTS: none\\nBLOCKERS: none'}}))
+""")
+        self.config(claude=claude)
+        for relative, text in (before or {}).items():
+            (self.workspace / relative).parent.mkdir(parents=True, exist_ok=True)
+            (self.workspace / relative).write_text(text, encoding="utf-8")
+        if git:
+            for argv in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"]):
+                subprocess.run(["git", *argv], cwd=self.workspace, check=True)
+        spec = {"task": "required artifact test",
+                "nodes": [{"id": "writer", "task": "write the corpus", "agent": "claude", "required_files": [required]}],
+                "acceptance": {"required_files": [required]}}
+        spec_path = self.workspace / "workflow.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        return run_workflow(self.workspace, json.loads((self.workspace / ".fusion.json").read_text()), spec_path)
+
+    def test_a_required_directory_with_new_files_is_present(self):
+        result = self.required_artifact_run(
+            "dir-claude", "d = pathlib.Path('corpus/concepts'); d.mkdir(parents=True)\n"
+                          "for n in ('a', 'b'): (d / f'{n}.md').write_text(n)", "corpus/concepts")
+        self.assertEqual(result["status"], "success", result["nodes"][0]["result"].get("blockers"))
+
+    def test_an_empty_required_directory_is_missing(self):
+        empty = self.required_artifact_run("empty-claude", "pathlib.Path('corpus/concepts').mkdir(parents=True)", "corpus/concepts")
+        self.assertEqual(empty["status"], "failed")
+        self.assertIn("required artifact is missing: corpus/concepts", " ".join(empty["nodes"][0]["result"]["blockers"]))
+
+    def test_an_unchanged_required_directory_did_not_change(self):
+        stale = self.required_artifact_run("stale-dir-claude", "pass", "corpus/concepts", before={"corpus/concepts/a.md": "old"})
+        self.assertEqual(stale["status"], "failed")
+        self.assertIn("did not change", " ".join(stale["nodes"][0]["result"]["blockers"]))
+
+    def test_symlinks_under_a_required_directory_are_skipped(self):
+        import fusion_workflow
+        outside = Path(self.temp.name) / "outside.md"
+        outside.write_text("one", encoding="utf-8")
+        required = self.workspace / "corpus"
+        required.mkdir()
+        (required / "link.md").symlink_to(outside)
+        (required / "linked-dir").symlink_to(Path(self.temp.name))
+        self.assertEqual(fusion_workflow._artifact_files(required), [])
+        self.assertEqual(fusion_workflow._fingerprint(required), {"exists": False})
+        (required / "real.md").write_text("real", encoding="utf-8")
+        before = fusion_workflow._fingerprint(required)
+        outside.write_text("two", encoding="utf-8")
+        self.assertEqual(fusion_workflow._fingerprint(required), before)
+        self.assertEqual(before["files"], 1)
+
+    def test_a_worker_that_commits_its_own_output_still_changed_it(self):
+        result = self.required_artifact_run(
+            "commit-claude",
+            "d = pathlib.Path('corpus/concepts'); (d / 'b.md').write_text('new')\n"
+            "pathlib.Path('FINAL.md').write_text('new output')\n"
+            "subprocess.run(['git', 'add', '-A'], check=True)\n"
+            "subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'session: end'], check=True)",
+            "corpus/concepts", before={"corpus/concepts/a.md": "old", "FINAL.md": "old output"}, git=True)
+        self.assertEqual(result["status"], "success", result["nodes"][0]["result"].get("blockers"))
+
     def test_workflow_report_groups_waves_and_usage(self):
         claude = self.write_agent(
             "report-claude",

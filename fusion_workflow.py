@@ -208,7 +208,32 @@ def parse_acceptance_contract(answer: str) -> dict[str, Any]:
     return contract
 
 
+def _artifact_files(path: Path) -> list[Path]:
+    """The regular files a required artifact stands for: the file itself, or every file under a
+    directory. Symlinks under a directory are skipped (links to files and to directories alike), so
+    a link never makes a directory present and its target, which may lie outside the workspace, is
+    never read. A directory is listed and hashed in full on every check, which is fine at today's
+    artifact sizes."""
+    if path.is_file():
+        return [path]
+    if not path.is_dir():
+        return []
+    files = []
+    for root, dirs, names in os.walk(path, followlinks=False):
+        dirs[:] = [name for name in dirs if name != ".git" and not os.path.islink(os.path.join(root, name))]
+        files += [Path(root) / name for name in names if not os.path.islink(os.path.join(root, name))]
+    return sorted(item for item in files if item.is_file())
+
+
 def _fingerprint(path: Path) -> dict[str, Any]:
+    if path.is_dir():
+        files = _artifact_files(path)
+        if not files:
+            return {"exists": False}
+        digest = hashlib.sha256()
+        for item in files:
+            digest.update(item.relative_to(path).as_posix().encode() + b"\0" + _fingerprint(item)["sha256"].encode() + b"\0")
+        return {"exists": True, "files": len(files), "sha256": digest.hexdigest()}
     if not path.is_file():
         return {"exists": False}
     digest = hashlib.sha256()
@@ -1379,7 +1404,7 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
             problem("worker_blockers", "worker reported unresolved blockers")
         for relative in node.get("required_files", []):
             path = self.workspace / relative
-            if not path.is_file():
+            if not _artifact_files(path):
                 problem("required_file_missing", f"required artifact is missing: {relative}", path=relative)
             else:
                 baseline = (node.get("_artifact_baseline") or {}).get(relative)
@@ -1707,7 +1732,7 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
         acceptance = self.spec.get("acceptance") or {}
         for relative in acceptance.get("required_files", []):
             path = self.workspace / relative
-            if not path.is_file():
+            if not _artifact_files(path):
                 problems.append(f"required workflow artifact is missing: {relative}")
             elif relative in self.workflow_baseline and _fingerprint(path) == self.workflow_baseline[relative]:
                 problems.append(f"required workflow artifact did not change during run: {relative}")
