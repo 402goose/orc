@@ -297,7 +297,11 @@ NONE_ANSWERS = {"none", "n/a", "na", "nil", "nothing", "-", "—"}
 NO_BLOCKERS_DECLARED = re.compile(
     r"(?:no\s+block(?:ers?|ing\s+(?:issues?|problems?))|nothing\s+(?:is\s+)?blocking|none\s+(?:are\s+)?blocking"
     r"|non-?blocking)\b[^.;:\n]*[.;:,—-]?\s*(.*)\Z", re.I | re.S)
-CONTRAST = re.compile(r"\b(?:but|however|except|although|though|yet)\b", re.I)
+SCOPED_NONE = re.compile(
+    r"(?:none|no\s+blockers?)\s+for\s+(?:the|this)\s+(?:assigned\s+)?(?:investigation|node|task|stage|review)"
+    r"[.;]\s+(.*)\Z", re.I | re.S)
+UNRESOLVED_CUE = re.compile(
+    r"\b(?:but|however|except|although|though|yet|still|requires?|needs?|pending|awaiting|outstanding|must)\b", re.I)
 
 # A delegated review answers with one of these on a `VERDICT:` line.
 REVIEW_VERDICTS = ("approve", "changes")
@@ -363,8 +367,8 @@ def parse_handoff(text: str) -> dict[str, Any]:
         elif active:
             blocks[active].append(line)
     fields = {label: "\n".join(value).strip() for label, value in blocks.items()}
-    declared = NO_BLOCKERS_DECLARED.match(fields.get("BLOCKERS", ""))
-    if declared and not CONTRAST.search(fields["BLOCKERS"]):
+    declared = NO_BLOCKERS_DECLARED.match(fields.get("BLOCKERS", "")) or SCOPED_NONE.match(fields.get("BLOCKERS", ""))
+    if declared and not UNRESOLVED_CUE.search(fields["BLOCKERS"]):
         fields["BLOCKERS"] = ""
         fields["LIMITATIONS"] = "\n\n".join(part for part in (fields.get("LIMITATIONS", ""), declared[1].strip()) if part)
 

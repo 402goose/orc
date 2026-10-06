@@ -152,6 +152,28 @@ none
             with self.subTest(clear=clear):
                 self.assertEqual(core.parse_handoff("BLOCKERS: " + clear)["blockers"], [])
 
+    def test_scoped_none_with_tool_caveats_moves_them_to_limitations(self):
+        for observed in (
+            "none for the assigned investigation. Context tools were unavailable; no context/memory calls or "
+            "journal writes were made.",
+            "none for the investigation. Context tools were unavailable, so context/memory calls could not run; "
+            "no journals or other artifacts were written under the read-only constraint.",
+            "none for the investigation. Context/memory tools were unavailable; label ambiguities and the totals "
+            "discrepancy remain flagged for the orchestrator.",
+            "None for the assigned investigation. Context/memory tools were unavailable in the callable tool "
+            "registry; no journals or memory were written. Label uncertainties remain explicitly flagged above.",
+            "None for this node. Context tools were unavailable. Label/name uncertainties, missing visual context, "
+            "and methodological limits are flagged above.",
+        ):
+            with self.subTest(observed=observed[:40]):
+                parsed = core.parse_handoff("STATUS: success\nSUMMARY: investigated\nBLOCKERS: " + observed)
+                self.assertEqual(parsed["blockers"], [])
+                self.assertTrue(parsed["limitations"])
+        for blocker in ("None for the investigation, but the suite could not run",
+                        "none for this node. The deploy still requires approval."):
+            with self.subTest(blocker=blocker):
+                self.assertTrue(core.parse_handoff("BLOCKERS: " + blocker)["blockers"])
+
     def test_limitations_field_never_becomes_a_blocker(self):
         parsed = core.parse_handoff("STATUS: success\nSUMMARY: read\nBLOCKERS: none\n"
                                     "LIMITATIONS: the load test was not run\n- memory use is unverified")
