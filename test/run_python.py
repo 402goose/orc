@@ -1,4 +1,4 @@
-"""Keep unexpected coverage gaps fatal, with one explicit local-runtime exception."""
+"""Keep unexpected coverage gaps fatal, with explicit local-runtime exceptions."""
 from pathlib import Path
 import os
 import shutil
@@ -8,10 +8,13 @@ import unittest
 MANAGED_LAYA = Path.home() / '.local/share/orc/laya/bin/python'
 SANDBOX_PROBE = ('codex_permissions_test.CodexPermissionsTest.'
                  'test_real_sandbox_allows_git_in_repos_and_worktrees_but_protects_other_paths')
+BROWSER_PROBE = ('codex_permissions_test.CodexPermissionsTest.'
+                 'test_real_browser_reader_binds_loopback_and_writes_temp_but_not_the_workspace')
+SANDBOX_PROBES = {SANDBOX_PROBE, BROWSER_PROBE}
 
 
 def expected_skip(test, reason):
-    if test.id() != SANDBOX_PROBE:
+    if test.id() not in SANDBOX_PROBES:
         return False
     if reason == 'requires the macOS Codex sandbox':
         return sys.platform != 'darwin' or not shutil.which('codex')
