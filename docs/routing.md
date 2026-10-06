@@ -84,8 +84,9 @@ counts here, whatever its class: the cap stops blind retries, not bad lanes. See
 A rejection's `rejection_class` decides whether it is evidence about the lane.
 `suite_red`, `no_diff`, `out_of_scope` and `review_changes` are quality failures and
 count against the lane. `land_conflict`, `eval_unmeasured` and `other` are harness
-problems: ranking, the Thompson posterior and rework exclusion leave them out, as if
-the run had no outcome. A rejection with no class counts. `fusion decisions routing-report`
+problems: ranking, the Thompson posterior and rework exclusion treat them as if no
+verdict was recorded. The run's own status still counts, so a worker that errored counts
+against the lane exactly as it would with no outcome. A rejection with no class counts. `fusion decisions routing-report`
 skips excluded outcomes in its estimates, counts them in `excluded_by_class`, and
 still lists them under `rejections` with `counts_against_lane: false`.
 

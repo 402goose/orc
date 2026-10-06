@@ -68,9 +68,18 @@ class RejectionClassRoutingTest(unittest.TestCase):
                          (before["checked_runs_local"], before["acceptance_rate_local"]))
         self.assertEqual(after["checked_runs_local"], 0)
 
-    def test_an_excluded_rejection_of_an_errored_run_is_not_counted_as_its_error(self):
-        self.record("A", False, "land_conflict", status="error")
-        self.assertEqual(self.candidates()["A"]["checked_runs_local"], 0)
+    def test_an_excluded_rejection_leaves_the_runs_own_status_to_count(self):
+        for name in ("eval_unmeasured", "other"):
+            with self.subTest(rejection_class=name):
+                self.spans.clear()
+                self.decisions.path.unlink(missing_ok=True)
+                self.record("A", False, name, status="error")
+                errored = self.candidates()["A"]
+                self.assertEqual((errored["checked_runs_local"], errored["acceptance_rate_local"]), (1, 0.0))
+                self.spans.clear()
+                self.decisions.path.unlink(missing_ok=True)
+                self.record("A", False, name, status="success")
+                self.assertEqual(self.candidates()["A"]["checked_runs_local"], 0)
 
     def test_each_quality_class_counts_against_the_lane(self):
         for name in QUALITY:

@@ -288,7 +288,6 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None, minim
     history = defaultdict(list)
     measured = effective_outcomes(read_jsonl(DecisionStore(store.workspace).path))
     outcomes = {run_id: event["accepted"] for run_id, event in measured.items() if counts_against_lane(event)}
-    excluded = {run_id for run_id, event in measured.items() if not counts_against_lane(event)}
     unhealthy = set(task.get("excluded_routes", []))
     unavailable_commands = set()
     for excluded in unhealthy:
@@ -337,10 +336,10 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None, minim
         # error is observed. Quota, auth and permission failures are lane health
         # (cooldown), not evidence about quality. A review that never gave its
         # VERDICT decided nothing, so it counts neither way, even with an outcome.
-        # A rejection classed as a harness problem says nothing about the lane.
+        # A rejection classed as a harness problem is treated as no verdict at
+        # all, so the run's own status still counts as it would without one.
         evidence = [(span, outcomes[span["run_id"]] if span.get("run_id") in outcomes else False) for span in spans
-                    if span.get("run_id") not in untrusted and span.get("run_id") not in excluded
-                    and span.get("status") != "verdict_missing" and (span.get("run_id") in outcomes or
+                    if span.get("run_id") not in untrusted and span.get("status") != "verdict_missing" and (span.get("run_id") in outcomes or
                         (span.get("status") == "error" and span.get("failure_class") not in {"quota", "auth", "permission_denied"}))]
         # Read-only and writing work differ: this task's class counts when
         # it has any evidence, else every class pooled. A writer never counts
@@ -1109,9 +1108,11 @@ QUALITY_REJECTION_CLASSES = frozenset({"suite_red", "no_diff", "out_of_scope", "
 def counts_against_lane(outcome):
     """Whether a measured outcome is evidence about its lane's quality. An acceptance
     always is. A rejection is too, unless its caller classed it as a harness problem
-    (land_conflict, eval_unmeasured, other): that run says nothing about the work, so
-    it neither ranks the lane, feeds its posterior, nor steers rework away from it.
-    A rejection with no class is the caller's verdict and counts. The rejection cap
+    (land_conflict, eval_unmeasured, other): that verdict says nothing about the work,
+    so it is treated as if no verdict was recorded, in ranking, the posterior and
+    rework. The run's own status still counts: a worker that errored counts against
+    the lane exactly as it would with no outcome. A rejection with no class is the
+    caller's verdict and counts. The rejection cap
     per issue and role guards against blind retries, not lane quality, and counts
     every rejection."""
     return not (outcome.get("accepted") is False and outcome.get("rejection_class") in HARNESS_REJECTION_CLASSES)
