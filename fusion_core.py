@@ -454,6 +454,20 @@ def classify_verdict(result: dict[str, Any]) -> dict[str, Any]:
     return {"verdict": "error", "reason": kind or str(result.get("status") or "error")}
 
 
+def is_review_task(task: dict[str, Any]) -> bool:
+    return "review" in str(task.get("role") or "").lower() and not task.get("write")
+
+
+def review_verdict(result: dict[str, Any]) -> str | None:
+    """What a completed review concluded: approve (no blockers) or changes_requested.
+    None when the review did not complete (error, timeout, quota, permissions). Results
+    saved before this field existed are judged the same way from their status and blockers."""
+    verdict = result.get("verdict") or classify_verdict(result)["verdict"]
+    if verdict != "ok":
+        return None
+    return "changes_requested" if result.get("blockers") else "approve"
+
+
 def json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
 
@@ -2605,7 +2619,128 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool | None = None, r
     DecisionStore(workspace).append("outcome", **event)
     from fusion_labeling import verdict_label
     label = verdict_label(workspace, load_config(workspace)[0], run_id, result, bool(accepted), reason, str(result_path))
-    return {"recorded": True, **event, "label": label}
+    payload = {"recorded": True, **event, "label": label}
+    if stage == "land" and accepted and issue:
+        payload["derived_reviews"] = derive_review_outcomes(workspace, issue, run_id)
+    return payload
+
+
+REVIEW_ROUND_GAP_MS = 10 * 60 * 1000
+
+
+def run_created_ms(run_dir: Path) -> int:
+    try:
+        created = json.loads((run_dir / "task.json").read_text(encoding="utf-8")).get("created_at")
+    except (OSError, ValueError):
+        created = None
+    if isinstance(created, (int, float)) and not isinstance(created, bool):
+        return int(created)
+    return int((run_dir / "result.json").stat().st_mtime * 1000)
+
+
+def completed_runs(workspace: Path) -> list[tuple[str, Path, dict[str, Any], int]]:
+    """(run_id, run_dir, result, created_ms) for every completed run of this workspace, oldest first."""
+    runs = []
+    root = RunStore(workspace).runs
+    if not root.is_dir():
+        return runs
+    for run_dir in root.iterdir():
+        try:
+            result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(result, dict):
+            runs.append((run_dir.name, run_dir, result, run_created_ms(run_dir)))
+    return sorted(runs, key=lambda item: (item[3], item[0]))
+
+
+def derive_review_outcomes(workspace: Path, issue: str, land_run_id: str) -> list[dict[str, Any]]:
+    """Grade the reviews of an issue that just landed, where the land settles them.
+
+    Reviews of the issue with no outcome yet are grouped into rounds (runs started within
+    10 minutes of each other). Two cases are recorded, as accepted review-stage verdicts with
+    reporter orc-land: an approval in the final round when no reviewer in that round asked
+    for changes, and a request for changes in an earlier round, since another round followed.
+    Everything else (a final-round blocker, an approval beside a peer's blocker, a review that
+    did not complete) is left for the lead; no existing verdict is overridden."""
+    from fusion_decisions import DecisionStore
+    workspace = RunStore(workspace).workspace
+    judged = {event.get("task_id") for event in DecisionStore(workspace).events()
+              if str(event.get("event", "")).startswith("outcome")}
+    reviews = [(run_id, result, created) for run_id, _, result, created in completed_runs(workspace)
+               if run_id != land_run_id and result.get("issue") == issue
+               and "review" in str(result.get("role") or "").lower()]
+    rounds: list[list[tuple[str, dict[str, Any], int]]] = []
+    for review in reviews:
+        if rounds and review[2] - rounds[-1][-1][2] <= REVIEW_ROUND_GAP_MS:
+            rounds[-1].append(review)
+        else:
+            rounds.append([review])
+    derived = []
+    for index, members in enumerate(rounds):
+        final = index == len(rounds) - 1
+        verdicts = {run_id: result.get("review_verdict") or review_verdict(result) for run_id, result, _ in members}
+        for run_id, _, _ in members:
+            if run_id in judged:
+                continue
+            if final and verdicts[run_id] == "approve" and "changes_requested" not in verdicts.values():
+                reason = f"approval held at land: {issue} landed after this final review round"
+            elif not final and verdicts[run_id] == "changes_requested":
+                reason = f"blocker led to another review round before {issue} landed"
+            else:
+                continue
+            record_outcome(workspace, run_id, True, reason, stage="review", issue=issue, reporter="orc-land")
+            derived.append({"run_id": run_id, "accepted": True, "reason": reason})
+    return derived
+
+
+def pending_outcomes(workspace: Path, role: str | None = None, hours: float | None = None) -> dict[str, Any]:
+    """Completed runs still owed a verdict: unreported (no outcome event at all) and
+    unmeasured (only unmeasured outcomes, with the latest reason), newest first."""
+    from fusion_decisions import DecisionStore
+    from fusion_policy import effective_outcomes
+    workspace = RunStore(workspace).workspace
+    events = DecisionStore(workspace).events()
+    measured = effective_outcomes(events)
+    unmeasured_reason: dict[str, str] = {}
+    reported = set()
+    for event in events:
+        name = str(event.get("event", ""))
+        if not name.startswith("outcome"):
+            continue
+        reported.add(event.get("task_id"))
+        if name == "outcome_unmeasured":
+            unmeasured_reason[event.get("task_id")] = str(event.get("reason") or "")
+    now = now_ms()
+    cutoff = now - hours * 3_600_000 if hours is not None else None
+    found: dict[str, list[dict[str, Any]]] = {"unreported": [], "unmeasured": []}
+    counts: dict[str, dict[str, int]] = {}
+    for run_id, _, result, created in reversed(completed_runs(workspace)):
+        if run_id in measured or (cutoff is not None and created < cutoff):
+            continue
+        if role is not None and result.get("role") != role:
+            continue
+        kind = "unmeasured" if run_id in unmeasured_reason else "unreported" if run_id not in reported else None
+        if kind is None:
+            continue
+        row = {"run_id": run_id, "role": result.get("role"), "agent": result.get("agent"), "issue": result.get("issue"),
+               "status": result.get("status"), "age_hours": round((now - created) / 3_600_000, 1)}
+        if kind == "unmeasured":
+            row["reason"] = unmeasured_reason[run_id]
+        found[kind].append(row)
+        bucket = counts.setdefault(str(result.get("role") or "unknown"), {"unreported": 0, "unmeasured": 0})
+        bucket[kind] += 1
+    return {**found, "counts": counts}
+
+
+def print_pending(payload: dict[str, Any]) -> None:
+    print(f"unreported {len(payload['unreported'])}, unmeasured {len(payload['unmeasured'])}")
+    for role, bucket in sorted(payload["counts"].items()):
+        print(f"  {role}: unreported {bucket['unreported']}, unmeasured {bucket['unmeasured']}")
+    for kind in ("unreported", "unmeasured"):
+        for row in payload[kind]:
+            tail = f" — {row['reason'][:120]}" if row.get("reason") else ""
+            print(f"{kind} {row['run_id']} {row['role']} {row['agent']} {row['issue'] or '-'} {row['age_hours']}h{tail}")
 
 
 def dispatch(
@@ -2723,6 +2858,8 @@ def dispatch(
         }
         verdict = classify_verdict(result)
         result.update(verdict=verdict["verdict"], verdict_reason=verdict.get("reason"), resets_at=verdict.get("resets_at"))
+        if is_review_task(task):
+            result["review_verdict"] = review_verdict(result)
         store.write_json(run_dir / "result.json", result)
         store.event(run_dir, "run.finished", {"result": result})
         store.trace_span(config, task, result, started_at_ms, now_ms(), metadata)
@@ -2914,6 +3051,8 @@ def dispatch(
     store.touch_session(task["session_key"], ended_at_ms)
     verdict = classify_verdict(result)
     result.update(verdict=verdict["verdict"], verdict_reason=verdict.get("reason"), resets_at=verdict.get("resets_at"))
+    if is_review_task(task):
+        result["review_verdict"] = review_verdict(result)
     store.write_json(run_dir / "result.json", result)
     store.event(run_dir, "run.finished", {"result": result})
     store.trace_span(config, task, result, started_at_ms, ended_at_ms, {**metadata, "model": model})
@@ -3619,8 +3758,8 @@ def build_parser() -> argparse.ArgumentParser:
     outcome = sub.add_parser("outcome", help="record the lead's verdict on a delegated run",
                              description="Record the lead's verdict on a delegated run. An invalid run id, issue, rejection "
                                          "class or reporter exits 2 and records nothing.")
-    outcome.add_argument("run_id")
-    verdict = outcome.add_mutually_exclusive_group(required=True)
+    outcome.add_argument("run_id", nargs="?")
+    verdict = outcome.add_mutually_exclusive_group()
     verdict.add_argument("--accepted", dest="accepted", action="store_true")
     verdict.add_argument("--rejected", dest="accepted", action="store_false")
     verdict.add_argument("--withdraw", action="store_true", help="withdraw external verdicts and labels; requires --reason")
@@ -3631,6 +3770,9 @@ def build_parser() -> argparse.ArgumentParser:
     outcome.add_argument("--issue", help="target issue as owner/repo#N (defaults to the run's delegated issue)")
     outcome.add_argument("--rejection-class", choices=REJECTION_CLASSES, help="why a rejected run was rejected")
     outcome.add_argument("--reporter", help="who reports the verdict, for example tenet; stored apart from source")
+    outcome.add_argument("--pending", action="store_true", help="list completed runs with no measured verdict (unreported or unmeasured) instead of recording one")
+    outcome.add_argument("--role", help="with --pending: only runs of this role")
+    outcome.add_argument("--hours", type=float, help="with --pending: only runs started in the last H hours")
 
     ultra = sub.add_parser("ultra", help="run a bounded UltraCode-style explore/plan/implement/review pipeline")
     ultra.add_argument("--stages", type=int, help="maximum number of configured stages")
@@ -4021,6 +4163,19 @@ def _main(args, parser) -> int:
         lead = args.agent or config.get("lead", "claude")
         return launch_lead(workspace, config, lead, args.task, interactive=args.command == "lead")
     if args.command == "outcome":
+        if args.pending:
+            if args.run_id or args.accepted is not None or args.withdraw or args.unmeasured:
+                parser.error("--pending lists runs; it takes no run id or verdict")
+            payload = pending_outcomes(workspace, args.role, args.hours)
+            if args.json:
+                print(json_text(payload))
+            else:
+                print_pending(payload)
+            return 0
+        if not args.run_id:
+            parser.error("outcome requires a run id (or --pending)")
+        if args.accepted is None and not args.withdraw and not args.unmeasured:
+            parser.error("one of the arguments --accepted --rejected --withdraw --unmeasured is required")
         try:
             payload = record_outcome(workspace, args.run_id, args.accepted, args.reason, stage=args.stage,
                                      withdraw=args.withdraw, unmeasured=args.unmeasured, issue=args.issue,

@@ -367,12 +367,12 @@ options:
 record the lead's verdict on a delegated run
 
 ```text
-usage: fusion outcome [-h] (--accepted | --rejected | --withdraw | --unmeasured)
+usage: fusion outcome [-h] [--accepted | --rejected | --withdraw | --unmeasured]
                       [--stage {gate,verify,land,review}] [--reason REASON]
                       [--issue ISSUE]
                       [--rejection-class {suite_red,no_diff,out_of_scope,eval_unmeasured,review_changes,land_conflict,other}]
-                      [--reporter REPORTER]
-                      run_id
+                      [--reporter REPORTER] [--pending] [--role ROLE] [--hours HOURS]
+                      [run_id]
 
 Record the lead's verdict on a delegated run. An invalid run id, issue, rejection class
 or reporter exits 2 and records nothing.
@@ -396,6 +396,10 @@ options:
                           why a rejected run was rejected
   --reporter REPORTER     who reports the verdict, for example tenet; stored apart from
                           source
+  --pending               list completed runs with no measured verdict (unreported or
+                          unmeasured) instead of recording one
+  --role ROLE             with --pending: only runs of this role
+  --hours HOURS           with --pending: only runs started in the last H hours
 ```
 
 ## fusion ultra

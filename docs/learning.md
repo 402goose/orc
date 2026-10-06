@@ -46,6 +46,30 @@ external verdicts and their labels, preserving independent gate evidence.
 `--unmeasured` records an unscored attempt without changing ranking or labels.
 Choose exactly one of accepted, rejected, withdraw, or unmeasured.
 
+A read-only review run (a role containing `review`) saves `review_verdict` in its
+result: `approve` when it completed with no blockers, `changes_requested` when it
+listed blockers, and null when it did not complete (error, timeout, quota or a
+permission denial).
+
+An accepted `--stage land` verdict that carries an issue (`--issue`, or the issue the
+run was delegated with) also grades the reviews of that issue that have no outcome
+yet. Reviews started within 10 minutes of each other form one round. Two cases are
+recorded as accepted `review`-stage verdicts with reporter `orc-land`: an approval in
+the final round when no reviewer in that round asked for changes, and a request for
+changes in an earlier round, since another round followed. Every other review is left
+for the lead, and no existing verdict is overridden. The land's output lists what it
+recorded under `derived_reviews`. Without an issue on the land verdict nothing is
+derived.
+
+```sh
+fusion outcome --pending                    # runs still owed a verdict
+fusion --json outcome --pending --role review --hours 24
+```
+
+`--pending` records nothing. It lists completed runs with no measured verdict,
+newest first, split into `unreported` (no outcome event at all) and `unmeasured`
+(only `--unmeasured` outcomes, with the latest reason), with per-role counts.
+
 The [decision and evidence design](../FUSION_DECISIONS.md) explains label provenance,
 qualification and executed verification. The [learning roadmap](learning-roadmap.md)
 distinguishes implemented evidence collection from proposed future work.
