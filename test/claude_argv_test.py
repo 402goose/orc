@@ -26,7 +26,8 @@ class ClaudeArgvTest(unittest.TestCase):
         parser.add_argument("--mcp-config", nargs="+")
         parser.add_argument("--strict-mcp-config", action="store_true")
         parser.add_argument("--dangerously-skip-permissions", action="store_true")
-        for option in ("--output-format", "--permission-mode", "--permission-prompts", "--model", "--max-budget-usd", "--settings", "--resume"):
+        for option in ("--output-format", "--permission-mode", "--permission-prompts", "--model", "--max-budget-usd", "--settings", "--resume",
+                       "--append-system-prompt"):
             parser.add_argument(option)
         parser.add_argument("prompt", nargs="?")
         return parser.parse_args(argv[1:])

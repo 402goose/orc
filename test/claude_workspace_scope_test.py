@@ -189,7 +189,9 @@ class ClaudeWorkspaceScopeTest(unittest.TestCase):
         self.assertEqual(self.scoped(self.workspace)[0], path)
 
     def test_readers_and_workspaces_outside_the_deny_keep_the_settings_file(self):
-        self.assertEqual(self.scoped(self.workspace, write=False)[0], str(self.settings))
+        reader = json.loads(Path(self.scoped(self.workspace, write=False)[0]).read_text())
+        self.assertIn(self.home_rule, reader["permissions"]["deny"])
+        self.assertTrue(set(core.CLAUDE_READER_DENIED_TOOLS) <= set(reader["permissions"]["deny"]))
         elsewhere = self.root / "worktree"
         elsewhere.mkdir()
         self.assertEqual(self.scoped(elsewhere)[0], str(self.settings))
