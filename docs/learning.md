@@ -3,6 +3,7 @@
 [Start here](../README.md) · [CLI reference](cli.md) · [MCP reference](mcp.md)
 
 - [Outcomes and labels](#outcomes-and-labels)
+- [Grader integrity](#grader-integrity)
 - [Laya setup and shadow mode](#laya-setup-and-shadow-mode)
 - [Lab navigation and review](#lab-navigation-and-review)
 - [Quality and automatic training](#quality-and-automatic-training)
@@ -81,6 +82,38 @@ newest first, split into `unreported` (no outcome event at all) and `unmeasured`
 The [decision and evidence design](../FUSION_DECISIONS.md) explains label provenance,
 qualification and executed verification. The [learning roadmap](learning-roadmap.md)
 distinguishes implemented evidence collection from proposed future work.
+
+## Grader integrity
+
+Routing and Laya learn only from evidence about the work. Two rules keep harness
+noise and guesses out of that evidence.
+
+**A harness failure is not a quality failure.** A run that failed because of the
+harness says nothing about the lane's quality. That covers a sandbox or permission
+denial, a missing VERDICT line, an eval that did not measure, a timeout, or a parse of
+the worker's handoff that misread caveats as blockers. Such a run must not rank a lane
+or become a training label. What ORC enforces today:
+
+- `--unmeasured` outcomes never change ranking or labels.
+- A review that ends `verdict_missing` counts neither way in routing and never becomes
+  an acceptance label.
+- ORC's own response to a permission denial is a cooldown on that lane, not an outcome.
+  A caller that later rejects the run still records a rejection (see the gap below).
+- Acceptance labels come only from runs that reported `success` or `partial`. Error,
+  blocked and quota runs are never labeled.
+
+Known gap: routing does not yet filter rejections by `--rejection-class`. A rejection
+the caller classes as a harness problem (for example `land_conflict`), or gives no class,
+still counts against the lane. Callers should report a harness failure as `--unmeasured`,
+not as a rejection, until routing reads the class.
+
+**Every label carries its provenance, and inferred grades never train.** Each label
+records who decided it (`source`, plus `reporter` when the caller gives one) and the
+evidence it was decided from. A verdict ORC infers instead of receiving is never a
+training label. Today this covers land-derived review grades: source `land_derived`,
+ranked below lead and gate verdicts, replaced by any lead verdict, and never labeled.
+New inference paths must follow the same rule: their own source, lower precedence,
+no labels.
 
 ## Laya setup and shadow mode
 
