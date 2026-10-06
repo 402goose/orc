@@ -175,7 +175,8 @@ The payload contains `schema`, a random per-machine `install_id`, and `spans`.
 Each span sends `trace_id`, `span_id`, `parent_span_id`, agent, role, route,
 model, whether it was a
 write, status, a coarse `failure_class` (`quota` / `auth` / `permission_denied` /
-`timeout` / `missing_executable` / `worker_error` / `coordinator_error` —
+`timeout` / `missing_executable` / `worker_error` / `coordinator_error` /
+`verdict_missing` —
 never the raw blocker
 text), `start_time_ms`, `end_time_ms`, `duration_ms`, and normalized token/cost
 `usage`. The install ID is generated locally, not derived from an account identity. A workflow node reused from a

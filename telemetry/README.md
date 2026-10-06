@@ -28,7 +28,7 @@ no per-install rate limiting, no multi-tenant auth.
 See `fusion_core.py`'s `send_remote_telemetry()` for the authoritative
 client-side list. Per dispatch: agent, role, route, model, write flag,
 status, a coarse `failure_class` (`quota` / `permission_denied` / `timeout`
-/ `missing_executable` / `worker_error` — never raw blocker text), start/end
+/ `missing_executable` / `worker_error` / `verdict_missing` — never raw blocker text), start/end
 timestamps, duration, and token/cost usage. Plus a random per-machine
 `install_id` that is not tied to identity.
 
