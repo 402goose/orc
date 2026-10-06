@@ -26,7 +26,7 @@ import urllib.request
 import uuid
 from typing import Any, Iterator
 
-from fusion_decisions import DEFAULTS as DECISION_DEFAULTS
+from fusion_decisions import DEFAULTS as DECISION_DEFAULTS, LAND_DERIVED_SOURCE
 import fusion_progress as progress
 from fusion_usage import event_quota
 from fusion_reasoning import EFFORTS, validate_pair
@@ -2554,7 +2554,7 @@ class RunNotFound(ValueError):
 def record_outcome(workspace: Path, run_id: str, accepted: bool | None = None, reason: str = "", *,
                    stage: str | None = None, withdraw: bool = False, unmeasured: bool = False,
                    issue: str | None = None, rejection_class: str | None = None,
-                   reporter: str | None = None) -> dict[str, Any]:
+                   reporter: str | None = None, derived: bool = False) -> dict[str, Any]:
     """The lead's verdict on a delegation, after inspecting its diff and tests.
 
     Delegations have no coordinator gate, so without this their only signal is
@@ -2572,6 +2572,10 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool | None = None, r
     `rejection_class` (rejections only) and `reporter` (who reported it; `source`
     stays "lead", which outcome precedence relies on) let rejections be counted
     per issue and cause.
+
+    `derived` marks a verdict ORC inferred rather than one a lead gave (source
+    land_derived, see derive_review_outcomes): it ranks below lead and gate
+    outcomes (fusion_policy.effective_outcomes) and never becomes a label.
     """
     from fusion_decisions import DecisionStore
     if accepted is not None and not isinstance(accepted, bool):
@@ -2580,6 +2584,8 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool | None = None, r
         raise ValueError("withdraw and unmeasured must be true or false")
     if sum((accepted is not None, withdraw, unmeasured)) != 1:
         raise ValueError("choose exactly one of accepted/rejected, withdraw, or unmeasured")
+    if derived and accepted is None:
+        raise ValueError("a derived outcome is an accepted or rejected verdict")
     if stage is not None and stage not in ("gate", "verify", "land", "review"):
         raise ValueError("stage must be gate, verify, land, or review")
     if withdraw and not str(reason).strip():
@@ -2601,7 +2607,7 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool | None = None, r
     except (OSError, ValueError) as exc:
         raise RunNotFound(f"no completed Fusion run {run_id} in this workspace") from exc
     event = {"task_id": run_id, "group": result.get("trace_id") or run_id,
-             "status": result.get("status"), "source": "lead", "reason": str(reason)[:2000], "role": result.get("role"),
+             "status": result.get("status"), "source": LAND_DERIVED_SOURCE if derived else "lead", "reason": str(reason)[:2000], "role": result.get("role"),
              "route": result.get("route"), "agent": result.get("agent"), "model": result.get("model"),
              "evidence": str(result_path)}
     if stage is not None:
@@ -2621,6 +2627,8 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool | None = None, r
         return {"recorded": True, **event, "label": label}
     event["accepted"] = accepted
     DecisionStore(workspace).append("outcome", **event)
+    if derived:
+        return {"recorded": True, **event, "label": {"status": "skipped", "reason": "No label: land-derived grades never become labels"}}
     from fusion_labeling import verdict_label
     label = verdict_label(workspace, load_config(workspace)[0], run_id, result, bool(accepted), reason, str(result_path))
     payload = {"recorded": True, **event, "label": label}
@@ -2630,6 +2638,14 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool | None = None, r
 
 
 REVIEW_ROUND_GAP_MS = 10 * 60 * 1000
+
+
+def same_issue(left: Any, right: Any) -> bool:
+    """owner/repo#N equality with owner/repo compared case-insensitively, as GitHub does."""
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    (left_repo, _, left_number), (right_repo, _, right_number) = left.partition("#"), right.partition("#")
+    return left_repo.lower() == right_repo.lower() and left_number == right_number
 
 
 def run_created_ms(run_dir: Path) -> int:
@@ -2662,8 +2678,9 @@ def derive_review_outcomes(workspace: Path, issue: str, land_run_id: str) -> lis
     """Grade the reviews of an issue that just landed, where the land settles them.
 
     Reviews of the issue with no outcome yet are grouped into rounds (runs started within
-    10 minutes of each other). Two cases are recorded, as accepted review-stage verdicts with
-    reporter orc-land: an approval in the final round when no reviewer in that round asked
+    10 minutes of each other). Two cases are recorded, as accepted review-stage outcomes with
+    source land_derived and reporter orc-land, which feed routing evidence below any lead
+    verdict and never become labels: an approval in the final round when no reviewer in that round asked
     for changes, and a request for changes in an earlier round, since another round followed.
     Everything else (a final-round blocker, an approval beside a peer's blocker, a review that
     did not complete) is left for the lead; no existing verdict is overridden."""
@@ -2672,7 +2689,7 @@ def derive_review_outcomes(workspace: Path, issue: str, land_run_id: str) -> lis
     judged = {event.get("task_id") for event in DecisionStore(workspace).events()
               if str(event.get("event", "")).startswith("outcome")}
     reviews = [(run_id, result, created) for run_id, _, result, created in completed_runs(workspace)
-               if run_id != land_run_id and result.get("issue") == issue
+               if run_id != land_run_id and same_issue(result.get("issue"), issue)
                and "review" in str(result.get("role") or "").lower()]
     rounds: list[list[tuple[str, dict[str, Any], int]]] = []
     for review in reviews:
@@ -2693,7 +2710,7 @@ def derive_review_outcomes(workspace: Path, issue: str, land_run_id: str) -> lis
                 reason = f"blocker led to another review round before {issue} landed"
             else:
                 continue
-            record_outcome(workspace, run_id, True, reason, stage="review", issue=issue, reporter="orc-land")
+            record_outcome(workspace, run_id, True, reason, stage="review", issue=issue, reporter="orc-land", derived=True)
             derived.append({"run_id": run_id, "accepted": True, "reason": reason})
     return derived
 
@@ -4189,7 +4206,8 @@ def _main(args, parser) -> int:
                                      rejection_class=args.rejection_class, reporter=args.reporter)
         except RunNotFound as exc:
             source = ("--control-workspace" if args.control_workspace else
-                      "FUSION_CONTROL_WORKSPACE" if os.environ.get("FUSION_CONTROL_WORKSPACE") else "--workspace")
+                      "FUSION_CONTROL_WORKSPACE" if os.environ.get("FUSION_CONTROL_WORKSPACE") else
+                      "--workspace" if args.workspace else "the current directory")
             print(f"fusion: {exc}; searched {RunStore(workspace).workspace} (from {source})", file=sys.stderr)
             return 4
         except ValueError as exc:

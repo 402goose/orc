@@ -607,6 +607,10 @@ and every exported answer names its source in `label_provenance`:
 `structural_gate`, `gym_grade` (it labels the input the gate records) and
 `user_explicit`.
 
+Review grades ORC infers from an issue's land (outcome source `land_derived`,
+see [learning](docs/learning.md)) are not a label source: they write no label
+of any kind and rank below every lead and gate outcome.
+
 #### Structural gate labels
 
 For every workflow node whose worker reported `success`, Fusion records an

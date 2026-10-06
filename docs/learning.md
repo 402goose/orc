@@ -53,13 +53,18 @@ permission denial).
 
 An accepted `--stage land` verdict that carries an issue (`--issue`, or the issue the
 run was delegated with) also grades the reviews of that issue that have no outcome
-yet. Reviews started within 10 minutes of each other form one round. Two cases are
-recorded as accepted `review`-stage verdicts with reporter `orc-land`: an approval in
-the final round when no reviewer in that round asked for changes, and a request for
+yet. Issues match with owner/repo compared case-insensitively. Reviews started within
+10 minutes of each other form one round. Two cases are recorded as accepted
+`review`-stage outcomes with source `land_derived` and reporter `orc-land`: an approval
+in the final round when no reviewer in that round asked for changes, and a request for
 changes in an earlier round, since another round followed. Every other review is left
-for the lead, and no existing verdict is overridden. The land's output lists what it
-recorded under `derived_reviews`. Without an issue on the land verdict nothing is
-derived.
+for the lead. The land's output lists what it recorded under `derived_reviews`.
+Without an issue on the land verdict nothing is derived.
+
+A `land_derived` outcome is an inference, not a verdict. It feeds routing evidence
+only while the run has no lead or gate outcome: any lead verdict on the run, earlier
+or later, replaces it, and a lead withdrawal removes it. It never produces a label,
+so it never reaches training, calibration or bucket qualification.
 
 ```sh
 fusion outcome --pending                    # runs still owed a verdict

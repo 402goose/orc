@@ -12,7 +12,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fusion_core as core
+import fusion_decisions
 from fusion_decisions import DecisionStore, read_jsonl
+from fusion_policy import effective_outcomes
 
 MINUTE_MS = 60 * 1000
 
@@ -106,6 +108,55 @@ class ReviewOutcomesTest(unittest.TestCase):
         self.assertEqual(self.outcomes(first_approve), [])
         self.assertEqual(self.outcomes(other_issue), [])
 
+    def test_a_derived_review_outcome_is_land_derived_and_writes_no_label(self):
+        reviews = [self.review("block", 0), self.review("approve", 30)]
+        writer = self.delegate("implementation", "--issue", "o/r#7", at_minute=50)["run_id"]
+
+        def no_runtime(options):
+            raise AssertionError("grading reviews must never start the Laya runtime")
+        with patch.dict(os.environ, {"FUSION_DECISIONS_MODE": "shadow"}), \
+                patch.object(fusion_decisions, "runtime_for", no_runtime):
+            payload = core.record_outcome(self.workspace, writer, True, "landed with a clean verify", stage="land")
+        self.assertEqual({row["run_id"] for row in payload["derived_reviews"]}, set(reviews))
+        events = read_jsonl(DecisionStore(self.workspace).path)
+        for review in reviews:
+            [event] = self.outcomes(review)
+            self.assertEqual((event["source"], event["reporter"]), ("land_derived", "orc-land"))
+        self.assertEqual(payload["label"]["status"], "labeled")
+        labeled_runs = {reviewer.get("run_id") for e in events if e.get("event") == "label" for reviewer in e.get("reviewers") or []}
+        self.assertEqual(labeled_runs, {writer})
+        self.assertFalse([e for e in events if e.get("event") == "decision"
+                          and (e.get("context") or {}).get("task_id") in reviews])
+
+    def test_a_lead_verdict_outranks_a_derived_one_whenever_it_came(self):
+        review = self.review("approve", 0)
+        writer = self.delegate("implementation", "--issue", "o/r#7", at_minute=20)["run_id"]
+        core.record_outcome(self.workspace, writer, True, "landed", stage="land")
+        events = read_jsonl(DecisionStore(self.workspace).path)
+        self.assertEqual(effective_outcomes(events)[review]["source"], "land_derived")
+        core.record_outcome(self.workspace, review, False, "missed a regression", stage="review")
+        events = read_jsonl(DecisionStore(self.workspace).path)
+        self.assertEqual((effective_outcomes(events)[review]["source"], effective_outcomes(events)[review]["accepted"]),
+                         ("lead", False))
+        derived_at, lead_at = (next(i for i, e in enumerate(events) if e.get("event") == "outcome"
+                                    and e.get("task_id") == review and e.get("source") == source)
+                               for source in ("land_derived", "lead"))
+        lead_first = [e for i, e in enumerate(events) if i not in (derived_at, lead_at)] + [events[lead_at], events[derived_at]]
+        self.assertEqual(effective_outcomes(lead_first)[review]["source"], "lead")
+        core.record_outcome(self.workspace, review, None, "graded the wrong tree", withdraw=True)
+        self.assertNotIn(review, effective_outcomes(read_jsonl(DecisionStore(self.workspace).path)))
+        with self.assertRaises(ValueError):
+            core.record_outcome(self.workspace, review, None, "x", unmeasured=True, derived=True)
+
+    def test_issues_match_with_owner_and_repo_case_folded(self):
+        review = self.review("approve", 0, issue="Owner/Repo#7")
+        other = self.review("approve", 1, issue="owner/repo#70")
+        writer = self.delegate("implementation", "--issue", "owner/repo#7", at_minute=20)["run_id"]
+        payload = core.record_outcome(self.workspace, writer, True, "landed", stage="land")
+        self.assertEqual([row["run_id"] for row in payload["derived_reviews"]], [review])
+        self.assertEqual(self.outcomes(other), [])
+        self.assertFalse(core.same_issue("o/r#7", "o/r#07"))
+
     def test_a_final_round_blocker_leaves_the_whole_round_to_the_lead(self):
         approve = self.review("approve", 0)
         block = self.review("block", 1)
@@ -175,6 +226,13 @@ class ReviewOutcomesTest(unittest.TestCase):
         self.assertEqual(code, 4)
         self.assertIn(f"{control.resolve()} (from --control-workspace)", err)
         self.assertEqual(self.cli("outcome", "not a run id!", "--accepted")[0], 2)
+        with contextlib.chdir(self.workspace):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                    patch.object(core, "load_config", return_value=(self.config, None)):
+                code = core.main(["outcome", "20990101-000000-deadbeef", "--accepted"])
+        self.assertEqual(code, 4)
+        self.assertIn(f"{self.workspace.resolve()} (from the current directory)", err.getvalue())
         with self.assertRaises(ValueError):
             core.record_outcome(self.workspace, "20990101-000000-deadbeef", True)
 
