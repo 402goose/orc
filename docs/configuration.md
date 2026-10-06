@@ -412,17 +412,61 @@ stay in `plan`. The sandbox covers Bash only, so deny `Edit(...)` on paths a
 writer must never change (for example `Edit(//Users/<you>/**)` when worktrees
 live under `/tmp`) and on evaluation files a worker could game.
 
-A writer's own workspace is never covered by such a deny. Claude Code's deny
-rules beat any allow, so `Edit(//Users/<you>/**)` would also refuse a writer whose
-workspace or worktree is under `$HOME`. For a task that writes, ORC reads the
-`--settings` file in `claude.launcher_args`. Each `Edit(...)` or `Write(...)` tree
-rule (`//path/**` or `~/path/**`) that covers the workspace is replaced by rules
-for everything beside the path down to it: each sibling file and directory at
-every level. The narrowed copy is written next to the original as
-`.<name>.workspace-<hash>.json`, so relative rules keep their meaning, and that
-copy is what the worker gets. Readers, inline `--settings` JSON and workspaces
-outside the rule are left unchanged. Files or directories created beside that
-path after launch are not covered. The Bash sandbox still bounds Bash writes.
+**Writers whose workspace is under a home deny.** Claude Code's deny rules beat
+any allow, so `Edit(//Users/<you>/**)` also refuses a writer whose workspace is
+under `$HOME`. The preferred setup fails closed: run writers in a git worktree
+outside `$HOME` (for example under `/tmp`, as TENET builds do). There, the home
+deny is never touched.
+
+A writer (not yolo) is covered when `claude.launcher_args` passes
+`--settings` as a file path (inline JSON is not read), and that file has an
+`Edit(...)` or `Write(...)` tree rule (`//path/**` or `~/path/**`) that covers its
+workspace. A covered writer is refused before any worker starts, because every
+write in its workspace would be denied. The result has status `error`,
+`provider_failure: "workspace_deny"`, and the blocker
+`workspace deny: workspace <path> is under deny rule <rule>; run the writer in a
+worktree outside $HOME or set claude.narrow_home_deny`.
+
+Narrowing is opt-in, for a writer whose workspace has to live under `$HOME`,
+such as a control workspace: set `claude.narrow_home_deny: true` (default
+`false`). The rules below depend on how Claude Code's matcher behaves, so ORC
+narrows only when `claude --version` (the lane's `command`) is listed in
+`claude.narrow_home_deny_versions`. The default is `["2.1.291"]`, the version the
+rules were checked against. Any other version, including an unknown one, is
+refused as above, with the version named in the blocker. Add a version only
+after checking it the same way.
+
+When narrowing applies, the rule is replaced by rules that deny everything
+beside the path from the rule's base down to the workspace. A name that differs
+from a path component is
+denied by a rule whose character class leaves out that component's character and
+every case variant of it. Claude Code matches case-insensitively on macOS, and a
+class that contained `/` would break the rule, so no class contains `/`. Shorter
+names are denied by their exact path, longer names by `<component>[class]*`.
+
+These rules depend on the path alone, not on what exists there. So new files and
+new directories beside the path are denied as well as existing ones, at every
+level. The workspace's own `.claude/` stays denied, so a worker cannot plant
+settings or hooks that later sessions load. The narrowed copy is written next to
+the original as `.<name>.workspace-<hash>.json`, so relative rules keep their
+meaning, and that copy is what the worker gets.
+
+Narrowing fails closed, keeps the original rule, and refuses the run as above in
+these cases:
+
+- The workspace is the rule's base (for example a workspace of `$HOME` under
+  `Edit(~/**)`).
+- A path component contains a glob character, a space, or a non-ASCII character
+  (case matching for those differs between engines).
+- More than 400 rules would result.
+
+Not covered: a name beside the path that first differs from the component at one
+of `] \ [ ^` or a control character, or differs only in letter case. On a
+case-insensitive volume, a case-only difference is the same directory. Checked
+against Claude Code 2.1.291 with real Write calls: the workspace subtree stays
+writable; siblings, new files and directories at the home and intermediate
+levels, dotfiles, shorter and longer names, and `.claude/` stay denied. The Bash
+sandbox still bounds Bash writes.
 
 Readers in `plan` mode have three consequences:
 
