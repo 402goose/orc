@@ -1,4 +1,6 @@
 """Git permissions for writers; sandbox probes run commands, never model calls."""
+import contextlib
+import io
 import json
 from pathlib import Path
 import shutil
@@ -72,6 +74,55 @@ class CodexPermissionsTest(unittest.TestCase):
         self.assertIn("--require " + json.dumps(str(core.CODEX_BROWSER_PRELOAD)), env["NODE_OPTIONS"])
         self.assertEqual(json.loads(env["FUSION_CHROMIUM_ARGS"]), ["--single-process"])
 
+    def delegate_probe(self, settings, *options):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root).resolve()
+            workspace, probe = root / "ws", root / "probe.json"
+            workspace.mkdir()
+            fake = root / "fake-codex"
+            fake.write_text("#!/usr/bin/env python3\n" + '''import json, os, pathlib, sys
+sys.stdin.read()
+seen = {key: os.environ.get(key) for key in ("TMPDIR", "TMP", "TEMP")}
+directory = pathlib.Path(seen["TMPDIR"] or "/nonexistent")
+seen["writable"] = directory.is_dir() and os.access(directory, os.W_OK)
+pathlib.Path(os.environ["PROBE_OUT"]).write_text(json.dumps(seen))
+print(json.dumps({"type": "thread.started", "thread_id": "s"}))
+print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "STATUS: success\\nSUMMARY: done"}}))
+''')
+            fake.chmod(0o755)
+            (workspace / ".fusion.json").write_text(json.dumps({"codex": {"command": str(fake), **settings}, "timeout_seconds": 10}))
+            env = {key: value for key, value in core.os.environ.items() if not key.startswith("FUSION_")}
+            env.update(ORC_HOME=str(root / "home"), FUSION_TELEMETRY="0", FUSION_DECISIONS_MODE="off", PROBE_OUT=str(probe))
+            output = io.StringIO()
+            with mock.patch.dict(core.os.environ, env, clear=True), contextlib.redirect_stdout(output):
+                code = core.main(["--workspace", str(workspace), "--json", "--quiet", "delegate", "--agent", "codex",
+                                  *options, "look"])
+            self.assertEqual(code, 0, output.getvalue())
+            return json.loads(probe.read_text())
+
+    def test_a_browser_reader_gets_its_own_temp_directory_removed_after_the_run(self):
+        shared = str(Path(tempfile.gettempdir()).resolve())
+        seen = self.delegate_probe({"browser": True}, "--read-only")
+        directory = seen["TMPDIR"].rstrip("/")
+        self.assertTrue(directory.startswith(str(Path("/tmp").resolve()) + "/orc-"), directory)
+        self.assertNotEqual(directory, shared)
+        self.assertEqual(seen["TMP"], directory)
+        self.assertEqual(seen["TEMP"], directory)
+        self.assertTrue(seen["writable"])
+        self.assertFalse(Path(directory).exists())
+
+    def test_writers_and_plain_readers_keep_the_inherited_temp_directory(self):
+        inherited = core.os.environ.get("TMPDIR")
+        for settings, options in (({"browser": True}, ()), ({}, ("--read-only",))):
+            seen = self.delegate_probe(settings, *options)
+            self.assertEqual(seen["TMPDIR"], inherited, (settings, options))
+
+    def test_the_reader_profile_grants_only_the_tmpdir_codex_resolves(self):
+        profile = next(arg for arg in core.codex_reader_browser_args() if arg.startswith("permissions.fusion_read_browser="))
+        self.assertIn('filesystem={":tmpdir"="write"}', profile)
+        self.assertNotIn('"/tmp', profile)
+        self.assertNotIn('"/private', profile)
+
     def test_browser_writers_keep_their_profile_and_gain_only_the_preload(self):
         with tempfile.TemporaryDirectory() as directory:
             task = {"agent": "codex", "workspace": directory, "write": True}
@@ -126,21 +177,37 @@ server.bind(("127.0.0.1", 0))
 server.listen()
 with tempfile.TemporaryDirectory() as profile:
     (pathlib.Path(profile) / "Local State").write_text("{}")
-try:
-    pathlib.Path(sys.argv[1], "denied.txt").write_text("must be denied")
-except PermissionError:
-    print("loopback and temp allowed; workspace write denied")
+for target in sys.argv[1:]:
+    try:
+        pathlib.Path(target, "written-by-reader").write_text("must be denied")
+        print("WRITTEN", target)
+    except PermissionError:
+        print("DENIED", target)
 '''
-        with tempfile.TemporaryDirectory(prefix=".orc-sandbox-test-", dir=Path.home()) as directory:
+        slash_tmp = Path("/tmp").resolve()
+        shared = Path(tempfile.gettempdir()).resolve()
+        with contextlib.ExitStack() as stack:
+            directory = stack.enter_context(tempfile.TemporaryDirectory(prefix=".orc-sandbox-test-", dir=Path.home()))
+            siblings = [stack.enter_context(tempfile.TemporaryDirectory(prefix=prefix, dir=slash_tmp))
+                        for prefix in ("tenet-agent-probe-", "tenet-round-probe-")]
+            plain = shared / "grading-tree-probe"
+            plain.mkdir(exist_ok=True)
+            stack.callback(shutil.rmtree, plain, True)
+            env = dict(core.os.environ)
+            run_tmp = core.codex_reader_tmpdir(env)
+            stack.callback(shutil.rmtree, run_tmp, True)
             args = core.codex_reader_browser_args()
             args.remove("--strict-config")
+            denied = [directory, str(slash_tmp), *siblings, str(plain)]
             result = subprocess.run(
                 ["codex", *args, "sandbox", "-P", "fusion_read_browser", "-C", directory, "--",
-                 sys.executable, "-c", script, directory],
-                capture_output=True, text=True, timeout=20,
+                 sys.executable, "-c", script, run_tmp, *denied],
+                capture_output=True, text=True, timeout=20, env=env,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("workspace write denied", result.stdout)
+            self.assertEqual(result.stdout.splitlines(), ["WRITTEN " + run_tmp, *("DENIED " + path for path in denied)])
+            for path in denied:
+                self.assertFalse(Path(path, "written-by-reader").exists(), path)
 
     @unittest.skipUnless(sys.platform == "darwin" and shutil.which("codex"), "requires the macOS Codex sandbox")
     def test_real_sandbox_allows_git_in_repos_and_worktrees_but_protects_other_paths(self):

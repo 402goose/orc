@@ -409,9 +409,16 @@ For sandboxed Codex workers (writers in restricted mode and every reader), ORC t
   test harnesses keep calling `chromium.launch()` unchanged. Override the list
   with `{"browser": {"chromium_args": [...]}}`.
 - runs readers under the `fusion_read_browser` profile instead of `-s read-only`:
-  read-only plus writes to the system temp directory (the browser profile) and
+  read-only plus writes to the worker's temp directory (the browser profile) and
   loopback binding through the managed proxy with an empty domain list. Readers
   still cannot write the workspace and reach no outside host.
+- gives each such reader a fresh private temp directory, `/tmp/orc-XXXXXXXX`
+  (`/private/tmp/...` on macOS), as its `TMPDIR`, `TMP` and `TEMP`, and removes it
+  when the run ends. Codex resolves the profile's `:tmpdir` from `TMPDIR`, so that
+  directory is the reader's only writable path: not `/tmp`, not other `/tmp`
+  directories such as writer worktrees, and not the shared per-user temp
+  directory where other runs and grading steps keep their trees. Writers and YOLO
+  runs keep the temp directory they inherit.
 
 Writers keep `fusion_git_write` unchanged; give them `codex.network` with
 `allow_local_binding` to serve a page on 127.0.0.1. YOLO writers have no sandbox
