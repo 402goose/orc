@@ -418,7 +418,10 @@ For sandboxed Codex workers (writers in restricted mode and every reader), ORC t
   directory is the reader's only writable path: not `/tmp`, not other `/tmp`
   directories such as writer worktrees, and not the shared per-user temp
   directory where other runs and grading steps keep their trees. Writers and YOLO
-  runs keep the temp directory they inherit.
+  runs keep the temp directory they inherit. That Codex resolves `:tmpdir` from
+  the worker's `TMPDIR` is probed behaviour (codex-cli 0.159.0), not a documented
+  contract: the deploy gate re-probes it whenever Codex is upgraded
+  (`test_real_browser_reader_binds_loopback_and_writes_temp_but_not_the_workspace`).
 
 Writers keep `fusion_git_write` unchanged; give them `codex.network` with
 `allow_local_binding` to serve a page on 127.0.0.1. YOLO writers have no sandbox
