@@ -278,7 +278,9 @@ def _stop_process(proc):
         time.sleep(.05)
     # Still signal the group after a clean exit: descendants outlive the leader,
     # and ones that forked while stopping are found below the tree already known.
-    tree |= _descendants([proc.pid, *tree])
+    # Only pids still alive are killed, so one that exited during the grace and was
+    # recycled is not hit.
+    tree = {pid for pid in tree | _descendants([proc.pid, *tree]) if _alive(pid)}
     _signal_tree(proc, tree, signal.SIGKILL, proc.kill)
     proc.wait()
 
