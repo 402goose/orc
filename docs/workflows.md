@@ -338,7 +338,13 @@ For a single delegation, use `fusion delegate --timeout 7200 ...` or set
 be integers from 60 through 14400 seconds; invalid values are rejected before
 launching a worker. Omit the override to use the configured `timeout_seconds`
 (default 3600). The effective limit is saved in the run's `task.json` and
-`result.json`, and expiration uses the existing worker timeout failure.
+`result.json`, and expiration uses the existing worker timeout failure
+(status `blocked`, exit code 124, the stream captured so far kept as evidence).
+A worker that times out, is cancelled, or is aborted is stopped with its whole
+process tree: its process group and every descendant, including commands that
+left the group for their own session, get SIGTERM, then SIGKILL after a
+three-second grace. A worker that exits on its own is not cleaned up after;
+anything it deliberately left running keeps running.
 
 Use `--progress` to force updates when redirecting output, or `--quiet` to
 hide them. Both are global flags, before the subcommand.

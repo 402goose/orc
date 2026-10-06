@@ -143,6 +143,61 @@ raise SystemExit(core.run_mcp(workspace, config))
             self.assertEqual(json.loads((run_dir / filename).read_text())["timeout_seconds"], 5)
         self.assertEqual(result["timeout_seconds"], 5)
 
+    def gone(self, pid, timeout=3):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            time.sleep(.05)
+        return False
+
+    def test_delegate_timeout_stops_grandchildren_in_and_outside_the_worker_group(self):
+        """Run 20261006-010355-84c00c38: a codex worker timed out and ~20 processes it
+        had started kept running, because codex runs commands in their own session
+        and killpg on the worker's group never reached them."""
+        pids = self.workspace / "pids"
+        sleeper = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+        self.fake_worker(f"""import subprocess,sys,time
+grouped = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+detached = subprocess.Popen([sys.executable, '-c', {sleeper!r}], start_new_session=True)
+open({str(pids)!r}, 'w').write(f'{{grouped.pid}} {{detached.pid}}')
+print('{{"type": "item.completed", "item": {{"type": "agent_message", "text": "partial"}}}}', flush=True)
+time.sleep(60)
+""")
+        script = "import fusion_core as core; core.MIN_DELEGATE_TIMEOUT = 1; raise SystemExit(core.main())"
+        proc = subprocess.run([sys.executable, "-c", script, "--workspace", str(self.workspace),
+                               "--json", "delegate", "--agent", "codex", "--read-only", "--fresh",
+                               "--timeout", "2", "inspect"], cwd=ROOT, env=self.env,
+                              text=True, capture_output=True, timeout=20)
+        grouped, detached = map(int, pids.read_text().split())
+        try:
+            self.assertTrue(self.gone(grouped), "grandchild in the worker's group survived the timeout")
+            self.assertTrue(self.gone(detached), "grandchild in its own session survived the timeout")
+        finally:
+            for pid in (grouped, detached):
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["exit_code"], 124)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["provider_failure"], "timeout after 2 seconds")
+        self.assertIn("partial", (Path(result["artifacts"]["run_dir"]) / "stdout.log").read_text())
+
+    def test_successful_worker_leaves_its_surviving_children_alone(self):
+        pid_file = self.workspace / "pid"
+        script = (f"import subprocess,sys; child = subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'], start_new_session=True); "
+                  f"open({str(pid_file)!r},'w').write(str(child.pid))")
+        progress.run_logged([sys.executable, "-c", script], cwd=self.workspace, env=self.env, input=None, timeout=5,
+                            stdout_path=self.workspace / "stdout.log", stderr_path=self.workspace / "stderr.log", label="fixture")
+        pid = int(pid_file.read_text())
+        try:
+            os.kill(pid, 0)
+        finally:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
     def test_delegate_timeout_validation_and_config_fallback(self):
         self.fake_worker("print('no live model')\n")
         for value in ("5", "0", "-1", "14401", "1.5", "oops"):
