@@ -110,7 +110,7 @@ class ClaudeWorkspaceScopeTest(unittest.TestCase):
     def scoped(self, workspace, write=True, narrow=True):
         args = ["--settings", str(self.settings), "--append-system-prompt", "sandboxed"]
         task = core.make_task(Path(workspace), "claude", "Write the report.", "implementation", [], [], None, False, write,
-                              settings_overrides={"launcher_args": args, "narrow_home_deny": narrow})
+                              settings_overrides={"launcher_args": args, "narrow_home_deny": narrow, "user_hooks": True})
         argv, _, _ = core.agent_command(core.DEFAULTS, task, None)
         return argv[argv.index("--settings") + 1], argv
 
