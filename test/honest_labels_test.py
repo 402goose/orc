@@ -402,6 +402,20 @@ class HonestLabelsTest(unittest.TestCase):
         [excluded] = self.events("outcome_excluded", result["run_id"])
         self.assertEqual((excluded["accepted"], excluded["laya_veto"], excluded["gate_codes"]), (False, False, ["worker_blockers"]))
 
+    def test_a_declared_no_blocker_caveat_does_not_gate(self):
+        outcome, nodes = self.run_build({"verification": [["python3", "hello_exists.py"]]}, write={"hello.py": "print(1)\n"},
+                                        blockers="No blocker to this change. Memory use under load remains unverified.")
+        self.assertEqual(outcome["status"], "success", outcome)
+        result = nodes["implement"]["result"]
+        self.assertEqual(result["blockers"], [])
+        self.assertEqual(result["limitations"], ["Memory use under load remains unverified."])
+
+    def test_a_limitations_field_does_not_gate(self):
+        outcome, nodes = self.run_build({"verification": [["python3", "hello_exists.py"]]}, write={"hello.py": "print(1)\n"},
+                                        blockers="none\nLIMITATIONS: the load test was not run")
+        self.assertEqual(outcome["status"], "success", outcome)
+        self.assertEqual(nodes["implement"]["result"]["limitations"], ["the load test was not run"])
+
     def test_laya_veto_never_labels_or_ranks_and_gate_labels_ignore_it(self):
         self.backend = ImplementsOnly()
         self.config["decisions"] = {"mode": "active", "auto_actions": ["acceptance"],
