@@ -127,7 +127,7 @@ Ask a running workflow's coordinator to stop. Cooperative: accepted stages stay 
 
 ## fusion_delegate
 
-Delegate a bounded task to the other coding agent and receive a structured handoff. The lead keeps final judgment.
+Delegate a bounded task to the other coding agent and receive a structured handoff. The lead keeps final judgment. A role containing "review" must answer with a VERDICT: approve or VERDICT: changes line; without one the status is verdict_missing (neither accepted nor rejected; retry or escalate).
 
 ### Input fields
 

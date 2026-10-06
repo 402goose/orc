@@ -334,9 +334,10 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None, minim
         spans themselves with `with_spans`."""
         # A success is the worker's claim until a gate or lead checks it; an
         # error is observed. Quota, auth and permission failures are lane health
-        # (cooldown), not evidence about quality.
+        # (cooldown), not evidence about quality. A review that never gave its
+        # VERDICT decided nothing, so it counts neither way, even with an outcome.
         evidence = [(span, outcomes[span["run_id"]] if span.get("run_id") in outcomes else False) for span in spans
-                    if span.get("run_id") not in untrusted and (span.get("run_id") in outcomes or
+                    if span.get("run_id") not in untrusted and span.get("status") != "verdict_missing" and (span.get("run_id") in outcomes or
                         (span.get("status") == "error" and span.get("failure_class") not in {"quota", "auth", "permission_denied"}))]
         # Read-only and writing work differ: this task's class counts when
         # it has any evidence, else every class pooled. A writer never counts

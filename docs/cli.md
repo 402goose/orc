@@ -329,6 +329,10 @@ usage: fusion delegate [-h] [--agent {auto,claude,codex,agy,grok,opencode}]
                        [--constraint CONSTRAINT] [--issue ISSUE] [--override-cap REASON]
                        task
 
+Run one bounded sidekick task. A role containing "review" must answer with a VERDICT:
+approve or VERDICT: changes line; without one the run ends verdict_missing. Exit 0 on
+success, 2 paused by operator control, 4 capped, 5 verdict_missing, 1 otherwise.
+
 positional arguments:
   task
 

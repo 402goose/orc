@@ -104,7 +104,8 @@ it. Interactive lead sessions use their own provider controls.
    evidence once any lane has reached that minimum -- then lanes
    follow smoothed acceptance `(accepted + 1) / (checked + 2)`. Workflow
    gate outcomes and lead verdicts count, and so does an observed error
-   (not quota or permission, which are lane health); a worker's
+   (not quota or permission, which are lane health; nor a review's
+   `verdict_missing`, which counts neither way); a worker's
    `STATUS: success` is its own claim until a gate or lead checks it. A
    reported success rejected only by Laya's own veto or by what was parsed
    from the worker's report (blockers, empty handoff fields) is recorded as
@@ -168,6 +169,21 @@ it. Interactive lead sessions use their own provider controls.
    fusion outcome RUN_ID --accepted --reason "diff reviewed, tests pass"
    fusion outcome RUN_ID --rejected --reason "empty diff"
    ```
+
+   A delegation whose role contains `review` (`review`, `reviewer`,
+   `lead reviewer`), from `fusion delegate` or MCP `fusion_delegate`, owes
+   its decision: the brief adds a `VERDICT: approve | changes` label and the
+   result records `reported_verdict`. A run that would otherwise end
+   `success` or `partial` without a parseable `VERDICT:` line (label at the
+   start of a line, `approve` or `changes`, case-insensitive, markdown
+   decoration allowed) ends `status: verdict_missing` with a blocker saying
+   so; `failure_class` and the structural `verdict` are `verdict_missing`
+   too. It is not quality evidence: routing counts it neither as an
+   acceptance nor a rejection, even if an outcome is later recorded on it,
+   and since it is not a reported success no outcome turns it into an
+   acceptance label. `fusion delegate` exits 5 so the caller can retry or
+   escalate. Workflow nodes and Ultra stages keep their own acceptance and
+   are unchanged; so is every other role.
 
    MCP leads call `fusion_outcome` with `run_id`, `accepted` and `reason`.
    The latest verdict for a run wins. A verdict with a reason also becomes

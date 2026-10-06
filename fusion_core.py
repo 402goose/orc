@@ -291,6 +291,23 @@ def _reads_as_prose(value: str) -> bool:
 
 NONE_ANSWERS = {"none", "n/a", "na", "nil", "nothing", "-", "—"}
 
+# A delegated review answers with one of these on a `VERDICT:` line.
+REVIEW_VERDICTS = ("approve", "changes")
+VERDICT_RE = re.compile(r"^[ \t]*(?:#{1,6}\s+)?([*_]{0,3})VERDICT\1?\s*:\s*\1?[\s*_`]*([A-Za-z]+)", re.I | re.M)
+
+
+def requires_verdict(role: Any) -> bool:
+    """A delegation in a review role (review, reviewer, lead reviewer) owes a VERDICT line."""
+    return isinstance(role, str) and "review" in role.lower()
+
+
+def parse_verdict(text: str) -> str:
+    """The first `VERDICT: approve|changes` line in a worker's answer, or "" when none parses."""
+    for match in VERDICT_RE.finditer(text or ""):
+        if match[2].lower() in REVIEW_VERDICTS:
+            return match[2].lower()
+    return ""
+
 
 def parse_handoff(text: str) -> dict[str, Any]:
     """Extract the small handoff contract from a worker's final message."""
@@ -411,6 +428,7 @@ def parse_handoff(text: str) -> dict[str, Any]:
         reported_status = ""
     return {
         "reported_status": reported_status,
+        "reported_verdict": parse_verdict(text),
         "summary": fields.get("SUMMARY", text.strip()),
         "changed": list_field("CHANGED"),
         "tests": list_field("TESTS"),
@@ -427,7 +445,7 @@ REFUSAL_RE = re.compile(r"\A\W*(?:I(?:'m| am) (?:sorry|not able)[^.\n]*(?:help|a
 
 def classify_verdict(result: dict[str, Any]) -> dict[str, Any]:
     """A structural verdict beside the worker's free-text summary: ok | error | quota | refused |
-    blocked_by_permissions. It is derived from failure_class(), the one vocabulary lane cooldown,
+    blocked_by_permissions | verdict_missing. It is derived from failure_class(), the one vocabulary lane cooldown,
     recovery and telemetry already share, so the four can never disagree. Status comes first: a
     successful run that mentions a rate limit in its summary is ok. A quota carries the reset text
     the CLI printed, so a harness can treat it as an unmeasured round instead of a zero score.
@@ -435,6 +453,8 @@ def classify_verdict(result: dict[str, Any]) -> dict[str, Any]:
     leaves the run an error even at exit 0 (only non-baseline denials a worker worked around are
     downgraded to partial), and a Claude run the denial guard stopped exits 125."""
     kind = failure_class(result)
+    if kind == "verdict_missing":
+        return {"verdict": "verdict_missing", "reason": "no VERDICT line"}
     if kind == "permission_denied":
         return {"verdict": "blocked_by_permissions", "reason": ", ".join(result.get("denied_tools") or []) or "permission denied"}
     if result.get("status") in {"success", "partial", "cache_hit"}:
@@ -917,6 +937,8 @@ def failure_class(result: dict[str, Any]) -> str | None:
     contain project-specific detail and is never sent remotely."""
     if result.get("failure_phase") in {"snapshot_before_review", "snapshot_after_review"}:
         return "coordinator_error"
+    if result.get("status") == "verdict_missing":
+        return "verdict_missing"
     text = " ".join(str(item) for item in result.get("blockers", [])).lower()
     worked_around = result.get("status") in {"partial", "blocked"} and result.get("exit_code") == 0 and not denial_blocks_lane(result)
     if any(marker in text for marker in PERMISSION_MARKERS) and not worked_around:
@@ -1457,6 +1479,7 @@ def choice_overrides(model: Any, reasoning_effort: Any) -> dict[str, Any]:
 def brief_for(task: dict[str, Any]) -> str:
     criteria = "\n".join(f"- {item}" for item in task["success_criteria"]) or "- Report what you verified."
     constraints = "\n".join(f"- {item}" for item in task["constraints"]) or "- Keep the change scoped to the task."
+    verdict = "VERDICT: approve | changes\n" if task.get("requires_verdict") else ""
     return f"""You are the {task['role']} sidekick in a Fusion coding harness.
 
 Workspace: {task['workspace']}
@@ -1471,7 +1494,7 @@ Constraints:
 Work directly in the workspace when the task permits writes. Inspect the repository before editing. Run the narrowest meaningful verification. Do not wait for a human response; make reasonable assumptions and report them.
 
 Return a compact handoff with these exact labels:
-STATUS: success | partial | blocked | error
+{verdict}STATUS: success | partial | blocked | error
 SUMMARY: what you did and the current result
 CHANGED: comma-separated paths, or none
 TESTS: commands run and their outcome, or none
@@ -2860,7 +2883,16 @@ def dispatch(
     if (status == "error" and not failure and exit_code == 0 and summary.strip() and task["agent"] != "codex"
             and evidence_notes and not denial_blocks_lane({"denied_tools": denied_tools})):
         status = "blocked" if handoff.get("reported_status") == "blocked" else "partial"
+    # A review that ends without its decision is neither an approval nor a
+    # rejection: the caller retries or escalates, and routing does not count it.
+    verdict_missing = (bool(task.get("requires_verdict")) and status in {"success", "partial"}
+                       and not handoff.get("reported_verdict"))
+    if verdict_missing:
+        status = "verdict_missing"
     blockers = handoff.get("blockers", []) + (evidence_notes if task["agent"] != "codex" else []) + ([failure] if failure else [])
+    if verdict_missing:
+        blockers.append("verdict missing: a review delegation must answer with a VERDICT: approve or VERDICT: changes "
+                        "line and this answer has none, so it is neither accepted nor rejected; retry or escalate")
     if key_source not in (None, "none") and not metered(agent_settings(config, task)):
         blockers.append(f"billing: a subscription lane ran on {key_source} (metered); declare billing: \"api\" on lanes meant to bill per token")
     result = {
@@ -2869,6 +2901,7 @@ def dispatch(
         "workspace": task["workspace"],
         **({"repo": task["repo"]} if task.get("repo") else {}),
         "status": status,
+        **({"reported_verdict": handoff.get("reported_verdict") or None} if task.get("requires_verdict") else {}),
         "execution_mode": task_execution_mode(config, task),
         "agent": task["agent"],
         "role": task["role"],
@@ -3086,7 +3119,7 @@ def tool_definitions() -> list[dict[str, Any]]:
         {
             "name": "fusion_delegate",
             "outputSchema": {"type": "object", "properties": {"status": {"type": "string"}, "summary": {"type": "string"}, "blockers": {"type": "array", "items": {"type": "string"}}, "artifacts": {"type": "object"}}, "required": ["status"]},
-            "description": "Delegate a bounded task to the other coding agent and receive a structured handoff. The lead keeps final judgment.",
+            "description": "Delegate a bounded task to the other coding agent and receive a structured handoff. The lead keeps final judgment. A role containing \"review\" must answer with a VERDICT: approve or VERDICT: changes line; without one the status is verdict_missing (neither accepted nor rejected; retry or escalate).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3293,6 +3326,8 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
                             task["issue"] = args["issue"]
                         if args.get("override_cap"):
                             task["override_cap"] = str(args["override_cap"])
+                        if requires_verdict(task["role"]):
+                            task["requires_verdict"] = True
                         payload = dispatch(target_config, task, target_store)
                     else:
                         target = workspace if name == "fusion_run_start" else store.workspace
@@ -3593,7 +3628,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--agent", choices=["claude", "codex", "opencode"], help="lead agent; defaults to .fusion.json or claude")
     run.add_argument("task", help="initial task for the lead")
 
-    delegate = sub.add_parser("delegate", help="run one bounded sidekick task")
+    delegate = sub.add_parser("delegate", help="run one bounded sidekick task",
+                              description="Run one bounded sidekick task. A role containing \"review\" must answer "
+                                          "with a VERDICT: approve or VERDICT: changes line; without one the run ends "
+                                          "verdict_missing. Exit 0 on success, 2 paused by operator control, 4 capped, "
+                                          "5 verdict_missing, 1 otherwise.")
     delegate.add_argument("--agent", choices=["auto", "claude", "codex", "agy", "grok", "opencode"], help="worker agent; defaults to the named route agent")
     delegate.add_argument("--role", default="implementation")
     delegate.add_argument("--needs", action="append", type=cli_need, default=[], metavar="NAME",
@@ -4070,9 +4109,11 @@ def _main(args, parser) -> int:
             parser.error(str(exc))
         if args.override_cap:
             task["override_cap"] = args.override_cap
+        if requires_verdict(task["role"]):
+            task["requires_verdict"] = True
         result = dispatch(config, task, RunStore(workspace))
         print_result(result, args.json)
-        return 0 if result["status"] == "success" else 2 if result["status"] == "paused_control" else 4 if result["status"] == "capped" else 1
+        return {"success": 0, "paused_control": 2, "capped": 4, "verdict_missing": 5}.get(result["status"], 1)
     parser.error("unknown command")
     return 2
 
