@@ -466,12 +466,16 @@ look for. So every Claude worker runs with `disableAllHooks: true`.
 - **Inline JSON:** the key is added to it.
 - **No `--settings`:** ORC appends an inline one.
 - **Yolo writers:** their inline settings carry the key alongside the sandbox switch.
+- **Unreadable settings fail closed:** a `--settings` file that cannot be read or parsed, inline JSON that
+  does not parse, or `--settings` with no value refuses the run before any worker starts. The result has
+  status `error`, `provider_failure: "settings_unreadable"`, and a blocker naming the path or the parse
+  error. A worker never runs with hooks live because its settings were unreadable.
 
 ORC itself uses no hooks: its controls are deny rules, the Bash sandbox,
 `--strict-mcp-config`, and the denial guard. Checked on Claude Code 2.1.292: the
 key, from a file or inline, suppressed both user-level and project-level hooks. A
 route that deliberately wants the user's hooks sets `claude.user_hooks: true`
-(default `false`). Interactive leads (`fusion run`) are the user's own session
+(default `false`); ORC then passes its settings through unread, as before. Interactive leads (`fusion run`) are the user's own session
 and keep their hooks.
 
 **Writers whose workspace is under a home deny.** Claude Code's deny rules beat

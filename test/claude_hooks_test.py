@@ -78,6 +78,47 @@ class ClaudeHooksTest(unittest.TestCase):
                 argv, _, _ = core.agent_command(config, task, None)
                 self.assertEqual(settings_sources(argv), [expected])
 
+    def dispatch_with(self, launcher, **claude):
+        started = self.root / "worker-started"
+        started.unlink(missing_ok=True)
+        fake = self.root / "claude-start-only"
+        fake.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nimport json\nPath({str(started)!r}).write_text('started')\n"
+                        "print(json.dumps({'type':'result','subtype':'success','is_error':False,'session_id':'s',"
+                        "'result':'STATUS: success\\nSUMMARY: done\\nCHANGED: none\\nTESTS: none\\nBLOCKERS: none'}))\n")
+        fake.chmod(0o755)
+        config = core.deep_merge(core.DEFAULTS, {"decisions": {"mode": "off"}, "claude": {
+            "command": str(fake), "launcher_args": launcher, **claude}})
+        task = core.make_task(self.workspace, "claude", "look at it", "triage-locate", [], [], None, False, False)
+        env = {"ORC_HOME": str(self.root / "orc"), "FUSION_PROGRESS": "0", "FUSION_TELEMETRY": "0", "FUSION_DECISIONS_MODE": "off"}
+        with patch.dict(os.environ, env), contextlib.redirect_stderr(io.StringIO()):
+            value = core.dispatch(config, task, core.RunStore(self.workspace))
+        return value, started.exists()
+
+    def test_settings_that_cannot_be_read_refuse_the_run_before_a_worker_starts(self):
+        missing = self.root / "absent-settings.json"
+        broken = self.root / "broken-settings.json"
+        broken.write_text("{not json")
+        for launcher, named in ((["--settings", '{"sandbox":'], "inline --settings JSON does not parse"),
+                                (["--settings", "[1, 2]"], None),
+                                (["--settings", str(missing)], str(missing)),
+                                (["--settings", str(broken)], str(broken)),
+                                (["--settings"], "--settings has no value")):
+            with self.subTest(launcher=launcher):
+                value, ran = self.dispatch_with(launcher)
+                self.assertFalse(ran)
+                self.assertEqual(value["status"], "error")
+                self.assertEqual(value["provider_failure"], "settings_unreadable")
+                self.assertTrue(value["blockers"][0].startswith("settings unreadable: "))
+                if named:
+                    self.assertIn(named, value["blockers"][0])
+                with self.assertRaises(ValueError):
+                    core.claude_hooks_off(launcher)
+
+    def test_a_route_that_keeps_user_hooks_passes_its_settings_through_unread(self):
+        value, ran = self.dispatch_with(["--settings", str(self.root / "absent-settings.json")], user_hooks=True)
+        self.assertTrue(ran)
+        self.assertNotEqual(value.get("provider_failure"), "settings_unreadable")
+
     def run_worker(self, user_hooks):
         config_dir = self.root / f"claude-config-{user_hooks}"
         config_dir.mkdir()

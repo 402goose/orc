@@ -969,31 +969,51 @@ def claude_workspace_settings(launcher_args: list[str], workspace: str) -> list[
     return [*launcher_args[:at], str(out), *launcher_args[at + 1:]]
 
 
+def claude_settings_problem(launcher_args: list[str]) -> str | None:
+    """Why the `--settings` source in launcher args is not a readable JSON object, or None."""
+    if "--settings" not in launcher_args:
+        return None
+    at = launcher_args.index("--settings") + 1
+    if at >= len(launcher_args):
+        return "--settings has no value"
+    source = launcher_args[at]
+    if source.lstrip().startswith("{"):
+        try:
+            value = json.loads(source)
+        except ValueError as exc:
+            return f"inline --settings JSON does not parse: {exc}"
+        return None if isinstance(value, dict) else "inline --settings JSON is not an object"
+    path = Path(source).expanduser()
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return f"--settings file {path} cannot be read: {exc.strerror or exc}"
+    except ValueError as exc:
+        return f"--settings file {path} does not parse: {exc}"
+    return None if isinstance(value, dict) else f"--settings file {path} is not a JSON object"
+
+
 def claude_hooks_off(launcher_args: list[str]) -> list[str]:
     """Launcher args whose settings turn off every Claude Code hook (`disableAllHooks`).
 
     User- and project-level hooks run inside a worker as side effects ORC cannot see or grade, such
     as a session hook committing the worker's output. A `--settings` file is copied beside itself
     with the key added, named by its content, so relative rules keep their meaning; inline JSON gets
-    the key; without `--settings` an inline one is appended."""
-    if "--settings" not in launcher_args or launcher_args.index("--settings") + 1 >= len(launcher_args):
+    the key; without `--settings` an inline one is appended. Settings that cannot be read as a JSON
+    object raise ValueError rather than launch with hooks live (dispatch refuses such a run first)."""
+    if "--settings" not in launcher_args:
         return [*launcher_args, "--settings", json.dumps({"disableAllHooks": True}, separators=(",", ":"))]
+    problem = claude_settings_problem(launcher_args)
+    if problem:
+        raise ValueError(problem)
     at = launcher_args.index("--settings") + 1
     source = launcher_args[at]
     if source.lstrip().startswith("{"):
-        try:
-            inline = json.loads(source)
-        except ValueError:
-            return launcher_args
-        if not isinstance(inline, dict):
-            return launcher_args
-        return [*launcher_args[:at], json.dumps({**inline, "disableAllHooks": True}, separators=(",", ":")), *launcher_args[at + 1:]]
+        return [*launcher_args[:at], json.dumps({**json.loads(source), "disableAllHooks": True}, separators=(",", ":")),
+                *launcher_args[at + 1:]]
     path = Path(source).expanduser()
-    try:
-        settings = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return launcher_args
-    if not isinstance(settings, dict) or settings.get("disableAllHooks") is True:
+    settings = json.loads(path.read_text(encoding="utf-8"))
+    if settings.get("disableAllHooks") is True:
         return launcher_args
     text = json_text({**settings, "disableAllHooks": True}) + "\n"
     out = path.with_name(f".{path.stem.lstrip('.')}.hooks-off-{hashlib.sha256(text.encode()).hexdigest()[:16]}.json")
@@ -3182,15 +3202,20 @@ def dispatch(
     if "review" in task["role"].lower() and not task["write"]:
         review_task(config, task, store)
     claude_settings = agent_settings(config, task) if task["agent"] == "claude" else {}
-    if claude_settings and task["write"] and execution_mode(config) != "yolo":
-        refusal = claude_workspace_plan(claude_settings, task)[1]
-        if refusal:
-            progress.emit(task.get("progress_label", task.get("role", "worker")), refusal + "; no worker was started")
-            return {"schema": SCHEMA, "run_id": task.get("run_id"), "workspace": task["workspace"], "status": "error",
-                    "agent": task["agent"], "route": task.get("route"), "role": task.get("role"),
-                    **({"issue": task["issue"]} if task.get("issue") else {}),
-                    "summary": refusal + "; no worker was started", "blockers": [f"workspace deny: {refusal}"],
-                    "provider_failure": "workspace_deny", "changed": [], "tests": [], "artifacts": {"run_dir": None}}
+    refusal = failure = None
+    if claude_settings and not claude_settings.get("user_hooks"):
+        refusal = claude_settings_problem([str(item) for item in claude_settings.get("launcher_args", [])])
+        failure = "settings_unreadable"
+    if not refusal and claude_settings and task["write"] and execution_mode(config) != "yolo":
+        refusal, failure = claude_workspace_plan(claude_settings, task)[1], "workspace_deny"
+    if refusal:
+        progress.emit(task.get("progress_label", task.get("role", "worker")), refusal + "; no worker was started")
+        return {"schema": SCHEMA, "run_id": task.get("run_id"), "workspace": task["workspace"], "status": "error",
+                "agent": task["agent"], "route": task.get("route"), "role": task.get("role"),
+                **({"issue": task["issue"]} if task.get("issue") else {}),
+                "summary": refusal + "; no worker was started",
+                "blockers": [f"{failure.replace('_', ' ')}: {refusal}"],
+                "provider_failure": failure, "changed": [], "tests": [], "artifacts": {"run_dir": None}}
     bash_limit = claude_settings.get("max_bash_denials", 6) if task["agent"] == "claude" else 0
     baseline_limit = claude_settings.get("max_baseline_denials", 2) if task["agent"] == "claude" else 0
     for name, value in (("max_bash_denials", bash_limit), ("max_baseline_denials", baseline_limit)):
