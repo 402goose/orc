@@ -414,7 +414,7 @@ For sandboxed Codex workers (writers in restricted mode and every reader), ORC t
   still cannot write the workspace and reach no outside host.
 - gives each such reader a fresh private temp directory, `/tmp/orc-XXXXXXXX`
   (`/private/tmp/...` on macOS), as its `TMPDIR`, `TMP` and `TEMP`, and removes it
-  when the run ends. Codex resolves the profile's `:tmpdir` from `TMPDIR`, so that
+  when the run ends (or the sweep does; see *Stale reader temp directories*). Codex resolves the profile's `:tmpdir` from `TMPDIR`, so that
   directory is the reader's only writable path: not `/tmp`, not other `/tmp`
   directories such as writer worktrees, and not the shared per-user temp
   directory where other runs and grading steps keep their trees. Writers and YOLO
@@ -511,6 +511,25 @@ Checked on Claude Code 2.1.292 with real sandboxed `touch` calls. With these set
 `/tmp/claude-<uid>` sibling, a `/private/tmp/tenet-round-*` holder and a sibling in the
 shared `$TMPDIR` were all denied. With the previous settings, the workspace and the
 `/tmp/claude-<uid>` sibling were writable. Re-probe on Claude Code upgrades.
+
+**Stale reader temp directories.** A run that is killed (SIGKILL, a host crash) never
+removes its `/tmp/orc-<id>`. Each such directory carries an owner marker, `.orc-owner`,
+holding the creating process's pid and start time, and every new reader directory first
+sweeps old ones. A directory is removed only if it is a plain directory (never a
+symlink, which is not followed), is owned by the current user, has a name ORC creates
+(`orc-` and 8 characters from `mkdtemp`, or 12 hex digits), is older than 24 hours, and
+its owner is gone: the pid is dead, now belongs to a process with another start time,
+or there is no readable marker (a marker that is itself a symlink is not read). Runs end
+long before 24 hours, so the age limit alone protects live runs. For a Claude reader the
+marker sits in the directory root, which the reader cannot write. A Codex browser reader
+can write its whole directory, marker included, but a forged marker can only keep that
+one directory from being swept, never cause another to be removed. Errors are skipped
+and reported once per process.
+
+`fusion tmp sweep` runs the same sweep on demand (`--dry-run` lists without removing,
+`--max-age-hours` changes the limit, `--json` prints the result). `FUSION_TMP_SWEEP=0`
+turns the automatic sweep off; `make test` sets it so the suite never sweeps the host's
+real `/tmp`.
 
 **Writers whose workspace is under a home deny.** Claude Code's deny rules beat
 any allow, so `Edit(//Users/<you>/**)` also refuses a writer whose workspace is
