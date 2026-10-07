@@ -256,7 +256,9 @@ A round is judged on balanced accuracy, not raw accuracy. Each evaluation report
 per question and pooled, accuracy, balanced accuracy, AUC from the predicted
 probabilities, and the share of `true` predictions. The majority baseline always
 answers the held-out majority label (balanced accuracy 0.5 on a true/false
-question); the training-set majority is kept as `train_majority`. A question with
+question); the training-set majority is kept as `train_majority`. On balanced accuracy
+the majority baseline is always 0.5, so "beats the majority" means "discriminates at
+all": a model that answers the same thing for every input never clears it. A question with
 one label value on the held-out set (such as `failed_task` when every held-out
 answer is `false`) is listed in `constant_questions` and left out of the headline,
 since every predictor gets it free. A candidate that predicts the same label for at
