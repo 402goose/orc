@@ -62,6 +62,7 @@ after its name. Aliases and hidden subcommands are included below.
 - [fusion learn](#fusion-learn)
 - [fusion learn tick](#fusion-learn-tick)
 - [fusion learn status](#fusion-learn-status)
+- [fusion learn prune](#fusion-learn-prune)
 - [fusion learn schedule](#fusion-learn-schedule)
 - [fusion gym](#fusion-gym)
 - [fusion gym extract](#fusion-gym-extract)
@@ -1107,13 +1108,15 @@ options:
 advance and inspect Laya's learning loop without the control room
 
 ```text
-usage: fusion learn [-h] {tick,status,schedule} ...
+usage: fusion learn [-h] {tick,status,prune,schedule} ...
 
 positional arguments:
-  {tick,status,schedule}
+  {tick,status,prune,schedule}
     tick                  advance label drafting and training rounds by one step, then
                           exit
     status                read-only summary: is the loop enabled, and is Laya improving?
+    prune                 remove evaluated candidate weights that are not promoted,
+                          configured or among the newest kept
     schedule              run `learn tick` periodically (launchd on macOS, a crontab
                           line elsewhere)
 
@@ -1144,6 +1147,22 @@ usage: fusion learn status [-h] [--workspace W | --all]
 
 options:
   -h, --help     show this help message and exit
+  --workspace W  workspace to include (repeatable); defaults to the current workspace
+  --all          every workspace the control room knows about, plus the current one when
+                 it has Laya decisions
+```
+
+## fusion learn prune
+
+remove evaluated candidate weights that are not promoted, configured or among the newest kept
+
+```text
+usage: fusion learn prune [-h] [--dry-run] [--json] [--workspace W | --all]
+
+options:
+  -h, --help     show this help message and exit
+  --dry-run      list what would be removed; remove nothing
+  --json
   --workspace W  workspace to include (repeatable); defaults to the current workspace
   --all          every workspace the control room knows about, plus the current one when
                  it has Laya decisions
