@@ -1071,7 +1071,9 @@ options:
   -h, --help              show this help message and exit
   --model-path MODEL_PATH
   --device DEVICE
-  --epochs EPOCHS
+  --epochs EPOCHS         maximum epochs; default decisions.training.max_epochs.
+                          Training stops early on the dev split carved from the training
+                          groups
   --learning-rate LEARNING_RATE
   --seed SEED
   --kind {acceptance,intake,recovery,review,routing}

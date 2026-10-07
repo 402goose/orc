@@ -257,7 +257,7 @@ def evaluate(args):
     return report
 
 
-def objective(logits, mask, target, qtype, weights, sigma, generator, proper=True):
+def objective(logits, mask, target, qtype, weights, sigma, generator, proper=True, proper_weight=None):
     """Soft-target cross-entropy plus upstream's proper-scoring policy term.
 
     A port of the RLCD step in NandhaKishorM/laya's typed-decisions
@@ -266,12 +266,18 @@ def objective(logits, mask, target, qtype, weights, sigma, generator, proper=Tru
     reward each sample by log + spherical score (minus the ranked probability
     score on `score` questions) against the target distribution, subtract the
     group mean, and push the logits toward better samples; plus soft
-    cross-entropy at weight 1.0. `weights` (mean 1 over the training set)
-    scale each item's loss. Returns (loss, per-item cross-entropy, mean reward).
+    cross-entropy at weight 1.0. Unlike upstream the advantage is not divided
+    by its own standard deviation, the log-likelihood divides by
+    policy_scale(sigma) squared, and the term is scaled by `proper_weight`
+    (fusion_laya_objective.policy_gradient is the reference). `weights` (mean
+    1 over the training set) scale each item's loss. Returns (loss, per-item
+    cross-entropy, mean reward).
     """
     import torch
     from laya.common import proper_reward
-    from fusion_laya_objective import PROPER_SCORING
+    from fusion_laya_objective import PROPER_SCORING, TRAINING_DEFAULTS, policy_scale
+    if proper_weight is None:
+        proper_weight = TRAINING_DEFAULTS["proper_scoring_weight"]
     weights = weights.to(logits.dtype)
     masked = logits.masked_fill(~mask, -1e4)
     cross_entropy = -(target * torch.log_softmax(masked, -1)).sum(-1)
@@ -288,27 +294,33 @@ def objective(logits, mask, target, qtype, weights, sigma, generator, proper=Tru
             reward = proper_reward(q, target.unsqueeze(0), qtype, mask, w_sph=PROPER_SCORING["w_sph"],
                                    w_rps=PROPER_SCORING["w_rps"], log_floor=PROPER_SCORING["log_floor"])
             advantage = reward - reward.mean(0, keepdim=True)
-            advantage = advantage / (advantage.std() + 1e-6)
-        log_prob = -(((z - logits.unsqueeze(0)) ** 2) * mask).sum(-1) / (2 * sigma ** 2)
-        loss = loss + (weights * -(advantage * log_prob)).mean()
+        log_prob = -(((z - logits.unsqueeze(0)) ** 2) * mask).sum(-1) / (2 * policy_scale(sigma) ** 2)
+        loss = loss + proper_weight * (weights * -(advantage * log_prob)).mean()
         reward = reward.mean()
     return loss, cross_entropy.detach(), reward.detach()
 
 
 def train(args):
-    """Supervised decision-head adaptation; holdout groups never enter optimization."""
+    """Supervised decision-head adaptation; holdout groups never enter optimization or selection.
+
+    The training groups split again into fit and dev (training_plan); fit
+    trains, dev picks the epoch (fit_epochs), and held-out waits for evaluate.
+    """
     learning_progress(args, 'loading', message='Loading local checkpoint for training')
     import random
     import torch
     from laya.common import QTYPES, build_sequence, collate_items
     from safetensors.torch import save_file
     from fusion_decisions import labels_for, digest
-    from fusion_laya_objective import (PROPER_SCORING, example_weight, item_weights, sigma as noise_at,
-                                       target_distribution, training_options)
+    from fusion_laya_objective import (MAX_EPOCHS, PROPER_SCORING, argmax, dev_score, example_weight, fit_epochs,
+                                       item_weights, selection_record, sigma as noise_at, target_distribution,
+                                       training_options, training_plan)
     from fusion_quality import dataset_quality, input_key
     options = training_options({key: getattr(args, key) for key in ("objective", "unfreeze_encoder", "encoder_learning_rate",
-                                                                      "label_smoothing", "class_balance", "max_class_weight")
+                                                                      "label_smoothing", "class_balance", "max_class_weight",
+                                                                      "patience", "proper_scoring_weight")
                                 if getattr(args, key, None) is not None})
+    epochs = args.epochs if getattr(args, "epochs", None) is not None else options["max_epochs"]
     rows = dataset_rows(args.dataset)
     kinds = set(filter(None, (getattr(args, "kinds", "") or "").split(",")))
     if kinds:
@@ -317,8 +329,9 @@ def train(args):
     if not train_rows or not any(row["split"] == "validation" for row in rows):
         raise ValueError("training requires both train and held-out validation groups"
                          + (f" of kind {', '.join(sorted(kinds))}" if kinds else ""))
-    if not 1 <= args.epochs <= 20 or not 0 < args.learning_rate <= 0.01:
-        raise ValueError("epochs must be 1..20 and learning rate in (0, .01]")
+    if not 1 <= epochs <= MAX_EPOCHS or not 0 < args.learning_rate <= 0.01:
+        raise ValueError(f"epochs must be 1..{MAX_EPOCHS} and learning rate in (0, .01]")
+    plan = training_plan(rows, getattr(args, "split", None) or "time")
     output = Path(args.output)
     if output.exists():
         raise ValueError("candidate output already exists")
@@ -329,9 +342,9 @@ def train(args):
     agent, source_id, source_path = Backend().load(source, args.device, args.model_path)
     max_len, head_len = agent.cfg.get("max_len", 512), agent.cfg.get("head_max_len", 192)
     # Build every example first: a truncated one stops training before any
-    # update, and class weights need the whole training split.
-    examples, flat, row_weights = [], [], []
-    for row in train_rows:
+    # update, and class weights need the whole fit split.
+    examples = {}
+    for row in plan["fit"] + plan["dev"]:
         questions = {key: row["questions"][key] for key in row["labels"]}
         if truncated(agent, row["state"], questions):
             raise ValueError("training example is truncated; shorten and re-review it")
@@ -339,23 +352,24 @@ def train(args):
         for key, q in questions.items():
             internal = agent._to_internal(q)
             ids, markers = build_sequence(agent.tok, row["state"], internal, max_len, head_len)
-            target = target_distribution(row, key, labels_for(q), options["label_smoothing"])
-            items.append({"ids": ids, "markers": markers, "qtype": QTYPES[internal["t"]], "target": target})
-            flat.append((digest(q), target))
-            row_weights.append(example_weight(row, key))
-        examples.append(items)
-    weights, per_class = item_weights(flat, row_weights, options["max_class_weight"], options["class_balance"])
-    position = 0
-    for items in examples:
-        for item in items:
-            item["weight"], position = weights[position], position + 1
+            items.append({"ids": ids, "markers": markers, "qtype": QTYPES[internal["t"]],
+                          "target": target_distribution(row, key, labels_for(q), options["label_smoothing"]),
+                          "question": f"{row['kind']}:{key}", "schema": digest(q), "row_weight": example_weight(row, key),
+                          "weight": 1.0})
+        examples[row["id"]] = items
+    fit_items = [item for row in plan["fit"] for item in examples[row["id"]]]
+    weights, per_class = item_weights([(item["schema"], item["target"]) for item in fit_items],
+                                      [item["row_weight"] for item in fit_items], options["max_class_weight"], options["class_balance"])
+    for item, weight in zip(fit_items, weights):
+        item["weight"] = weight
     unfreeze = options["unfreeze_encoder"]
-    head, encoder = [], []
+    head, encoder, trainable = [], [], []
     for name, parameter in agent.model.named_parameters():
-        trainable = not name.startswith("act_head.") and (unfreeze or not name.startswith("encoder."))
-        parameter.requires_grad_(trainable)
-        if trainable:
+        update = not name.startswith("act_head.") and (unfreeze or not name.startswith("encoder."))
+        parameter.requires_grad_(update)
+        if update:
             (encoder if name.startswith("encoder.") else head).append(parameter)
+            trainable.append((name, parameter))
     groups = [{"params": head, "lr": args.learning_rate}]
     if encoder:
         groups.append({"params": encoder, "lr": options["encoder_learning_rate"]})
@@ -365,23 +379,29 @@ def train(args):
     # term is a zero-mean surrogate, so the full objective can go negative
     # and is recorded only as `mean_objective`.
     steps, losses, objectives, rewards = 0, [], [], []
-    total_steps = args.epochs * len(examples)
-    for epoch in range(args.epochs):
-        noise = noise_at(epoch, args.epochs)
-        order = list(range(len(examples)))
+    total_steps = epochs * len(plan["fit"])
+
+    def tensors(items):
+        collated = collate_items([items], agent.tok.pad_token_id)
+        batch = {key: collated[key].to(agent.device) for key in ["input_ids", "attention_mask", "marker_pos", "marker_mask", "qtype"]}
+        return batch, collated["target"].to(agent.device)
+
+    def run_epoch(epoch, fit):
+        nonlocal steps
+        noise = noise_at(epoch, epochs)
+        order = list(range(len(fit)))
         random.Random(args.seed + epoch).shuffle(order)
         for index in order:
-            items = examples[index]
-            collated = collate_items([items], agent.tok.pad_token_id)
-            batch = {key: collated[key].to(agent.device) for key in ["input_ids", "attention_mask", "marker_pos", "marker_mask", "qtype"]}
+            items = examples[fit[index]["id"]]
+            batch, target = tensors(items)
             agent.model.train()
             if not unfreeze:
                 agent.model.encoder.eval()
             optimizer.zero_grad()
             logits, _ = agent.model(**batch, detach_encoder=not unfreeze)
             item_weight = torch.tensor([item["weight"] for item in items], device=agent.device)
-            loss, cross_entropy, reward = objective(logits, batch["marker_mask"], collated["target"].to(agent.device),
-                                                    batch["qtype"], item_weight, noise, generator, proper)
+            loss, cross_entropy, reward = objective(logits, batch["marker_mask"], target, batch["qtype"], item_weight, noise,
+                                                    generator, proper, options["proper_scoring_weight"])
             loss.backward()
             torch.nn.utils.clip_grad_norm_([p for group in groups for p in group["params"]], 1.0)
             optimizer.step()
@@ -397,6 +417,32 @@ def train(args):
             if emits_progress(steps, total_steps):
                 learning_progress(args, 'training', done=steps, total=total_steps,
                                   loss=losses[-1], loss_curve=loss_curve(losses))
+
+    def score(selected):
+        agent.model.eval()
+        answers, entropies = [], []
+        with torch.no_grad():
+            for row in selected:
+                items = examples[row["id"]]
+                batch, target = tensors(items)
+                logits, _ = agent.model(**batch, detach_encoder=True)
+                masked = logits.masked_fill(~batch["marker_mask"], -1e4)
+                entropies.extend((-(target * torch.log_softmax(masked, -1)).sum(-1)).cpu().tolist())
+                for item, predicted in zip(items, masked.argmax(-1).cpu().tolist()):
+                    answers.append((item["question"], argmax(item["target"]), predicted))
+        return {**dev_score(answers), "cross_entropy": sum(entropies) / len(entropies) if entropies else None}
+
+    def snapshot():
+        return {name: parameter.detach().clone() for name, parameter in trainable}
+
+    def restore(saved):
+        with torch.no_grad():
+            for name, parameter in trainable:
+                parameter.copy_(saved[name])
+
+    selection = fit_epochs(plan, epochs, options["patience"], run_epoch, score, snapshot, restore)
+    fit_metrics = score(plan["fit"])
+    selection = selection_record(plan, selection, options, epochs)
     output.mkdir(parents=True)
     agent.model.encoder.config.save_pretrained(output / "encoder")
     agent.tok.save_pretrained(output / "tokenizer")
@@ -406,22 +452,27 @@ def train(args):
     parent = {}
     if args.model_path and (Path(args.model_path) / 'training.json').is_file():
         parent = json.loads((Path(args.model_path) / 'training.json').read_text())
-    per_epoch = len(examples)
+    per_epoch = len(plan["fit"])
+    run = selection["epochs_run"]
     report = {"method": f"supervised {'decision head and encoder' if encoder else 'decision head'} fine-tuning ({options['objective']})",
               "source_identity": source_id, "model_identity": identity(output),
               "checkpoint": str(source_path) if args.model_path else source,
               "limits": {"max_len": max_len, "head_max_len": head_len}, "kinds": sorted(kinds) or None,
               "objective": {**options, "proper_scoring": PROPER_SCORING if proper else None,
-                            "sigma_by_epoch": [noise_at(epoch, args.epochs) for epoch in range(args.epochs)] if proper else None,
+                            "advantage": "sample reward minus the group mean, not normalized" if proper else None,
+                            "log_likelihood_scale": f"1 / (2 * max(sigma, {PROPER_SCORING['sigma_end']})^2)" if proper else None,
+                            "sigma_by_epoch": [noise_at(epoch, epochs) for epoch in range(run)] if proper else None,
                             "learning_rates": {"head": args.learning_rate, "encoder": options["encoder_learning_rate"] if encoder else None},
                             "weight_decay": 0.01, "gradient_clip": 1.0,
                             "class_weights": [{"question": schema, "class": cls, "weight": weight}
                                               for (schema, cls), weight in sorted(per_class.items())],
-                            "item_weight_range": [min(weights), max(weights)]},
+                            "item_weight_range": [min(weights), max(weights)] if weights else None},
               "dataset_hash": hashlib.sha256(Path(args.dataset).read_bytes()).hexdigest(),
-              "seed": args.seed, "epochs": args.epochs, "steps": steps, "mean_loss": sum(losses) / steps, "loss_curve": loss_curve(losses),
+              "seed": args.seed, "epochs": run, "chosen_epoch": selection["chosen_epoch"], "selection": selection,
+              "train_accuracy": fit_metrics["accuracy"], "train_balanced_accuracy": fit_metrics["balanced_accuracy"],
+              "steps": steps, "mean_loss": sum(losses) / steps, "loss_curve": loss_curve(losses),
               "loss": "soft cross-entropy", "mean_objective": sum(objectives) / steps,
-              "cross_entropy_by_epoch": [sum(losses[e * per_epoch:(e + 1) * per_epoch]) / per_epoch for e in range(args.epochs)],
+              "cross_entropy_by_epoch": [sum(losses[e * per_epoch:(e + 1) * per_epoch]) / per_epoch for e in range(run)],
               "mean_reward": sum(rewards) / steps if proper else None,
               "data_quality": dataset_quality(train_rows),
               "seen_train_groups": sorted(set(parent.get('seen_train_groups', [])) | {digest(r['group']) for r in train_rows}),
@@ -441,7 +492,7 @@ def main():
     parser.add_argument("--model-path", default="")
     parser.add_argument("--dataset")
     parser.add_argument("--output")
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, help="train: most epochs; default decisions.training.max_epochs")
     parser.add_argument("--learning-rate", type=float, default=0.0001)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--kinds", default="", help="train: only these decision kinds (comma-separated)")
@@ -451,6 +502,9 @@ def main():
     parser.add_argument("--label-smoothing", dest="label_smoothing", type=float)
     parser.add_argument("--no-class-balance", dest="class_balance", action="store_false", default=None)
     parser.add_argument("--max-class-weight", dest="max_class_weight", type=float)
+    parser.add_argument("--patience", type=int)
+    parser.add_argument("--proper-scoring-weight", dest="proper_scoring_weight", type=float)
+    parser.add_argument("--split", choices=["time", "group-hash"], help="train: the export's split rule, reused to carve dev from training groups")
     parser.add_argument("--control", action="store_true", help="evaluate: also score held-out examples against a different example's state")
     args = parser.parse_args()
     if args.command != "warmup":

@@ -84,6 +84,7 @@ def measured_round(round):
             "baselines": {name: {k: v.get(k) for k in ("n", "accuracy", "balanced_accuracy", "candidate_accuracy",
                                                         "candidate_balanced_accuracy") if k in v}
                           for name, v in (proof.get("baselines") or {}).items()},
+            "training": {k: v for k, v in (proof.get("training") or {}).items() if k != "dev_groups"},
             "questions": training_loop.question_lines(proof.get("questions") or {})}
 
 

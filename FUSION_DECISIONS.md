@@ -443,6 +443,9 @@ settings):
       "label_smoothing": 0.0,
       "class_balance": true,
       "max_class_weight": 4.0,
+      "max_epochs": 15,
+      "patience": 3,
+      "proper_scoring_weight": 0.1,
       "keep_candidates": 2
     },
     "verdict_labels": true,
@@ -939,7 +942,7 @@ orc fusion decisions calibrate .fusion/decisions/reviewed.jsonl \
 
 # Train a separate candidate (decisions.training sets the objective).
 orc fusion decisions train .fusion/decisions/reviewed.jsonl \
-  .fusion/decisions/candidate --epochs 1
+  .fusion/decisions/candidate
 # Or one kind, starting from that kind's decisions.checkpoints entry.
 orc fusion decisions train .fusion/decisions/reviewed.jsonl \
   .fusion/decisions/acceptance-candidate --kind acceptance
@@ -1141,7 +1144,16 @@ notebook's training step, scored with `laya.common.proper_reward`):
   0.4 in the first epoch falling linearly to 0.1 in the last) are scored
   against the target by log score plus 0.75 × spherical score, less the
   ranked probability score on `score` questions. Each sample's advantage over
-  the group mean, normalized, weights its Gaussian log-likelihood.
+  the group mean weights its Gaussian log-likelihood. Unlike upstream, the
+  advantage is not divided by its own standard deviation, the log-likelihood
+  divides by max(σ, 0.1)², and the term is scaled by `proper_scoring_weight`
+  (default 0.1). See [docs/learning.md](docs/learning.md#quality-and-automatic-training)
+  for why.
+- **Epochs and dev selection**: training carves a dev split from the
+  training groups by the export's split rule, trains on the rest for up to
+  `max_epochs` (default 15; `--epochs` overrides), scores dev after each
+  epoch, stops after `patience` epochs without improvement (default 3), and
+  keeps the best epoch's weights. Held-out groups are never used.
 - **Class balance** (`class_balance`, default on): per question schema, a
   class seen n times gets weight min(`max_class_weight`, n_majority / n),
   where an item's class is its target's argmax. The cap (default 4) follows
@@ -1160,13 +1172,15 @@ notebook's training step, scored with `laya.common.proper_reward`):
 
 `training.json` records the objective and all of the above: settings,
 upstream constants, per-class weights, the item weight range, learning
-rates, noise by epoch, seed, starting checkpoint and its token limits, and
-the soft cross-entropy by epoch. The loss curve is the soft cross-entropy;
+rates, noise by epoch, seed, starting checkpoint and its token limits, the
+soft cross-entropy by epoch, and under `selection` the dev groups (hashed),
+dev score by epoch, `chosen_epoch` and `proper_scoring_weight`. The loss curve is the soft cross-entropy;
 the policy term is a zero-mean surrogate whose value is not a loss, and is
 reported only as `mean_objective`. `test/laya_training_objective.py` checks
 the objective against a pure-Python reference with the managed runtime and,
 with `--train`, fine-tunes the cached English checkpoint on a small synthetic
-set.
+set; `--overfit` trains the default settings on 32 balanced synthetic rows and
+fails below 95% train accuracy.
 
 Compare candidate and baseline reports before setting `model_path`,
 `calibration_file`, `mode: active` and selected `auto_actions`. None of those

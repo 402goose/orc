@@ -71,7 +71,8 @@ def add_parser(sub):
         action.add_argument("--model-path", default="")
         action.add_argument("--device", default="cpu")
         if command == "train":
-            action.add_argument("--epochs", type=int, default=1)
+            action.add_argument("--epochs", type=int, help="maximum epochs; default decisions.training.max_epochs. "
+                                "Training stops early on the dev split carved from the training groups")
             action.add_argument("--learning-rate", type=float, default=0.0001)
             action.add_argument("--seed", type=int, default=42)
             action.add_argument("--kind", choices=sorted(KINDS),
@@ -89,7 +90,8 @@ def training_source(args, options, model_path):
     --kind's decisions.checkpoints entry, else decisions.model_path, else
     English. Without --kind, kinds whose decisions.checkpoints entry names a
     different checkpoint are left out. decisions.training settings become
-    explicit arguments, so the runtime records exactly what it trained with.
+    explicit arguments, so the runtime records exactly what it trained with,
+    and decisions.split is passed so dev is carved by the export's rule.
     """
     extra = []
     configured = options["checkpoints"].get(args.kind) if getattr(args, "kind", None) else None
@@ -109,7 +111,9 @@ def training_source(args, options, model_path):
         extra += ["--kinds", ",".join(kinds)]
     training = options["training"]
     extra += ["--objective", training["objective"], "--encoder-learning-rate", str(training["encoder_learning_rate"]),
-              "--label-smoothing", str(training["label_smoothing"]), "--max-class-weight", str(training["max_class_weight"])]
+              "--label-smoothing", str(training["label_smoothing"]), "--max-class-weight", str(training["max_class_weight"]),
+              "--patience", str(training["patience"]), "--proper-scoring-weight", str(training["proper_scoring_weight"]),
+              "--split", options["split"]]
     if training["unfreeze_encoder"]:
         extra.append("--unfreeze-encoder")
     if not training["class_balance"]:
@@ -145,7 +149,8 @@ def run(args, workspace, config):
         argv = [runtime_python(options), script, command, "--dataset", str(Path(args.dataset).resolve()),
                 "--output", str(Path(args.output).resolve()), "--device", args.device, "--model-path", model_path, *extra]
         if command == "train":
-            argv += ["--epochs", str(args.epochs), "--learning-rate", str(args.learning_rate), "--seed", str(args.seed)]
+            epochs = args.epochs if args.epochs is not None else options["training"]["max_epochs"]
+            argv += ["--epochs", str(epochs), "--learning-rate", str(args.learning_rate), "--seed", str(args.seed)]
         elif getattr(args, "control", False):
             argv.append("--control")
         return subprocess.run(argv, check=False).returncode
