@@ -94,60 +94,132 @@ def review_quality(rows, split="time"):
             "draft_reviews": dict(edits), "revised_answers": revisions, "council": dict(council)}
 
 
-BASELINES = ("majority", "heuristic", "control")
+BASELINES = ("majority", "train_majority", "heuristic", "control")
+DEGENERATE_SHARE = 0.99
 
 
 def _selected(probs):
     return max(probs, key=probs.get)
 
 
+def _auc(scored):
+    ranked = sorted(scored, key=lambda pair: pair[0])
+    positives = sum(positive for _, positive in ranked)
+    negatives = len(ranked) - positives
+    if not positives or not negatives:
+        return None
+    rank_sum, start = 0.0, 0
+    while start < len(ranked):
+        end = start
+        while end < len(ranked) and ranked[end][0] == ranked[start][0]:
+            end += 1
+        rank_sum += (start + 1 + end) / 2 * sum(positive for _, positive in ranked[start:end])
+        start = end
+    return (rank_sum - positives * (positives + 1) / 2) / (positives * negatives)
+
+
+def classification(answers):
+    if not answers:
+        return None
+    n = len(answers)
+    labels = Counter(label for label, _ in answers)
+    predicted = [(label, _selected(answer) if isinstance(answer, dict) else answer) for label, answer in answers]
+    rates = Counter(value for _, value in predicted)
+    recalls = [sum(value == label for label, value in predicted if label == target) / count for target, count in labels.items()]
+    aucs = ([_auc([(answer.get(target, 0.0), label == target) for label, answer in answers]) for target in sorted(labels)]
+            if len(labels) > 1 and all(isinstance(answer, dict) for _, answer in answers) else [])
+    return {"n": n, "accuracy": sum(label == value for label, value in predicted) / n,
+            "balanced_accuracy": sum(recalls) / len(recalls), "auc": sum(aucs) / len(aucs) if aucs else None,
+            "positive_rate": rates["true"] / n if set(labels) | set(rates) <= {"true", "false"} else None,
+            "label_rates": {k: v / n for k, v in sorted(labels.items())},
+            "predicted_rates": {k: v / n for k, v in sorted(rates.items())}}
+
+
+def degenerate(probabilities):
+    if not probabilities:
+        return None
+    values = set().union(*probabilities)
+    if all(max(p.get(v, 0.0) for p in probabilities) - min(p.get(v, 0.0) for p in probabilities) <= 1e-9 for v in values):
+        return f"identical probabilities on all {len(probabilities)} held-out answers"
+    value, count = Counter(_selected(p) for p in probabilities).most_common(1)[0]
+    if count / len(probabilities) >= DEGENERATE_SHARE:
+        return f"answers {value} on {count} of {len(probabilities)} held-out answers"
+    return None
+
+
 def baseline_comparison(rows, predictions, controls=None):
-    """Held-out accuracy per question beside each baseline that applies to it.
+    """Held-out metrics per question and pooled, beside each baseline that applies.
 
     `predictions` maps a row id to its {question: probabilities}; `controls`
     maps a validation row id to the same questions answered against another
     example's state. Baselines, each compared on only the answers it covers:
-    majority -- the most common training label for that exact question;
+    majority -- always the held-out majority label for that question
+      (balanced accuracy 1/k on k label values);
+    train_majority -- the most common training label for that exact question
+      (the old `majority`; held-out label balance can differ from training);
     heuristic -- the deterministic policy's answer exported with the row
       (fusion_decisions.heuristic_answers);
     control -- the candidate itself, reading a shuffled state.
+
+    A question with a single held-out label value is constant: every predictor
+    that answers it gets it free, so it is listed in `constant_questions` and
+    left out of `headline` and the overall `baselines`. `pooled` keeps every
+    answer. `headline.degenerate` flags a candidate that is constant on any
+    headline question.
     """
     train_labels = defaultdict(Counter)
     for row in rows:
         if row["split"] == "train":
             for key, label in row["labels"].items():
                 train_labels[digest(row["questions"][key])][label] += 1
-    empty = lambda: {"n": 0, "correct": 0, "baseline_correct": 0}
-    questions = defaultdict(lambda: {"n": 0, "correct": 0, "groups": set(), "baselines": defaultdict(empty)})
-    overall = defaultdict(empty)
-    for row in rows:
-        if row["split"] != "validation":
-            continue
+    validation = [row for row in rows if row["split"] == "validation"]
+    held_out = defaultdict(Counter)
+    for row in validation:
         for key, label in row["labels"].items():
-            hit = _selected(predictions[row["id"]][key]) == label
-            entry = questions[f"{row['kind']}:{key}"]
-            entry["n"] += 1
-            entry["correct"] += hit
+            held_out[f"{row['kind']}:{key}"][label] += 1
+    majority = lambda counts: sorted(counts, key=lambda v: (-counts[v], v))[0] if counts else None
+    constant = {name: next(iter(counts)) for name, counts in held_out.items() if len(counts) == 1}
+    questions = defaultdict(lambda: {"groups": set(), "answers": [], "baselines": defaultdict(list)})
+    for row in validation:
+        for key, label in row["labels"].items():
+            name = f"{row['kind']}:{key}"
+            prediction = predictions[row["id"]][key]
+            entry = questions[name]
             entry["groups"].add(row["group"])
-            counts = train_labels[digest(row["questions"][key])]
-            answers = {"majority": sorted(counts, key=lambda v: (-counts[v], v))[0] if counts else None,
+            entry["answers"].append((label, prediction))
+            answers = {"majority": majority(held_out[name]),
+                       "train_majority": majority(train_labels[digest(row["questions"][key])]),
                        "heuristic": (row.get("heuristic") or {}).get(key),
-                       "control": _selected(controls[row["id"]][key]) if controls and row["id"] in controls else None}
-            for name, answer in answers.items():
-                if answer is None:
-                    continue
-                for target in (entry["baselines"][name], overall[name]):
-                    target["n"] += 1
-                    target["correct"] += hit
-                    target["baseline_correct"] += answer == label
+                       "control": controls[row["id"]][key] if controls and row["id"] in controls else None}
+            for baseline, answer in answers.items():
+                if answer is not None:
+                    entry["baselines"][baseline].append((label, prediction, answer))
 
-    def summary(value):
-        return {"n": value["n"], "accuracy": value["baseline_correct"] / value["n"],
-                "candidate_accuracy": value["correct"] / value["n"],
-                "margin": (value["correct"] - value["baseline_correct"]) / value["n"]}
-    return {"baselines": {name: summary(overall[name]) for name in BASELINES if overall[name]["n"]},
-            "by_question": {name: {"n": value["n"], "groups": len(value["groups"]), "accuracy": value["correct"] / value["n"],
-                                   "baselines": {b: summary(value["baselines"][b]) for b in BASELINES if value["baselines"][b]["n"]}}
+    def summary(triples):
+        candidate = classification([(label, prediction) for label, prediction, _ in triples])
+        baseline = classification([(label, answer) for label, _, answer in triples])
+        return {"n": len(triples), "accuracy": baseline["accuracy"], "balanced_accuracy": baseline["balanced_accuracy"],
+                "auc": baseline["auc"], "candidate_accuracy": candidate["accuracy"],
+                "candidate_balanced_accuracy": candidate["balanced_accuracy"],
+                "margin": candidate["accuracy"] - baseline["accuracy"],
+                "balanced_margin": candidate["balanced_accuracy"] - baseline["balanced_accuracy"]}
+
+    def baselines(names):
+        triples = {b: [t for name in names for t in questions[name]["baselines"][b]] for b in BASELINES}
+        return {b: summary(value) for b, value in triples.items() if value}
+
+    headline_names = sorted(name for name in questions if name not in constant)
+    reasons = {name: degenerate([p for _, p in questions[name]["answers"]]) for name in questions}
+    flagged = [f"{name} {reasons[name]}" for name in headline_names if reasons[name]]
+    headline = classification([a for name in headline_names for a in questions[name]["answers"]]) or {"n": 0}
+    return {"baselines": baselines(headline_names),
+            "headline": {**headline, "questions": headline_names, "degenerate": bool(flagged),
+                         "degenerate_reason": "; ".join(flagged) or None},
+            "pooled": classification([a for value in questions.values() for a in value["answers"]]),
+            "constant_questions": {name: {"label": label, "n": held_out[name][label]} for name, label in sorted(constant.items())},
+            "by_question": {name: {**classification(value["answers"]), "groups": len(value["groups"]),
+                                   "constant": name in constant, "degenerate": bool(reasons[name]),
+                                   "degenerate_reason": reasons[name], "baselines": baselines([name])}
                             for name, value in sorted(questions.items())}}
 
 
@@ -187,8 +259,11 @@ def matched_comparisons(candidates, evaluations):
                                 "by_kind": result.get("by_kind", {}), "baseline_by_kind": before.get("by_kind", {}),
                                 "control_accuracy": result.get("control_accuracy"),
                                 "majority_accuracy": result.get("majority_accuracy"),
+                                "train_majority_accuracy": result.get("train_majority_accuracy"),
                                 "heuristic_accuracy": result.get("heuristic_accuracy"),
                                 "baselines": result.get("baselines"), "by_question": result.get("by_question", {}),
+                                "headline": result.get("headline"), "pooled": result.get("pooled"),
+                                "constant_questions": result.get("constant_questions"),
                                 "baseline_by_question": before.get("by_question", {}),
                                 "holdout_status": result.get("holdout", {}).get("status", "unknown"), "notes": reasons})
     return sorted(comparisons, key=lambda r: r.get("time_ms") or 0, reverse=True)

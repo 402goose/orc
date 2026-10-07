@@ -977,12 +977,18 @@ that group is caught at evaluation, which compares the candidate's
 
 **Baselines per question.** `evaluate` reports, for each held-out question
 (`kind:question`), the number of answers and groups, the candidate's
-accuracy, and each baseline that applies to it, each compared on only the
-answers it covers:
+accuracy, balanced accuracy (mean recall over the label values present),
+AUC from its predicted probabilities (one-vs-rest mean; `null` with a single
+label value), `positive_rate` (share predicted `true`, true/false questions
+only), `label_rates` and `predicted_rates`, and each baseline that applies to
+it, each compared on only the answers it covers. Every baseline reports
+`accuracy` and `balanced_accuracy` beside the candidate's
+(`candidate_accuracy`, `candidate_balanced_accuracy`):
 
 | Baseline | Answer |
 |---|---|
-| `majority` | Most common training label for that exact question schema. |
+| `majority` | Always the most common **held-out** label for that question. Its balanced accuracy is 1/k on k label values (0.5 for true/false). |
+| `train_majority` | Most common training label for that exact question schema (the `majority` of reports saved before this change). Training and held-out label balance can differ, so it can sit far below `majority`. |
 | `heuristic` | What the deterministic policy answers without Laya, exported with each row as `heuristic`. |
 | `control` | The candidate itself, reading another held-out example's state (`evaluate --control`). A model that scores the same here is answering from the question, not the state. |
 
@@ -1003,12 +1009,41 @@ result, because a gate-sourced label is that result and would score 1.0 by
 construction. Routing has no labeled questions: routes are bandit feedback
 (see [Routing log and exploration](#routing-log-and-exploration)).
 
-A round's outcome is **gain** only if the candidate beats the source
-checkpoint *and* every applicable baseline on the held-out answers by more
-than 0.02 accuracy (`IMPROVEMENT_MARGIN`). It is **regression** if it trails
-the source by more than that, and otherwise **flat**; a note names each
-baseline that was not beaten. Evaluations saved before per-question
-baselines compare against their overall majority and control scores.
+**Constant questions and the headline.** A question with a single label
+value on the held-out set (for example `failed_task` when every held-out row
+is `false`) is free for every predictor. It is listed under
+`constant_questions` (`{label, n}`) and left out of `headline` and the
+overall `baselines`. `headline` holds accuracy, balanced accuracy, AUC and
+`positive_rate` pooled over the remaining questions, and names them in
+`questions`; `pooled` holds the same metrics over every held-out answer. The
+report's top-level `accuracy` (the source/candidate `delta`) stays pooled;
+`balanced_accuracy`, `auc`, `degenerate` and `degenerate_reason` are copied
+from `headline`, `majority_accuracy` and `majority_balanced_accuracy` are the
+held-out majority on the headline questions, and `train_majority_accuracy`
+is the training majority.
+
+**Degenerate candidates.** A question's candidate is degenerate when its
+predicted label is the same on at least 99% of the question's held-out
+answers (`DEGENERATE_SHARE`), or its probabilities are identical on all of
+them. `headline.degenerate` is true when any headline question is
+degenerate, with the reason, e.g. `acceptance:plausible answers false on 54
+of 54 held-out answers`.
+
+A round's outcome is **gain** only if all of these hold:
+
+- the candidate beats the source checkpoint *and* every applicable baseline
+  on the headline answers by more than 0.02 accuracy (`IMPROVEMENT_MARGIN`);
+- its headline balanced accuracy beats both the held-out `majority`'s and the
+  shuffled-state `control`'s balanced accuracy by more than 0.02;
+- it is not degenerate.
+
+It is **degenerate** when the candidate is a constant predictor (a measured
+round only), **regression** if it trails the source by more than 0.02, and
+otherwise **flat**. Notes name each baseline that was not beaten. A missing
+control, an evaluation with no non-constant question, or an evaluation saved
+before balanced accuracy cannot be a gain. Evaluations saved before
+per-question baselines compare against their overall training-majority
+(`train_majority`) and control scores.
 
 **Temperature.** Calibration fits one temperature per question bucket
 (`kind:schema_hash:question`) on train groups, so the probabilities shown are
@@ -1758,10 +1793,13 @@ an error. `status` prints, per workspace:
 - garden `enabled`, `approval_mode`, `queued` and `latest_job`
 - training `enabled`, `min_new_answers`, `completed_rounds` and `last_round`
   (with `outcome` and held-out `delta` once a round completes)
-- `measured_round`: the newest completed round's `outcome`, `margin`, overall
-  `baselines`, and per question (`kind:question`) the `holdout_n` and
+- `measured_round`: the newest completed round's `outcome`, `margin`, headline
+  `balanced_accuracy`, `auc`, `degenerate` and `degenerate_reason`,
+  `constant_questions`, overall `baselines` (accuracy and balanced accuracy),
+  and per question (`kind:question`) the `holdout_n` and
   `holdout_groups`, the candidate's accuracy beside `source`, `majority`,
-  `heuristic` and `control`, and the candidate calibration's `gate`: either
+  `train_majority`, `heuristic` and `control`, its `balanced`, `auc` and
+  `positive_rate`, `constant` and `degenerate`, and the candidate calibration's `gate`: either
   "acts at p>=T, coverage C of N held-out; error <= α with probability 1−δ"
   or why it is not qualified, e.g. `not qualified (n<30)`
 - decision counts by state, `drafts` awaiting review, and approved decisions

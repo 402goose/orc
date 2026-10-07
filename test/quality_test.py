@@ -81,7 +81,8 @@ class QualityTest(unittest.TestCase):
             with patch('fusion_laya.Backend', return_value=FakeBackend()):
                 report = evaluate(args)
             self.assertEqual(report['accuracy'], 1)
-            self.assertEqual(report['majority_accuracy'], 1)
+            self.assertIsNone(report['majority_accuracy'])
+            self.assertEqual(report['constant_questions'], {'acceptance:ok': {'label': 'false', 'n': 1}})
             self.assertEqual(report['by_kind']['acceptance']['questions'], 1)
             self.assertEqual(report['holdout']['status'], 'contaminated')
             self.assertEqual(report['holdout']['overlap_inputs'], 1)
