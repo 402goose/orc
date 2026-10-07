@@ -412,7 +412,7 @@ For sandboxed Codex workers (writers in restricted mode and every reader), ORC t
   read-only plus writes to the worker's temp directory (the browser profile) and
   loopback binding through the managed proxy with an empty domain list. Readers
   still cannot write the workspace and reach no outside host.
-- gives each such reader a fresh private temp directory, `/tmp/orc-XXXXXXXX`
+- gives each such reader a fresh private temp directory, `/tmp/orc-run-XXXXXXXX`
   (`/private/tmp/...` on macOS), as its `TMPDIR`, `TMP` and `TEMP`, and removes it
   when the run ends (or the sweep does; see *Stale reader temp directories*). Codex resolves the profile's `:tmpdir` from `TMPDIR`, so that
   directory is the reader's only writable path: not `/tmp`, not other `/tmp`
@@ -493,7 +493,7 @@ decides:
   `sandbox.filesystem.denyWrite`.
 - **No shared scratch:** `/tmp/claude-<uid>` and `/private/tmp/claude-<uid>` are dropped
   from `permissions.additionalDirectories`.
-- **Its own scratch:** each reader run gets a fresh `/tmp/orc-<id>`, created `0700` by
+- **Its own scratch:** each reader run gets a fresh `/tmp/orc-run-<id>`, created `0700` by
   dispatch and removed when the run ends. It is set as `CLAUDE_CODE_TMPDIR`, `TMPDIR`,
   `TMP` and `TEMP`. Claude Code then gives sandboxed Bash `<it>/claude-<uid>` as
   `TMPDIR`, and that is the only path a reader can write. The appended system prompt
@@ -520,13 +520,16 @@ shared `$TMPDIR` were all denied. With the previous settings, the workspace and 
 `/tmp/claude-<uid>` sibling were writable. Re-probe on Claude Code upgrades.
 
 **Stale reader temp directories.** A run that is killed (SIGKILL, a host crash) never
-removes its `/tmp/orc-<id>`. Each such directory carries an owner marker, `.orc-owner`,
+removes its `/tmp/orc-run-<id>`. Each such directory carries an owner marker, `.orc-owner`,
 holding the creating process's pid and start time, and every new reader directory first
 sweeps old ones. A directory is removed only if it is a plain directory (never a
 symlink, which is not followed), is owned by the current user, has a name ORC creates
-(`orc-` and 8 characters from `mkdtemp`, or 12 hex digits), is older than 24 hours, and
-its owner is gone: the pid is dead, now belongs to a process with another start time,
-or there is no readable marker (a marker that is itself a symlink is not read). Runs end
+(`orc-run-` and 8 characters from `mkdtemp`, or 12 hex digits; the older `orc-` form is
+still recognised), is older than 24 hours, carries a readable ORC owner marker, and that
+owner is gone: the pid is dead or now belongs to a process with another start time. A
+directory with no readable marker (missing, unparseable, or itself a symlink) is never
+removed, so a same-named directory a person or agent made is left alone. The cap of 500
+entries counts only matching names, never the rest of `/tmp`. Runs end
 long before 24 hours, so the age limit alone protects live runs. For a Claude reader the
 marker sits in the directory root, which the reader cannot write. A Codex browser reader
 can write its whole directory, marker included, but a forged marker can only keep that

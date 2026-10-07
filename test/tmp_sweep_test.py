@@ -1,6 +1,6 @@
 """Per-run reader temp directories carry an owner marker, and the sweep removes only stale ones:
-plain directories owned by this user, named as ORC names them, older than the limit, whose owner
-is gone."""
+plain directories owned by this user, named as ORC names them, older than the limit, carrying
+ORC's marker, whose owner is gone."""
 import contextlib
 import io
 import json
@@ -69,10 +69,25 @@ class TmpSweepTest(unittest.TestCase):
         self.sweep()
         self.assertFalse(recycled.exists())
 
-    def test_an_old_directory_without_a_marker_is_removed(self):
-        bare = self.make("orc-nomarker", owner=None)
-        self.sweep()
-        self.assertFalse(bare.exists())
+    def test_an_old_directory_without_a_marker_is_kept(self):
+        bare = self.make("orc-blockers", owner=None)
+        result = self.sweep()
+        self.assertTrue(bare.exists())
+        self.assertEqual(result["kept"], [{"path": str(bare), "reason": "no ORC owner marker"}])
+
+    def test_a_run_prefixed_directory_whose_owner_is_dead_is_removed(self):
+        stale = self.make("orc-run-abcd1234")
+        result = self.sweep()
+        self.assertFalse(stale.exists())
+        self.assertEqual(result["removed"], [str(stale)])
+
+    def test_the_cap_counts_only_names_orc_creates(self):
+        for index in range(fusion_tmp.LIMIT + 100):
+            (self.root / f"aaa-{index:04d}").write_text("x")
+        stale = self.make("orc-zz991234")
+        result = self.sweep()
+        self.assertFalse(stale.exists())
+        self.assertEqual(result["removed"], [str(stale)])
 
     def test_a_young_directory_is_kept_even_when_its_owner_is_dead(self):
         young = self.make("orc-young123", age=60)
@@ -111,9 +126,10 @@ class TmpSweepTest(unittest.TestCase):
         decoy.write_text(json.dumps({"pid": os.getpid(), "start": fusion_tmp.process_start(os.getpid())}))
         (stale / fusion_tmp.MARKER).symlink_to(decoy)
         os.utime(stale, (self.now - 2 * DAY, self.now - 2 * DAY))
-        self.sweep()
-        self.assertFalse(stale.exists())
+        result = self.sweep()
+        self.assertTrue(stale.exists())
         self.assertTrue(decoy.exists())
+        self.assertIn({"path": str(stale), "reason": "no ORC owner marker"}, result["kept"])
 
     def test_a_dry_run_lists_without_removing(self):
         stale = self.make("orc-dryrun12")
