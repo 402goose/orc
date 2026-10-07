@@ -88,7 +88,11 @@ quality failures of the reviewing lane: `missed_gap`, when the review approved a
 gap was found afterwards (by another reviewer, verify or land), and `false_blocker`, when
 the review blocked on something that was not a problem (the change landed as it was).
 A review that caught a real gap is an accepted `--stage review` verdict, so reviewer
-precision per lane reads straight from review-stage outcomes. `land_conflict`, `eval_unmeasured` and `other` are harness
+precision per lane reads straight from review-stage outcomes. Both grades are a lead's verdict only:
+ORC never derives them (a land does not prove a blocker was false; the lead may have
+overridden a correct one), and `fusion outcome` refuses either without a `--reason`
+naming the evidence: for `missed_gap` the PR or run where the gap was found, for
+`false_blocker` the lead's ruling that it was not a problem. `land_conflict`, `eval_unmeasured` and `other` are harness
 problems: ranking, the Thompson posterior and rework exclusion treat them as if no
 verdict was recorded. The run's own status still counts, so a worker that errored counts
 against the lane exactly as it would with no outcome. A rejection with no class counts. `fusion decisions routing-report`
