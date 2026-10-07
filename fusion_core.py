@@ -2920,7 +2920,8 @@ def run_directory(workspace: Path, run_id: str) -> Path | None:
     return None
 
 
-REJECTION_CLASSES = ("suite_red", "no_diff", "out_of_scope", "eval_unmeasured", "review_changes", "land_conflict", "other")
+REJECTION_CLASSES = ("suite_red", "no_diff", "out_of_scope", "eval_unmeasured", "review_changes", "missed_gap",
+                     "false_blocker", "land_conflict", "other")
 ISSUE_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+")
 
 

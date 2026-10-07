@@ -105,8 +105,8 @@ or become a training label. What ORC enforces today:
 - A rejection the caller classes as a harness problem (`--rejection-class land_conflict`,
   `eval_unmeasured` or `other`) is treated as if no verdict was recorded, in ranking, the
   Thompson posterior and rework exclusion; the run's own status still counts, so a worker
-  that errored counts against the lane as it would with no outcome. Only `suite_red`, `no_diff`, `out_of_scope`
-  and `review_changes` count against the lane. A rejection with no class is the caller's
+  that errored counts against the lane as it would with no outcome. Only `suite_red`, `no_diff`, `out_of_scope`,
+  `review_changes` and the two review grades `missed_gap` and `false_blocker` count against the lane. A rejection with no class is the caller's
   verdict and still counts, so a caller that knows a failure was the harness's should
   class it, or record it as `--unmeasured`. The routing report and view still list
   excluded rejections, marked `counts_against_lane: false`. The rejection cap per issue
