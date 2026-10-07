@@ -60,7 +60,8 @@ ABSENT = "import pathlib, sys\nsys.exit(1 if pathlib.Path('done.txt').exists() e
 
 
 def run_git(cwd, *args):
-    return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=cwd, check=True,
+    return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "maintenance.auto=false",
+                           "-c", "gc.auto=0", *args], cwd=cwd, check=True,
                           capture_output=True, text=True).stdout.strip()
 
 
