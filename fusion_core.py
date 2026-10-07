@@ -1039,6 +1039,22 @@ def claude_reader_tmpdir(env: dict[str, str]) -> str:
     return directory
 
 
+READER_CACHE_DIRS = {"XDG_CACHE_HOME": "cache", "npm_config_cache": "npm", "YARN_CACHE_FOLDER": "yarn",
+                     "PIP_CACHE_DIR": "pip", "UV_CACHE_DIR": "uv", "PYTHONPYCACHEPREFIX": "pycache"}
+
+
+def reader_cache_env(env: dict[str, str], root: str) -> None:
+    """Point a reader's tool caches inside `root`, the one directory its sandbox lets it write, so a
+    reviewer that runs a test suite does not fail on a cache write outside it. pytest's cache plugin
+    is turned off (`-p no:cacheprovider` is appended to PYTEST_ADDOPTS) because it writes beside the
+    tests. Vite and Vitest have no environment variable for their cache directory, so a Vitest run in
+    a reader still needs a writable `node_modules/.vite`."""
+    env.update({name: f"{root}/{leaf}" for name, leaf in READER_CACHE_DIRS.items()})
+    addopts = env.get("PYTEST_ADDOPTS", "").strip()
+    if "no:cacheprovider" not in addopts:
+        env["PYTEST_ADDOPTS"] = " ".join(part for part in (addopts, "-p no:cacheprovider") if part)
+
+
 def claude_reader_settings(launcher_args: list[str], workspace: str) -> list[str]:
     """Launcher args whose settings make a read-only worker read-only by construction, not by
     plan mode alone: Edit, Write, MultiEdit and NotebookEdit are denied outright; the Bash sandbox
@@ -2818,6 +2834,7 @@ def agent_command(
         if not task["write"]:
             launcher_args = claude_reader_settings(launcher_args, task["workspace"])
             reader_tmpdir = claude_reader_tmpdir(env)
+            reader_cache_env(env, f"{reader_tmpdir}/claude-{os.getuid()}")
             launcher_args = claude_reader_prompt(launcher_args, reader_tmpdir)
         profile = str(settings.get("profile", ""))
         if command_name == "orc" and profile:
@@ -3384,7 +3401,9 @@ def dispatch(
             with progress.activity(label, "acquiring workspace writer lock" if task["write"] else "preparing read-only worker"):
                 stack.enter_context(writer_lock(Path(task["workspace"]), task["write"], store.control_workspace))
             if codex_browser_reader(config, task, resolved_settings):
-                stack.callback(shutil.rmtree, codex_reader_tmpdir(env), True)
+                reader_tmp = codex_reader_tmpdir(env)
+                reader_cache_env(env, reader_tmp)
+                stack.callback(shutil.rmtree, reader_tmp, True)
             if metadata.get("reader_tmpdir"):
                 os.mkdir(metadata["reader_tmpdir"], 0o700)
                 stack.callback(shutil.rmtree, metadata["reader_tmpdir"], True)
@@ -4078,6 +4097,7 @@ def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str |
             codex_browser_env(settings, env)
         if read_only and not yolo and codex_browser(settings) is not None:
             directory = codex_reader_tmpdir(env)
+            reader_cache_env(env, directory)
             try:
                 return subprocess.run(argv, cwd=workspace, env=env, check=False).returncode
             finally:

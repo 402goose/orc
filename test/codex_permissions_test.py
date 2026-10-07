@@ -82,7 +82,7 @@ class CodexPermissionsTest(unittest.TestCase):
             fake = root / "fake-codex"
             fake.write_text("#!/usr/bin/env python3\n" + '''import json, os, pathlib, sys
 sys.stdin.read()
-seen = {key: os.environ.get(key) for key in ("TMPDIR", "TMP", "TEMP")}
+seen = {key: os.environ.get(key) for key in ("TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "npm_config_cache", "YARN_CACHE_FOLDER", "PIP_CACHE_DIR", "UV_CACHE_DIR", "PYTHONPYCACHEPREFIX", "PYTEST_ADDOPTS")}
 directory = pathlib.Path(seen["TMPDIR"] or "/nonexistent")
 seen["writable"] = directory.is_dir() and os.access(directory, os.W_OK)
 pathlib.Path(os.environ["PROBE_OUT"]).write_text(json.dumps(seen))
@@ -110,6 +110,19 @@ print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "t
         self.assertEqual(seen["TEMP"], directory)
         self.assertTrue(seen["writable"])
         self.assertFalse(Path(directory).exists())
+
+    def test_a_browser_readers_caches_live_in_its_own_temp_directory(self):
+        seen = self.delegate_probe({"browser": True}, "--read-only")
+        directory = seen["TMPDIR"].rstrip("/")
+        for name in core.READER_CACHE_DIRS:
+            self.assertTrue(seen[name].startswith(directory + "/"), (name, seen[name]))
+        self.assertIn("-p no:cacheprovider", seen["PYTEST_ADDOPTS"])
+
+    def test_writers_and_plain_readers_keep_their_caches(self):
+        for settings, options in (({"browser": True}, ()), ({}, ("--read-only",))):
+            seen = self.delegate_probe(settings, *options)
+            for name in (*core.READER_CACHE_DIRS, "PYTEST_ADDOPTS"):
+                self.assertEqual(seen[name], core.os.environ.get(name), (settings, options, name))
 
     def test_writers_and_plain_readers_keep_the_inherited_temp_directory(self):
         inherited = core.os.environ.get("TMPDIR")
