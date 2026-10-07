@@ -98,6 +98,22 @@ class ClaudeReaderScopeTest(unittest.TestCase):
         self.assertEqual(env.get("CLAUDE_CODE_TMPDIR"), os.environ.get("CLAUDE_CODE_TMPDIR"))
         self.assertEqual(argv[argv.index("--append-system-prompt") + 1], PROMPT)
 
+    def test_a_readers_caches_live_in_its_own_sandbox_temp_directory(self):
+        with patch.dict(os.environ, {"PYTEST_ADDOPTS": "-q"}):
+            _, env, metadata = self.command()
+        own = f"{metadata['reader_tmpdir']}/claude-{UID}"
+        for name in core.READER_CACHE_DIRS:
+            self.assertTrue(env[name].startswith(own + "/"), (name, env[name]))
+        self.assertEqual(env["PYTEST_ADDOPTS"], "-q -p no:cacheprovider")
+        self.assertFalse(any(SHARED.fullmatch(env[name].rsplit("/", 1)[0]) for name in core.READER_CACHE_DIRS))
+
+    def test_a_writers_caches_are_left_alone(self):
+        with patch.dict(os.environ, {"PYTEST_ADDOPTS": "-q"}):
+            _, env, _ = self.command(write=True)
+        for name in core.READER_CACHE_DIRS:
+            self.assertEqual(env.get(name), os.environ.get(name), name)
+        self.assertEqual(env["PYTEST_ADDOPTS"], "-q")
+
     def test_unreadable_settings_raise_rather_than_launch_unscoped(self):
         broken = self.root / "broken.json"
         broken.write_text("{not json")

@@ -502,9 +502,16 @@ decides:
 The derived file is a copy named `.<name>.reader-<hash>.json`, written after the
 hooks-off copy, so both changes reach the one file passed to `--settings`. Settings
 that cannot be read refuse a reader before it starts (`settings_unreadable`), even on
-a route with `claude.user_hooks`. Writers and yolo runs are unchanged. A reader that
-runs a test suite cannot write caches such as `node_modules/.vite` or
-`.pytest_cache`; tools that honour `TMPDIR` can write there instead.
+a route with `claude.user_hooks`. Writers and yolo runs are unchanged.
+
+A reader's tool caches point inside the one directory it can write
+(`<run tmp>/claude-<uid>` for a Claude reader, its own `TMPDIR` for a Codex browser
+reader): `XDG_CACHE_HOME`, `npm_config_cache`, `YARN_CACHE_FOLDER`, `PIP_CACHE_DIR`,
+`UV_CACHE_DIR` and `PYTHONPYCACHEPREFIX` are set to subdirectories of it, and
+`-p no:cacheprovider` is appended to `PYTEST_ADDOPTS` because pytest writes its cache
+beside the tests. Vite and Vitest have no environment variable for their cache
+directory, so a Vitest run in a reader still fails on `node_modules/.vite`; other tools
+that write into the workspace fail the same way.
 
 Checked on Claude Code 2.1.292 with real sandboxed `touch` calls. With these settings,
 `<run tmp>/claude-<uid>` was writable and the run tmp root, the workspace, a
