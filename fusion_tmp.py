@@ -132,7 +132,7 @@ def sweep(root: str | Path | None = None, max_age_seconds: float = MAX_AGE_SECON
             kept.append({"path": str(path), "reason": "younger than the age limit"})
             continue
         owner = _owner(path)
-        if owner is None or not isinstance(owner.get("pid"), int):
+        if owner is None or type(owner.get("pid")) is not int:
             kept.append({"path": str(path), "reason": "no ORC owner marker"})
             continue
         if _owner_running(owner):

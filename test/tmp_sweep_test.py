@@ -81,6 +81,14 @@ class TmpSweepTest(unittest.TestCase):
         self.assertFalse(stale.exists())
         self.assertEqual(result["removed"], [str(stale)])
 
+    def test_a_boolean_pid_is_not_a_marker(self):
+        odd = self.make("orc-run-bool1234", owner=None)
+        (odd / fusion_tmp.MARKER).write_text(json.dumps({"pid": True, "start": "x"}))
+        os.utime(odd, (self.now - 2 * DAY, self.now - 2 * DAY))
+        result = self.sweep()
+        self.assertTrue(odd.exists())
+        self.assertEqual(result["kept"], [{"path": str(odd), "reason": "no ORC owner marker"}])
+
     def test_the_cap_counts_only_names_orc_creates(self):
         for index in range(fusion_tmp.LIMIT + 100):
             (self.root / f"aaa-{index:04d}").write_text("x")
