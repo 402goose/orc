@@ -318,7 +318,7 @@ def train(args):
     from fusion_quality import dataset_quality, input_key
     options = training_options({key: getattr(args, key) for key in ("objective", "unfreeze_encoder", "encoder_learning_rate",
                                                                       "label_smoothing", "class_balance", "max_class_weight",
-                                                                      "patience", "min_dev_rows", "min_dev_per_class",
+                                                                      "patience", "min_epochs", "min_dev_rows", "min_dev_per_class",
                                                                       "proper_scoring_weight")
                                 if getattr(args, key, None) is not None})
     epochs = args.epochs if getattr(args, "epochs", None) is not None else options["max_epochs"]
@@ -444,7 +444,7 @@ def train(args):
 
     guard = dev_guard(plan["dev"], [(item["question"], item["label"]) for row in plan["dev"] for item in examples[row["id"]]],
                       options["min_dev_rows"], options["min_dev_per_class"])
-    selection = fit_epochs(plan, epochs, options["patience"], run_epoch, score, snapshot, restore, guard)
+    selection = fit_epochs(plan, epochs, options["patience"], run_epoch, score, snapshot, restore, guard, options["min_epochs"])
     fit_metrics = score(plan["fit"])
     selection = selection_record(plan, selection, options, epochs)
     output.mkdir(parents=True)
@@ -507,6 +507,7 @@ def main():
     parser.add_argument("--no-class-balance", dest="class_balance", action="store_false", default=None)
     parser.add_argument("--max-class-weight", dest="max_class_weight", type=float)
     parser.add_argument("--patience", type=int)
+    parser.add_argument("--min-epochs", dest="min_epochs", type=int)
     parser.add_argument("--min-dev-rows", dest="min_dev_rows", type=int)
     parser.add_argument("--min-dev-per-class", dest="min_dev_per_class", type=int)
     parser.add_argument("--proper-scoring-weight", dest="proper_scoring_weight", type=float)

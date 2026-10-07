@@ -171,7 +171,7 @@ def training_summary(train):
     selection = train.get('selection') or {}
     chosen = next((e for e in selection.get('dev_by_epoch', []) if e.get('epoch') == selection.get('chosen_epoch')), {})
     return {'max_epochs':selection.get('max_epochs'),'epochs_run':selection.get('epochs_run'),
-            'chosen_epoch':selection.get('chosen_epoch'),'patience':selection.get('patience'),
+            'chosen_epoch':selection.get('chosen_epoch'),'min_epochs':selection.get('min_epochs'),'patience':selection.get('patience'),
             'selected_on':selection.get('selected_on'),'selection_mode':selection.get('mode'),
             'selection_reason':selection.get('reason'),'dev_rows':selection.get('dev_rows'),
             'dev_per_class':selection.get('dev_per_class'),'dev_groups':selection.get('dev_groups'),

@@ -445,6 +445,7 @@ settings):
       "max_class_weight": 4.0,
       "max_epochs": 15,
       "patience": 3,
+      "min_epochs": 10,
       "min_dev_rows": 30,
       "min_dev_per_class": 10,
       "proper_scoring_weight": 0.1,
@@ -1154,11 +1155,15 @@ notebook's training step, scored with `laya.common.proper_reward`):
 - **Epochs and dev selection**: training carves a dev split from the
   training groups by the export's split rule, trains on the rest for up to
   `max_epochs` (default 15; `--epochs` overrides), scores dev after each
-  epoch, stops after `patience` epochs without improvement (default 3), and
-  keeps the best epoch's weights. Held-out groups are never used. A dev split
+  epoch, and never stops before `min_epochs` (default 10, clamped to
+  `max_epochs`; 0 means no floor). Only epochs at or after `min_epochs` can be
+  chosen: after the floor it stops once `patience` epochs (default 3) pass
+  without improvement, and the best dev epoch at or after `min_epochs` is
+  restored. Held-out groups are never used. A dev split
   with fewer than `min_dev_rows` rows (default 30), or fewer than
   `min_dev_per_class` rows (default 10) of any label of the questions dev
-  selects on, trains all `max_epochs` and keeps the final weights, recorded as
+  selects on, trains all `max_epochs` and keeps the final weights, whatever
+  `min_epochs` is, recorded as
   `selection.mode: "fixed"`, `reason: "dev too small"`; see
   [docs/learning.md](docs/learning.md#quality-and-automatic-training).
 - **Class balance** (`class_balance`, default on): per question schema, a

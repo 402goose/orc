@@ -76,7 +76,7 @@ class DevSplitTest(unittest.TestCase):
 
 
 class SelectionTest(unittest.TestCase):
-    def run_scripted(self, dev, held_out, patience=3, max_epochs=10, plan=None, guard=None):
+    def run_scripted(self, dev, held_out, patience=3, max_epochs=10, plan=None, guard=None, min_epochs=0, entropy=None):
         plan = plan or training_plan(exported(), "time")
         held_ids, seen_fit, seen_dev, weights = ids(plan["held_out"]), [], [], {"epoch": 0}
         restored = []
@@ -88,9 +88,11 @@ class SelectionTest(unittest.TestCase):
         def score(selected):
             seen_dev.append(ids(selected))
             return {"balanced_accuracy": dev[weights["epoch"] - 1], "accuracy": dev[weights["epoch"] - 1],
-                    "held_out_would_be": held_out[weights["epoch"] - 1]}
+                    "held_out_would_be": held_out[weights["epoch"] - 1],
+                    **({"cross_entropy": entropy[weights["epoch"] - 1]} if entropy else {})}
 
-        result = fit_epochs(plan, max_epochs, patience, run_epoch, score, lambda: dict(weights), restored.append, guard)
+        result = fit_epochs(plan, max_epochs, patience, run_epoch, score, lambda: dict(weights), restored.append, guard,
+                            min_epochs)
         self.assertTrue(all(not (s & held_ids) for s in seen_fit + seen_dev))
         self.assertTrue(all(s == ids(plan["fit"]) for s in seen_fit))
         self.assertTrue(all(s == ids(plan["dev"]) for s in seen_dev))
@@ -104,6 +106,43 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(restored, [{"epoch": 4}])
         self.assertEqual(result["selected_on"], "dev")
         self.assertEqual([e["epoch"] for e in result["dev_by_epoch"]], list(range(1, 8)))
+
+    def test_a_flat_warm_up_does_not_stop_before_min_epochs(self):
+        dev = [0.5] * 8 + [0.7] * 7
+        result, restored = self.run_scripted(dev, [0.5] * 15, max_epochs=15, min_epochs=10)
+        self.assertGreaterEqual(result["epochs_run"], 10)
+        self.assertGreaterEqual(result["chosen_epoch"], 10)
+        self.assertEqual((result["chosen_epoch"], result["epochs_run"], result["stopped_early"]), (10, 13, True))
+        self.assertEqual(restored, [{"epoch": 10}])
+
+    def test_without_a_floor_the_same_warm_up_stops_at_epoch_four(self):
+        dev = [0.5] * 8 + [0.7] * 7
+        result, restored = self.run_scripted(dev, [0.5] * 15, max_epochs=15, min_epochs=0)
+        self.assertEqual((result["chosen_epoch"], result["epochs_run"], result["stopped_early"]), (1, 4, True))
+        self.assertEqual(restored, [{"epoch": 1}])
+
+    def test_a_warm_up_epoch_that_wins_the_cross_entropy_tie_is_never_restored(self):
+        dev = [0.5] * 4 + [0.7] + [0.5] * 5 + [0.7] * 5
+        entropy = [0.9] * 4 + [0.2] + [0.8] * 5 + [0.6] * 5
+        unfloored, _ = self.run_scripted(dev, [0.5] * 15, patience=15, max_epochs=15, entropy=entropy)
+        self.assertEqual(unfloored["chosen_epoch"], 5)
+        patient, _ = self.run_scripted(dev, [0.5] * 15, patience=15, max_epochs=15, min_epochs=10, entropy=entropy)
+        self.assertEqual((patient["chosen_epoch"], patient["epochs_run"]), (11, 15))
+        result, restored = self.run_scripted(dev, [0.5] * 15, max_epochs=15, min_epochs=10, entropy=entropy)
+        self.assertNotEqual(result["chosen_epoch"], 5)
+        self.assertGreaterEqual(result["chosen_epoch"], 10)
+        self.assertEqual((result["chosen_epoch"], result["epochs_run"]), (11, 14))
+        self.assertEqual(restored, [{"epoch": 11}])
+
+    def test_a_floor_above_max_epochs_keeps_the_last_epoch(self):
+        result, restored = self.run_scripted([0.9, 0.8, 0.7, 0.6, 0.5, 0.4], [0.5] * 6, max_epochs=6, min_epochs=10)
+        self.assertEqual((result["chosen_epoch"], result["epochs_run"], result["stopped_early"], restored), (6, 6, False, []))
+
+    def test_a_fixed_selection_ignores_the_floor(self):
+        plan = dev_plan(5, 2)
+        result = fit_epochs(plan, 15, 3, lambda epoch, fit: None, lambda rows: {"balanced_accuracy": 0.6, "accuracy": 0.7},
+                            lambda: None, lambda saved: self.fail("restored"), guard_for(plan), 10)
+        self.assertEqual((result["chosen_epoch"], result["epochs_run"], result["selected_on"]), (15, 15, None))
 
     def test_the_last_epoch_needs_no_restore(self):
         result, restored = self.run_scripted([0.5 + 0.05 * n for n in range(10)], [0.5] * 10)
@@ -364,6 +403,53 @@ class TrainingConfigRecordTest(unittest.TestCase):
             with self.subTest(value), self.assertRaises(ValueError):
                 training_options(value)
         self.assertEqual(training_options({"proper_scoring_weight": 0.25, "max_epochs": 20})["proper_scoring_weight"], 0.25)
+
+    def test_min_epochs_defaults_to_ten_is_clamped_to_max_epochs_and_refuses_invalid_values(self):
+        self.assertEqual(config_for({})["training"]["min_epochs"], 10)
+        self.assertEqual(training_options({"min_epochs": 0})["min_epochs"], 0)
+        self.assertEqual(training_options({"min_epochs": 25})["min_epochs"], 15)
+        self.assertEqual(training_options({"max_epochs": 5, "min_epochs": 8})["min_epochs"], 5)
+        for value in (-1, 2.0, True, "10", None):
+            with self.subTest(value), self.assertRaises(ValueError):
+                training_options({"min_epochs": value})
+
+    def test_the_cli_and_runtime_carry_min_epochs(self):
+        from fusion_decision_cli import run
+        sent = []
+        for config in ({}, {"decisions": {"training": {"min_epochs": 4}}}, {"decisions": {"training": {"min_epochs": 0}}}):
+            values = dict(decision_command="train", dataset="data.jsonl", output="candidate", model_path="", device="cpu",
+                          epochs=None, learning_rate=0.0001, seed=7, kind=None, checkpoint=None)
+            with tempfile.TemporaryDirectory() as directory, \
+                    patch("fusion_decision_cli.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as execute:
+                self.assertEqual(run(argparse.Namespace(**values), Path(directory), config), 0)
+            argv = execute.call_args.args[0]
+            sent.append(argv[argv.index("--min-epochs") + 1])
+        self.assertEqual(sent, ["10", "4", "0"])
+        captured = {}
+        argv = ["fusion_laya.py", "train", "--dataset", "d", "--output", "o", "--min-epochs", "6"]
+        with patch.dict("os.environ"), patch.object(sys, "argv", argv), \
+                patch.object(fusion_laya, "train", side_effect=lambda args: captured.update(vars(args)) or {}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(fusion_laya.main(), 0)
+        self.assertEqual(captured["min_epochs"], 6)
+
+    def test_training_json_the_round_and_status_record_min_epochs(self):
+        import fusion_learn_cli
+        plan = training_plan(exported(), "time")
+        dev = [0.5] * 8 + [0.7] * 7
+        weights = {"epoch": 0}
+        selection = fit_epochs(plan, 15, 3, lambda epoch, fit: weights.update(epoch=epoch + 1),
+                               lambda rows: {"balanced_accuracy": dev[weights["epoch"] - 1], "accuracy": dev[weights["epoch"] - 1]},
+                               lambda: dict(weights), lambda saved: None, None, 10)
+        record = selection_record(plan, selection, training_options({}), 15)
+        self.assertEqual((record["min_epochs"], record["patience"], record["max_epochs"], record["chosen_epoch"]), (10, 3, 15, 10))
+        self.assertEqual(selection_record(plan, selection, training_options({}), 6)["min_epochs"], 6)
+        self.assertEqual(selection_record(plan, selection, training_options({"min_epochs": 0}), 15)["min_epochs"], 0)
+        summary = loop.training_summary({"selection": record})
+        self.assertEqual((summary["min_epochs"], summary["patience"], summary["chosen_epoch"]), (10, 3, 10))
+        shown = fusion_learn_cli.measured_round({"id": "r1", "proof": {"training": summary}})["training"]
+        self.assertEqual((shown["min_epochs"], shown["patience"]), (10, 3))
+        self.assertIsNone(loop.training_summary({})["min_epochs"])
 
     def argv(self, config, epochs=None):
         from fusion_decision_cli import run
