@@ -1032,8 +1032,9 @@ def claude_reader_tmpdir(env: dict[str, str]) -> str:
     """A fresh private temp directory path for one read-only Claude worker, set as CLAUDE_CODE_TMPDIR
     (Claude Code's own temp root; sandboxed Bash gets `<it>/claude-<uid>` as TMPDIR) and as TMPDIR,
     TMP and TEMP. The shared /tmp/claude-<uid> holds other sessions' scratchpads and worktrees, so a
-    reader must not write it. The path is only chosen here; dispatch creates it (0700) for the run
-    and removes it when the run ends."""
+    reader must not write it. The path is only chosen here; dispatch creates it (0700) for the run,
+    records itself as owner in the directory root (which the reader cannot write) and removes it
+    when the run ends; fusion_tmp's sweep removes it if the run never gets there."""
     directory = str(Path("/tmp").resolve() / f"orc-{uuid.uuid4().hex[:12]}")
     env.update(CLAUDE_CODE_TMPDIR=directory, TMPDIR=directory + "/", TMP=directory, TEMP=directory)
     return directory
@@ -2658,8 +2659,12 @@ def codex_reader_tmpdir(env: dict[str, str]) -> str:
     TMPDIR, TMP and TEMP. The shared per-user temp directory holds other runs'
     files and grading trees, and /tmp holds writer worktrees, so a reader must
     write neither. The path stays short for Chromium's sockets; the caller
-    removes it when the run ends."""
+    removes it when the run ends. A run that never gets there leaves the directory to
+    fusion_tmp's sweep, which each new directory runs first."""
+    import fusion_tmp
+    fusion_tmp.sweep_quietly()
     directory = tempfile.mkdtemp(prefix="orc-", dir=Path("/tmp").resolve())
+    fusion_tmp.mark(directory)
     env.update(TMPDIR=directory + "/", TMP=directory, TEMP=directory)
     return directory
 
@@ -3405,8 +3410,11 @@ def dispatch(
                 reader_cache_env(env, reader_tmp)
                 stack.callback(shutil.rmtree, reader_tmp, True)
             if metadata.get("reader_tmpdir"):
+                import fusion_tmp
+                fusion_tmp.sweep_quietly()
                 os.mkdir(metadata["reader_tmpdir"], 0o700)
                 stack.callback(shutil.rmtree, metadata["reader_tmpdir"], True)
+                fusion_tmp.mark(metadata["reader_tmpdir"])
             store.event(run_dir, "worker.started", {"argv": argv, "resumed_session": bool(session_id), **session})
             if metadata.get("execution_choice"):
                 metadata["execution_choice"]["dispatch"] = {"status": "attempted", "argv": argv}
@@ -4395,6 +4403,12 @@ def build_parser() -> argparse.ArgumentParser:
     for cmd in (control_pause, control_resume):
         cmd.add_argument("--scope", choices=("host", "workspace"), default="host",
                          help="host: ORC_HOME/control.json (default); workspace: $FUSION_CONTROL_WORKSPACE/.fusion/control.json")
+    tmp = sub.add_parser("tmp", help="per-run temp directories of sandboxed readers")
+    tmp_sub = tmp.add_subparsers(dest="tmp_command", required=True)
+    tmp_sweep = tmp_sub.add_parser("sweep", help="remove stale /tmp/orc-* directories whose run is gone")
+    tmp_sweep.add_argument("--dry-run", action="store_true", help="list what would be removed; remove nothing")
+    tmp_sweep.add_argument("--max-age-hours", type=float, default=24, help="only directories older than this (default 24)")
+    tmp_sweep.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     telemetry = sub.add_parser("telemetry", help="local and remote telemetry configuration")
     telemetry_sub = telemetry.add_subparsers(dest="telemetry_command", required=True)
     telemetry_sub.add_parser("status", help="show effective remote telemetry state and reasons sending is disabled")
@@ -4445,6 +4459,21 @@ def main(argv: list[str] | None = None) -> int:
 def _main(args, parser) -> int:
     workspace = workspace_path(args.workspace)
     control_workspace = RunStore(workspace).workspace
+    if args.command == "tmp":
+        import fusion_tmp
+        if args.max_age_hours < 0:
+            parser.error("--max-age-hours must be 0 or more")
+        payload = fusion_tmp.sweep(max_age_seconds=args.max_age_hours * 3600, dry_run=args.dry_run)
+        if args.json:
+            print(json_text(payload))
+        else:
+            verb = "would remove" if args.dry_run else "removed"
+            for path in payload["removed"]:
+                print(f"{verb} {path}")
+            for item in payload["errors"]:
+                print(f"error {item['path']}: {item['error']}")
+            print(f"{verb} {len(payload['removed'])}, kept {len(payload['kept'])}, errors {len(payload['errors'])} under {payload['root']}")
+        return 1 if payload["errors"] else 0
     if args.command == "usage":
         from fusion_usage import command as usage_command
         try:

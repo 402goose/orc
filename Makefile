@@ -29,8 +29,9 @@ build:
 # Unexpected skips and expected failures fail the suite. The only allowed skips
 # are the real macOS Codex sandbox probes when that runtime/profile is unavailable;
 # run_python.py checks their exact test IDs and reason, and reports them explicitly.
+# FUSION_TMP_SWEEP=0 keeps the suite from sweeping the host's real /tmp.
 test:
-	env -u FUSION_CONTROL_WORKSPACE PYTHONDONTWRITEBYTECODE=1 python3 test/run_python.py
+	env -u FUSION_CONTROL_WORKSPACE PYTHONDONTWRITEBYTECODE=1 FUSION_TMP_SWEEP=0 python3 test/run_python.py
 
 # Unit tests for the control room's pure logic (fusion_ui_assets/logic.js).
 # No browser, no server: the Playwright checks in test/*_browser.cjs stay the
