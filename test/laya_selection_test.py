@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fusion_laya
 import fusion_training_loop as loop
 from fusion_decisions import assign_splits, config_for, digest
-from fusion_laya_objective import (MAX_EPOCHS, TRAINING_DEFAULTS, dev_score, fit_epochs, log_softmax, policy_gradient,
+from fusion_laya_objective import (MAX_EPOCHS, TRAINING_DEFAULTS, dev_guard, dev_score, fit_epochs, log_softmax, policy_gradient,
                                    policy_scale, proper_reward, selection_key, selection_record, sigma, training_options,
                                    training_plan)
 
@@ -76,9 +76,8 @@ class DevSplitTest(unittest.TestCase):
 
 
 class SelectionTest(unittest.TestCase):
-    def run_scripted(self, dev, held_out, patience=3, max_epochs=10):
-        rows = exported()
-        plan = training_plan(rows, "time")
+    def run_scripted(self, dev, held_out, patience=3, max_epochs=10, plan=None, guard=None):
+        plan = plan or training_plan(exported(), "time")
         held_ids, seen_fit, seen_dev, weights = ids(plan["held_out"]), [], [], {"epoch": 0}
         restored = []
 
@@ -91,7 +90,7 @@ class SelectionTest(unittest.TestCase):
             return {"balanced_accuracy": dev[weights["epoch"] - 1], "accuracy": dev[weights["epoch"] - 1],
                     "held_out_would_be": held_out[weights["epoch"] - 1]}
 
-        result = fit_epochs(plan, max_epochs, patience, run_epoch, score, lambda: dict(weights), restored.append)
+        result = fit_epochs(plan, max_epochs, patience, run_epoch, score, lambda: dict(weights), restored.append, guard)
         self.assertTrue(all(not (s & held_ids) for s in seen_fit + seen_dev))
         self.assertTrue(all(s == ids(plan["fit"]) for s in seen_fit))
         self.assertTrue(all(s == ids(plan["dev"]) for s in seen_dev))
@@ -126,6 +125,89 @@ class SelectionTest(unittest.TestCase):
         self.assertGreater(selection_key({"balanced_accuracy": 0.9, "cross_entropy": 0.4}),
                            selection_key({"balanced_accuracy": 0.9, "cross_entropy": 0.5}))
         self.assertGreater(selection_key({"balanced_accuracy": None, "accuracy": 0.6}), selection_key({}))
+
+
+def dev_plan(true, false, question="plausible", kind="acceptance"):
+    rows = [{"id": f"dev-{n}", "group": f"dev-{n:03d}", "split": "train", "kind": kind,
+             "labels": {question: "true" if n < true else "false"}} for n in range(true + false)]
+    fit = [{"id": f"fit-{n}", "group": f"fit-{n:03d}", "split": "train", "kind": kind, "labels": {question: "true"}}
+           for n in range(40)]
+    return {"fit": fit, "dev": rows, "held_out": []}
+
+
+def answers(rows):
+    return [(f"{row['kind']}:{key}", label) for row in rows for key, label in row["labels"].items()]
+
+
+def guard_for(plan, options=None):
+    options = training_options(options or {})
+    return dev_guard(plan["dev"], answers(plan["dev"]), options["min_dev_rows"], options["min_dev_per_class"])
+
+
+class DevTooSmallTest(unittest.TestCase):
+    FLAT = [0.6] * 10
+    run_scripted = SelectionTest.run_scripted
+
+    def test_a_seven_row_dev_trains_every_epoch_and_keeps_the_last(self):
+        plan = dev_plan(5, 2)
+        guard = guard_for(plan)
+        self.assertEqual(guard, {"mode": "fixed", "reason": "dev too small", "dev_rows": 7,
+                                 "dev_per_class": {"acceptance:plausible": {"false": 2, "true": 5}},
+                                 "min_dev_rows": 30, "min_dev_per_class": 10})
+        early, restored = self.run_scripted(self.FLAT, self.FLAT, plan=plan)
+        self.assertEqual((early["epochs_run"], early["chosen_epoch"], restored), (4, 1, [{"epoch": 1}]))
+        result, restored = self.run_scripted(self.FLAT, self.FLAT, plan=plan, guard=guard)
+        self.assertEqual((result["epochs_run"], result["chosen_epoch"], result["stopped_early"], restored), (10, 10, False, []))
+        self.assertEqual((result["mode"], result["reason"], result["dev_rows"], result["selected_on"]),
+                         ("fixed", "dev too small", 7, None))
+        self.assertEqual([e["epoch"] for e in result["dev_by_epoch"]], list(range(1, 11)))
+
+    def test_a_large_balanced_dev_keeps_early_stopping(self):
+        plan = dev_plan(20, 10)
+        guard = guard_for(plan)
+        self.assertEqual((guard["mode"], guard["reason"], guard["dev_rows"]), ("early_stopping", None, 30))
+        dev = [0.5, 0.6, 0.7, 0.9, 0.8, 0.8, 0.85, 0.95, 0.95, 0.95]
+        result, restored = self.run_scripted(dev, dev, plan=plan, guard=guard)
+        self.assertEqual((result["chosen_epoch"], result["epochs_run"], result["stopped_early"], restored),
+                         (4, 7, True, [{"epoch": 4}]))
+        self.assertEqual((result["mode"], result["selected_on"]), ("early_stopping", "dev"))
+
+    def test_one_class_under_the_minimum_trains_fixed(self):
+        self.assertEqual(guard_for(dev_plan(81, 9))["mode"], "fixed")
+        self.assertEqual(guard_for(dev_plan(80, 10))["mode"], "early_stopping")
+        result, restored = self.run_scripted(self.FLAT, self.FLAT, plan=dev_plan(81, 9), guard=guard_for(dev_plan(81, 9)))
+        self.assertEqual((result["epochs_run"], result["chosen_epoch"], restored), (10, 10, []))
+
+    def test_per_class_counts_follow_the_questions_selection_uses(self):
+        plan = dev_plan(20, 20)
+        for n, row in enumerate(plan["dev"]):
+            row["labels"]["blocking"] = "false"
+            if n < 3:
+                row["labels"]["scope"] = "narrow" if n else "wide"
+        guard = guard_for(plan)
+        self.assertEqual(guard["dev_per_class"], {"acceptance:plausible": {"false": 20, "true": 20},
+                                                  "acceptance:scope": {"narrow": 2, "wide": 1}})
+        self.assertEqual(guard["mode"], "fixed")
+        for row in plan["dev"]:
+            row["labels"].pop("scope", None)
+        guard = guard_for(plan)
+        self.assertEqual((guard["mode"], list(guard["dev_per_class"])), ("early_stopping", ["acceptance:plausible"]))
+        constant = dev_plan(35, 0)
+        self.assertEqual(guard_for(constant)["dev_per_class"], {"acceptance:plausible": {"true": 35}})
+        self.assertEqual(guard_for(constant)["mode"], "early_stopping")
+
+    def test_the_thresholds_come_from_config(self):
+        plan = dev_plan(5, 2)
+        self.assertEqual(guard_for(plan, {"min_dev_rows": 7, "min_dev_per_class": 2})["mode"], "early_stopping")
+        self.assertEqual(guard_for(plan, {"min_dev_rows": 8, "min_dev_per_class": 2})["mode"], "fixed")
+        self.assertEqual(guard_for(plan, {"min_dev_rows": 7, "min_dev_per_class": 3})["mode"], "fixed")
+        self.assertEqual(guard_for(dev_plan(81, 9), {"min_dev_per_class": 9})["mode"], "early_stopping")
+        options = config_for({"decisions": {"training": {"min_dev_rows": 12, "min_dev_per_class": 4}}})["training"]
+        self.assertEqual((options["min_dev_rows"], options["min_dev_per_class"]), (12, 4))
+        self.assertEqual((TRAINING_DEFAULTS["min_dev_rows"], TRAINING_DEFAULTS["min_dev_per_class"]), (30, 10))
+        for value in ({"min_dev_rows": -1}, {"min_dev_rows": 2.0}, {"min_dev_per_class": True}, {"min_dev_per_class": "10"}):
+            with self.subTest(value), self.assertRaises(ValueError):
+                training_options(value)
 
 
 class ProperScoringTermTest(unittest.TestCase):
@@ -251,6 +333,17 @@ class LearnabilityTest(unittest.TestCase):
         self.assertEqual(selection["selected_on"], "dev")
         self.assertGreaterEqual(selection["dev_by_epoch"][selection["chosen_epoch"] - 1]["balanced_accuracy"], 0.85)
 
+    def test_the_tiny_set_trains_every_epoch_when_dev_is_too_small(self):
+        options = training_options({})
+        plan, head = training_plan(separable(), "time"), TinyHead()
+        guard = guard_for(plan)
+        selection = fit_epochs(plan, options["max_epochs"], options["patience"],
+                               lambda epoch, fit: head.epoch(epoch, options["max_epochs"], fit),
+                               head.score, head.snapshot, lambda saved: self.fail("restored"), guard)
+        self.assertEqual((guard["mode"], guard["dev_rows"]), ("fixed", 7))
+        self.assertEqual((selection["epochs_run"], selection["chosen_epoch"], selection["selected_on"]), (15, 15, None))
+        self.assertGreaterEqual(head.score(plan["fit"])["accuracy"], 0.95)
+
     def test_the_old_configuration_stalls_on_the_same_set(self):
         _, _, one_epoch = self.fit(TinyHead(normalized=True, weight=1.0), 1, 1)
         self.assertLess(one_epoch["accuracy"], 0.95)
@@ -281,6 +374,26 @@ class TrainingConfigRecordTest(unittest.TestCase):
             self.assertEqual(run(argparse.Namespace(**values), Path(directory), config), 0)
         argv = execute.call_args.args[0]
         return {flag: argv[argv.index(flag) + 1] for flag in ("--epochs", "--patience", "--proper-scoring-weight", "--split")}
+
+    def test_the_cli_and_runtime_carry_the_dev_size_thresholds(self):
+        from fusion_decision_cli import run
+        sent = []
+        for config in ({}, {"decisions": {"training": {"min_dev_rows": 12, "min_dev_per_class": 4}}}):
+            values = dict(decision_command="train", dataset="data.jsonl", output="candidate", model_path="", device="cpu",
+                          epochs=None, learning_rate=0.0001, seed=7, kind=None, checkpoint=None)
+            with tempfile.TemporaryDirectory() as directory, \
+                    patch("fusion_decision_cli.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as execute:
+                self.assertEqual(run(argparse.Namespace(**values), Path(directory), config), 0)
+            argv = execute.call_args.args[0]
+            sent.append((argv[argv.index("--min-dev-rows") + 1], argv[argv.index("--min-dev-per-class") + 1]))
+        self.assertEqual(sent, [("30", "10"), ("12", "4")])
+        captured = {}
+        argv = ["fusion_laya.py", "train", "--dataset", "d", "--output", "o", "--min-dev-rows", "12", "--min-dev-per-class", "4"]
+        with patch.dict("os.environ"), patch.object(sys, "argv", argv), \
+                patch.object(fusion_laya, "train", side_effect=lambda args: captured.update(vars(args)) or {}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(fusion_laya.main(), 0)
+        self.assertEqual((captured["min_dev_rows"], captured["min_dev_per_class"]), (12, 4))
 
     def test_the_cli_sends_max_epochs_patience_weight_and_split(self):
         self.assertEqual(self.argv({}), {"--epochs": "15", "--patience": "3", "--proper-scoring-weight": "0.1", "--split": "time"})
@@ -318,6 +431,22 @@ class TrainingConfigRecordTest(unittest.TestCase):
                          (4, 0.1, 4, "dev", 0.97, "soft_ce+proper_scoring"))
         self.assertAlmostEqual(summary["dev_balanced_accuracy"], 0.7)
         self.assertEqual(loop.training_summary({})["chosen_epoch"], None)
+
+    def test_training_json_and_the_round_record_a_fixed_selection(self):
+        plan = dev_plan(5, 2)
+        guard = guard_for(plan)
+        selection = fit_epochs(plan, 15, 3, lambda epoch, fit: None, lambda rows: {"balanced_accuracy": 0.6, "accuracy": 0.7},
+                               lambda: None, lambda saved: self.fail("restored"), guard)
+        record = selection_record(plan, selection, training_options({}), 15)
+        self.assertEqual((record["mode"], record["reason"], record["dev_rows"], record["dev_per_class"], record["chosen_epoch"]),
+                         ("fixed", "dev too small", 7, {"acceptance:plausible": {"false": 2, "true": 5}}, 15))
+        summary = loop.training_summary({"selection": record})
+        self.assertEqual((summary["selection_mode"], summary["selection_reason"], summary["dev_rows"], summary["dev_per_class"],
+                          summary["selected_on"], summary["chosen_epoch"], summary["dev_balanced_accuracy"]),
+                         ("fixed", "dev too small", 7, {"acceptance:plausible": {"false": 2, "true": 5}}, None, 15, 0.6))
+        import fusion_learn_cli
+        shown = fusion_learn_cli.measured_round({"id": "r1", "proof": {"training": summary}})["training"]
+        self.assertEqual((shown["selection_mode"], shown["selection_reason"], shown["dev_rows"]), ("fixed", "dev too small", 7))
 
 
 if __name__ == "__main__":

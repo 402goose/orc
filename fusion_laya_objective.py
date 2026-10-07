@@ -18,6 +18,8 @@ TRAINING_DEFAULTS = {
     "max_class_weight": 4.0,
     "max_epochs": 15,
     "patience": 3,
+    "min_dev_rows": 30,
+    "min_dev_per_class": 10,
     "proper_scoring_weight": 0.1,
 }
 MAX_EPOCHS = 20
@@ -56,6 +58,9 @@ def training_options(value):
     for key, top in (("max_epochs", MAX_EPOCHS), ("patience", MAX_EPOCHS)):
         if type(options[key]) is not int or not 1 <= options[key] <= top:
             raise ValueError(f"decisions.training.{key} must be an integer in [1, {top}]")
+    for key in ("min_dev_rows", "min_dev_per_class"):
+        if type(options[key]) is not int or options[key] < 0:
+            raise ValueError(f"decisions.training.{key} must be a nonnegative integer")
     if not _number(options["proper_scoring_weight"]) or not 0 < options["proper_scoring_weight"] <= 1:
         raise ValueError("decisions.training.proper_scoring_weight must be in (0, 1]; choose objective soft_ce to turn the term off")
     return options
@@ -223,15 +228,37 @@ def selection_key(score):
     return (-1.0 if metric is None else metric, -(score.get("cross_entropy") or 0.0))
 
 
-def fit_epochs(plan, max_epochs, patience, run_epoch, score, snapshot, restore):
+def dev_guard(rows, answers, min_rows, min_per_class):
+    """Whether the dev split is large enough to choose an epoch.
+
+    `answers` are the dev split's (question, label) pairs. Per-class counts
+    cover the questions dev_score selects on: those with more than one dev
+    label value, or every dev question when none varies. Fewer than
+    `min_rows` dev rows, or fewer than `min_per_class` rows of any of those
+    questions' labels, trains a fixed epoch count instead.
+    """
+    by_question = defaultdict(Counter)
+    for question, label in answers:
+        by_question[question][label] += 1
+    varied = {question: counts for question, counts in by_question.items() if len(counts) > 1}
+    per_class = {question: dict(sorted(counts.items())) for question, counts in sorted((varied or by_question).items())}
+    small = len(rows) < min_rows or any(n < min_per_class for counts in per_class.values() for n in counts.values())
+    return {"mode": "fixed" if small else "early_stopping", "reason": "dev too small" if small else None,
+            "dev_rows": len(rows), "dev_per_class": per_class, "min_dev_rows": min_rows, "min_dev_per_class": min_per_class}
+
+
+def fit_epochs(plan, max_epochs, patience, run_epoch, score, snapshot, restore, guard=None):
     """Train on plan["fit"] for up to max_epochs and keep the best epoch on plan["dev"].
 
     run_epoch(epoch, fit rows) takes one pass; score(dev rows) returns
     dev_score's fields (plus cross_entropy). After `patience` epochs without a
     better selection_key the loop stops, and the best epoch's weights
     (snapshot()) are restored. Held-out rows are never passed to either
-    callback. Without dev rows every epoch runs and the last one is kept.
+    callback. Without dev rows every epoch runs and the last one is kept; so
+    does a dev split that `guard` (dev_guard) marks fixed, which is still
+    scored each epoch for the record.
     """
+    fixed = guard is not None and guard["mode"] == "fixed"
     history, best, chosen, kept = [], None, 0, None
     for epoch in range(max_epochs):
         run_epoch(epoch, plan["fit"])
@@ -241,14 +268,16 @@ def fit_epochs(plan, max_epochs, patience, run_epoch, score, snapshot, restore):
             continue
         value = score(plan["dev"])
         history.append({"epoch": epoch + 1, **value})
-        if best is None or selection_key(value) > selection_key(best):
+        if fixed:
+            chosen = epoch + 1
+        elif best is None or selection_key(value) > selection_key(best):
             best, chosen, kept = value, epoch + 1, snapshot()
         elif epoch + 1 - chosen >= patience:
             break
     if kept is not None and chosen != len(history):
         restore(kept)
     return {"chosen_epoch": chosen, "epochs_run": len(history), "stopped_early": len(history) < max_epochs,
-            "selected_on": "dev" if plan["dev"] else None, "dev_by_epoch": history}
+            "selected_on": "dev" if plan["dev"] and not fixed else None, "dev_by_epoch": history, **(guard or {})}
 
 
 def selection_record(plan, selection, options, max_epochs):

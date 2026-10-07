@@ -172,7 +172,9 @@ def training_summary(train):
     chosen = next((e for e in selection.get('dev_by_epoch', []) if e.get('epoch') == selection.get('chosen_epoch')), {})
     return {'max_epochs':selection.get('max_epochs'),'epochs_run':selection.get('epochs_run'),
             'chosen_epoch':selection.get('chosen_epoch'),'patience':selection.get('patience'),
-            'selected_on':selection.get('selected_on'),'dev_groups':selection.get('dev_groups'),
+            'selected_on':selection.get('selected_on'),'selection_mode':selection.get('mode'),
+            'selection_reason':selection.get('reason'),'dev_rows':selection.get('dev_rows'),
+            'dev_per_class':selection.get('dev_per_class'),'dev_groups':selection.get('dev_groups'),
             'dev_group_count':selection.get('dev_group_count'),'dev_balanced_accuracy':chosen.get('balanced_accuracy'),
             'dev_accuracy':chosen.get('accuracy'),'train_accuracy':train.get('train_accuracy'),
             'proper_scoring_weight':selection.get('proper_scoring_weight'),
