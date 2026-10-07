@@ -48,11 +48,13 @@ class TrainingLoopTest(unittest.TestCase):
             save(root/'candidate/training.json',result);(root/'candidate/model.safetensors').write_bytes(b'wwww')
         elif action=='evaluate':
             rows=dataset_rows(body['dataset']);validation=[r for r in rows if r['split']=='validation']
-            candidate=bool(body.get('model_path'))
+            candidate=bool(body.get('model_path'));accuracy=.8 if candidate else .6
+            floor=dict(n=len(validation),accuracy=.5,balanced_accuracy=.5,candidate_accuracy=accuracy,margin=accuracy-.5)
             result=dict(path=str(root/'dataset.jsonl'),model_identities=['candidate' if candidate else 'source'],
-                        accuracy=.8 if candidate else .6,correct=8 if candidate else 6,control_accuracy=.5,majority_accuracy=.5,
+                        accuracy=accuracy,correct=8 if candidate else 6,control_accuracy=.5,majority_accuracy=.5,
                         validation_questions=len(validation),validation_groups=len({r['group'] for r in validation}),
-                        benchmark_hash=digest(validation),holdout={'status':'checked'},by_kind={})
+                        benchmark_hash=digest(validation),holdout={'status':'checked'},by_kind={},
+                        baselines=dict(majority=floor,control=floor),headline=dict(balanced_accuracy=accuracy,degenerate=False))
             root.mkdir(parents=True,exist_ok=True)
             (root/'dataset.jsonl').write_text(Path(body['dataset']).read_text())
         elif action=='calibrate': result={'buckets':{'a':{'qualified':False}}}
@@ -122,7 +124,7 @@ class TrainingLoopTest(unittest.TestCase):
         self.assertEqual(loop.proof(bad)['outcome'],'unmeasured')
         bad=copy.deepcopy(r);bad['results']['baseline']['model_identities']=['wrong-source']
         self.assertIsNone(loop.proof(bad)['delta'])
-        bad=copy.deepcopy(r);bad['results']['evaluate']['accuracy']=.4
+        bad=copy.deepcopy(r);bad['results']['evaluate'].update(accuracy=.4,headline=dict(balanced_accuracy=.4,degenerate=False))
         self.assertEqual(loop.proof(bad)['outcome'],'regression')
         self.assertTrue(any('control' in n for n in loop.proof(bad)['notes']))
         bad=copy.deepcopy(r);bad['results']['evaluate']['benchmark_hash']='another-benchmark'

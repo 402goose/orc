@@ -170,23 +170,26 @@ class BaselineTest(unittest.TestCase):
                             "baseline": base, "evaluate": candidate, "calibrate": calibration}}
 
     def test_proof_is_flat_unless_every_baseline_is_beaten_by_the_margin(self):
-        beaten = {"majority": {"n": 40, "accuracy": 0.5, "candidate_accuracy": 0.8, "margin": 0.3},
-                  "heuristic": {"n": 40, "accuracy": 0.79, "candidate_accuracy": 0.8, "margin": 0.01}}
-        proof = loop.proof(self.round(baselines=beaten, by_question={"acceptance:ok": {"n": 40, "groups": 12, "accuracy": 0.8,
-                                                                                         "baselines": beaten}}))
+        beaten = {"majority": {"n": 40, "accuracy": 0.5, "balanced_accuracy": 0.5, "candidate_accuracy": 0.8, "margin": 0.3},
+                  "heuristic": {"n": 40, "accuracy": 0.79, "candidate_accuracy": 0.8, "margin": 0.01},
+                  "control": {"n": 40, "accuracy": 0.5, "balanced_accuracy": 0.5, "candidate_accuracy": 0.8, "margin": 0.3}}
+        headline = {"balanced_accuracy": 0.8, "degenerate": False}
+        proof = loop.proof(self.round(baselines=beaten, headline=headline,
+                                      by_question={"acceptance:ok": {"n": 40, "groups": 12, "accuracy": 0.8, "baselines": beaten}}))
         self.assertEqual(proof["outcome"], "flat")
         self.assertTrue(any("deterministic-policy baseline" in note for note in proof["notes"]))
         line = loop.question_lines(proof["questions"])["acceptance:ok"]
         self.assertEqual((line["holdout_n"], line["candidate"], line["heuristic"]), (40, 0.8, 0.79))
         self.assertEqual(line["gate"], ["not qualified (n<30)"])
         beaten["heuristic"].update(accuracy=0.7, margin=0.1)
-        self.assertEqual(loop.proof(self.round(baselines=beaten))["outcome"], "gain")
-        self.assertEqual(loop.proof(self.round(baselines=beaten, accuracy=0.61))["outcome"], "flat")
-        self.assertEqual(loop.proof(self.round(baselines=beaten, accuracy=0.5))["outcome"], "regression")
+        self.assertEqual(loop.proof(self.round(baselines=beaten, headline=headline))["outcome"], "gain")
+        self.assertEqual(loop.proof(self.round(baselines=beaten))["outcome"], "flat")
+        self.assertEqual(loop.proof(self.round(baselines=beaten, headline=headline, accuracy=0.61))["outcome"], "flat")
+        self.assertEqual(loop.proof(self.round(baselines=beaten, headline=headline, accuracy=0.5))["outcome"], "regression")
         # An evaluation without per-question baselines still compares against majority and control.
         legacy = loop.proof(self.round(majority_accuracy=0.9, control_accuracy=0.5))
         self.assertEqual(legacy["outcome"], "flat")
-        self.assertIn("majority", legacy["baselines"])
+        self.assertIn("train_majority", legacy["baselines"])
 
 
 class GatingTest(unittest.TestCase):

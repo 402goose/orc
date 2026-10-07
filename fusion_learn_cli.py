@@ -75,6 +75,18 @@ def brief(job):
     return {k: job.get(k) for k in ("id", "action", "status", "decision_id", "started_at_ms")} if isinstance(job, dict) else None
 
 
+def measured_round(round):
+    import fusion_training_loop as training_loop
+    proof = round["proof"]
+    return {"id": round.get("id"), "outcome": proof.get("outcome"), "margin": proof.get("margin"),
+            **{k: proof.get(k) for k in ("balanced_accuracy", "auc", "degenerate", "degenerate_reason")},
+            "constant_questions": proof.get("constant_questions") or {},
+            "baselines": {name: {k: v.get(k) for k in ("n", "accuracy", "balanced_accuracy", "candidate_accuracy",
+                                                        "candidate_balanced_accuracy") if k in v}
+                          for name, v in (proof.get("baselines") or {}).items()},
+            "questions": training_loop.question_lines(proof.get("questions") or {})}
+
+
 def report(app, workspace, detail=False):
     """One workspace's loop state. Reads only; safe while jobs or a UI run."""
     import fusion_core as core
@@ -105,12 +117,7 @@ def report(app, workspace, detail=False):
     value["training"].update(approved_answers=t["approved_answers"], groups=t["groups"], completed_rounds=t["completed_rounds"])
     measured = next((r for r in t["rounds"] if r.get("proof")), None)
     if measured:
-        proof = measured["proof"]
-        value["training"]["measured_round"] = {
-            "id": measured.get("id"), "outcome": proof.get("outcome"), "margin": proof.get("margin"),
-            "baselines": {name: {k: v.get(k) for k in ("n", "accuracy", "candidate_accuracy")}
-                          for name, v in (proof.get("baselines") or {}).items()},
-            "questions": training_loop.question_lines(proof.get("questions") or {})}
+        value["training"]["measured_round"] = measured_round(measured)
     try:
         config, _ = core.load_config(workspace)
         summary = learning_summary(workspace, config, rows)

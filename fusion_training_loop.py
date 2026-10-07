@@ -25,7 +25,8 @@ ACTIONS = {"baseline": "evaluate", **{p:p for p in PHASES if p != "baseline"}}
 ACTIVE = {"queued", "running", "stopping"}
 DEFAULT_SPLIT = DECISION_DEFAULTS['split']
 # A candidate improves only if it beats the source checkpoint and every
-# applicable baseline on the held-out questions by more than this much accuracy.
+# applicable baseline on the held-out questions by more than this much accuracy,
+# and the held-out majority and control by more than this much balanced accuracy.
 IMPROVEMENT_MARGIN = 0.02
 WEIGHT_SUFFIXES = {'.safetensors', '.bin', '.pt', '.pth', '.ckpt', '.gguf'}
 
@@ -124,19 +125,38 @@ def proof(round):
         # An evaluation from before per-question baselines: compare on its whole-benchmark numbers.
         accuracy = comparison.get('accuracy')
         baselines = {name: {'n': n, 'accuracy': comparison[key], 'candidate_accuracy': accuracy, 'margin': accuracy - comparison[key]}
-                     for name, key in (('majority','majority_accuracy'),('control','control_accuracy'))
+                     for name, key in (('train_majority','majority_accuracy'),('control','control_accuracy'))
                      if accuracy is not None and comparison.get(key) is not None}
     missed = unbeaten(baselines, IMPROVEMENT_MARGIN)
-    labels = {'majority': 'training-majority baseline', 'heuristic': 'deterministic-policy baseline', 'control': 'shuffled-state control'}
+    labels = {'majority': 'held-out majority baseline', 'train_majority': 'training-majority baseline',
+              'heuristic': 'deterministic-policy baseline', 'control': 'shuffled-state control'}
     for name in missed:
         notes.append(f"The candidate did not beat the {labels.get(name, name)} by more than {IMPROVEMENT_MARGIN:g}.")
+    headline = comparison.get('headline') or {}
+    balanced, degenerate = headline.get('balanced_accuracy'), headline.get('degenerate') is True
+    if degenerate:
+        notes.append(f"The candidate is a constant predictor: {headline.get('degenerate_reason')}.")
+    if not headline:
+        notes.append('This evaluation predates balanced accuracy; re-evaluate the candidate to measure it.')
+    elif balanced is None:
+        notes.append('No held-out question has more than one label value; balanced accuracy is unmeasured.')
+    honest = balanced is not None and not degenerate
+    for name in ('majority', 'control'):
+        floor = (baselines.get(name) or {}).get('balanced_accuracy')
+        if balanced is not None and (floor is None or not balanced > floor + IMPROVEMENT_MARGIN):
+            honest = False
+            notes.append(f"Balanced accuracy {balanced:.3f} on the non-constant questions does not beat the {labels[name]} "
+                         f"({'unmeasured' if floor is None else format(floor, '.3f')}) by more than {IMPROVEMENT_MARGIN:g}.")
     if delta is None: outcome = 'unmeasured'
+    elif degenerate: outcome = 'degenerate'
     elif delta < -IMPROVEMENT_MARGIN: outcome = 'regression'
-    elif delta > IMPROVEMENT_MARGIN and not missed: outcome = 'gain'
+    elif delta > IMPROVEMENT_MARGIN and not missed and honest: outcome = 'gain'
     else: outcome = 'flat'
     notes.append('Benchmarks can change between rounds. Compare source and candidate within each round; repeated trials are not independent evidence.')
     calibration = results.get('calibrate',{})
     return {**comparison,'baselines':baselines,'delta':delta,'outcome':outcome,'margin':IMPROVEMENT_MARGIN,'notes':notes,
+            'balanced_accuracy':balanced,'auc':headline.get('auc'),'degenerate':degenerate,
+            'degenerate_reason':headline.get('degenerate_reason'),
             'questions':question_table(comparison, calibration),
             'qualified_buckets':sum(b.get('qualified') is True for b in calibration.get('buckets',{}).values()),
             'promoted':False}
@@ -152,7 +172,9 @@ def question_table(comparison, calibration):
     for name, value in (comparison.get('by_question') or {}).items():
         before = (comparison.get('baseline_by_question') or {}).get(name, {})
         table[name] = {'n': value.get('n'), 'groups': value.get('groups'), 'candidate': value.get('accuracy'),
-                       'source': before.get('accuracy'),
+                       'source': before.get('accuracy'), 'balanced': value.get('balanced_accuracy'), 'auc': value.get('auc'),
+                       'positive_rate': value.get('positive_rate'), 'constant': value.get('constant'),
+                       'degenerate': value.get('degenerate'),
                        **{b: v.get('accuracy') for b, v in (value.get('baselines') or {}).items()}, 'gates': []}
     for key, bucket in (calibration.get('buckets') or {}).items():
         kind, question = key.split(':', 1)[0], key.rsplit(':', 1)[-1]
@@ -179,7 +201,9 @@ def question_lines(table):
     lines = {}
     for name, row in sorted(table.items()):
         line = {'holdout_n': row.get('n'), 'holdout_groups': row.get('groups')}
-        line.update({key: score(row.get(key)) for key in ('candidate', 'source', 'majority', 'heuristic', 'control') if key in row})
+        line.update({key: score(row.get(key)) for key in ('candidate', 'source', 'majority', 'train_majority', 'heuristic', 'control',
+                                                          'balanced', 'auc', 'positive_rate') if key in row})
+        line.update({key: row[key] for key in ('constant', 'degenerate') if row.get(key) is not None})
         line['gate'] = [gate_line(g) for g in row.get('gates', [])] or ['not calibrated']
         lines[name] = line
     return lines

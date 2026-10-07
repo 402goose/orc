@@ -233,11 +233,16 @@ def evaluate(args):
                "cross_split_duplicates": len(quality['cross_split_duplicates'])}
     benchmark = [{k: r[k] for k in ('id', 'group', 'state', 'questions', 'labels')} for r in sorted(validation, key=lambda r: r['id'])]
     comparison = baseline_comparison(rows, predictions, controls)
-    baselines = comparison["baselines"]
+    baselines, headline = comparison["baselines"], comparison["headline"]
     report = {"path": str(output), "validation_questions": total, "accuracy": correct / total if total else None,
               "correct": correct, "by_kind": {k: {**v, "accuracy": v['correct'] / v['questions']} for k, v in by_kind.items()},
+              "balanced_accuracy": headline.get("balanced_accuracy"), "auc": headline.get("auc"),
+              "degenerate": headline["degenerate"], "degenerate_reason": headline["degenerate_reason"],
+              "headline": headline, "pooled": comparison["pooled"], "constant_questions": comparison["constant_questions"],
               "majority_accuracy": baselines.get("majority", {}).get("accuracy"),
+              "majority_balanced_accuracy": baselines.get("majority", {}).get("balanced_accuracy"),
               "majority_questions": baselines.get("majority", {}).get("n", 0),
+              "train_majority_accuracy": baselines.get("train_majority", {}).get("accuracy"),
               "heuristic_accuracy": baselines.get("heuristic", {}).get("accuracy"),
               "heuristic_questions": baselines.get("heuristic", {}).get("n", 0),
               "baselines": baselines, "by_question": comparison["by_question"],

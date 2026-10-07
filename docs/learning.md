@@ -232,7 +232,7 @@ evidence, edits at approval, answer revisions, missing classes, and label source
 Duplicate inputs and conflicting labels link back to the examples for correction
 or exclusion. **Measured results** pairs exact source/candidate model identities
 on identical held-out inputs and labels, with sample counts, results by decision
-type, a training-majority baseline, and shuffled-state control. Export and training
+type, a held-out majority baseline, and shuffled-state control. Export and training
 jobs save data-quality snapshots. New candidates record their local training
 ancestry; evaluation flags overlapping inputs or groups and withholds improvement
 claims for known leakage. Older candidates without this metadata show an unknown
@@ -251,6 +251,24 @@ charts. Loss measures training fit; held-out trials measure improvement. Regress
 and flat results stay visible. A changed benchmark gets its own comparison instead of
 a misleading trend line. Receipts show sample counts, shuffled-state and majority
 controls, exact model identities, dataset cleanup, and links to every job.
+
+A round is judged on balanced accuracy, not raw accuracy. Each evaluation reports,
+per question and pooled, accuracy, balanced accuracy, AUC from the predicted
+probabilities, and the share of `true` predictions. The majority baseline always
+answers the held-out majority label (balanced accuracy 0.5 on a true/false
+question); the training-set majority is kept as `train_majority`. On balanced accuracy
+the majority baseline is always 0.5, so "beats the majority" means "discriminates at
+all": a model that answers the same thing for every input never clears it. A question with
+one label value on the held-out set (such as `failed_task` when every held-out
+answer is `false`) is listed in `constant_questions` and left out of the headline,
+since every predictor gets it free. A candidate that predicts the same label for at
+least 99% of a question's held-out answers, or identical probabilities for all of
+them, is `degenerate`. A round is a **gain** only when it beats the source and every
+baseline by more than 0.02 accuracy, beats the held-out majority's and the
+shuffled-state control's balanced accuracy by more than 0.02, and is not degenerate;
+a degenerate candidate's round is labelled **degenerate**, and otherwise **flat** or
+**regression**. `fusion learn status` shows the measured round's balanced accuracy,
+AUC and `degenerate`; see [Baselines per question](../FUSION_DECISIONS.md#evaluation-and-gating).
 
 Automatic rounds keep one copy of identical inputs, preferring an existing held-out
 copy, and withhold conflicting inputs. Original labels and exports stay intact.
