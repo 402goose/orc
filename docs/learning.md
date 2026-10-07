@@ -270,6 +270,34 @@ a degenerate candidate's round is labelled **degenerate**, and otherwise **flat*
 **regression**. `fusion learn status` shows the measured round's balanced accuracy,
 AUC and `degenerate`; see [Baselines per question](../FUSION_DECISIONS.md#evaluation-and-gating).
 
+**Epochs and the dev split.** The export splits workflow groups into training and
+held-out (`decisions.split`: `time` holds out the newest ~20% of groups, at least two
+on each side; `group-hash` assigns by a hash of the group name). Training then carves
+a **dev** split out of the training groups only, by the same group-level rule: with
+`time`, the newest ~20% of the training groups (at least one; none when there is only
+one training group); with `group-hash`, the same count in the order of a dev-salted hash.
+Fit and dev never share a group, and no held-out row is used to train or to choose
+anything; the held-out set is first read by the round's evaluation. A candidate trains
+for at most `decisions.training.max_epochs` (default 15, at most 20). After each epoch
+it is scored on dev, by balanced accuracy over the dev questions with more than one
+label value (accuracy when none varies; lower dev cross-entropy breaks ties). After
+`decisions.training.patience` epochs without a better dev score (default 3) training
+stops, and the best epoch's weights are saved. With no dev groups every epoch runs.
+`training.json` records `chosen_epoch`, the epochs run, the dev score by epoch, the
+dev group ids (hashed) and count, train accuracy on the fit rows, and
+`proper_scoring_weight`. Each round's proof repeats these under `training`, and
+`fusion learn status` shows them for the measured round.
+
+**The proper-scoring term** (`objective: "soft_ce+proper_scoring"`) has a fixed weight,
+`decisions.training.proper_scoring_weight` (default 0.1, in (0, 1]). Set `objective:
+"soft_ce"` to train without it. The term's advantage is each noisy sample's reward
+minus the group mean. It is no longer divided by its own standard deviation: that
+made the term's gradient about 1/σ regardless of how well the head already fit, so on
+32 balanced rows training oscillated at 87.5% train accuracy while soft cross-entropy
+alone reached 96.9%. Without that division, the 1/σ² in the Gaussian log-likelihood
+gives an estimate of the reward gradient whose size does not grow as the noise
+shrinks. σ is also floored at 0.1 (the schedule's end), so the scale is bounded.
+
 Automatic rounds keep one copy of identical inputs, preferring an existing held-out
 copy, and withhold conflicting inputs. Original labels and exports stay intact.
 At least two training and two held-out workflow groups must remain after cleanup.

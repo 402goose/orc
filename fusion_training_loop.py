@@ -159,7 +159,24 @@ def proof(round):
             'degenerate_reason':headline.get('degenerate_reason'),
             'questions':question_table(comparison, calibration),
             'qualified_buckets':sum(b.get('qualified') is True for b in calibration.get('buckets',{}).values()),
-            'promoted':False}
+            'training':training_summary(results['train']),'promoted':False}
+
+
+def training_summary(train):
+    """How the candidate was fit: epochs, the dev split that chose the epoch, and the policy-term weight.
+
+    Dev groups come from the training split only, so they say nothing about the
+    held-out benchmark; a candidate trained before dev selection has None here.
+    """
+    selection = train.get('selection') or {}
+    chosen = next((e for e in selection.get('dev_by_epoch', []) if e.get('epoch') == selection.get('chosen_epoch')), {})
+    return {'max_epochs':selection.get('max_epochs'),'epochs_run':selection.get('epochs_run'),
+            'chosen_epoch':selection.get('chosen_epoch'),'patience':selection.get('patience'),
+            'selected_on':selection.get('selected_on'),'dev_groups':selection.get('dev_groups'),
+            'dev_group_count':selection.get('dev_group_count'),'dev_balanced_accuracy':chosen.get('balanced_accuracy'),
+            'dev_accuracy':chosen.get('accuracy'),'train_accuracy':train.get('train_accuracy'),
+            'proper_scoring_weight':selection.get('proper_scoring_weight'),
+            'objective':(train.get('objective') or {}).get('objective') if isinstance(train.get('objective'), dict) else None}
 
 
 def question_table(comparison, calibration):
