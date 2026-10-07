@@ -31,6 +31,7 @@ DEFAULTS = {
     "risk": {"alpha": 0.05, "delta": 0.1, "min_examples": 30, "min_groups": 20},
 }
 SPLITS = {"time", "group-hash"}
+KEEP_CANDIDATES = 2
 # Share of workflow groups held out, and the fewest groups kept on each side.
 VALIDATION_FRACTION = 0.2
 MIN_SPLIT_GROUPS = 2
@@ -391,7 +392,14 @@ def config_for(config):
                          f"({', '.join(CHECKPOINTS)}) or a checkpoint directory")
     from fusion_laya_objective import training_options
     options["checkpoints"] = {kind: value.strip() for kind, value in checkpoints.items()}
-    options["training"] = training_options(options.get("training"))
+    training = options.get("training")
+    keep = training.get("keep_candidates", KEEP_CANDIDATES) if isinstance(training, dict) else KEEP_CANDIDATES
+    if type(keep) is not int or keep < 0:
+        raise ValueError("decisions.training.keep_candidates must be a nonnegative integer")
+    if isinstance(training, dict):
+        training = {key: value for key, value in training.items() if key != "keep_candidates"}
+    options["training"] = training_options(training)
+    options["keep_candidates"] = keep
     return options
 
 

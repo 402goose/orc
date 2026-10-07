@@ -6,11 +6,13 @@ model identities. New evidence, not a timer alone, triggers another round.
 from __future__ import annotations
 from collections import defaultdict
 import json
+import os
 from pathlib import Path
+import stat
 import uuid
 
 import fusion_core as core
-from fusion_decisions import DEFAULTS as DECISION_DEFAULTS, LABELABLE_STATUSES, DecisionEngine, digest, exceeds_token_budget, labeled_splits
+from fusion_decisions import DEFAULTS as DECISION_DEFAULTS, CHECKPOINTS, LABELABLE_STATUSES, DecisionEngine, digest, exceeds_token_budget, labeled_splits
 from fusion_garden import locked
 from fusion_learning import decision_rows, read_object
 from fusion_publish import save
@@ -24,6 +26,7 @@ DEFAULT_SPLIT = DECISION_DEFAULTS['split']
 # A candidate improves only if it beats the source checkpoint and every
 # applicable baseline on the held-out questions by more than this much accuracy.
 IMPROVEMENT_MARGIN = 0.02
+WEIGHT_SUFFIXES = {'.safetensors', '.bin', '.pt', '.pth', '.ckpt', '.gguf'}
 
 
 def root(workspace):
@@ -295,6 +298,12 @@ def tick(app, workspace):
                 index=PHASES.index(phase)+1
                 if index==len(PHASES):
                     round.update(status='complete',phase='complete',finished_at_ms=core.now_ms(),proof=proof(round))
+                    save(path,round)
+                    try:
+                        retained=prune(workspace)
+                    except Exception as exc:
+                        retained={'status':'error','reason':str(exc)}
+                    round['retention']={k:retained[k] for k in ('status','reason','removed_bytes','retained_bytes') if k in retained}
                     save(path,round); return
                 round['phase']=phase=PHASES[index]
                 round.pop('dispatch_key',None)
@@ -315,3 +324,127 @@ def tick(app, workspace):
         except Exception as exc:
             round.update(status='needs_attention',error=str(exc))
         save(path,round)
+
+
+def weight_files(candidate):
+    """(path, bytes) of each regular weight file under a candidate, outside tokenizer/.
+
+    Symlinks are never followed or listed, and a candidate that is itself a
+    symlink has none.
+    """
+    candidate = Path(candidate)
+    if candidate.is_symlink() or not candidate.is_dir():
+        return []
+    found = []
+    for directory, folders, names in os.walk(candidate):
+        if Path(directory) == candidate:
+            folders[:] = [name for name in folders if name != 'tokenizer']
+        for name in sorted(names):
+            path = Path(directory) / name
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode) and path.suffix in WEIGHT_SUFFIXES:
+                found.append((path, info.st_size))
+    return found
+
+
+def job_dirs(workspace):
+    jobs = Path(workspace) / '.fusion/ui/jobs'
+    if not jobs.is_dir():
+        return []
+    return sorted(d for d in jobs.iterdir() if d.is_dir() and not d.is_symlink())
+
+
+def candidate_bytes(workspace):
+    """Bytes of candidate weights still on disk across this workspace's training jobs."""
+    try:
+        return sum(size for d in job_dirs(workspace) for _, size in weight_files(d / 'candidate'))
+    except OSError:
+        return None
+
+
+def strict_object(path):
+    value = json.loads(Path(path).read_text())
+    if not isinstance(value, dict):
+        raise ValueError(f'{path} is not a JSON object')
+    return value
+
+
+def job_model(workspace, request):
+    """The resolved --model-path a train or evaluate job ran on, or None."""
+    value = (request.get('learning') or {}).get('model_path') or ''
+    argv = request.get('argv') or []
+    if not value and '--model-path' in argv[:-1]:
+        value = argv[argv.index('--model-path') + 1]
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else Path(workspace) / '.fusion' / path).resolve()
+
+
+def prune(workspace, dry_run=False):
+    """Remove candidate weights that no round, job or configuration still needs.
+
+    A candidate's weight files are removed only when an evaluation of it
+    succeeded, its round (if any) is complete, it is not among the newest
+    decisions.training.keep_candidates successful training jobs, it is not
+    promoted, and no configured checkpoint, unfinished round or active job
+    refers to it. training.json, configs, tokenizer/ and logs stay. When the
+    configuration, a round receipt or a job record cannot be read, nothing is
+    removed.
+    """
+    workspace = Path(workspace)
+    try:
+        config, _ = core.load_config(workspace)
+        options = DecisionEngine(workspace, config).options
+        keep = options['keep_candidates']
+        protected = {Path(v).resolve() for v in [options['model_path'], *options['checkpoints'].values()] if v and v not in CHECKPOINTS}
+        history = [strict_object(p) for p in (root(workspace) / 'rounds').glob('*/round.json')]
+        jobs = [(d, strict_object(d / 'job.json')) for d in job_dirs(workspace)]
+        held, evaluated = set(), set()
+        for r in history:
+            train = (r.get('jobs') or {}).get('train')
+            if r.get('status') != 'complete' or (r.get('proof') or {}).get('promoted') is True:
+                held.add(train)
+            if r.get('status') != 'complete' and r.get('source_path'):
+                protected.add(Path(r['source_path']).expanduser().resolve())
+        for directory, job in jobs:
+            if job.get('status') in ACTIVE:
+                held.add(directory.name)
+                model = job_model(workspace, strict_object(directory / 'request.json'))
+                if model:
+                    protected.add(model)
+            elif job.get('action') == 'evaluate' and job.get('status') == 'success':
+                model = job_model(workspace, read_object(directory / 'request.json'))
+                if model:
+                    evaluated.add(model)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, SystemExit) as exc:
+        return {'status': 'kept', 'reason': f'Promotion state is unreadable, so every candidate is kept: {exc}',
+                'removed': [], 'removed_bytes': 0, 'retained_bytes': candidate_bytes(workspace)}
+    trained = [d for d, job in sorted(jobs, key=lambda j: j[1].get('started_at_ms') or 0, reverse=True)
+               if job.get('action') == 'train' and job.get('status') == 'success']
+    held.update(d.name for d in trained[:keep])
+    removed, errors = [], []
+    for directory in trained:
+        candidate = directory / 'candidate'
+        if directory.name in held or candidate.is_symlink() or not candidate.is_dir():
+            continue
+        path = candidate.resolve()
+        if path not in evaluated or any(path == p or path.is_relative_to(p) or p.is_relative_to(path) for p in protected):
+            continue
+        try:
+            if strict_object(candidate / 'training.json').get('promoted') is not False:
+                continue
+        except (OSError, ValueError):
+            continue
+        for file, size in weight_files(candidate):
+            try:
+                if not dry_run:
+                    file.unlink()
+                removed.append({'path': str(file), 'bytes': size})
+            except OSError as exc:
+                errors.append(f'{file}: {exc}')
+    return {'status': 'dry_run' if dry_run else 'pruned', 'keep_candidates': keep, 'removed': removed,
+            'removed_bytes': sum(r['bytes'] for r in removed), 'retained_bytes': candidate_bytes(workspace), 'errors': errors}

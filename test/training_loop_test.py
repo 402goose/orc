@@ -44,8 +44,8 @@ class TrainingLoopTest(unittest.TestCase):
         if action=='export': result=self.store.export(root/'dataset.jsonl')
         elif action=='train':
             result=dict(path=str(root/'candidate'),source_identity='source',model_identity='candidate',steps=12,
-                        method='fixture decision head',train_groups=10,loss_curve=[dict(step=1,loss=.8),dict(step=12,loss=.3)])
-            save(root/'candidate/training.json',result)
+                        method='fixture decision head',train_groups=10,loss_curve=[dict(step=1,loss=.8),dict(step=12,loss=.3)],promoted=False)
+            save(root/'candidate/training.json',result);(root/'candidate/model.safetensors').write_bytes(b'wwww')
         elif action=='evaluate':
             rows=dataset_rows(body['dataset']);validation=[r for r in rows if r['split']=='validation']
             candidate=bool(body.get('model_path'))
@@ -82,6 +82,19 @@ class TrainingLoopTest(unittest.TestCase):
         self.finish();self.assertEqual(len(self.calls),5)
         self.seed(10,40);self.finish();self.assertEqual(len(self.calls),10)
         self.assertEqual(loop.status(self.app,self.w)['completed_rounds'],2)
+
+    def test_a_completed_round_removes_older_evaluated_candidate_weights(self):
+        config=json.loads((self.w/'.fusion.json').read_text())
+        config['decisions']={**config['decisions'],'training':{'keep_candidates':1}}
+        save(self.w/'.fusion.json',config)
+        self.enable();first=self.finish()
+        weights=self.w/'.fusion/ui/jobs'/first['jobs']['train']/'candidate/model.safetensors'
+        self.assertTrue(weights.is_file());self.assertEqual(first['retention']['removed_bytes'],0)
+        self.seed(10,40);second=self.finish()
+        self.assertEqual(second['status'],'complete',second)
+        self.assertFalse(weights.exists());self.assertTrue(weights.with_name('training.json').is_file())
+        self.assertEqual((second['retention']['removed_bytes'],second['retention']['retained_bytes']),(4,4))
+        self.assertTrue((self.w/'.fusion/ui/jobs'/second['jobs']['train']/'candidate/model.safetensors').is_file())
 
     def test_pause_and_restart_preserve_next_step_and_failed_job_requires_retry(self):
         self.enable();loop.tick(self.app,self.w)
