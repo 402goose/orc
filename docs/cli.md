@@ -38,6 +38,8 @@ after its name. Aliases and hidden subcommands are included below.
 - [fusion control status](#fusion-control-status)
 - [fusion control pause](#fusion-control-pause)
 - [fusion control resume](#fusion-control-resume)
+- [fusion tmp](#fusion-tmp)
+- [fusion tmp sweep](#fusion-tmp-sweep)
 - [fusion telemetry](#fusion-telemetry)
 - [fusion telemetry status](#fusion-telemetry-status)
 - [fusion telemetry on](#fusion-telemetry-on)
@@ -81,12 +83,12 @@ after its name. Aliases and hidden subcommands are included below.
 ```text
 usage: fusion [-h] [--workspace WORKSPACE] [--control-workspace CONTROL_WORKSPACE]
               [--json] [--progress | --quiet]
-              {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,telemetry,decisions,learn,gym,quota,mcp-serve} ...
+              {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,learn,gym,quota,mcp-serve} ...
 
 Lead/sidekick orchestration for Claude Code, Codex CLI, and Antigravity CLI
 
 positional arguments:
-  {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,telemetry,decisions,learn,gym,quota,mcp-serve}
+  {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,learn,gym,quota,mcp-serve}
     truffle               scout tractable GitHub issues and queue isolated fixes
     ui                    open the local ORC/Fusion control room in your browser
     lead                  launch an interactive lead agent with the Fusion MCP server
@@ -106,6 +108,7 @@ positional arguments:
     usage                 show local ORC, Claude and Codex usage and quota
     control               operator pause: stop new worker runs from every caller (quota
                           probes still run)
+    tmp                   per-run temp directories of sandboxed readers
     telemetry             local and remote telemetry configuration
     decisions             local Laya setup, decisions and reviewed learning
     learn                 advance and inspect Laya's learning loop without the control
@@ -715,6 +718,36 @@ options:
   --scope {host,workspace}
                           host: ORC_HOME/control.json (default); workspace:
                           $FUSION_CONTROL_WORKSPACE/.fusion/control.json
+```
+
+## fusion tmp
+
+per-run temp directories of sandboxed readers
+
+```text
+usage: fusion tmp [-h] {sweep} ...
+
+positional arguments:
+  {sweep}
+    sweep     remove stale /tmp/orc-* directories whose run is gone
+
+options:
+  -h, --help  show this help message and exit
+```
+
+## fusion tmp sweep
+
+remove stale /tmp/orc-* directories whose run is gone
+
+```text
+usage: fusion tmp sweep [-h] [--dry-run] [--max-age-hours MAX_AGE_HOURS] [--json]
+
+options:
+  -h, --help              show this help message and exit
+  --dry-run               list what would be removed; remove nothing
+  --max-age-hours MAX_AGE_HOURS
+                          only directories older than this (default 24)
+  --json
 ```
 
 ## fusion telemetry
