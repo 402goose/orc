@@ -284,6 +284,18 @@ label value (accuracy when none varies; lower dev cross-entropy breaks ties). Af
 `decisions.training.patience` epochs without a better dev score (default 3) training
 stops, and the best epoch's weights are saved. With no dev groups every epoch runs.
 
+**A floor under early stopping.** On real rows the head starts confidently wrong: dev
+accuracy stays flat for the first ~6–8 epochs while cross-entropy falls, then climbs
+from epoch 7–9. With patience 3, early stopping could fire inside that warm-up even on a
+normal-size dev split; one check stopped at epoch 4. `decisions.training.min_epochs`
+(default 10, an integer ≥ 0, clamped to `max_epochs`; 0 means no floor) keeps training
+going: only epochs at or after `min_epochs` can be chosen, so training never stops
+before the floor and patience counts only epochs after it. The best dev epoch at or
+after `min_epochs` is restored. A warm-up epoch is never restored, even one that ties
+a later epoch on dev balanced accuracy and wins the dev cross-entropy tie-break, since
+that would ship the undertrained head. A fixed selection (below) already runs every
+epoch and ignores the floor.
+
 **A dev split too small to choose an epoch.** When dev has fewer than
 `decisions.training.min_dev_rows` rows (default 30), or fewer than
 `decisions.training.min_dev_per_class` rows (default 10) of any label of the questions
@@ -300,10 +312,10 @@ threshold to 0 to turn its check off. `training.json` records the decision under
 thresholds; a fixed selection has `selected_on: null` and `chosen_epoch` equal to
 `max_epochs`.
 
-`training.json` records `chosen_epoch`, the epochs run, the dev score by epoch, the
-dev group ids (hashed) and count, train accuracy on the fit rows, and
-`proper_scoring_weight`. Each round's proof repeats these under `training`, with
-`selection_mode`, `selection_reason`, `dev_rows` and `dev_per_class`, and
+`training.json` records `chosen_epoch`, `min_epochs` (after clamping), `patience`, the
+epochs run, the dev score by epoch, the dev group ids (hashed) and count, train accuracy
+on the fit rows, and `proper_scoring_weight`. Each round's proof repeats these under
+`training`, with `selection_mode`, `selection_reason`, `dev_rows` and `dev_per_class`, and
 `fusion learn status` shows them for the measured round.
 
 **The proper-scoring term** (`objective: "soft_ce+proper_scoring"`) has a fixed weight,
