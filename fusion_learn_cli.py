@@ -9,6 +9,7 @@ the same step twice.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,10 @@ def add_parser(sub):
 
     scope(commands.add_parser("tick", help="advance label drafting and training rounds by one step, then exit"))
     scope(commands.add_parser("status", help="read-only summary: is the loop enabled, and is Laya improving?"))
+    prune = commands.add_parser("prune", help="remove evaluated candidate weights that are not promoted, configured or among the newest kept")
+    prune.add_argument("--dry-run", action="store_true", help="list what would be removed; remove nothing")
+    prune.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    scope(prune)
     schedule = commands.add_parser("schedule", help="run `learn tick` periodically (launchd on macOS, a crontab line elsewhere)")
     schedule.add_argument("action", choices=["install", "uninstall", "status"])
     schedule.add_argument("--interval", type=int, default=300, help="seconds between ticks (default 300, minimum 60)")
@@ -89,6 +94,7 @@ def report(app, workspace, detail=False):
     value["training"] = {"enabled": t["enabled"], "min_new_answers": t["min_new_answers"], "state": t["state"],
                          "reason": t["reason"], "new_answers": t["new_answers"],
                          "active_job": (t["active_job"] or {}).get("id"),
+                         "candidate_bytes": training_loop.candidate_bytes(workspace),
                          "last_round": {k: last.get(k) for k in ("id", "number", "status", "phase", "started_at_ms",
                                                                   "finished_at_ms", "error")} if last else None}
     if last.get("proof"):
@@ -143,6 +149,32 @@ def tick(app, workspaces):
             value["error"] = app.garden_errors[str(workspace)]
         results.append(value)
     return results
+
+
+def prune(workspaces, dry_run=False, as_json=False, out=None):
+    import fusion_garden as garden
+    import fusion_training_loop as training_loop
+    out = out or sys.stdout
+    results = []
+    for workspace in workspaces:
+        with garden.locked(workspace, "training-loop"):
+            results.append({"workspace": str(workspace), **training_loop.prune(workspace, dry_run)})
+    code = 1 if any(v["status"] == "kept" or v.get("errors") for v in results) else 0
+    if as_json:
+        print(json.dumps(results, ensure_ascii=False, indent=2, sort_keys=True), file=out)
+        return code
+    verb = "would remove" if dry_run else "removed"
+    for value in results:
+        if value["status"] == "kept":
+            print(f"{value['workspace']}: {value['reason']}", file=out)
+            continue
+        for item in value["removed"]:
+            print(f"{verb} {item['path']} ({item['bytes']} bytes)", file=out)
+        for error in value["errors"]:
+            print(f"could not remove {error}", file=out)
+        print(f"{value['workspace']}: {verb} {value['removed_bytes']} bytes; "
+              f"{value['retained_bytes']} bytes of candidate weights remain", file=out)
+    return code
 
 
 def launchctl(*argv):
@@ -259,6 +291,8 @@ def run(args, workspace, out=None):
         rotate_learn_log(log)
     app = room(workspace)
     selected = targets(app, args, workspace)
+    if command == "prune":
+        return prune(selected, args.dry_run, getattr(args, "json", False), out)
     if command == "tick":
         results = tick(app, selected)
         for value in results:

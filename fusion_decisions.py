@@ -31,6 +31,7 @@ DEFAULTS = {
     "risk": {"alpha": 0.05, "delta": 0.1, "min_examples": 30, "min_groups": 20},
 }
 SPLITS = {"time", "group-hash"}
+KEEP_CANDIDATES = 2
 # Share of workflow groups held out, and the fewest groups kept on each side.
 VALIDATION_FRACTION = 0.2
 MIN_SPLIT_GROUPS = 2
@@ -391,7 +392,14 @@ def config_for(config):
                          f"({', '.join(CHECKPOINTS)}) or a checkpoint directory")
     from fusion_laya_objective import training_options
     options["checkpoints"] = {kind: value.strip() for kind, value in checkpoints.items()}
-    options["training"] = training_options(options.get("training"))
+    training = options.get("training")
+    keep = training.get("keep_candidates", KEEP_CANDIDATES) if isinstance(training, dict) else KEEP_CANDIDATES
+    if type(keep) is not int or keep < 0:
+        raise ValueError("decisions.training.keep_candidates must be a nonnegative integer")
+    if isinstance(training, dict):
+        training = {key: value for key, value in training.items() if key != "keep_candidates"}
+    options["training"] = training_options(training)
+    options["keep_candidates"] = keep
     return options
 
 
@@ -905,14 +913,21 @@ def calibration_bucket(report, record, question):
     return buckets.get(f"{prefix}:{question}", {})
 
 
+def model_dir(workspace, value, base=""):
+    """A checkpoint directory as ORC loads it: an absolute path as given, else
+    relative to the workspace. `.fusion.json` paths use base ""; a learning
+    job's requested model_path uses base ".fusion" (fusion_ui.model_path_for)."""
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else Path(workspace).resolve() / base / path).resolve()
+
+
 class DecisionEngine:
     def __init__(self, workspace, config, backend=None):
         self.workspace = Path(workspace)
         self.options = config_for(config)
         if self.options["model_path"]:
-            path = Path(self.options["model_path"]).expanduser()
-            self.options["model_path"] = str((self.workspace / path).resolve())
-        self.options["checkpoints"] = {kind: value if value in CHECKPOINTS else str((self.workspace / Path(value).expanduser()).resolve())
+            self.options["model_path"] = str(model_dir(self.workspace, self.options["model_path"]))
+        self.options["checkpoints"] = {kind: value if value in CHECKPOINTS else str(model_dir(self.workspace, value))
                                        for kind, value in self.options["checkpoints"].items()}
         self.store = DecisionStore(workspace)
         self.backend = backend

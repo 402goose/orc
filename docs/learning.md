@@ -267,6 +267,32 @@ datasets, progress, and round receipts live under `.fusion/decisions/training`;
 individual jobs remain under `.fusion/ui/jobs`. **Manual training tools & saved
 candidates** keeps the original controls available below the training grounds.
 
+A candidate's weights (`candidate/model.safetensors`, about 1.6 GB from the English
+checkpoint) are nearly all of its size. When a round completes, ORC removes the weight files
+(`.safetensors`, `.bin`, `.pt`, `.pth`, `.ckpt`, `.gguf`) of older candidates and keeps
+everything else: `training.json`, `rl_agent_config.json`, `encoder/`, `tokenizer/`,
+job records and logs. A candidate keeps its weights while any of these holds:
+
+- it is among the newest `decisions.training.keep_candidates` successful training
+  jobs (default 2; `0` keeps none beyond the other rules);
+- no evaluation of it has succeeded yet, or its round is not complete;
+- its `training.json` does not say `"promoted": false`, or its round's proof says
+  `promoted: true`;
+- `decisions.model_path` or a `decisions.checkpoints` entry names it (or a path
+  inside it), an unfinished round started from it, or an active job uses it. A
+  relative configured path is matched both from the workspace (as Laya loads it)
+  and from `.fusion` (as a learning job requests one), never from the current
+  directory.
+
+If `.fusion.json`, a round receipt or a job record cannot be read, nothing is removed.
+Only regular files inside a job's own `candidate/` directory are removed; symlinks are
+never followed, and a candidate directory that is a symlink is skipped. A candidate
+whose weights were removed keeps its receipts but can no longer be evaluated or
+selected as a checkpoint. `fusion learn status` reports the weights still on disk as
+`training.candidate_bytes`; `fusion learn prune` applies the same rule to existing jobs.
+Each completed round's `retention`, and `fusion learn prune --json`, list the
+directories that were treated as live under `protected`.
+
 ## Garden and council
 
 **Laya lab → Garden → Enable auto-drafts** queues incoming complete decisions for a
@@ -329,6 +355,8 @@ orc fusion decisions suggest --approval council --council codex claude -- DECISI
 fusion learn status
 fusion learn tick
 fusion learn tick --workspace /path/to/project
+fusion learn prune --dry-run
+fusion learn prune --json
 fusion learn schedule install --interval 300
 fusion learn schedule status
 fusion learn schedule uninstall
@@ -338,7 +366,9 @@ fusion learn schedule uninstall
 control room once and exits. It respects the existing enabled/paused settings;
 it does not enable training itself. Detached jobs continue between ticks.
 Per-workspace locks prevent a scheduled tick and live UI from launching the same
-step twice. Repeat `--workspace` for multiple targets, or use `--all` for known
+step twice. `prune` removes candidate weights by the retention rule above, under
+the same training lock (`--dry-run` lists them and removes nothing). It exits 1 when
+it kept everything because state was unreadable, or when a file could not be removed. Repeat `--workspace` for multiple targets, or use `--all` for known
 workspaces (including the current one when it has Laya decisions).
 
 Scheduling installs a launchd job on macOS; elsewhere it prints a crontab line

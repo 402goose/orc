@@ -442,7 +442,8 @@ settings):
       "encoder_learning_rate": 2.5e-5,
       "label_smoothing": 0.0,
       "class_balance": true,
-      "max_class_weight": 4.0
+      "max_class_weight": 4.0,
+      "keep_candidates": 2
     },
     "verdict_labels": true,
     "score_verdicts": false,
@@ -1136,6 +1137,11 @@ Compare candidate and baseline reports before setting `model_path`,
 `calibration_file`, `mode: active` and selected `auto_actions`. None of those
 settings is changed by train, evaluate or calibrate. Output commands refuse
 to overwrite existing datasets, reports or candidates.
+`decisions.training.keep_candidates` (default 2) is not a training setting: a
+completed round keeps the weights of that many newest candidates and removes the
+weight files of older evaluated ones that nothing configures or promotes
+(`fusion learn prune` does the same on demand; see
+[docs/learning.md](docs/learning.md#quality-and-automatic-training)).
 
 The control room can run this sequence automatically: **Laya lab → Training →
 Enable auto-training**. A round exports effective approvals, removes duplicate

@@ -108,6 +108,7 @@ class LearnTickTest(unittest.TestCase):
         self.assertEqual((value['decisions']['drafts'], value['decisions']['approved_answers']), (0, 0))
         self.assertEqual(set(value['garden']) >= {'enabled', 'approval_mode', 'queued', 'state'}, True)
         self.assertEqual(set(value['training']) >= {'enabled', 'min_new_answers', 'last_round', 'state'}, True)
+        self.assertEqual(value['training']['candidate_bytes'], 0)
         self.assertEqual(set(value['laya']) >= {'mode', 'model_path', 'qualified_buckets'}, True)
 
     def test_unknown_workspace_is_a_usage_error(self):
