@@ -283,9 +283,27 @@ it is scored on dev, by balanced accuracy over the dev questions with more than 
 label value (accuracy when none varies; lower dev cross-entropy breaks ties). After
 `decisions.training.patience` epochs without a better dev score (default 3) training
 stops, and the best epoch's weights are saved. With no dev groups every epoch runs.
+
+**A dev split too small to choose an epoch.** When dev has fewer than
+`decisions.training.min_dev_rows` rows (default 30), or fewer than
+`decisions.training.min_dev_per_class` rows (default 10) of any label of the questions
+the dev score selects on, training does not stop early: it runs all `max_epochs` and
+keeps the final weights. Those questions are the ones the dev score itself uses: the
+dev questions with more than one label value, or every dev question when none varies
+(the accuracy fallback). A label absent from dev is not counted; a question constant on
+dev does not count while another varies. Dev is still scored each epoch for the record.
+A 32-row set leaves a 7-row dev (5 true, 2 false) whose balanced accuracy stays flat,
+so patience used to stop it at epoch 4 with the fit loss still falling. Set either
+threshold to 0 to turn its check off. `training.json` records the decision under
+`selection`: `mode` (`fixed` or `early_stopping`), `reason` (`dev too small` or null),
+`dev_rows`, `dev_per_class` (`{question: {label: rows}}` for those questions) and both
+thresholds; a fixed selection has `selected_on: null` and `chosen_epoch` equal to
+`max_epochs`.
+
 `training.json` records `chosen_epoch`, the epochs run, the dev score by epoch, the
 dev group ids (hashed) and count, train accuracy on the fit rows, and
-`proper_scoring_weight`. Each round's proof repeats these under `training`, and
+`proper_scoring_weight`. Each round's proof repeats these under `training`, with
+`selection_mode`, `selection_reason`, `dev_rows` and `dev_per_class`, and
 `fusion learn status` shows them for the measured round.
 
 **The proper-scoring term** (`objective: "soft_ce+proper_scoring"`) has a fixed weight,

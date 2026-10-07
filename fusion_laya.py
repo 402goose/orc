@@ -312,13 +312,14 @@ def train(args):
     from laya.common import QTYPES, build_sequence, collate_items
     from safetensors.torch import save_file
     from fusion_decisions import labels_for, digest
-    from fusion_laya_objective import (MAX_EPOCHS, PROPER_SCORING, argmax, dev_score, example_weight, fit_epochs,
+    from fusion_laya_objective import (MAX_EPOCHS, PROPER_SCORING, argmax, dev_guard, dev_score, example_weight, fit_epochs,
                                        item_weights, selection_record, sigma as noise_at, target_distribution,
                                        training_options, training_plan)
     from fusion_quality import dataset_quality, input_key
     options = training_options({key: getattr(args, key) for key in ("objective", "unfreeze_encoder", "encoder_learning_rate",
                                                                       "label_smoothing", "class_balance", "max_class_weight",
-                                                                      "patience", "proper_scoring_weight")
+                                                                      "patience", "min_dev_rows", "min_dev_per_class",
+                                                                      "proper_scoring_weight")
                                 if getattr(args, key, None) is not None})
     epochs = args.epochs if getattr(args, "epochs", None) is not None else options["max_epochs"]
     rows = dataset_rows(args.dataset)
@@ -352,8 +353,9 @@ def train(args):
         for key, q in questions.items():
             internal = agent._to_internal(q)
             ids, markers = build_sequence(agent.tok, row["state"], internal, max_len, head_len)
+            target = target_distribution(row, key, labels_for(q), options["label_smoothing"])
             items.append({"ids": ids, "markers": markers, "qtype": QTYPES[internal["t"]],
-                          "target": target_distribution(row, key, labels_for(q), options["label_smoothing"]),
+                          "target": target, "label": labels_for(q)[argmax(target)],
                           "question": f"{row['kind']}:{key}", "schema": digest(q), "row_weight": example_weight(row, key),
                           "weight": 1.0})
         examples[row["id"]] = items
@@ -440,7 +442,9 @@ def train(args):
             for name, parameter in trainable:
                 parameter.copy_(saved[name])
 
-    selection = fit_epochs(plan, epochs, options["patience"], run_epoch, score, snapshot, restore)
+    guard = dev_guard(plan["dev"], [(item["question"], item["label"]) for row in plan["dev"] for item in examples[row["id"]]],
+                      options["min_dev_rows"], options["min_dev_per_class"])
+    selection = fit_epochs(plan, epochs, options["patience"], run_epoch, score, snapshot, restore, guard)
     fit_metrics = score(plan["fit"])
     selection = selection_record(plan, selection, options, epochs)
     output.mkdir(parents=True)
@@ -503,6 +507,8 @@ def main():
     parser.add_argument("--no-class-balance", dest="class_balance", action="store_false", default=None)
     parser.add_argument("--max-class-weight", dest="max_class_weight", type=float)
     parser.add_argument("--patience", type=int)
+    parser.add_argument("--min-dev-rows", dest="min_dev_rows", type=int)
+    parser.add_argument("--min-dev-per-class", dest="min_dev_per_class", type=int)
     parser.add_argument("--proper-scoring-weight", dest="proper_scoring_weight", type=float)
     parser.add_argument("--split", choices=["time", "group-hash"], help="train: the export's split rule, reused to carve dev from training groups")
     parser.add_argument("--control", action="store_true", help="evaluate: also score held-out examples against a different example's state")

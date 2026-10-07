@@ -112,7 +112,9 @@ def training_source(args, options, model_path):
     training = options["training"]
     extra += ["--objective", training["objective"], "--encoder-learning-rate", str(training["encoder_learning_rate"]),
               "--label-smoothing", str(training["label_smoothing"]), "--max-class-weight", str(training["max_class_weight"]),
-              "--patience", str(training["patience"]), "--proper-scoring-weight", str(training["proper_scoring_weight"]),
+              "--patience", str(training["patience"]), "--min-dev-rows", str(training["min_dev_rows"]),
+              "--min-dev-per-class", str(training["min_dev_per_class"]),
+              "--proper-scoring-weight", str(training["proper_scoring_weight"]),
               "--split", options["split"]]
     if training["unfreeze_encoder"]:
         extra.append("--unfreeze-encoder")
