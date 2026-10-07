@@ -244,5 +244,20 @@ class ReviewOutcomesTest(unittest.TestCase):
             core.record_outcome(self.workspace, "20990101-000000-deadbeef", True)
 
 
+    def test_review_grades_need_evidence_and_never_come_from_a_derived_outcome(self):
+        run = self.review("approve", 0)
+        for grade in ("missed_gap", "false_blocker"):
+            with self.subTest(grade=grade):
+                with self.assertRaisesRegex(ValueError, "needs a reason"):
+                    core.record_outcome(self.workspace, run, False, "  ", stage="review", rejection_class=grade)
+                with self.assertRaisesRegex(ValueError, "derived outcome cannot carry"):
+                    core.record_outcome(self.workspace, run, False, "found in PR 9", stage="review",
+                                        rejection_class=grade, derived=True)
+                code, _, err = self.cli("outcome", run, "--rejected", "--stage", "review", "--rejection-class", grade)
+                self.assertEqual(code, 2, err)
+        recorded = core.record_outcome(self.workspace, run, False, "gap found by the second review in PR 9",
+                                       stage="review", rejection_class="missed_gap", reporter="coordinator")
+        self.assertEqual(recorded["rejection_class"], "missed_gap")
+
 if __name__ == "__main__":
     unittest.main()

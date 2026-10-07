@@ -377,7 +377,7 @@ record the lead's verdict on a delegated run
 usage: fusion outcome [-h] [--accepted | --rejected | --withdraw | --unmeasured]
                       [--stage {gate,verify,land,review}] [--reason REASON]
                       [--issue ISSUE]
-                      [--rejection-class {suite_red,no_diff,out_of_scope,eval_unmeasured,review_changes,land_conflict,other}]
+                      [--rejection-class {suite_red,no_diff,out_of_scope,eval_unmeasured,review_changes,missed_gap,false_blocker,land_conflict,other}]
                       [--reporter REPORTER] [--pending] [--role ROLE] [--hours HOURS]
                       [run_id]
 
@@ -402,7 +402,7 @@ options:
                           acceptance label
   --issue ISSUE           target issue as owner/repo#N (defaults to the run's delegated
                           issue)
-  --rejection-class {suite_red,no_diff,out_of_scope,eval_unmeasured,review_changes,land_conflict,other}
+  --rejection-class {suite_red,no_diff,out_of_scope,eval_unmeasured,review_changes,missed_gap,false_blocker,land_conflict,other}
                           why a rejected run was rejected
   --reporter REPORTER     who reports the verdict, for example tenet; stored apart from
                           source

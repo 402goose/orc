@@ -267,6 +267,8 @@ Record a verdict on a run. The latest measured verdict ranks future automatic ro
         "out_of_scope",
         "eval_unmeasured",
         "review_changes",
+        "missed_gap",
+        "false_blocker",
         "land_conflict",
         "other"
       ],

@@ -1102,7 +1102,7 @@ def route_task(config, task, store, rng=None):
 
 
 HARNESS_REJECTION_CLASSES = frozenset({"land_conflict", "eval_unmeasured", "other"})
-QUALITY_REJECTION_CLASSES = frozenset({"suite_red", "no_diff", "out_of_scope", "review_changes"})
+QUALITY_REJECTION_CLASSES = frozenset({"suite_red", "no_diff", "out_of_scope", "review_changes", "missed_gap", "false_blocker"})
 
 
 def counts_against_lane(outcome):

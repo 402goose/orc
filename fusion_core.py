@@ -2920,7 +2920,9 @@ def run_directory(workspace: Path, run_id: str) -> Path | None:
     return None
 
 
-REJECTION_CLASSES = ("suite_red", "no_diff", "out_of_scope", "eval_unmeasured", "review_changes", "land_conflict", "other")
+REJECTION_CLASSES = ("suite_red", "no_diff", "out_of_scope", "eval_unmeasured", "review_changes", "missed_gap",
+                     "false_blocker", "land_conflict", "other")
+REVIEW_GRADES = ("missed_gap", "false_blocker")
 ISSUE_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+")
 
 
@@ -3080,6 +3082,12 @@ def record_outcome(workspace: Path, run_id: str, accepted: bool | None = None, r
             raise ValueError("rejection class must be one of " + ", ".join(REJECTION_CLASSES))
         if accepted is not False:
             raise ValueError("a rejection class goes only with a rejected verdict")
+        if rejection_class in REVIEW_GRADES:
+            if derived:
+                raise ValueError(f"{rejection_class} is a lead's grade of a review; a derived outcome cannot carry it")
+            if not str(reason).strip():
+                raise ValueError(f"{rejection_class} needs a reason naming the evidence: for missed_gap the PR or run "
+                                 "where the gap was found, for false_blocker the lead's ruling that it was not a problem")
     if reporter is not None and (not isinstance(reporter, str) or not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", reporter)):
         raise ValueError("reporter must be a short name (letters, digits, _ . @ -)")
     workspace = RunStore(workspace).workspace

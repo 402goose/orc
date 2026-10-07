@@ -12,7 +12,7 @@ import fusion_policy as policy
 from fusion_decisions import DecisionStore
 from fusion_policy import route_candidates, routing_report
 
-QUALITY = ("suite_red", "no_diff", "out_of_scope", "review_changes")
+QUALITY = ("suite_red", "no_diff", "out_of_scope", "review_changes", "missed_gap", "false_blocker")
 HARNESS = ("land_conflict", "eval_unmeasured", "other")
 
 
