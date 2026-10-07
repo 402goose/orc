@@ -126,8 +126,16 @@ _FIX_HEADING = re.compile(r"^#+\s*(?:fix|solution|proposal|proposed|implementati
 
 # ---------------------------------------------------------------- git helpers
 
+GIT_QUIET = ("-c", "core.fsmonitor=false", "-c", "maintenance.auto=false", "-c", "gc.auto=0")
+
+
 def git(repo, *args, env=None, binary=False, check=True):
-    proc = subprocess.run(["git", "-c", "core.fsmonitor=false", *args], cwd=repo, capture_output=True,
+    """Git in a gym repository, with no background work.
+
+    Since Git 2.47 a commit spawns a detached `git maintenance run --auto`, which can
+    still be writing lock files under .git while a disposable gym namespace is removed
+    (#31). Gym repositories are short-lived, so maintenance and auto-gc stay off."""
+    proc = subprocess.run(["git", *GIT_QUIET, *args], cwd=repo, capture_output=True,
                           env={**os.environ, **env} if env else None, stdin=subprocess.DEVNULL)
     if check and proc.returncode:
         raise ValueError(f"git {' '.join(args[:2])} failed: {proc.stderr.decode(errors='replace').strip()[:600]}")

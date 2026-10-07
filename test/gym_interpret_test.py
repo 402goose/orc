@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -298,6 +299,21 @@ print(json.dumps({"type": "turn.completed", "usage": {}}))
         self.assertEqual(row["verdict"], "misread")
         self.assertEqual(row["scores"]["trap_misread_rate"], 1)
         self.assertEqual(row["changed"], [])
+
+
+class GymGitTest(unittest.TestCase):
+    def test_a_gym_commit_spawns_no_background_maintenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo, trace = Path(temporary) / "repo", Path(temporary) / "trace.jsonl"
+            repo.mkdir()
+            gym.git(repo, "init", "-q")
+            (repo / "f").write_text("a")
+            gym.git(repo, "add", "f")
+            gym.git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "m",
+                    env={"GIT_TRACE2_EVENT": str(trace)})
+            argvs = [json.loads(line).get("argv", []) for line in trace.read_text().splitlines()]
+            self.assertTrue(any("commit" in argv for argv in argvs))
+            self.assertFalse([argv for argv in argvs if "maintenance" in argv or "gc" in argv])
 
 
 class RoutingClassTest(unittest.TestCase):
