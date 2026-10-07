@@ -94,6 +94,7 @@ class TrainingLoopTest(unittest.TestCase):
         self.assertEqual(second['status'],'complete',second)
         self.assertFalse(weights.exists());self.assertTrue(weights.with_name('training.json').is_file())
         self.assertEqual((second['retention']['removed_bytes'],second['retention']['retained_bytes']),(4,4))
+        self.assertEqual(second['retention']['protected'],[])
         self.assertTrue((self.w/'.fusion/ui/jobs'/second['jobs']['train']/'candidate/model.safetensors').is_file())
 
     def test_pause_and_restart_preserve_next_step_and_failed_job_requires_retry(self):

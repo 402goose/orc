@@ -108,6 +108,26 @@ class CandidateRetentionTest(unittest.TestCase):
         self.assertEqual(result['removed'], [])
         self.assertTrue(all(self.weights(p) for p in (promoted, configured, per_kind, unknown)))
 
+    def test_relative_configured_paths_are_protected_from_any_directory(self):
+        from_fusion = self.candidate('train-1', 100)
+        from_workspace = self.candidate('train-2', 200)
+        self.candidate('train-3', 300)
+        self.candidate('train-4', 400)
+        self.configure(model_path='ui/jobs/train-1/candidate', checkpoints={'review': '.fusion/ui/jobs/train-2/candidate'})
+        elsewhere = self.root / 'elsewhere'
+        elsewhere.mkdir()
+        before = os.getcwd()
+        os.chdir(elsewhere)
+        self.addCleanup(os.chdir, before)
+        result = loop.prune(self.w)
+        self.assertEqual(result['removed'], [])
+        self.assertTrue(self.weights(from_fusion) and self.weights(from_workspace))
+        self.assertIn(str(from_fusion), result['protected'])
+        self.assertIn(str(from_workspace), result['protected'])
+        self.assertFalse(any(p.startswith(str(elsewhere)) for p in result['protected']))
+        code, output = self.cli('learn', 'prune', '--dry-run', '--json')
+        self.assertIn(str(from_fusion), json.loads(output)[0]['protected'])
+
     def test_a_round_marked_promoted_keeps_its_candidate(self):
         old = self.candidate('train-1', 100)
         self.candidate('train-2', 200)

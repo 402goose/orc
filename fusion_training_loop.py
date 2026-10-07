@@ -12,7 +12,8 @@ import stat
 import uuid
 
 import fusion_core as core
-from fusion_decisions import DEFAULTS as DECISION_DEFAULTS, CHECKPOINTS, LABELABLE_STATUSES, DecisionEngine, digest, exceeds_token_budget, labeled_splits
+from fusion_decisions import (DEFAULTS as DECISION_DEFAULTS, CHECKPOINTS, LABELABLE_STATUSES, DecisionEngine, config_for, digest,
+                              exceeds_token_budget, labeled_splits, model_dir)
 from fusion_garden import locked
 from fusion_learning import decision_rows, read_object
 from fusion_publish import save
@@ -303,7 +304,7 @@ def tick(app, workspace):
                         retained=prune(workspace)
                     except Exception as exc:
                         retained={'status':'error','reason':str(exc)}
-                    round['retention']={k:retained[k] for k in ('status','reason','removed_bytes','retained_bytes') if k in retained}
+                    round['retention']={k:retained[k] for k in ('status','reason','protected','removed_bytes','retained_bytes') if k in retained}
                     save(path,round); return
                 round['phase']=phase=PHASES[index]
                 round.pop('dispatch_key',None)
@@ -380,8 +381,7 @@ def job_model(workspace, request):
         value = argv[argv.index('--model-path') + 1]
     if not value:
         return None
-    path = Path(value).expanduser()
-    return (path if path.is_absolute() else Path(workspace) / '.fusion' / path).resolve()
+    return model_dir(workspace, value, '.fusion')
 
 
 def prune(workspace, dry_run=False):
@@ -391,16 +391,19 @@ def prune(workspace, dry_run=False):
     succeeded, its round (if any) is complete, it is not among the newest
     decisions.training.keep_candidates successful training jobs, it is not
     promoted, and no configured checkpoint, unfinished round or active job
-    refers to it. training.json, configs, tokenizer/ and logs stay. When the
-    configuration, a round receipt or a job record cannot be read, nothing is
-    removed.
+    refers to it. A relative configured path is protected both as the decision
+    engine loads it (from the workspace) and as a learning job requests one
+    (from .fusion), never from the current directory. training.json, configs,
+    tokenizer/ and logs stay. When the configuration, a round receipt or a job
+    record cannot be read, nothing is removed.
     """
     workspace = Path(workspace)
     try:
         config, _ = core.load_config(workspace)
-        options = DecisionEngine(workspace, config).options
+        options = config_for(config)
         keep = options['keep_candidates']
-        protected = {Path(v).resolve() for v in [options['model_path'], *options['checkpoints'].values()] if v and v not in CHECKPOINTS}
+        configured = [v for v in [options['model_path'], *options['checkpoints'].values()] if v and v not in CHECKPOINTS]
+        protected = {model_dir(workspace, v, base) for v in configured for base in ('', '.fusion')}
         history = [strict_object(p) for p in (root(workspace) / 'rounds').glob('*/round.json')]
         jobs = [(d, strict_object(d / 'job.json')) for d in job_dirs(workspace)]
         held, evaluated = set(), set()
@@ -409,7 +412,7 @@ def prune(workspace, dry_run=False):
             if r.get('status') != 'complete' or (r.get('proof') or {}).get('promoted') is True:
                 held.add(train)
             if r.get('status') != 'complete' and r.get('source_path'):
-                protected.add(Path(r['source_path']).expanduser().resolve())
+                protected.add(model_dir(workspace, r['source_path']))
         for directory, job in jobs:
             if job.get('status') in ACTIVE:
                 held.add(directory.name)
@@ -446,5 +449,5 @@ def prune(workspace, dry_run=False):
                 removed.append({'path': str(file), 'bytes': size})
             except OSError as exc:
                 errors.append(f'{file}: {exc}')
-    return {'status': 'dry_run' if dry_run else 'pruned', 'keep_candidates': keep, 'removed': removed,
+    return {'status': 'dry_run' if dry_run else 'pruned', 'keep_candidates': keep, 'protected': sorted(map(str, protected)), 'removed': removed,
             'removed_bytes': sum(r['bytes'] for r in removed), 'retained_bytes': candidate_bytes(workspace), 'errors': errors}

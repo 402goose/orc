@@ -913,14 +913,21 @@ def calibration_bucket(report, record, question):
     return buckets.get(f"{prefix}:{question}", {})
 
 
+def model_dir(workspace, value, base=""):
+    """A checkpoint directory as ORC loads it: an absolute path as given, else
+    relative to the workspace. `.fusion.json` paths use base ""; a learning
+    job's requested model_path uses base ".fusion" (fusion_ui.model_path_for)."""
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else Path(workspace).resolve() / base / path).resolve()
+
+
 class DecisionEngine:
     def __init__(self, workspace, config, backend=None):
         self.workspace = Path(workspace)
         self.options = config_for(config)
         if self.options["model_path"]:
-            path = Path(self.options["model_path"]).expanduser()
-            self.options["model_path"] = str((self.workspace / path).resolve())
-        self.options["checkpoints"] = {kind: value if value in CHECKPOINTS else str((self.workspace / Path(value).expanduser()).resolve())
+            self.options["model_path"] = str(model_dir(self.workspace, self.options["model_path"]))
+        self.options["checkpoints"] = {kind: value if value in CHECKPOINTS else str(model_dir(self.workspace, value))
                                        for kind, value in self.options["checkpoints"].items()}
         self.store = DecisionStore(workspace)
         self.backend = backend

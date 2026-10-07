@@ -279,7 +279,10 @@ job records and logs. A candidate keeps its weights while any of these holds:
 - its `training.json` does not say `"promoted": false`, or its round's proof says
   `promoted: true`;
 - `decisions.model_path` or a `decisions.checkpoints` entry names it (or a path
-  inside it), an unfinished round started from it, or an active job uses it.
+  inside it), an unfinished round started from it, or an active job uses it. A
+  relative configured path is matched both from the workspace (as Laya loads it)
+  and from `.fusion` (as a learning job requests one), never from the current
+  directory.
 
 If `.fusion.json`, a round receipt or a job record cannot be read, nothing is removed.
 Only regular files inside a job's own `candidate/` directory are removed; symlinks are
@@ -287,6 +290,8 @@ never followed, and a candidate directory that is a symlink is skipped. A candid
 whose weights were removed keeps its receipts but can no longer be evaluated or
 selected as a checkpoint. `fusion learn status` reports the weights still on disk as
 `training.candidate_bytes`; `fusion learn prune` applies the same rule to existing jobs.
+Each completed round's `retention`, and `fusion learn prune --json`, list the
+directories that were treated as live under `protected`.
 
 ## Garden and council
 
