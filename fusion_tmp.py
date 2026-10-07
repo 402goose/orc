@@ -4,9 +4,12 @@ A reader's `/tmp/orc-<name>` directory is removed when its run ends. A run that 
 SIGKILLed never gets there, so each directory carries an owner marker
 (`.orc-owner`: the creating process's pid and start time) and every new directory
 first sweeps old ones. A directory is removed only when it is a plain directory (not
-a symlink) owned by this user, its name matches the exact pattern ORC creates, it is
-older than the age limit, and its owner is gone: the marker's pid is dead, belongs to
-a different process now (another start time), or there is no readable marker.
+a symlink) owned by this user, its name matches the pattern ORC creates (`orc-run-`
+plus 8 mkdtemp characters or 12 hex digits; the older `orc-` form is still recognised), it is
+older than the age limit, it carries ORC's owner marker, and that owner is gone: the
+marker's pid is dead or belongs to a different process now (another start time). A
+directory without a readable marker is never removed, so a same-named directory that
+ORC did not create (or one from before markers existed) is left alone.
 
 For a Claude reader the directory root is outside what the worker may write (it gets
 `<root>/claude-<uid>`), so its marker cannot be forged. A Codex browser reader may
@@ -27,7 +30,7 @@ import time
 from typing import Any
 
 ROOT = Path("/tmp").resolve()
-NAME = re.compile(r"orc-(?:[a-z0-9_]{8}|[0-9a-f]{12})")
+NAME = re.compile(r"orc-run-(?:[a-z0-9_]{8}|[0-9a-f]{12})|orc-(?:[a-z0-9_]{8}|[0-9a-f]{12})")
 MARKER = ".orc-owner"
 MAX_AGE_SECONDS = 24 * 3600
 LIMIT = 500
@@ -112,9 +115,7 @@ def sweep(root: str | Path | None = None, max_age_seconds: float = MAX_AGE_SECON
     except OSError as exc:
         return {"root": str(root), "dry_run": dry_run, "removed": removed, "kept": kept,
                 "errors": [{"path": str(root), "error": str(exc)}]}
-    for name in names[:limit]:
-        if not NAME.fullmatch(name):
-            continue
+    for name in [name for name in names if NAME.fullmatch(name)][:limit]:
         path = root / name
         try:
             info = os.lstat(path)
@@ -130,7 +131,11 @@ def sweep(root: str | Path | None = None, max_age_seconds: float = MAX_AGE_SECON
         if now - info.st_mtime < max_age_seconds:
             kept.append({"path": str(path), "reason": "younger than the age limit"})
             continue
-        if _owner_running(_owner(path)):
+        owner = _owner(path)
+        if owner is None or type(owner.get("pid")) is not int:
+            kept.append({"path": str(path), "reason": "no ORC owner marker"})
+            continue
+        if _owner_running(owner):
             kept.append({"path": str(path), "reason": "owner still running"})
             continue
         if not dry_run:

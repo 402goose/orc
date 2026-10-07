@@ -1035,7 +1035,7 @@ def claude_reader_tmpdir(env: dict[str, str]) -> str:
     reader must not write it. The path is only chosen here; dispatch creates it (0700) for the run,
     records itself as owner in the directory root (which the reader cannot write) and removes it
     when the run ends; fusion_tmp's sweep removes it if the run never gets there."""
-    directory = str(Path("/tmp").resolve() / f"orc-{uuid.uuid4().hex[:12]}")
+    directory = str(Path("/tmp").resolve() / f"orc-run-{uuid.uuid4().hex[:12]}")
     env.update(CLAUDE_CODE_TMPDIR=directory, TMPDIR=directory + "/", TMP=directory, TEMP=directory)
     return directory
 
@@ -2663,7 +2663,7 @@ def codex_reader_tmpdir(env: dict[str, str]) -> str:
     fusion_tmp's sweep, which each new directory runs first."""
     import fusion_tmp
     fusion_tmp.sweep_quietly()
-    directory = tempfile.mkdtemp(prefix="orc-", dir=Path("/tmp").resolve())
+    directory = tempfile.mkdtemp(prefix="orc-run-", dir=Path("/tmp").resolve())
     fusion_tmp.mark(directory)
     env.update(TMPDIR=directory + "/", TMP=directory, TEMP=directory)
     return directory
