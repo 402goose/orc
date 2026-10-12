@@ -30,6 +30,7 @@ from typing import Any, Iterator
 
 from fusion_decisions import DEFAULTS as DECISION_DEFAULTS, LAND_DERIVED_SOURCE
 import fusion_progress as progress
+from fusion_publish import GIT_FLAGS
 import fusion_runs
 from fusion_usage import event_quota
 from fusion_reasoning import EFFORTS, validate_pair
@@ -3046,7 +3047,7 @@ def codex_permission_args(workspace: Path, settings: dict[str, Any], write: bool
     roots = set()
     try:
         result = subprocess.run(
-            ["git", "-C", str(workspace), "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+            ["git", *GIT_FLAGS, "-C", str(workspace), "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
             capture_output=True, text=True, check=False, timeout=5,
         )
         if result.returncode == 0:
@@ -3369,7 +3370,7 @@ def repo_slug(path: str | Path | None) -> str | None:
     if not path or not Path(path).is_dir():
         return None
     try:
-        url = subprocess.run(["git", "-C", str(path), "config", "--get", "remote.origin.url"],
+        url = subprocess.run(["git", *GIT_FLAGS, "-C", str(path), "config", "--get", "remote.origin.url"],
                              capture_output=True, text=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
         return None
@@ -3661,8 +3662,8 @@ _SHA_RE = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
 
 def _git_text(path: str | Path, *args: str) -> str | None:
     try:
-        completed = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, errors="replace",
-                                   timeout=30)
+        completed = subprocess.run(["git", *GIT_FLAGS, "-C", str(path), *args], capture_output=True, text=True,
+                                   errors="replace", timeout=30)
     except (OSError, subprocess.SubprocessError):
         return None
     return completed.stdout if completed.returncode == 0 else None
@@ -3756,7 +3757,7 @@ def capture_diff(workspace: str | Path, base: str | None, limit: int = DIFF_LIMI
         if len(text) > limit:
             break
         try:
-            added = subprocess.run(["git", "-C", str(workspace), "diff", "--no-color", "--no-ext-diff", "--no-index",
+            added = subprocess.run(["git", *GIT_FLAGS, "-C", str(workspace), "diff", "--no-color", "--no-ext-diff", "--no-index",
                                     "--", os.devnull, path], capture_output=True, text=True, errors="replace", timeout=30)
         except (OSError, subprocess.SubprocessError):
             continue
