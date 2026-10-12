@@ -83,6 +83,7 @@ DEFAULT_LANES = {
     "agy-flash-low": {"agent": "agy", "model": "gemini-3.8-flash-low"},
     "grok": {"agent": "grok"},
     "opencode": {"agent": "opencode"},
+    "muse": {"agent": "muse"},
 }
 LANE_KEYS = {"agent", "route", "model", "reasoning_effort"}
 # Run in each tree by `extract`: per-test outcomes for the given files, written
@@ -625,7 +626,7 @@ def resolve_lane(config, name):
         lane = {"agent": (config["routes"][name] or {}).get("agent", "claude"), "route": name}
     else:
         raise ValueError(f"unknown gym lane {name}: use {', '.join(sorted(lanes))}, a route, or gym.lanes")
-    if not isinstance(lane, dict) or set(lane) - LANE_KEYS or lane.get("agent") not in {"claude", "codex", "agy", "grok", "opencode"}:
+    if not isinstance(lane, dict) or set(lane) - LANE_KEYS or lane.get("agent") not in {"claude", "codex", "agy", "grok", "opencode", "muse"}:
         raise ValueError(f"gym lane {name} must be an object with agent and optional route, model, reasoning_effort")
     return lane
 

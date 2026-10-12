@@ -17,6 +17,57 @@
   },
   {
     "schema": "fusion.lane_offer.v1",
+    "lane": "muse-wonder-full-high",
+    "agent": "muse",
+    "model": "muse-wonder-full-1.0",
+    "reasoning_effort": "high",
+    "creator": "meta",
+    "upstream": "meta",
+    "billing": "subscription",
+    "endpoint": null,
+    "features": [
+      "write",
+      "tools"
+    ],
+    "rates_usd_per_mtok": null,
+    "cost_tier": null
+  },
+  {
+    "schema": "fusion.lane_offer.v1",
+    "lane": "muse-wonder-high",
+    "agent": "muse",
+    "model": "muse-wonder-1.0",
+    "reasoning_effort": "high",
+    "creator": "meta",
+    "upstream": "meta",
+    "billing": "subscription",
+    "endpoint": null,
+    "features": [
+      "write",
+      "tools"
+    ],
+    "rates_usd_per_mtok": null,
+    "cost_tier": null
+  },
+  {
+    "schema": "fusion.lane_offer.v1",
+    "lane": "muse-spark-high",
+    "agent": "muse",
+    "model": "muse-spark-1.3",
+    "reasoning_effort": "high",
+    "creator": "meta",
+    "upstream": "meta",
+    "billing": "subscription",
+    "endpoint": null,
+    "features": [
+      "write",
+      "tools"
+    ],
+    "rates_usd_per_mtok": null,
+    "cost_tier": null
+  },
+  {
+    "schema": "fusion.lane_offer.v1",
     "lane": "claude-sub",
     "agent": "claude",
     "model": "claude-sonnet-5",
@@ -221,6 +272,23 @@
     "billing": "subscription",
     "endpoint": null,
     "features": [
+      "tools"
+    ],
+    "rates_usd_per_mtok": null,
+    "cost_tier": null
+  },
+  {
+    "schema": "fusion.lane_offer.v1",
+    "lane": "muse",
+    "agent": "muse",
+    "model": null,
+    "reasoning_effort": null,
+    "creator": null,
+    "upstream": "meta",
+    "billing": "subscription",
+    "endpoint": null,
+    "features": [
+      "write",
       "tools"
     ],
     "rates_usd_per_mtok": null,

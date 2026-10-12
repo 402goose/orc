@@ -175,7 +175,7 @@ investigate open issues; save a shortlist without implementing
 ```text
 usage: fusion truffle hunt [-h] [--count COUNT] [--scan-limit SCAN_LIMIT]
                            [--search SEARCH]
-                           [--agent {agy,auto,claude,codex,grok,opencode}]
+                           [--agent {agy,auto,claude,codex,grok,muse,opencode}]
                            [--route ROUTE] [--model MODEL] [--remote REMOTE]
                            [--include-assigned]
 
@@ -184,7 +184,7 @@ options:
   --count COUNT
   --scan-limit SCAN_LIMIT
   --search SEARCH
-  --agent {agy,auto,claude,codex,grok,opencode}
+  --agent {agy,auto,claude,codex,grok,muse,opencode}
   --route ROUTE           named route from .fusion.json, for example orc-free
   --model MODEL           model for the scout, overriding the route and agent settings
   --remote REMOTE
@@ -196,14 +196,14 @@ options:
 map every open issue into tracking patches and grade in resumable batches
 
 ```text
-usage: fusion truffle survey [-h] [--agent {agy,auto,claude,codex,grok,opencode}]
+usage: fusion truffle survey [-h] [--agent {agy,auto,claude,codex,grok,muse,opencode}]
                              [--route ROUTE] [--model MODEL] [--remote REMOTE]
                              [--resume RESUME] [--sync-only] [--include-assigned]
                              [--takeover]
 
 options:
   -h, --help              show this help message and exit
-  --agent {agy,auto,claude,codex,grok,opencode}
+  --agent {agy,auto,claude,codex,grok,muse,opencode}
   --route ROUTE           named route from .fusion.json, for example orc-free
   --model MODEL           model for grading, overriding the route and agent settings
   --remote REMOTE
@@ -438,7 +438,7 @@ run a bounded UltraCode-style explore/plan/implement/review pipeline
 
 ```text
 usage: fusion ultra [-h] [--stages STAGES] [--cheap-only]
-                    [--harness {claude,codex,agy,grok,opencode}]
+                    [--harness {claude,codex,agy,grok,opencode,muse}]
                     task
 
 positional arguments:
@@ -448,7 +448,7 @@ options:
   -h, --help              show this help message and exit
   --stages STAGES         maximum number of configured stages
   --cheap-only            force Claude stages onto the orc-free route
-  --harness {claude,codex,agy,grok,opencode}
+  --harness {claude,codex,agy,grok,opencode,muse}
                           run every Ultra stage through one harness
 ```
 
@@ -522,7 +522,7 @@ resume a paused or failed workflow
 
 ```text
 usage: fusion workflow resume [-h] [--node NODE]
-                              [--agent {auto,claude,codex,agy,grok,opencode}]
+                              [--agent {auto,claude,codex,agy,grok,opencode,muse}]
                               [--route ROUTE] [--max-attempts MAX_ATTEMPTS]
                               [--spec SPEC]
                               run_id
@@ -533,7 +533,7 @@ positional arguments:
 options:
   -h, --help              show this help message and exit
   --node NODE             unfinished stage to retry with a different worker
-  --agent {auto,claude,codex,agy,grok,opencode}
+  --agent {auto,claude,codex,agy,grok,opencode,muse}
   --route ROUTE           configured route to use for the selected stage
   --max-attempts MAX_ATTEMPTS
                           new explicit attempt limit per stage
@@ -1056,7 +1056,7 @@ positional arguments:
 
 options:
   -h, --help              show this help message and exit
-  --agent AGENT           auto, a worker (codex, claude, agy, grok, opencode) or a
+  --agent AGENT           auto, a worker (codex, claude, agy, grok, opencode, muse) or a
                           configured route
   --council COUNCIL [COUNCIL ...]
                           independent workers or configured routes; unanimous answers
@@ -1077,12 +1077,12 @@ evaluate drafts against human reviews in a temporary decision-store copy
 
 ```text
 usage: fusion decisions eval-drafter [-h]
-                                     [--agent {auto,codex,claude,agy,grok,opencode}]
+                                     [--agent {auto,codex,claude,agy,grok,opencode,muse}]
                                      [--rebuild-input] [--limit LIMIT] [--json]
 
 options:
   -h, --help              show this help message and exit
-  --agent {auto,codex,claude,agy,grok,opencode}
+  --agent {auto,codex,claude,agy,grok,opencode,muse}
   --rebuild-input         rebuild acceptance inputs from saved run artifacts
   --limit LIMIT           maximum reviewed decisions to evaluate
   --json                  print machine-readable results instead of a summary table

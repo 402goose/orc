@@ -94,7 +94,7 @@ def teacher_questions(questions):
     return result
 
 
-WORKERS = {"codex", "claude", "agy", "grok", "opencode"}
+WORKERS = {"codex", "claude", "agy", "grok", "opencode", "muse"}
 
 
 def member_lane(config, member):

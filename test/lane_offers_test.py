@@ -56,7 +56,7 @@ class LaneOffersTest(unittest.TestCase):
         config = core.load_config(self.root)[0]
         golden = json.loads((FIXTURES / "golden.json").read_text(encoding="utf-8"))
         self.assertEqual(lanes.lane_offers(config), golden)
-        self.assertEqual([item["lane"] for item in golden][-5:], ["claude", "codex", "opencode", "agy", "grok"])
+        self.assertEqual([item["lane"] for item in golden][-6:], ["claude", "codex", "opencode", "agy", "grok", "muse"])
         self.assertEqual(set(golden[0]), {"schema", "lane", "agent", "model", "reasoning_effort", "creator", "upstream", "billing",
                                           "endpoint", "features", "rates_usd_per_mtok", "cost_tier"})
 

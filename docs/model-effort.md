@@ -92,6 +92,18 @@ Laya model/effort advice works for OpenCode lanes the same way it does for
 `agy`: entries in `decisions.model_effort_pairs` with `"agent": "opencode"`
 are offered as candidates for tasks pinned to an OpenCode worker.
 
+## Muse Code
+
+Muse workers pass `reasoning_effort` as `--reasoning-effort` to `muse exec`. Accepted tiers are the ones `muse model-profile` names: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. A pair requires an explicit model.
+
+```sh
+fusion delegate --agent muse --route muse-spark-high --read-only \
+  --model muse-wonder-full-1.0 --reasoning-effort max \
+  "Review the persistence boundaries."
+```
+
+`execution_choice.catalog` is `unchecked` for Muse workers: the harness records the requested tier but the exec event stream does not attest what was applied, so `observed` stays `unobserved` apart from the reported model.
+
 ## Laya advice using the existing router
 
 ```json

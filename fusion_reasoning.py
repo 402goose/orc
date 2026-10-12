@@ -14,7 +14,10 @@ AGY_EFFORTS = frozenset({"low", "medium", "high", "max"})
 # `opencode run --variant` is provider-specific (e.g. Anthropic high/max,
 # OpenAI minimal..xhigh); OpenCode itself validates the pair at request time.
 OPENCODE_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
-HARNESS_EFFORTS = {"codex": EFFORTS, "claude": CLAUDE_EFFORTS, "agy": AGY_EFFORTS, "opencode": OPENCODE_EFFORTS}
+# `muse exec --reasoning-effort` (and `muse model-profile`) name the full tier set.
+MUSE_EFFORTS = EFFORTS
+HARNESS_EFFORTS = {"codex": EFFORTS, "claude": CLAUDE_EFFORTS, "agy": AGY_EFFORTS, "opencode": OPENCODE_EFFORTS,
+                   "muse": MUSE_EFFORTS}
 
 
 def claude_choice(settings):
@@ -102,7 +105,7 @@ def check_pair(agent, settings, write=False):
     """Refuse a pair the harness cannot run; the harness decides what it accepts."""
     pair = validate_pair(settings.get("model"), settings.get("reasoning_effort"))
     if agent not in HARNESS_EFFORTS:
-        raise ValueError("reasoning_effort is supported for native Codex, Claude Code, agy and OpenCode")
+        raise ValueError("reasoning_effort is supported for native Codex, Claude Code, agy, OpenCode and Muse Code")
     if pair["reasoning_effort"] not in HARNESS_EFFORTS[agent]:
         raise ValueError(f"{agent} accepts reasoning_effort " + ", ".join(sorted(HARNESS_EFFORTS[agent])))
     if agent == "codex":

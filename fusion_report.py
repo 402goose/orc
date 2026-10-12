@@ -63,6 +63,8 @@ def read_answer(workspace, result):
             text = raw  # The native Grok adapter requests its plain headless output.
         elif result.get("agent") == "opencode":
             text = core.parse_opencode_output(raw)[1]
+        elif result.get("agent") == "muse":
+            text = core.parse_muse_output(raw)[1]
         elif result.get("agent") in {"claude", "agy"}:
             try:
                 envelope = json.loads(raw)

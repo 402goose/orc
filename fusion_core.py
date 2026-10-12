@@ -110,6 +110,23 @@ DEFAULTS: dict[str, Any] = {
             "sandbox": "workspace-write",
             "approval": "never",
         },
+        # Muse Code lanes (Meta-hosted). Unpriced until an operator sets
+        # cost_tier, and never auto-routed until named in decisions.auto_routes:
+        # a lane earns automatic routing through measured evidence, not by
+        # being added. Only use them on repositories cleared for Meta-hosted
+        # processing.
+        "muse-wonder-full-high": {
+            "agent": "muse", "model": "muse-wonder-full-1.0", "reasoning_effort": "high",
+            "upstream": "meta", "creator": "meta", "billing": "subscription",
+        },
+        "muse-wonder-high": {
+            "agent": "muse", "model": "muse-wonder-1.0", "reasoning_effort": "high",
+            "upstream": "meta", "creator": "meta", "billing": "subscription",
+        },
+        "muse-spark-high": {
+            "agent": "muse", "model": "muse-spark-1.3", "reasoning_effort": "high",
+            "upstream": "meta", "creator": "meta", "billing": "subscription",
+        },
     },
     "ultra": {
         "max_stages": 5,
@@ -176,6 +193,28 @@ DEFAULTS: dict[str, Any] = {
         "bash_allow": [],
         "permission": {},
         "config": {},
+    },
+    # Muse Code (`muse exec --json`, Meta-hosted). Workers always run with
+    # --contributor-mode off and --no-foreign-personal-context, approvals
+    # never and the OS sandbox on (proxy-only network); readers also get
+    # --disable-write and no shell, so neither tool writes nor shell writes
+    # reach the workspace. A named `permission_profile` (defined in the
+    # user's Muse settings) replaces --disable-shell for readers. Muse
+    # loads MCP servers from `mcpServers` in its settings.json; workers get
+    # every server named there (plus `disable_mcp`) disabled per run, except
+    # servers declared for workers in `mcp_servers`. Keys come from `muse
+    # login`, or from the env var named by `api_key_env` fed to
+    # --api-key-stdin -- never argv. Sessions are not logged unless
+    # `session_log` is set, which persisted --session-id resume requires.
+    "muse": {
+        "command": "muse",
+        "model": "",
+        "sandbox_network": "proxy-only",
+        "permission_profile": "",
+        "disable_mcp": [],
+        "mcp_servers": {},
+        "api_key_env": "",
+        "session_log": False,
     },
 }
 
@@ -2576,6 +2615,120 @@ def price_fallback(settings: dict[str, Any], usage: dict[str, Any], model: str |
     return round(total, 8) if counted else None
 
 
+def _muse_dicts(value: Any):
+    if isinstance(value, dict):
+        yield value
+        for item in value.values():
+            yield from _muse_dicts(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _muse_dicts(item)
+
+
+_MUSE_USAGE_KEYS = {
+    "inputTokens": "input_tokens", "input_tokens": "input_tokens",
+    "outputTokens": "output_tokens", "output_tokens": "output_tokens",
+    "reasoningTokens": "reasoning_output_tokens", "reasoning_tokens": "reasoning_output_tokens",
+    "cacheReadTokens": "cache_read_input_tokens", "cache_read_tokens": "cache_read_input_tokens",
+    "cacheWriteTokens": "cache_creation_input_tokens", "cache_write_tokens": "cache_creation_input_tokens",
+    "cachedTokens": "cached_input_tokens", "cached_tokens": "cached_input_tokens",
+}
+
+
+def _muse_usage(payload: dict[str, Any]) -> dict[str, Any]:
+    """Last usage-shaped object in an event payload, mapped to Fusion fields.
+
+    Muse's raw counters (MSP `TokenUsage`) are provider-reported:
+    `reasoningTokens` is a subset of `outputTokens`, and `cachedTokens`
+    sits inside or beside `inputTokens` by provider convention -- it maps
+    to `cached_input_tokens`, which Fusion's cache accounting treats as
+    inside input. Cache read/write splits, when present, are beside input
+    like Anthropic's. Server-computed cost (`cost.usd`, an estimate) is
+    not recorded: Muse lanes stay unpriced until an operator sets a price.
+    """
+    usage: dict[str, Any] = {}
+    for item in _muse_dicts(payload):
+        found = {target: item[key] for key, target in _MUSE_USAGE_KEYS.items()
+                 if isinstance(item.get(key), (int, float)) and not isinstance(item.get(key), bool)}
+        if found:
+            usage = found
+    return usage
+
+
+def parse_muse_output(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None, list[str]]:
+    """`muse exec --json`: one JSONL stream event per line.
+
+    The handoff is the terminal run event's text (falling back to the
+    concatenated output deltas). Only the run terminal decides failure:
+    child reminder/agent tasks may fail inside a successful run. Unknown
+    events are kept in the log and ignored here, never fatal.
+    """
+    session_id = None
+    deltas: list[str] = []
+    terminal_text = None
+    failure = None
+    usage: dict[str, Any] = {}
+    model = None
+    evidence: list[str] = []
+    saw_event = False
+    saw_terminal = False
+    for line in stdout.splitlines():
+        try:
+            value = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        saw_event = True
+        stream = value.get("stream") if isinstance(value.get("stream"), dict) else {}
+        if stream.get("kind") == "session" and isinstance(stream.get("id"), str):
+            session_id = session_id or stream["id"]
+        payload = value.get("payload") if isinstance(value.get("payload"), dict) else {}
+        payload_type = str(value.get("payload_type") or "")
+        if payload_type == "run.output.delta" and isinstance(payload.get("text"), str):
+            deltas.append(payload["text"])
+        elif payload_type.startswith("run.terminal."):
+            saw_terminal = True
+            terminal_text = payload.get("text") if isinstance(payload.get("text"), str) else terminal_text
+            if payload.get("terminal") not in (None, "completed"):
+                failure = str(payload.get("reason") or f"Muse run {payload.get('terminal')}")
+        found_usage = _muse_usage(payload)
+        if found_usage:
+            usage = found_usage
+        for item in _muse_dicts(payload):
+            candidate = item.get("model") or item.get("model_id") or item.get("modelId")
+            if model is None and isinstance(candidate, str) and candidate:
+                model = candidate
+            exit_code = item.get("exit_code", item.get("exitCode"))
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0:
+                command = item.get("command") or item.get("cmd") or "command"
+                note = f"command exited {exit_code}: {compact(str(command), 200)}"
+                if note not in evidence:
+                    evidence.append(note)
+    if not saw_event:
+        return None, stdout.strip(), None, {}, None, []
+    if not saw_terminal and not failure:
+        failure = "Muse stream ended without a terminal event"
+    text = terminal_text if terminal_text is not None else "".join(deltas)
+    return session_id, text.strip(), failure, usage, model, evidence
+
+
+def muse_settings_mcp_names(env: dict[str, str]) -> list[str]:
+    """MCP server names Muse would load from the user's settings.json.
+
+    Names only -- never commands, URLs or headers -- so a worker run can
+    disable every one of them (`-c mcpServers.<name>.enabled=false`)
+    without Fusion ever holding the operator's MCP configuration."""
+    root = env.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    path = Path(root).expanduser() / "muse" / "settings.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    servers = value.get("mcpServers") if isinstance(value, dict) else None
+    return sorted(name for name in servers if isinstance(name, str) and name) if isinstance(servers, dict) else []
+
+
 def opencode_empty_step_guard(limit: int):
     """Stop a run whose provider keeps answering with nothing.
 
@@ -3097,8 +3250,8 @@ def agent_command(
 ) -> tuple[list[str], dict[str, str], dict[str, Any]]:
     agent = task["agent"]
     settings = agent_settings(config, task)
-    if settings.get("reasoning_effort") is not None and agent not in {"codex", "claude", "agy", "opencode"}:
-        raise ValueError("reasoning_effort is currently supported only for native Codex, Claude Code, agy and OpenCode")
+    if settings.get("reasoning_effort") is not None and agent not in {"codex", "claude", "agy", "opencode", "muse"}:
+        raise ValueError("reasoning_effort is currently supported only for native Codex, Claude Code, agy, OpenCode and Muse Code")
     # YOLO grants full access to work that writes. A read-only task keeps each
     # harness's read-only mode even in a YOLO workspace: --read-only is a promise.
     yolo = execution_mode(config) == "yolo" and bool(task.get("write"))
@@ -3232,6 +3385,81 @@ def agent_command(
             raise ValueError("opencode.empty_step_limit must be a non-negative integer (0 disables)")
         return argv, env, {"command": command, "model": selected_model, "empty_step_limit": limit,
                            **({"execution_choice": choice} if choice else {})}
+    if agent == "muse":
+        command = settings.get("command", "muse")
+        selected_model = str(settings.get("model") or "")
+        argv = [command, "exec", "--json"]
+        if selected_model:
+            argv += ["--model", selected_model]
+        choice = None
+        if settings.get("reasoning_effort") is not None:
+            from fusion_reasoning import check_pair, recorded_choice
+            choice = recorded_choice(check_pair("muse", settings),
+                                     {"status": "unchecked", "reason": "Muse reports no per-model effort catalog in exec events"})
+            argv += ["--reasoning-effort", settings["reasoning_effort"]]
+        # Approvals off, sandbox on: a headless worker cannot answer prompts,
+        # and the OS sandbox is what keeps it in its workspace. YOLO (writing
+        # work in a yolo workspace) is the only exception, as elsewhere.
+        if yolo:
+            argv.append("--yolo")
+        else:
+            network = settings.get("sandbox_network", "proxy-only")
+            if network not in {"restricted", "enabled", "proxy-only"}:
+                raise ValueError("muse.sandbox_network must be restricted, enabled or proxy-only")
+            argv += ["--approval-mode", "never", "--sandbox-network", network]
+        argv += ["--contributor-mode", "off", "--no-foreign-personal-context"]
+        if settings.get("session_log") is not True:
+            argv.append("--no-session-log")
+        profile = str(settings.get("permission_profile") or "")
+        if profile and not re.fullmatch(r"[A-Za-z0-9_.-]+", profile):
+            raise ValueError("muse.permission_profile must be a Muse permission profile id")
+        if not task["write"]:
+            # --disable-write covers Muse's own file tools; with no shell
+            # tool there is no shell write either. An operator-supplied
+            # permission profile may replace the shell ban.
+            argv.append("--disable-write")
+            argv += ["--permission-profile", profile] if profile and not yolo else ["--disable-shell"]
+        elif profile and not yolo:
+            argv += ["--permission-profile", profile]
+        # Workers get none of the operator's MCP servers: every server the
+        # user's Muse settings would load is disabled for this run, except
+        # servers declared for workers in muse.mcp_servers.
+        worker_servers = settings.get("mcp_servers") or {}
+        if not isinstance(worker_servers, dict) or not all(
+                isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", name) and isinstance(server, dict)
+                for name, server in worker_servers.items()):
+            raise ValueError("muse.mcp_servers must be an object of MCP server objects by name")
+        disabled = settings.get("disable_mcp") or []
+        if not isinstance(disabled, list) or not all(isinstance(item, str) and item for item in disabled):
+            raise ValueError("muse.disable_mcp must be a list of MCP server names")
+        for name in sorted((set(muse_settings_mcp_names(env)) | set(disabled)) - set(worker_servers)):
+            if re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+                argv += ["-c", f"mcpServers.{name}.enabled=false"]
+        for name, server in worker_servers.items():
+            argv += ["-c", f"mcpServers.{name}=" + json.dumps(server, separators=(",", ":"))]
+        metadata: dict[str, Any] = {"command": command, "model": selected_model,
+                                    **({"execution_choice": choice} if choice else {})}
+        key_env = str(settings.get("api_key_env") or "")
+        if key_env:
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key_env) or not env.get(key_env):
+                raise ValueError(f"muse.api_key_env must name a set environment variable (got {key_env!r})")
+            argv.append("--api-key-stdin")
+            metadata["api_key_env"] = key_env
+        argv += ["--workspace", task["workspace"]]
+        if session_id:
+            try:
+                uuid.UUID(session_id)
+            except (ValueError, TypeError, AttributeError):
+                session_id = None
+            if session_id:
+                argv += ["--session-id", session_id]
+        prompt = tempfile.NamedTemporaryFile(mode="w", suffix=".md", prefix="fusion-muse-brief-",
+                                             delete=False, encoding="utf-8")
+        prompt.write(brief_for(task))
+        prompt.close()
+        argv += ["--prompt-file", prompt.name]
+        metadata["prompt_file"] = prompt.name
+        return argv, env, metadata
     if agent == "claude":
         command = settings.get("command", "claude")
         command_name = Path(command).name
@@ -3854,7 +4082,7 @@ def _dispatch(
                 task["session_key"] += suffix
     # Pinned choices do not resume a session created for a different pair.
     # Keep legacy session keys unchanged when effort is inherited.
-    if task["agent"] in {"codex", "claude", "agy", "opencode"}:
+    if task["agent"] in {"codex", "claude", "agy", "opencode", "muse"}:
         settings = agent_settings(config, task)
         if settings.get("reasoning_effort") is not None:
             from fusion_reasoning import pair_key, validate_pair
@@ -3950,9 +4178,15 @@ def _dispatch(
         store.write_json(run_dir / "result.json", result)
         store.event(run_dir, "run.finished", {"result": result})
         store.trace_span(config, task, result, started_at_ms, now_ms(), metadata)
+        if metadata.get("prompt_file"):
+            Path(metadata["prompt_file"]).unlink(missing_ok=True)
         return result
     argv[0] = binary
     prompt = brief_for(task) if task["agent"] == "codex" else None
+    # A Muse API key named in config reaches the worker on stdin only:
+    # run_logged feeds stdin from an anonymous temp file, never a log.
+    if task["agent"] == "muse" and metadata.get("api_key_env"):
+        prompt = env.get(metadata["api_key_env"]) or ""
     started = time.monotonic()
     stdout_path = run_dir / "stdout.log"
     stderr_path = run_dir / "stderr.log"
@@ -3993,7 +4227,7 @@ def _dispatch(
                 argv,
                 cwd=task["workspace"],
                 env=env,
-                input=prompt if task["agent"] == "codex" else None,
+                input=prompt,
                 timeout=effective_timeout,
                 stdout_path=stdout_path, stderr_path=stderr_path, label=label,
                 plain_output=task["agent"] == "grok" and metadata.get("output_format") == "plain",
@@ -4016,6 +4250,12 @@ def _dispatch(
             new_session, summary, failure, usage, event_model, evidence_notes = parse_opencode_output(completed.stdout)
             if exit_code != 0 and completed.stderr.strip():
                 failure = failure or compact(progress.clean(completed.stderr), 1500)
+        elif task["agent"] == "muse":
+            # Per-command exits are evidence, as for Codex, not blockers.
+            new_session, summary, failure, usage, event_model, evidence_notes = parse_muse_output(completed.stdout)
+            session_id_seen = new_session
+            if exit_code != 0 and completed.stderr.strip():
+                failure = failure or compact(progress.clean(completed.stderr), 1500)
         else:
             new_session, summary, failure, usage, event_model, evidence_notes = parse_claude_output(completed.stdout, not task["write"])
         # Preserve the public deliverable outside the compact receipt and trace.
@@ -4036,12 +4276,13 @@ def _dispatch(
         if metadata.get("execution_choice") and event_model:
             metadata["execution_choice"]["observed"] = {
                 "model": event_model, "reasoning_effort": None, "status": "model_reported",
-                "source": "codex_json", "note": "effort is not attested by the stock exec event stream"}
+                "source": "codex_json" if task["agent"] == "codex" else f"{task['agent']}_events",
+                "note": "effort is not attested by the stock exec event stream"}
         handoff = parse_handoff(summary)
         if new_session:
             store.set_session(task["session_key"], new_session)
-        # Codex command exits remain evidence; provider permission denials fail.
-        if failure or (task["agent"] != "codex" and evidence_notes):
+        # Codex and Muse command exits remain evidence; provider permission denials fail.
+        if failure or (task["agent"] not in {"codex", "muse"} and evidence_notes):
             status = "error"
         elif exit_code == 0 and not summary.strip():
             # A clean exit with nothing said is not a result. Free OpenRouter
@@ -4091,7 +4332,7 @@ def _dispatch(
     harness = {name: init[field] for name, field in (("provider_version", "claude_code_version"),
                                                      ("provider_permission_mode", "permissionMode"))
                if isinstance(init.get(field), str)}
-    denied_tools = normalize_tools(item["tool"] for item in denied) or blocker_denied_tools(evidence_notes if task["agent"] != "codex" else [])
+    denied_tools = normalize_tools(item["tool"] for item in denied) or blocker_denied_tools(evidence_notes if task["agent"] not in {"codex", "muse"} else [])
     # A worker that was denied only non-baseline tools (a Bash command outside its
     # allowlist) and still exited 0 with a handoff worked around the denial: that
     # is a degraded result the gate should score, not a permission failure. The
@@ -4140,7 +4381,7 @@ def _dispatch(
         "denied_tools": denied_tools or blocker_denied_tools(blockers),
         "denied": denied,
         "denied_count": len(denied),
-        "command_evidence": evidence_notes if task["agent"] == "codex" else [],
+        "command_evidence": evidence_notes if task["agent"] in {"codex", "muse"} else [],
         "exit_code": exit_code,
         "duration_ms": duration_ms,
         "timeout_seconds": effective_timeout,
@@ -4345,7 +4586,7 @@ def tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "agent": {"type": "string", "enum": ["auto", "codex", "claude", "agy", "grok", "opencode"]},
+                    "agent": {"type": "string", "enum": ["auto", "codex", "claude", "agy", "grok", "opencode", "muse"]},
                     "task": {"type": "string"},
                     "role": {"type": "string", "default": "implementation"},
                     "success_criteria": {"type": "array", "items": {"type": "string"}},
@@ -4357,7 +4598,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "workspace": {"type": "string", "description": "Optional workspace path for the delegated task."},
                     "route": {"type": "string", "description": "Optional named route such as orc-free or orc-best."},
                     "model": {"type": "string", "description": "Model for this task, overriding the route and agent settings."},
-                    "reasoning_effort": {"type": "string", "enum": sorted(EFFORTS), "description": "Codex, or Claude Code (low-max); requires model."},
+                    "reasoning_effort": {"type": "string", "enum": sorted(EFFORTS), "description": "Codex, Claude Code (low-max), or Muse Code; requires model."},
                     "issue": {"type": "string", "pattern": "^" + ISSUE_RE.pattern + "$", "description": "Target issue as owner/repo#N, recorded on the run."},
                     "override_cap": {"type": "string", "description": "A reason to run once past decisions.max_rejections_per_issue; logged."},
                     "needs": {"type": "array", "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"}, "description": "Capabilities the task needs from its lane, such as local_server; automatic routing skips lanes whose config `lacks` one."},
@@ -4518,8 +4759,8 @@ def run_mcp(workspace: Path, config: dict[str, Any]) -> int:
                     elif name == "fusion_delegate":
                         timeout_seconds = validate_timeout(args["timeout_seconds"]) if "timeout_seconds" in args else None
                         agent = args.get("agent")
-                        if agent not in {"auto", "codex", "claude", "agy", "grok", "opencode"}:
-                            raise ValueError("agent must be auto, codex, claude, agy, or grok")
+                        if agent not in {"auto", "codex", "claude", "agy", "grok", "opencode", "muse"}:
+                            raise ValueError("agent must be auto, codex, claude, agy, grok, opencode, or muse")
                         target = workspace_path(args["workspace"]) if args.get("workspace") else workspace
                         if target != workspace:
                             target_config, _ = load_config(target)
@@ -4738,6 +4979,8 @@ def launch_lead(workspace: Path, config: dict[str, Any], agent: str, task: str |
             Path(prompt.name).unlink(missing_ok=True)
     if agent == "agy":
         raise SystemExit("fusion: agy can be a sidekick, workflow node, or Ultra harness, but not (yet) the interactive lead")
+    if agent == "muse":
+        raise SystemExit("fusion: muse can be a sidekick, workflow node, or Ultra harness, but not (yet) the interactive lead")
     raise SystemExit(f"fusion: unsupported lead agent {agent}")
 
 
@@ -4769,7 +5012,7 @@ def print_ultra_result(result: dict[str, Any], as_json: bool) -> None:
 
 def doctor(workspace: Path, config: dict[str, Any]) -> int:
     checks = []
-    for agent in ("claude", "codex", "agy", "grok", "opencode"):
+    for agent in ("claude", "codex", "agy", "grok", "opencode", "muse"):
         command = config.get(agent, {}).get("command", agent)
         path = executable(command)
         checks.append(
@@ -4911,7 +5154,7 @@ def build_parser() -> argparse.ArgumentParser:
     ultra = sub.add_parser("ultra", help="run a bounded UltraCode-style explore/plan/implement/review pipeline")
     ultra.add_argument("--stages", type=int, help="maximum number of configured stages")
     ultra.add_argument("--cheap-only", action="store_true", help="force Claude stages onto the orc-free route")
-    ultra.add_argument("--harness", choices=["claude", "codex", "agy", "grok", "opencode"], help="run every Ultra stage through one harness")
+    ultra.add_argument("--harness", choices=["claude", "codex", "agy", "grok", "opencode", "muse"], help="run every Ultra stage through one harness")
     ultra.add_argument("task", help="task for the pipeline")
 
     workflow = sub.add_parser("workflow", help="run a persisted bounded Fusion DAG")
@@ -4924,7 +5167,7 @@ def build_parser() -> argparse.ArgumentParser:
     workflow_resume = workflow_sub.add_parser("resume", help="resume a paused or failed workflow")
     workflow_resume.add_argument("run_id")
     workflow_resume.add_argument("--node", help="unfinished stage to retry with a different worker")
-    workflow_resume.add_argument("--agent", choices=["auto", "claude", "codex", "agy", "grok", "opencode"])
+    workflow_resume.add_argument("--agent", choices=["auto", "claude", "codex", "agy", "grok", "opencode", "muse"])
     workflow_resume.add_argument("--route", help="configured route to use for the selected stage")
     workflow_resume.add_argument("--max-attempts", type=int, help="new explicit attempt limit per stage")
     workflow_resume.add_argument(

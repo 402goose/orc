@@ -390,6 +390,16 @@ consulted. See [OpenCode and --variant](model-effort.md#opencode).
 
 For keys, wrappers and per-provider routes see [OpenCode settings](configuration.md#opencode-settings).
 
+## Muse lanes
+
+`muse` (`muse exec --json`) is a sixth worker harness for Meta-hosted models. It runs as a sidekick (`--agent muse`), a workflow node, an Ultra stage/harness, or a labeling worker. Sessions resume through `--session-id` when `muse.session_log` is enabled. The default lanes are `muse-wonder-full-high` (`muse-wonder-full-1.0`), `muse-wonder-high` (`muse-wonder-1.0`) and `muse-spark-high` (`muse-spark-1.3`), each shown with upstream and creator `meta` and subscription billing.
+
+**Muse lanes are not auto-routed by default.** A Muse lane earns automatic routing through measured evidence (gym, held-out, Bradley-Terry); until then automatic candidacy drops it with `Muse lanes are not auto-routed until measured; name this lane in decisions.auto_routes to opt in`. Only delegate repositories cleared for Meta-hosted processing.
+
+`reasoning_effort` on a Muse lane passes `--reasoning-effort` to `muse exec` and is validated against the `muse model-profile` tiers. See [Muse Code](model-effort.md#muse-code).
+
+For sandboxing, MCP and keys see [Muse Code settings](configuration.md#muse-code-settings).
+
 ## Antigravity lanes
 
 `agy` — the Google Antigravity CLI — is a third worker harness. It runs as a

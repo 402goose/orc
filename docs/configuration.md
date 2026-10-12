@@ -920,6 +920,29 @@ of the derived ones:
 Config load refuses any other key, naming the route. Nothing reads offers yet:
 an `offer` block changes no routing choice, quota or price.
 
+## Muse Code settings
+
+[Muse Code](https://muse.ai) (`muse exec --json`) is a sixth worker harness, hosted by Meta. Workers always run with `--approval-mode never`, the OS sandbox on (`--sandbox-network proxy-only`), `--contributor-mode off` (worker content is never used for product improvement, whatever your setting) and `--no-foreign-personal-context` (your personal rules and skills are not loaded). Writers may write the workspace through the sandbox; readers also get `--disable-write` and no shell tool (`--disable-shell`), so neither file tools nor shell commands can write for a reader. A `permission_profile` defined in your Muse settings replaces `--disable-shell` for readers. Only a writing task in an `execution_mode: "yolo"` workspace gets `muse exec --yolo`; nothing else passes `--yolo` or `--disable-sandbox`.
+
+```json
+{
+  "muse": {
+    "command": "muse",
+    "model": "muse-wonder-1.0",
+    "sandbox_network": "proxy-only",
+    "permission_profile": "",
+    "disable_mcp": [],
+    "mcp_servers": {},
+    "api_key_env": "",
+    "session_log": false
+  }
+}
+```
+
+The default routes `muse-wonder-full-high` (`muse-wonder-full-1.0`), `muse-wonder-high` (`muse-wonder-1.0`) and `muse-spark-high` (`muse-spark-1.3`) each derive a lane offer with creator and upstream `meta` and subscription billing; set `cost_tier` on a route to price one (with no published per-token price the lanes stay unpriced). **Muse lanes are not auto-routed by default**: name one in `decisions.auto_routes` to opt in once gym or held-out evidence says it earns it. Muse is a hosted provider, so only delegate repositories you have cleared for Meta-hosted processing.
+
+Muse loads MCP servers from `mcpServers` in its own `settings.json`. Workers get none of them: every server named there (plus `disable_mcp`) is disabled for the run with `-c mcpServers.<name>.enabled=false`, except servers declared for workers in `mcp_servers` (for example a Playwright-only server). Keys come from `muse login`, or from `--api-key-stdin` fed from the env var named by `api_key_env`; a key never appears in argv, the run directory or logs. Sessions are not logged by default (`--no-session-log`), so resume starts fresh unless `session_log: true` lets `--session-id` resume a persisted session. `muse` is a sidekick, workflow node, Ultra stage and labeling worker, not an interactive Fusion lead.
+
 ## Older Grok clients
 
 Grok workers default to `streaming-json` output. For an older CLI without that

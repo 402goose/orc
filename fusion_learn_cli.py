@@ -20,7 +20,7 @@ import sys
 import time
 
 LABEL = "ai.orc.fusion-learn"
-WORKERS = ("claude", "codex", "agy", "grok", "opencode", "orc", "node")
+WORKERS = ("claude", "codex", "agy", "grok", "opencode", "muse", "orc", "node")
 BASE_PATH = ("/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin")
 
 
