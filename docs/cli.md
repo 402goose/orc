@@ -85,6 +85,7 @@ after its name. Aliases and hidden subcommands are included below.
 - [fusion quota](#fusion-quota)
 - [fusion quota probe](#fusion-quota-probe)
 - [fusion quota rates](#fusion-quota-rates)
+- [fusion lanes](#fusion-lanes)
 - [fusion mcp-serve](#fusion-mcp-serve)
 
 ## fusion
@@ -92,12 +93,12 @@ after its name. Aliases and hidden subcommands are included below.
 ```text
 usage: fusion [-h] [--workspace WORKSPACE] [--control-workspace CONTROL_WORKSPACE]
               [--json] [--progress | --quiet]
-              {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,trajectories,learn,gym,quota,mcp-serve} ...
+              {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,trajectories,learn,gym,quota,lanes,mcp-serve} ...
 
 Lead/sidekick orchestration for Claude Code, Codex CLI, and Antigravity CLI
 
 positional arguments:
-  {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,trajectories,learn,gym,quota,mcp-serve}
+  {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,trajectories,learn,gym,quota,lanes,mcp-serve}
     truffle               scout tractable GitHub issues and queue isolated fixes
     ui                    open the local ORC/Fusion control room in your browser
     lead                  launch an interactive lead agent with the Fusion MCP server
@@ -127,6 +128,8 @@ positional arguments:
     gym                   replay merged fix PRs as benchmark tasks across lanes
     quota                 show what each account has left, probe accounts at reset, and
                           measure quota per run
+    lanes                 show one offer per lane: model, creator, upstream, billing,
+                          features and prices; dispatches nothing
     mcp-serve             ==SUPPRESS==
 
 options:
@@ -1669,6 +1672,20 @@ options:
   -h, --help   show this help message and exit
   --days DAYS
   --json
+```
+
+## fusion lanes
+
+show one offer per lane: model, creator, upstream, billing, features and prices; dispatches nothing
+
+```text
+usage: fusion lanes [-h] [--json] [--live]
+
+options:
+  -h, --help  show this help message and exit
+  --json
+  --live      add each lane's quota class and whether its command is on PATH, from local
+              state
 ```
 
 ## fusion mcp-serve

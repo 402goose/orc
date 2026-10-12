@@ -863,6 +863,28 @@ enforces a policy on them yet.
 
 Routes without `endpoint` are unchanged.
 
+## Lane offers
+
+`fusion lanes` derives one `fusion.lane_offer.v1` record per route and per bare
+agent from the settings above: model and effort, who made the model
+(`creator`), who serves it (`upstream`), `billing`, `features`, the declared
+prices and `cost_tier`. See [routing](routing.md#fusion-lanes) for the
+derivation. A route's optional `offer` block states any of four values in place
+of the derived ones:
+
+```json
+{"routes": {"oc-kimi": {"agent": "opencode", "model": "gateway/kimi-k2.6",
+                        "offer": {"creator": "kimi", "upstream": "gateway-eu", "billing": "api",
+                                  "features": ["write", "tools"]}}}}
+```
+
+- `creator`, `upstream`: a name, or `null`.
+- `billing`: `api`, `subscription`, `free` or `local`.
+- `features`: a list of names, replacing the derived list.
+
+Config load refuses any other key, naming the route. Nothing reads offers yet:
+an `offer` block changes no routing choice, quota or price.
+
 ## Older Grok clients
 
 Grok workers default to `streaming-json` output. For an older CLI without that

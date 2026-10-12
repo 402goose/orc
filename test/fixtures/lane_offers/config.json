@@ -1,0 +1,84 @@
+{
+  "claude": {
+    "model": "claude-sonnet-5",
+    "command": "claude"
+  },
+  "codex": {
+    "browser": true,
+    "price_per_mtok": {
+      "gpt-6.1-sol": {
+        "input": 2.0,
+        "output": 10.0,
+        "cache_read": 0.1
+      },
+      "gpt-6-astra": {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 1.0
+      }
+    },
+    "command": "codex"
+  },
+  "routes": {
+    "codex-read": null,
+    "codex-write": null,
+    "orc-best": null,
+    "claude-sub": {
+      "agent": "claude",
+      "model": "claude-sonnet-5",
+      "cost_tier": 1
+    },
+    "claude-api": {
+      "agent": "claude",
+      "model": "claude-sonnet-5",
+      "billing": "api",
+      "account": "api",
+      "cost_tier": 3,
+      "price_per_mtok": {
+        "input": 3.0,
+        "output": 15.0,
+        "cache_read": 0.3,
+        "cache_write": 3.75
+      }
+    },
+    "codex-sol61-high": {
+      "agent": "codex",
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "high",
+      "cost_tier": 1
+    },
+    "codex-astra-read": {
+      "agent": "codex",
+      "model": "gpt-6-astra",
+      "sandbox": "read-only",
+      "cost_tier": 2
+    },
+    "oc-local": {
+      "agent": "opencode",
+      "model": "local/coder-30b",
+      "endpoint": {
+        "base_url": "http://127.0.0.1:8000/v1",
+        "region": "host",
+        "retention": "none"
+      },
+      "price_per_mtok": {
+        "input": 0,
+        "output": 0
+      }
+    },
+    "oc-kimi": {
+      "agent": "opencode",
+      "model": "gateway/kimi-k2.6",
+      "cost_tier": 1,
+      "price_per_mtok": {
+        "input": 0.95,
+        "output": 4.0,
+        "cache_read": 0.095
+      },
+      "offer": {
+        "creator": "kimi",
+        "billing": "api"
+      }
+    }
+  }
+}

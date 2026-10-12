@@ -316,6 +316,48 @@ per USD (Claude) or per million tokens (Codex). Per lane it shows p50/p90 run
 cost and minutes and the share of each window a p90 run uses. Other sessions on
 the same subscription are folded in, so the figures are upper bounds.
 
+### `fusion lanes`
+
+`fusion lanes` prints one line per lane: every configured route, then each bare
+agent (claude, codex, opencode, agy, grok). `--json` prints the records as a
+list of `fusion.lane_offer.v1` objects:
+
+```json
+{"schema": "fusion.lane_offer.v1", "lane": "codex-sol61-high", "agent": "codex", "model": "gpt-6.1-sol",
+ "reasoning_effort": "high", "creator": "openai", "upstream": "openai", "billing": "subscription",
+ "endpoint": null, "features": ["write", "browser", "tools"],
+ "rates_usd_per_mtok": {"input": 2.0, "output": 10.0, "cache_read": 0.1}, "cost_tier": 1}
+```
+
+Each value comes from settings that already exist:
+
+- `upstream`: with an [`endpoint`](configuration.md#model-endpoints), `self` when
+  its `data_class` is `local`, else the endpoint's host. Otherwise an `orc`
+  command is `openrouter`, claude `anthropic`, codex `openai`, agy `google`,
+  grok `xai`, and opencode the model's provider prefix (`null` without one).
+- `creator`: `anthropic` for a `claude-*` model, `openai` for `gpt-*`, `google`
+  for `gemini-*` (after any provider prefix), else `null`.
+- `billing`: `api` for a metered lane (`billing: "api"`), `free` for a `:free`
+  model or the orc `free` selector, `local` for a local endpoint, else
+  `subscription`.
+- `features`: `write` unless the lane is read-only (a `read-only` sandbox, `plan`
+  permission mode or mode, or `lacks: ["write"]`); `browser` when a codex or
+  claude lane has `browser` on; `tools` for every agent harness.
+- `endpoint`: the endpoint's `host` and `data_class`, or `null`.
+- `rates_usd_per_mtok`: the lane's [`price_per_mtok`](configuration.md#declared-prices)
+  for its model, by-model tables included; `null` when unpriced.
+
+A route's `offer` block may state `creator`, `upstream`, `billing` and
+`features` instead (see [configuration](configuration.md#lane-offers)).
+
+`--live` adds `live` to each offer from local state only: today's quota class
+of the lane's account (`available`, `tight`, `exhausted`, or `unknown` with no
+reading), the same assessment `route --explain` uses, and whether the lane can
+run here (`available` is false when its command is not on PATH or its quota is
+exhausted, with the `reason`). It sends no request and starts no worker.
+
+Nothing reads offers yet; routing, quota and pricing do not change.
+
 ## OpenCode lanes
 
 `opencode` (`opencode run --format json`) is a fifth worker harness that routes
