@@ -141,7 +141,8 @@ Delegate a bounded task to the other coding agent and receive a structured hando
         "claude",
         "agy",
         "grok",
-        "opencode"
+        "opencode",
+        "muse"
       ],
       "type": "string"
     },
@@ -178,7 +179,7 @@ Delegate a bounded task to the other coding agent and receive a structured hando
       "type": "string"
     },
     "reasoning_effort": {
-      "description": "Codex, or Claude Code (low-max); requires model.",
+      "description": "Codex, Claude Code (low-max), or Muse Code; requires model.",
       "enum": [
         "high",
         "low",

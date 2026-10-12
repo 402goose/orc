@@ -88,7 +88,7 @@ print(json.dumps({"type":"turn.completed","usage":{"input_tokens":12,"output_tok
             core.agent_command(self.config, self.task({"model": "", "reasoning_effort": "high"}), None)
         task = self.task(ASTRA)
         task["agent"] = "grok"
-        with self.assertRaisesRegex(ValueError, "native Codex, Claude Code, agy and OpenCode"):
+        with self.assertRaisesRegex(ValueError, "native Codex, Claude Code, agy, OpenCode and Muse Code"):
             core.agent_command(self.config, task, None)
         with self.assertRaisesRegex(ValueError, "explicit Codex, Claude, agy or OpenCode"):
             validate_spec({"nodes": [{"id": "one", "task": "inspect", "agent": "auto", **ASTRA}]})

@@ -13,9 +13,9 @@ import time
 import fusion_core as core
 
 SCHEMA = "fusion.lane_offer.v1"
-AGENTS = ("claude", "codex", "opencode", "agy", "grok")
-AGENT_UPSTREAM = {"claude": "anthropic", "codex": "openai", "agy": "google", "grok": "xai"}
-MODEL_CREATORS = (("claude-", "anthropic"), ("gpt-", "openai"), ("gemini-", "google"))
+AGENTS = ("claude", "codex", "opencode", "agy", "grok", "muse")
+AGENT_UPSTREAM = {"claude": "anthropic", "codex": "openai", "agy": "google", "grok": "xai", "muse": "meta"}
+MODEL_CREATORS = (("claude-", "anthropic"), ("gpt-", "openai"), ("gemini-", "google"), ("muse-", "meta"))
 
 
 def creator(model):

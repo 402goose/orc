@@ -136,7 +136,7 @@ def _lanes(workspace: Path) -> list[dict[str, Any]]:
     except Exception:
         return []
     lanes = []
-    for agent in ("claude", "codex", "agy", "grok", "opencode"):
+    for agent in ("claude", "codex", "agy", "grok", "opencode", "muse"):
         settings = config.get(agent) or {}
         lanes.append({"agent": agent, "route": None, "model": settings.get("model") or None,
                       "available": bool(core.executable(str(settings.get("command", agent))))})
@@ -145,12 +145,18 @@ def _lanes(workspace: Path) -> list[dict[str, Any]]:
             continue
         agent = str(route["agent"])
         command = str(route.get("command") or (config.get(agent) or {}).get("command") or agent)
-        lanes.append({"agent": agent, "route": name,
-                      "model": route.get("model") or route.get("model_selector") or (config.get(agent) or {}).get("model") or None,
-                      "cost_tier": route.get("cost_tier"), "available": bool(core.executable(command))})
+        lane = {"agent": agent, "route": name,
+                "model": route.get("model") or route.get("model_selector") or (config.get(agent) or {}).get("model") or None,
+                "cost_tier": route.get("cost_tier"), "available": bool(core.executable(command))}
+        for field in ("upstream", "creator", "billing"):
+            if route.get(field) is not None:
+                lane[field] = route[field]
+        lanes.append(lane)
     pool = (config.get("decisions") or {}).get("auto_routes")
     for lane in lanes:
-        lane["automatic"] = pool is None or (lane["route"] or lane["agent"]) in pool
+        named = pool is not None and (lane["route"] or lane["agent"]) in pool
+        # Muse lanes earn automatic routing only once an operator names one.
+        lane["automatic"] = named if lane["agent"] == "muse" else pool is None or named
     return lanes
 
 
