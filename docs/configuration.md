@@ -686,6 +686,17 @@ cost unknown, and a lane with no table is unchanged.
 
 Keys are `input`, `output` (reasoning tokens count as output), `cache_read` and `cache_write`.
 
+One agent often serves models with different prices (Codex serves several). The table may
+instead map model ids to prices, with `"*"` for any other model. The run's model picks the
+entry. A model with no entry and no `"*"` stays unpriced.
+
+```json
+{"codex": {"price_per_mtok": {"gpt-6.1-sol": {"input": 2.0, "output": 10.0, "cache_read": 0.1},
+                              "gpt-6-astra": {"input": 10.0, "output": 50.0, "cache_read": 1.0}}}}
+```
+
+For a subscription lane, the estimate is the API-list equivalent of the tokens used, not money spent.
+
 ## OpenCode settings
 
 [OpenCode](https://opencode.ai) (`opencode run --format json`) is a fifth worker

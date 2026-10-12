@@ -2265,23 +2265,35 @@ PRICE_FIELDS = {"input": ("input_tokens",), "output": ("output_tokens", "reasoni
                 "cache_write": ("cache_creation_input_tokens", "cache_write_input_tokens")}
 
 
-def price_per_mtok(settings: dict[str, Any]) -> dict[str, float] | None:
-    """A route's or agent's `price_per_mtok`: USD per million tokens by kind, or None."""
-    value = settings.get("price_per_mtok")
-    if value is None:
-        return None
+def _price_table(value: Any) -> dict[str, float]:
     if (not isinstance(value, dict) or not value or set(value) - set(PRICE_FIELDS)
             or any(isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0 for v in value.values())):
-        raise ValueError("price_per_mtok must map input, output, cache_read, cache_write to non-negative USD per 1M tokens")
+        raise ValueError("price_per_mtok must map input, output, cache_read, cache_write to non-negative USD per 1M tokens"
+                         " (or map model ids, and optionally \"*\", to such tables)")
     return {key: float(price) for key, price in value.items()}
 
 
-def price_fallback(settings: dict[str, Any], usage: dict[str, Any]) -> float | None:
+def price_per_mtok(settings: dict[str, Any], model: str | None = None) -> dict[str, float] | None:
+    """A route's or agent's `price_per_mtok`: USD per million tokens by kind, or None.
+
+    The table is either one set of prices for every model, or a map from model id to
+    prices, with `"*"` for any other model. A by-model table without an entry for
+    `model` and without `"*"` prices nothing. Every entry is validated either way."""
+    value = settings.get("price_per_mtok")
+    if value is None:
+        return None
+    if isinstance(value, dict) and value and not set(value) <= set(PRICE_FIELDS):
+        tables = {name: _price_table(table) for name, table in value.items()}
+        return tables.get(model) if model in tables else tables.get("*")
+    return _price_table(value)
+
+
+def price_fallback(settings: dict[str, Any], usage: dict[str, Any], model: str | None = None) -> float | None:
     """The cost of a run whose worker reported tokens but no cost, from the lane's declared
-    prices. Reported costs always win; without prices or tokens the cost stays unknown."""
+    prices for `model`. Reported costs always win; without prices or tokens the cost stays unknown."""
     if usage.get("cost_usd") is not None:
         return None
-    prices = price_per_mtok(settings)
+    prices = price_per_mtok(settings, model)
     if not prices:
         return None
     total, counted = 0.0, False
@@ -3468,7 +3480,7 @@ def dispatch(
             # count toward budgets or routing cost.
             usage["cost_estimate_usd"] = usage.pop("cost_usd")
             usage["cost_usd"] = 0.0
-        estimated = price_fallback(resolved_settings, usage)
+        estimated = price_fallback(resolved_settings, usage, model)
         if estimated is not None:
             usage["cost_usd"], usage["cost_estimated"] = estimated, True
         if metadata.get("execution_choice") and event_model:

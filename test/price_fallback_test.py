@@ -32,6 +32,27 @@ class PriceFallbackTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "price_per_mtok"):
                 core.price_per_mtok({"price_per_mtok": value})
 
+    def test_a_by_model_table_prices_each_model_and_falls_back_to_star(self):
+        prices = {"price_per_mtok": {"gpt-6.1-sol": {"input": 2.0, "output": 10.0, "cache_read": 0.1},
+                                     "gpt-6-astra": {"input": 10.0, "output": 50.0, "cache_read": 1.0},
+                                     "*": {"input": 1.0, "output": 1.0}}}
+        usage = {"input_tokens": 1_000_000, "output_tokens": 100_000, "cached_input_tokens": 1_000_000}
+        self.assertAlmostEqual(core.price_fallback(prices, usage, "gpt-6.1-sol"), 2.0 + 1.0 + 0.1)
+        self.assertAlmostEqual(core.price_fallback(prices, usage, "gpt-6-astra"), 10.0 + 5.0 + 1.0)
+        self.assertIsNone(core.price_fallback(prices, usage, "other"))  # "*" does not price cache reads
+        self.assertAlmostEqual(core.price_fallback(prices, {"input_tokens": 1_000_000}, "other"), 1.0)
+
+    def test_a_by_model_table_without_the_model_or_star_prices_nothing(self):
+        prices = {"price_per_mtok": {"gpt-6.1-sol": {"input": 2.0}}}
+        self.assertIsNone(core.price_fallback(prices, {"input_tokens": 10}, "gpt-6-astra"))
+        self.assertIsNone(core.price_fallback(prices, {"input_tokens": 10}))
+
+    def test_a_malformed_by_model_entry_is_refused_whatever_the_model(self):
+        for value in ({"gpt-6.1-sol": {"input": -1}}, {"gpt-6.1-sol": {}}, {"gpt-6.1-sol": "cheap"},
+                      {"gpt-6.1-sol": {"input": 1.0}, "*": {"inputs": 1.0}}):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "price_per_mtok"):
+                core.price_per_mtok({"price_per_mtok": value}, "gpt-6.1-sol")
+
     def test_dispatch_records_an_estimated_cost(self):
         events = [{"type": "text", "sessionID": "s", "part": {"type": "text", "text": "STATUS: success\nSUMMARY: ok"}},
                   {"type": "step_finish", "sessionID": "s", "part": {"reason": "stop", "tokens": {"input": 1000, "output": 500},
@@ -47,6 +68,24 @@ class PriceFallbackTest(unittest.TestCase):
             result = core.dispatch(config, task, core.RunStore(root))
         self.assertEqual(result["status"], "success", result)
         self.assertAlmostEqual(result["usage"]["cost_usd"], 0.001 + 0.002)
+        self.assertTrue(result["usage"]["cost_estimated"])
+
+    def test_dispatch_prices_by_the_runs_model(self):
+        events = [{"type": "text", "sessionID": "s", "part": {"type": "text", "text": "STATUS: success\nSUMMARY: ok"}},
+                  {"type": "step_finish", "sessionID": "s", "part": {"reason": "stop", "tokens": {"input": 1000, "output": 500},
+                                                                     "cost": 0}}]
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {"FUSION_DECISIONS_MODE": "off", "FUSION_TELEMETRY": "0"}):
+            root = Path(d)
+            worker = root / "opencode-fixture"
+            worker.write_text(f"#!{sys.executable}\nimport json\nfor e in {events!r}:\n    print(json.dumps(e))\n")
+            worker.chmod(0o755)
+            table = {"x/y": {"input": 2.0, "output": 8.0}, "*": {"input": 100.0, "output": 100.0}}
+            config = core.deep_merge(core.DEFAULTS, {"decisions": {"mode": "off"}, "opencode": {"command": str(worker)},
+                                                     "routes": {"oc": {"agent": "opencode", "model": "x/y", "price_per_mtok": table}}})
+            task = core.make_task(root, "opencode", "Review", "reviewer", [], [], None, False, False, route="oc")
+            result = core.dispatch(config, task, core.RunStore(root))
+        self.assertEqual(result["status"], "success", result)
+        self.assertAlmostEqual(result["usage"]["cost_usd"], 0.002 + 0.004)
         self.assertTrue(result["usage"]["cost_estimated"])
 
     def test_a_malformed_table_fails_before_the_worker_runs(self):
