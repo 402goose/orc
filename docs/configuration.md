@@ -783,6 +783,81 @@ Use model ids from `opencode models`; the example ids are illustrative. Use
 `fusion delegate --agent opencode --route oc-sonnet --read-only "Check the diff"`
 to try a route before adding it to `decisions.auto_routes`.
 
+## Model endpoints
+
+A route's `endpoint` points its lane at a self-hosted or private server that
+speaks the OpenAI or Anthropic wire format, and records where the lane's model
+runs.
+
+```json
+{
+  "routes": {
+    "local-coder": {
+      "agent": "opencode",
+      "model": "local/coder-30b",
+      "endpoint": {"base_url": "http://127.0.0.1:8000/v1", "api_key_env": "LOCAL_LLM_KEY",
+                   "api": "openai", "region": "host", "retention": "none"},
+      "price_per_mtok": {"input": 0, "output": 0}
+    }
+  }
+}
+```
+
+- `base_url` (required): an `http` or `https` URL, without credentials or a query.
+- `api`: the wire format the server speaks, `"openai"` (the default) or `"anthropic"`.
+- `api_key_env`: the environment variable the key is read from. The key itself
+  never goes in config; it must be set in the environment Fusion runs in.
+- `region`: a free-form label, such as `host`, `us` or a host name.
+- `retention`: `none`, `provider_default` or `allowed`.
+
+Config load refuses an unknown key (a literal `api_key` included), a malformed
+URL, or an `api_key_env` that is not a variable name.
+
+Each harness reaches the endpoint its own way:
+
+- **OpenCode** (`api: "openai"`): a provider is merged into
+  `OPENCODE_CONFIG_CONTENT` under the model's provider prefix, with
+  `npm: "@ai-sdk/openai-compatible"`, `options.baseURL`,
+  `options.apiKey: "{env:LOCAL_LLM_KEY}"` and the model under `models`. The
+  route's `model` must be `provider/model`; the example above defines the
+  provider `local` with the model `coder-30b`.
+- **Claude Code** (`api: "anthropic"` only): sets `ANTHROPIC_BASE_URL`, and
+  `ANTHROPIC_AUTH_TOKEN` from `api_key_env` when given. No other Anthropic key
+  in the environment reaches the worker. An `orc` lane sets its own base URL
+  and cannot take an endpoint.
+
+  ```json
+  {"routes": {"private-claude": {"agent": "claude", "model": "private-model",
+                                 "endpoint": {"base_url": "https://llm.internal.example/anthropic", "api": "anthropic",
+                                              "api_key_env": "PRIVATE_LLM_KEY", "region": "us", "retention": "provider_default"}}}}
+  ```
+
+- **Codex** (`api: "openai"` only): adds
+  `-c model_providers.fusion_endpoint={name=…, base_url=…, env_key=…, wire_api="chat"}`
+  and `-c model_provider="fusion_endpoint"`; Codex reads the key from `env_key`
+  itself. `name` is the route's name.
+
+  ```json
+  {"routes": {"local-codex": {"agent": "codex", "model": "coder-30b",
+                              "endpoint": {"base_url": "http://127.0.0.1:8000/v1", "api_key_env": "LOCAL_LLM_KEY",
+                                           "region": "host", "retention": "none"}}}}
+  ```
+
+Any other agent, an `api` the harness cannot speak, or an `api_key_env` that is
+not set is refused at dispatch, before the worker starts; automatic routing
+drops such a lane with the reason.
+
+A run records the endpoint in `result.json`, in its trace and in the task's
+`resolved` metadata, never the key:
+`"endpoint": {"host": "127.0.0.1", "api": "openai", "region": "host", "retention": "none", "data_class": "local"}`.
+`data_class` is `local` when the host is loopback or `region` is `host`, and
+`remote` otherwise. `fusion route --explain` and `fusion decisions routing-report`
+show each endpoint lane's `data_class` (a family whose lanes differ shows `mixed`);
+lanes without an endpoint show none. These are facts for data policy; nothing
+enforces a policy on them yet.
+
+Routes without `endpoint` are unchanged.
+
 ## Older Grok clients
 
 Grok workers default to `streaming-json` output. For an older CLI without that
