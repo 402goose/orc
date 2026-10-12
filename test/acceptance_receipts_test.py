@@ -318,7 +318,7 @@ class AcceptanceReceiptsTest(unittest.TestCase):
         started, release, completed = [self.workspace / name for name in ("started", "release", "completed")]
         child = ("import pathlib,time;"
                  f"pathlib.Path({str(started)!r}).write_text('ready');"
-                 f"release=pathlib.Path({str(release)!r}); deadline=time.monotonic()+5;"
+                 f"release=pathlib.Path({str(release)!r}); deadline=time.monotonic()+60;"
                  "\nwhile not release.exists() and time.monotonic()<deadline: time.sleep(0.01)\n"
                  "print('late child output',flush=True);"
                  f"pathlib.Path({str(completed)!r}).write_text('escaped cleanup')")
@@ -353,7 +353,7 @@ class AcceptanceReceiptsTest(unittest.TestCase):
         # demonstrably writes through both inherited FDs before marking done.
         child = ("import os,pathlib,sys,time;"
                  f"pathlib.Path({str(started)!r}).write_text(str(os.getpid()));"
-                 f"release=pathlib.Path({str(release)!r}); deadline=time.monotonic()+5;"
+                 f"release=pathlib.Path({str(release)!r}); deadline=time.monotonic()+60;"
                  "\nwhile not release.exists() and time.monotonic()<deadline: time.sleep(0.01)\n"
                  "print('late escaped stdout',flush=True);print('late escaped stderr',file=sys.stderr,flush=True);"
                  f"pathlib.Path({str(completed)!r}).write_text('done')")
