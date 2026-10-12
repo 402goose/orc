@@ -479,6 +479,28 @@ work class with a Wilson 95% interval, as `0.62 [0.41, 0.79]`; `gym report
 dozen runs per lane, a 10-point gap between lanes is often inside both
 intervals. The intervals are reporting only: no routing choice reads them.
 
+A lane's own success rate mixes its skill with the tasks it happened to get.
+`gym report --bradley-terry` compares lanes only where they met: for each task,
+kind and mode, every pair of lanes with a graded result (graded as the priors
+grade it) is one comparison, and a lane that succeeded beats a lane that
+failed. Two successes or two failures are a tie and are skipped, so a task
+every lane passes, or every lane fails, contributes nothing. A Bradley-Terry
+model, P(i beats j) = s_i / (s_i + s_j), is fitted per kind by an MM iteration
+with one virtual win and one virtual loss per lane against a reference lane,
+so a lane that never lost still gets a finite strength.
+
+Each lane's strength is `log s`, normalised to mean 0 across the lanes of that
+kind: a gap of 1 between two lanes means the stronger one wins about 73% of
+their decisive pairs. The report also gives the probability of beating the
+median lane (0.50 for the median lane itself), a 95% interval for both from a
+bootstrap that resamples tasks, not pairs (500 resamples, seed 57), and the
+decisive pairs and tasks behind each lane. A lane with no decisive pair, such
+as the only lane of a kind, is listed as `no pairs`. With `split.json`, train
+and held-out tasks are fitted and reported separately, never pooled
+(`--split` keeps one side), and `--json` carries the result as
+`bradley_terry.<split>.<kind>`. The strengths are reporting only: no routing
+choice, prior or training label reads them.
+
 
 Use `interpret` to measure read-only triage against factual evidence. Seed it
 from existing extracted fix tasks, including their real check commands,
