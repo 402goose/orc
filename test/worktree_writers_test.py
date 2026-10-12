@@ -254,6 +254,15 @@ class WorktreeWritersTest(unittest.TestCase):
         self.assertEqual(self.branch_files(self.base, saved["branch"]), ["out.txt"])
 
 
+class WorktreeCommitNoteTest(unittest.TestCase):
+    def test_a_claude_writer_is_told_fusion_commits_and_others_may_commit(self):
+        from fusion_workflow import WORKTREE_COMMIT_NOTE
+        self.assertIn("Do not commit or push", WORKTREE_COMMIT_NOTE["claude"])
+        self.assertIn("Fusion commits", WORKTREE_COMMIT_NOTE["claude"])
+        self.assertEqual(WORKTREE_COMMIT_NOTE.get("codex", WORKTREE_COMMIT_NOTE[None]),
+                         "You may commit to this branch. Do not push.")
+
+
 class WriterIsolationValidationTest(unittest.TestCase):
     def writer(self, node_id, *needs):
         return {"id": node_id, "agent": "codex", "write": True, "task": "write", "needs": list(needs)}

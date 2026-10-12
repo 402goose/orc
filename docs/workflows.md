@@ -522,9 +522,10 @@ only with `"worktree"`:
   are refused with more than one writer).
 - **On success** the coordinator commits whatever the writer left uncommitted
   (the tree the gate saw, without ignored or workflow state files) to its
-  branch. A worker may commit for itself. The node result, the manifest and
-  the workflow result record `branch`, `head_sha` and `diff_stat` (against the
-  commit the writer started from).
+  branch. A Codex worker may commit for itself; a Claude worker is told not to,
+  because its sandbox does not reach a linked worktree's Git directory. The
+  node result, the manifest and the workflow result record `branch`,
+  `head_sha` and `diff_stat` (against the commit the writer started from).
 - **On failure** (a writer's last attempt fails, or its thread crashes) the
   worktree and branch stay where they are and the node records
   `worktree_left: PATH`. Nothing is ever deleted. A resume with attempts left

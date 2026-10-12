@@ -35,6 +35,14 @@ TERMINAL_SUCCESS = {"success"}
 TERMINAL_FAILURE = {"failed", "blocked", "invalid"}
 TERMINAL_PAUSED = {"paused_quota", "paused_budget", "paused_control"}
 WRITER_ISOLATION = {"shared", "worktree"}
+# What a writer in its own worktree is told about commits. Codex's sandbox
+# grants a worktree's Git directories, so it can commit for itself. A Claude
+# writer's sandbox does not reach a linked worktree's Git directory, which sits
+# in the main repository's .git, so Fusion commits the gated tree for it.
+WORKTREE_COMMIT_NOTE = {
+    None: "You may commit to this branch. Do not push.",
+    "claude": "Do not commit or push; Fusion commits your changes to this branch when the node passes.",
+}
 
 
 def control_pause():
@@ -1643,7 +1651,8 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
             agent,
             self._prompt(node) + (f"\nWork in this dedicated worktree on branch {own['branch']}. The starting Git commit is "
                                   f"{own['start_sha']}. Inspect the full diff against that commit, including newly created "
-                                  "files. You may commit to this branch. Do not push." if own else
+                                  "files. " + (WORKTREE_COMMIT_NOTE.get(agent, WORKTREE_COMMIT_NOTE[None]))
+                                  if own else
                                   f"\nWork in this dedicated worktree. The starting Git commit is {self.git_context['base_sha']}. "
                                   "Inspect the full diff against that commit, including newly created files. "
                                   + ("Do not commit or push; Fusion publishes the reviewed changes after completion."
