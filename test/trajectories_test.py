@@ -300,6 +300,24 @@ class ProvenanceTest(Isolated):
         _, again = self.dispatch(git_repo(self.root / "repo2"), secret="two")
         self.assertEqual(again["provenance"]["lane_config_sha256"], recorded["lane_config_sha256"])
 
+    def test_provenance_git_calls_spawn_no_background_maintenance(self):
+        workspace = git_repo(self.root / "repo")
+        base = core.git_head(workspace)
+        (workspace / "kept.txt").write_text("changed\n")
+        (workspace / "new_file.py").write_text("print(1)\n")
+        trace = self.root / "trace.jsonl"
+        with patch.dict(os.environ, {"GIT_TRACE2_EVENT": str(trace)}):
+            self.assertEqual(core.git_head(workspace), base)
+            self.assertIn("new_file.py", core.capture_diff(workspace, base))
+            self.assertIsNone(core.repo_slug(workspace))
+        events = [json.loads(line) for line in trace.read_text().splitlines()]
+        started = [event["argv"] for event in events if event.get("event") == "start"]
+        self.assertTrue(any("diff" in argv for argv in started))
+        for argv in started:
+            self.assertTrue({"maintenance.auto=false", "gc.auto=0", "core.fsmonitor=false"} <= set(argv), argv)
+        self.assertFalse([argv for argv in (event.get("argv", []) for event in events)
+                          if "maintenance" in argv or "gc" in argv])
+
     def test_suite_digest_names_pinned_checks(self):
         task = {"check_input_pins": {"test/check.py": "d" * 64}, "verification_argv": [["python3", "test/check.py"]]}
         self.assertRegex(core.suite_digest(task), "^[0-9a-f]{64}$")

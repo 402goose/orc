@@ -17,6 +17,7 @@ import fusion_progress as progress
 
 DEFAULTS = {"mode": "off", "base": "staging", "remote": "origin", "draft": True}
 EXCLUDED = {".fusion", ".git", ".fusion.json", ".orc.json"}
+GIT_FLAGS = ("-c", "maintenance.auto=false", "-c", "gc.auto=0", "-c", "core.fsmonitor=false")
 
 
 def read(path):
@@ -55,8 +56,7 @@ def git(workspace, *args, **kwargs):
     """Every internal Git call. Since Git 2.47 a commit can spawn a detached
     `git maintenance run --auto` that outlives the caller and still holds locks
     under .git, so background maintenance, auto-gc and fsmonitor stay off."""
-    return run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", "-c", "core.fsmonitor=false", *args],
-               workspace, **kwargs)
+    return run(["git", *GIT_FLAGS, *args], workspace, **kwargs)
 
 
 def text(workspace, *args):
