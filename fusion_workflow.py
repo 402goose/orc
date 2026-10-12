@@ -34,6 +34,7 @@ NODE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 TERMINAL_SUCCESS = {"success"}
 TERMINAL_FAILURE = {"failed", "blocked", "invalid"}
 TERMINAL_PAUSED = {"paused_quota", "paused_budget", "paused_control"}
+WRITER_ISOLATION = {"shared", "worktree"}
 
 
 def control_pause():
@@ -384,6 +385,33 @@ def _tests_run(paths: list[Path]) -> int | None:
     return max(counts) if counts else None
 
 
+def _ancestors(nodes: dict[str, dict[str, Any]], node_id: str) -> set[str]:
+    seen: set[str] = set()
+    pending = list(nodes[node_id]["needs"])
+    while pending:
+        dependency = pending.pop()
+        if dependency not in seen:
+            seen.add(dependency)
+            pending.extend(nodes[dependency]["needs"])
+    return seen
+
+
+def _writer_tip(nodes: dict[str, dict[str, Any]], node_id: str) -> str | None:
+    """Under worktree isolation, the writer whose tree a node continues: the
+    last of the writers among its ancestors, or None when it has none. Those
+    writers must lie on one chain; two unrelated ones would need merging."""
+    writers = {dependency for dependency in _ancestors(nodes, node_id) if nodes[dependency]["write"]}
+    tips = sorted(writer for writer in writers
+                  if not any(writer in _ancestors(nodes, other) for other in writers - {writer}))
+    if len(tips) > 1:
+        if nodes[node_id]["write"]:
+            raise ValueError(f"workflow node {node_id} follows writers {', '.join(tips)} that are not on one chain; "
+                             "merging writers is the caller's job")
+        raise ValueError(f"workflow node {node_id} follows writers {', '.join(tips)} that are not on one chain, "
+                         "so it has no single tree to run in")
+    return tips[0] if tips else None
+
+
 def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(spec, dict):
         raise ValueError("workflow spec must be an object")
@@ -394,8 +422,14 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("workflow.max_parallel must be between 1 and 64")
     if not 1 <= max_attempts <= 5:
         raise ValueError("workflow.max_attempts must be between 1 and 5")
-    if not 0 <= max_writers <= 1:
-        raise ValueError("workflow.max_parallel_writers must be 0 or 1 until worktree workers are enabled")
+    isolation = spec.get("writer_isolation", "shared")
+    if isolation not in WRITER_ISOLATION:
+        raise ValueError('workflow.writer_isolation must be "shared" or "worktree"')
+    if not 0 <= max_writers <= 64:
+        raise ValueError("workflow.max_parallel_writers must be between 0 and 64")
+    if max_writers > 1 and isolation != "worktree":
+        raise ValueError('workflow.max_parallel_writers above 1 needs writer_isolation: "worktree", '
+                         "so that each writer gets its own Git worktree")
     budget = float(spec.get("budget_usd", 0) or 0)
     if budget < 0:
         raise ValueError("workflow.budget_usd cannot be negative")
@@ -449,6 +483,14 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
                     or not all(isinstance(argv, list) and argv and all(isinstance(p, str) and p and "\x00" not in p for p in argv)
                                for argv in commands)):
                 raise ValueError(f"workflow node {node['id']} verification_argv must be a list of argv lists on a write node")
+    if isolation == "worktree":
+        by_id = {node["id"]: node for node in nodes}
+        for node in nodes:
+            # Every node's tree must be one line of writers; this raises otherwise.
+            _writer_tip(by_id, node["id"])
+            if node["write"] and (node["id"].startswith(".") or node["id"].endswith((".", ".lock")) or ".." in node["id"]):
+                raise ValueError(f"workflow node {node['id']} writes, so its id names a Git branch and cannot "
+                                 'start or end with ".", end with ".lock" or contain ".."')
 
     acceptance = spec.get("acceptance") or {}
     if not isinstance(acceptance, dict):
@@ -458,6 +500,9 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
         _safe_relative(path, "workflow acceptance required_files")
         for path in _as_list(acceptance.get("required_files", acceptance.get("required_outputs")))
     ]
+    if isolation == "worktree" and acceptance["required_files"] and sum(node["write"] for node in nodes) > 1:
+        raise ValueError("workflow acceptance.required_files cannot be combined with more than one writer under "
+                         'writer_isolation: "worktree"; each writer has its own tree, so gate the files on the nodes')
     normalized = copy.deepcopy(spec)
     normalized["schema"] = WORKFLOW_SCHEMA
     normalized["max_parallel"] = max_parallel
@@ -471,6 +516,9 @@ def validate_spec(spec: dict[str, Any]) -> dict[str, Any]:
         normalized["publish"] = options({}, spec["publish"])
         if normalized["publish"]["mode"] != "off" and not any(n["write"] for n in nodes):
             raise ValueError("Publishing requires an implementation workflow")
+        if normalized["publish"]["mode"] != "off" and isolation == "worktree":
+            raise ValueError('Publishing cannot be combined with writer_isolation: "worktree"; '
+                             "each writer leaves its own branch and merging them is the caller's job")
     return normalized
 
 
@@ -538,6 +586,16 @@ class WorkflowRunner:
             save(self.root / "git.json", self.git_context)
         if self.git_context:
             self.workspace = Path(self.git_context["workspace"])
+        self.isolation = self.spec.get("writer_isolation", "shared")
+        # Worktree isolation: the base commit and each writer's worktree,
+        # branch and outcome, saved in the workflow root for resume.
+        self.worktrees: dict[str, Any] = {}
+        self._tips: dict[str, str | None] = {}
+        if self.isolation == "worktree":
+            from fusion_publish import read
+            by_id = {node["id"]: node for node in self.spec["graph"]["nodes"]}
+            self._tips = {node_id: _writer_tip(by_id, node_id) for node_id in by_id}
+            self.worktrees = (read(self.root / "worktrees.json") if resume else {}) or self._isolation_base()
         self.workflow_baseline = {
             relative: _fingerprint(self.workspace / relative)
             for relative in self.spec.get("acceptance", {}).get("required_files", [])
@@ -562,7 +620,91 @@ class WorkflowRunner:
             self.nodes_root.mkdir(parents=True, exist_ok=True)
             self._write_manifest("running")
             self._event("workflow.created", {"task": self.spec.get("task", "")})
+        if self.worktrees:
+            self._save_worktrees()
         self._preflight_lanes()
+
+    def _isolation_base(self) -> dict[str, Any]:
+        """Writers start from the caller's base commit, else HEAD. Tracked
+        changes that are not committed would silently not reach them."""
+        from fusion_publish import text
+        try:
+            dirty = text(self.workspace, "status", "--porcelain", "--untracked-files=no")
+            base_sha = self.git_context.get("base_sha") or text(self.workspace, "rev-parse", "HEAD")
+        except ValueError as exc:
+            raise ValueError(f'writer_isolation: "worktree" needs a Git workspace with a commit: {exc}') from exc
+        if dirty:
+            raise ValueError(f'writer_isolation: "worktree" starts writers from a commit, but {self.workspace} has '
+                             "uncommitted changes to tracked files; commit or stash them first")
+        return {"base_sha": base_sha, "nodes": {}}
+
+    def _save_worktrees(self) -> None:
+        from fusion_publish import save
+        save(self.root / "worktrees.json", self.worktrees)
+
+    def _tree_dir(self, node: dict[str, Any]) -> Path:
+        """The tree a node works in. Without worktree isolation that is the
+        workflow workspace. With it, a writer has its own worktree and any
+        other node uses its nearest writer ancestor's, or the workspace."""
+        if self.isolation != "worktree":
+            return self.workspace
+        owner = node["id"] if node["write"] else self._tips[node["id"]]
+        if owner is None:
+            return self.workspace
+        saved = self.worktrees["nodes"].get(owner) or {}
+        return Path(saved.get("path") or os.path.abspath(self.root / "worktrees" / owner))
+
+    def _ensure_worktree(self, node: dict[str, Any]) -> None:
+        """Create a writer's worktree and branch at its first attempt; retries
+        and resumes reuse it. A writer after another starts from that
+        writer's branch tip, otherwise from the workflow base."""
+        from fusion_publish import git, text
+        saved = self.worktrees["nodes"].get(node["id"])
+        path = self._tree_dir(node)
+        if saved and path.is_dir():
+            return
+        if saved:
+            git(self.workspace, "worktree", "add", str(path), saved["branch"])
+            return
+        tip = self._tips[node["id"]]
+        start = (text(self.workspace, "rev-parse", "refs/heads/" + self.worktrees["nodes"][tip]["branch"])
+                 if tip else self.worktrees["base_sha"])
+        branch = f"fusion/{self.run_id}/{node['id']}"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        git(self.workspace, "worktree", "add", "-b", branch, str(path), start)
+        self.worktrees["nodes"][node["id"]] = {"path": str(path), "branch": branch, "start_sha": start}
+        self._save_worktrees()
+
+    def _commit_worktree(self, node: dict[str, Any]) -> dict[str, Any]:
+        """Commit what an accepted writer left uncommitted to its branch and
+        report the branch. The commit is the tree the gate saw (workflow state
+        and ignored files excluded); a worker's own commits are kept as they
+        are."""
+        from fusion_publish import git, snapshot, text
+        path = self._tree_dir(node)
+        saved = self.worktrees["nodes"][node["id"]]
+        tree = snapshot(path)
+        head = text(path, "rev-parse", "HEAD")
+        if tree != text(path, "rev-parse", "HEAD^{tree}"):
+            message = f"{node['id']}: {(node['task'].strip().splitlines() or [node['role']])[0]}"[:200]
+            commit = text(path, "commit-tree", tree, "-p", head, "-m", message)
+            git(path, "update-ref", "HEAD", commit, head)
+            git(path, "reset", "-q")  # the index follows the new HEAD; files on disk are untouched
+            head = commit
+        record = {"branch": saved["branch"], "head_sha": head,
+                  "diff_stat": text(path, "diff", "--stat", saved["start_sha"], head)}
+        saved.update(record)
+        saved.pop("worktree_left", None)
+        self._save_worktrees()
+        return record
+
+    def _leave_worktree(self, node: dict[str, Any]) -> None:
+        """A writer that will not finish keeps its worktree for inspection."""
+        saved = self.worktrees.get("nodes", {}).get(node["id"])
+        if not node["write"] or not saved:
+            return
+        node["worktree_left"] = saved["worktree_left"] = saved["path"]
+        self._save_worktrees()
 
     def _load_existing(self) -> None:
         if not self.manifest_path.exists():
@@ -596,7 +738,7 @@ class WorkflowRunner:
             self.nodes[node_id]["result"] = result
             self.nodes[node_id]["excluded_routes"] = old.get("excluded_routes", [])
             for key in ("_artifact_baseline", "_tree_baseline", "_check_input_pins", "_declared_check_paths",
-                        "acceptance_warnings", "review_repair", "repair_feedback"):
+                        "acceptance_warnings", "review_repair", "repair_feedback", "worktree_left"):
                 if key in old:
                     self.nodes[node_id][key] = old[key]
             status = str(old.get("status", "pending"))
@@ -803,6 +945,8 @@ class WorkflowRunner:
         }
         if self.store.control_workspace is not None:
             manifest.update(workspace=str(self.workspace.resolve()), control_workspace=str(self.control_workspace))
+        if self.worktrees:
+            manifest["worktrees"] = self.worktrees
         temp = self.manifest_path.with_suffix(".tmp")
         temp.write_text(core.json_text(manifest) + "\n", encoding="utf-8")
         temp.replace(self.manifest_path)
@@ -935,7 +1079,7 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
             files.extend(contract.get("required_files") or [])
         return files
 
-    def _tree(self) -> str | None:
+    def _tree(self, node: dict[str, Any]) -> str | None:
         """Git tree hash of the working state, or None when it cannot be read.
 
         Unavailable is not evidence of no change, so callers must treat None
@@ -944,17 +1088,17 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
         try:
             from fusion_publish import snapshot
 
-            return snapshot(self.workspace)
+            return snapshot(self._tree_dir(node))
         except Exception:
             return None
 
-    def _check_inputs(self, check: Any, *, include_directories: bool = False) -> list[str]:
+    def _check_inputs(self, check: Any, workspace: Path, *, include_directories: bool = False) -> list[str]:
         """Existing workspace inputs, including unittest discovery's test files."""
         argv = _check_argv(check)
         if not isinstance(argv, list) or not all(isinstance(p, str) for p in argv):
             return []
-        root = self.workspace.resolve()
-        workspace_alias = Path(os.path.abspath(self.workspace))
+        root = workspace.resolve()
+        workspace_alias = Path(os.path.abspath(workspace))
         candidates = list(argv)
         if isinstance(check, dict) and check.get("path"):
             candidates.append(check["path"])
@@ -976,7 +1120,7 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
         inputs = set()
         for part in candidates:
             try:
-                path = Path(os.path.abspath(self.workspace / part))
+                path = Path(os.path.abspath(workspace / part))
                 if ((path.is_file() or (include_directories and path.is_dir()))
                         and path.resolve().is_relative_to(root)):
                     # Keep symlinks inside the workspace in the saved path:
@@ -992,12 +1136,13 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
         checks = [*_as_list((node.get("acceptance") or {}).get("checks")), *(node.get("_plan_checks") or [])]
         # Never recapture after a worker has run, including older manifests
         # without pins. An empty dictionary is still a saved baseline.
+        workspace = self._tree_dir(node)
         if node["attempts"] == 1 and "_check_input_pins" not in node:
-            paths = {path for check in checks for path in self._check_inputs(check)}
-            node["_check_input_pins"] = {path: _sha256(self.workspace / path) for path in sorted(paths)}
+            paths = {path for check in checks for path in self._check_inputs(check, workspace)}
+            node["_check_input_pins"] = {path: _sha256(workspace / path) for path in sorted(paths)}
         warnings = [f"Unpinned acceptance check uses workspace input: {path}"
                     for path in sorted({path for check in checks if isinstance(check, list)
-                                        for path in self._check_inputs(check, include_directories=True)})]
+                                        for path in self._check_inputs(check, workspace, include_directories=True)})]
         node["acceptance_warnings"] = warnings
         for warning in warnings:
             self._event("acceptance.check.warning", {"node_id": node["id"], "message": warning})
@@ -1013,19 +1158,22 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
         if not isinstance(acceptance, dict):
             return
         paths = node.setdefault("_declared_check_paths", {})
+        workspace = self._tree_dir(node)
+        # A worktree not yet created starts from the workspace's commit.
+        probe = workspace if workspace.is_dir() else self.workspace
         for check in _as_list(acceptance.get("checks")):
             if not isinstance(check, dict) or "sha256" not in check:
                 continue
             key = json.dumps(check, sort_keys=True)
             if key in paths:
                 continue
-            path = self.workspace / check["path"] if "path" in check else None
+            path = workspace / check["path"] if "path" in check else None
             if path is None and infer:
                 # Bare argv[0] is resolved by the subprocess through PATH,
                 # never by treating a same-named workspace file as the program.
-                path = next((self.workspace / part for index, part in enumerate(check["argv"])
+                path = next((workspace / part for index, part in enumerate(check["argv"])
                              if (index != 0 or os.path.dirname(part))
-                             and (self.workspace / part).is_file()), None)
+                             and (probe / part).is_file()), None)
             if path is None:
                 raise ValueError(f"workflow node {node['id']} cannot bind acceptance sha256 to a file before dispatch; "
                                  'declare an explicit "path"')
@@ -1089,7 +1237,7 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
             "argv": command,
             **({"declaration": declaration} if declaration else {}),
             **({"check_inputs_changed": result["check_inputs_changed"]} if result.get("check_inputs_changed") else {}),
-            "cwd": str(self.workspace.resolve()),
+            "cwd": str(self._tree_dir(node).resolve()),
             "started_at_ms": core.now_ms(),
             "finished_at_ms": None,
             "duration_ms": None,
@@ -1123,7 +1271,7 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
                 with self._fixtures_applied(node, directory, receipt), \
                         self._declared_check_contract(declaration, receipt,
                             (node.get("_declared_check_paths") or {}).get(json.dumps(declaration, sort_keys=True))), \
-                        subprocess.Popen(command, cwd=self.workspace, stdin=subprocess.DEVNULL,
+                        subprocess.Popen(command, cwd=self._tree_dir(node), stdin=subprocess.DEVNULL,
                                          env={**os.environ, **env} if env else None, stdout=stdout, stderr=stderr,
                                          start_new_session=(os.name == "posix")) as process:
                     observed = receipt["process"]
@@ -1236,12 +1384,13 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
             yield
             return
         loaded = [(item["path"], self._fixture_bytes(item)) for item in fixtures]
-        root = self.workspace.resolve()
+        workspace = self._tree_dir(node)
+        root = workspace.resolve()
         applied: list[tuple[Path, Path | None, Path | None]] = []
         records: list[dict[str, Any]] = []
         try:
             for index, (relative, data) in enumerate(loaded):
-                target = self.workspace / relative
+                target = workspace / relative
                 if not target.parent.resolve().is_relative_to(root):
                     raise ValueError(f"acceptance fixture {relative} resolves outside the workspace")
                 found = _describe(target)
@@ -1251,7 +1400,7 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
                     moved.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(target), str(moved))
                 created, probe = None, target.parent
-                while probe != self.workspace and not probe.exists():
+                while probe != workspace and not probe.exists():
                     created, probe = probe, probe.parent
                 applied.append((target, moved, created))
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -1382,8 +1531,9 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
         # Older/rechecked receipts remain on disk in their unique directories.
         result["acceptance_checks"] = []
         result["gate_codes"] = []
+        workspace = self._tree_dir(node)
         result["check_inputs_changed"] = sorted(path for path, digest in (node.get("_check_input_pins") or {}).items()
-                                                if _sha256(self.workspace / path) != digest)
+                                                if _sha256(workspace / path) != digest)
         if result["check_inputs_changed"]:
             self._event("node.check_inputs_changed", {"node_id": node["id"], "check_inputs_changed": result["check_inputs_changed"]})
         if core.failure_class(result) == "coordinator_error":
@@ -1403,7 +1553,7 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
         if result.get("blockers"):
             problem("worker_blockers", "worker reported unresolved blockers")
         for relative in node.get("required_files", []):
-            path = self.workspace / relative
+            path = workspace / relative
             if not _artifact_files(path):
                 problem("required_file_missing", f"required artifact is missing: {relative}", path=relative)
             else:
@@ -1424,7 +1574,7 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
             # the repository against its own pre-dispatch tree: a worker
             # cannot misreport that the way it can CHANGED.
             baseline = node.get("_tree_baseline")
-            unchanged = bool(baseline) and self._tree() == baseline
+            unchanged = bool(baseline) and self._tree(node) == baseline
         for field in _as_list(acceptance.get("required_handoff")):
             if not result.get(str(field)):
                 problem("required_handoff_empty", f"required handoff field is empty: {field}", field=str(field))
@@ -1486,10 +1636,15 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
             "max_budget_usd", "permission_mode", "permission_prompts", "allowed_tools", "read_only_allowed_tools",
             "allow_untested",
         ) if key in node}
+        workspace = self._tree_dir(node)
+        own = self.worktrees["nodes"][node_id] if write and self.isolation == "worktree" else None
         task = core.make_task(
-            self.workspace,
+            workspace,
             agent,
-            self._prompt(node) + (f"\nWork in this dedicated worktree. The starting Git commit is {self.git_context['base_sha']}. "
+            self._prompt(node) + (f"\nWork in this dedicated worktree on branch {own['branch']}. The starting Git commit is "
+                                  f"{own['start_sha']}. Inspect the full diff against that commit, including newly created "
+                                  "files. You may commit to this branch. Do not push." if own else
+                                  f"\nWork in this dedicated worktree. The starting Git commit is {self.git_context['base_sha']}. "
                                   "Inspect the full diff against that commit, including newly created files. "
                                   + ("Do not commit or push; Fusion publishes the reviewed changes after completion."
                                      if self.git_context.get("mode") in {"manual", "auto"} else "Do not commit or push.")
@@ -1540,12 +1695,12 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
             if self.git_context and not write and "review" in node["role"].lower():
                 from fusion_publish import snapshot
                 phase = "snapshot_before_review"
-                review_tree = snapshot(self.workspace)
+                review_tree = snapshot(workspace)
             phase = "worker_dispatch"
             result = core.dispatch(self.config, task, store)
             if review_tree:
                 phase = "snapshot_after_review"
-                if snapshot(self.workspace) != review_tree:
+                if snapshot(workspace) != review_tree:
                     result.update(status="error", blockers=[*result.get("blockers", []), "Files changed during review; review a stable tree before publishing"])
                 else:
                     result["reviewed_tree"] = review_tree
@@ -1572,7 +1727,7 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
                     "usage": {},
                     "artifacts": {},
                 }
-        result["workspace"] = str(self.workspace.resolve())
+        result["workspace"] = str(workspace.resolve())
         result["workflow_id"] = self.run_id
         result["node_id"] = node_id
         result["attempt"] = attempt
@@ -1727,11 +1882,21 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
             return "success" if self._accept_workflow()[0] else "failed"
         return "running"
 
+    def _workflow_tree(self) -> Path:
+        """Where workflow acceptance looks: the workspace, or, under worktree
+        isolation with a single writer, that writer's tree, since writers never
+        change the workspace. Validation refuses the files with more writers."""
+        writers = [node for node in self.nodes.values() if node["write"]]
+        if self.isolation == "worktree" and len(writers) == 1:
+            return self._tree_dir(writers[0])
+        return self.workspace
+
     def _accept_workflow(self) -> tuple[bool, list[str]]:
         problems: list[str] = []
         acceptance = self.spec.get("acceptance") or {}
+        tree = self._workflow_tree()
         for relative in acceptance.get("required_files", []):
-            path = self.workspace / relative
+            path = tree / relative
             if not _artifact_files(path):
                 problems.append(f"required workflow artifact is missing: {relative}")
             elif relative in self.workflow_baseline and _fingerprint(path) == self.workflow_baseline[relative]:
@@ -1751,6 +1916,8 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
                 if node["status"] == "running":
                     node["status"] = "blocked"
                     node["result"] = {"status": "blocked", "summary": "interrupted by user", "blockers": ["workflow interrupted; inspect partial worker logs before resuming"]}
+                    if self.worktrees:
+                        self._leave_worktree(node)
             self._write_manifest("interrupted")
             self._event("workflow.interrupted", {})
             raise
@@ -1798,6 +1965,18 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
                         break
                     selected["status"] = "running"
                     selected["attempts"] += 1
+                    if selected["write"] and self.isolation == "worktree":
+                        try:
+                            self._ensure_worktree(selected)
+                        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                            selected["status"] = "failed"
+                            selected["result"] = {"status": "error", "summary": "could not create the writer's worktree",
+                                                  "blockers": [str(exc)]}
+                            self._save_node(selected["id"], {"task": {}, "result": selected["result"],
+                                                             "acceptance": {"ok": False, "problems": selected["result"]["blockers"]}})
+                            self._event("node.failed", {"node_id": selected["id"], "attempt": selected["attempts"],
+                                                        "problems": selected["result"]["blockers"]})
+                            continue
                     # A planning node can declare what the implementation must
                     # produce. Apply it before the baseline is taken, so the
                     # artifacts it names are actually gated on this node.
@@ -1812,7 +1991,7 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
                     first_attempt = selected["attempts"] == 1 or "_artifact_baseline" not in selected
                     if first_attempt:
                         selected["_artifact_baseline"] = {
-                            relative: _fingerprint(self.workspace / relative)
+                            relative: _fingerprint(self._tree_dir(selected) / relative)
                             for relative in selected.get("required_files", [])
                         }
                     if selected["write"]:
@@ -1827,7 +2006,7 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
                     # the tree so acceptance can check the repository itself
                     # rather than the worker's account of it.
                     if first_attempt or "_tree_baseline" not in selected:
-                        selected["_tree_baseline"] = self._tree() if selected["write"] else None
+                        selected["_tree_baseline"] = self._tree(selected) if selected["write"] else None
                     attempt = selected["attempts"]
                     writer = bool(selected["write"])
                     if writer:
@@ -1843,10 +2022,12 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
                     node_id, writer = active.pop(future)
                     if writer:
                         active_writers -= 1
+                    crashed = False
                     try:
                         payload = future.result()
                     except Exception as exc:  # pragma: no cover - defensive worker boundary
                         payload = {"task": {}, "result": {"status": "error", "summary": "worker thread failed", "blockers": [str(exc)]}}
+                        crashed = True
                     node = self.nodes[node_id]
                     result = payload.get("result") or {}
                     if result.get("status") == "paused_control":
@@ -1883,6 +2064,12 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
                         if not plausible:
                             accepted, laya_veto = False, True
                             problems = problems + ["Laya acceptance check: reported success does not plausibly match the task"]
+                    if accepted and node["write"] and self.isolation == "worktree":
+                        try:
+                            result.update(self._commit_worktree(node))
+                        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                            accepted = False
+                            problems = problems + [f"could not commit the writer's worktree to its branch: {exc}"]
                     if gate_input:
                         # Only objective gate codes label; the veto above never does.
                         result["gate_label"] = gate_label(self.config, self.control_workspace, gate_input, codes,
@@ -1914,6 +2101,7 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
                     self._save_node(node_id, payload)
                     if accepted:
                         node["status"] = "success"
+                        node.pop("worktree_left", None)
                         self._event("node.succeeded", {"node_id": node_id, "attempt": node["attempts"]})
                     elif action == "switch":
                         node["status"] = "pending"
@@ -1935,6 +2123,8 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
                     else:
                         node["status"] = "invalid" if problems and result.get("status") == "success" else "failed"
                         self._event("node.failed", {"node_id": node_id, "attempt": node["attempts"], "problems": problems})
+                    if self.worktrees and (crashed or node["status"] in TERMINAL_FAILURE):
+                        self._leave_worktree(node)
                     self._write_manifest("running")
 
         self._block_unrunnable()
@@ -1972,6 +2162,7 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
                 "manifest": str(self.manifest_path),
                 "events": str(self.events_path),
             },
+            **({"worktrees": self.worktrees} if self.worktrees else {}),
         }
 
 

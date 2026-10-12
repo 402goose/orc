@@ -488,10 +488,58 @@ execution. Markdown export refuses to overwrite an existing file.
 Every node gets a durable artifact under `.fusion/workflows/WORKFLOW_ID/` and
 every worker still gets the existing `.fusion/runs/` trace. A node is accepted
 only when its worker reports success and its declared `required_files` and
-acceptance checks pass. `max_parallel`, `max_attempts`, `budget_usd`, and the
-single-writer limit are enforced by the scheduler. Keep fan-out nodes
-read-only; put repository writes behind a final writer or use separate Git
-worktrees for independent implementations.
+acceptance checks pass. `max_parallel`, `max_attempts`, `budget_usd`, and
+`max_parallel_writers` are enforced by the scheduler. By default every node
+shares one tree, so at most one writer runs at a time. Keep fan-out nodes
+read-only and put repository writes behind a final writer, or give each writer
+its own worktree as described next.
+
+### Parallel writers in separate worktrees
+
+`writer_isolation` is `"shared"` (the default: every node runs in the workflow
+workspace, as above) or `"worktree"`. `max_parallel_writers` above 1 is allowed
+only with `"worktree"`:
+
+```json
+{"writer_isolation": "worktree", "max_parallel_writers": 4, "nodes": [...]}
+```
+
+- **Base.** Writers start from the base commit the caller supplied, else from
+  `HEAD` of the workflow workspace when the run starts. A workspace with
+  uncommitted changes to tracked files is refused at start: commit or stash
+  them first, since they would not reach the writers.
+- **A writer's tree.** Each writing node gets a Git worktree at
+  `.fusion/workflows/WORKFLOW_ID/worktrees/NODE_ID` under the control workspace,
+  on branch `fusion/WORKFLOW_ID/NODE_ID`, created at its first attempt; retries
+  and resumes reuse it. It starts from the base, or, when a writer is among its
+  dependencies (directly or transitively), from that writer's branch tip.
+- **Other nodes.** A reader or reviewer runs in the worktree of its nearest
+  writer ancestor, or in the workflow workspace when it has none.
+- Each node's tree baseline, checks, fixtures, required files, gate, review
+  snapshot and dispatched workspace use that tree. The manifest stays on the
+  workflow workspace, which writers never change. Workflow-level
+  `acceptance.required_files` are checked in the single writer's tree (they
+  are refused with more than one writer).
+- **On success** the coordinator commits whatever the writer left uncommitted
+  (the tree the gate saw, without ignored or workflow state files) to its
+  branch. A worker may commit for itself. The node result, the manifest and
+  the workflow result record `branch`, `head_sha` and `diff_stat` (against the
+  commit the writer started from).
+- **On failure** (a writer's last attempt fails, or its thread crashes) the
+  worktree and branch stay where they are and the node records
+  `worktree_left: PATH`. Nothing is ever deleted. A resume with attempts left
+  continues in the same worktree.
+
+Workers never push, and merging the branches is the caller's job. Validation
+therefore refuses a writer or reader whose writer ancestors are not on one
+chain (two writers neither of which depends on the other), as well as
+`publish.mode` other than `off` and workflow `acceptance.required_files` with
+more than one writer. Worktree paths, branches and outcomes are saved in
+`worktrees.json` in the workflow directory.
+
+A writer chained after another keeps the start point it was created from. If a
+review repair reopens the earlier writer after the chained writer has started,
+the chained writer does not move to the repaired tip; rebase or rerun it.
 
 When a read-only review reports unresolved blockers in a valid handoff, its
 normal `repair` action can reopen a successful direct write dependency. Fusion
