@@ -57,6 +57,20 @@ class ScoreboardTest(unittest.TestCase):
         self.assertEqual((sol["median_cost_usd"], sol["median_minutes"]), (0.4, 10.0))
         self.assertEqual(rows["claude:claude-opus-5-5:high"]["settled"], 1)
 
+    def test_effort_falls_back_to_the_requested_choice(self):
+        directory = self.workspace / ".fusion" / "runs" / "old-1"
+        directory.mkdir(parents=True)
+        (directory / "task.json").write_text(json.dumps({
+            "schema": core.SCHEMA, "run_id": "old-1", "agent": "claude", "role": "implementation", "write": True,
+            "task": "Fix old-1", "created_at": core.now_ms(),
+            "resolved": {"model": "claude-opus-5-5", "execution_choice": {"requested": {"model": "claude-opus-5-5",
+                                                                                      "reasoning_effort": "medium"}}}}))
+        (directory / "result.json").write_text(json.dumps({
+            "schema": core.SCHEMA, "run_id": "old-1", "status": "success", "verdict": "ok", "agent": "claude",
+            "role": "implementation", "model": "claude-opus-5-5", "blockers": []}))
+        self.verdict("old-1")
+        self.assertEqual([row["lane"] for row in board.scoreboard(self.workspace)["rows"]], ["claude:claude-opus-5-5:medium"])
+
     def test_routed_and_fallback_runs_are_told_apart(self):
         self.run_dir("auto-1")
         self.verdict("auto-1")

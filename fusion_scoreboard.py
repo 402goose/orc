@@ -19,10 +19,15 @@ from fusion_policy import acceptance_ci95, format_rate
 
 
 def family(result, task):
-    """agent:model:effort, as routing-report's `--by family` names a lane."""
+    """agent:model:effort, as routing-report's `--by family` names a lane.
+
+    Runs from before effort was recorded on the result carry it only in the
+    execution choice's request, which is what the harness was given."""
     agent = result.get("agent") or task.get("agent") or "-"
     model = result.get("model") or (task.get("resolved") or {}).get("model") or "default"
-    effort = result.get("reasoning_effort") or (task.get("resolved") or {}).get("reasoning_effort")
+    resolved = task.get("resolved") or {}
+    requested = (resolved.get("execution_choice") or {}).get("requested") or {}
+    effort = result.get("reasoning_effort") or resolved.get("reasoning_effort") or requested.get("reasoning_effort")
     return f"{agent}:{model}" + (f":{effort}" if effort else "")
 
 
