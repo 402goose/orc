@@ -307,7 +307,9 @@ one label value on the held-out set (such as `failed_task` when every held-out
 answer is `false`) is listed in `constant_questions` and left out of the headline,
 since every predictor gets it free. A candidate that predicts the same label for at
 least 99% of a question's held-out answers, or identical probabilities for all of
-them, is `degenerate`. A round is a **gain** only when it beats the source and every
+them, is `degenerate`. On a true/false question it is also degenerate when it answers
+`true` on at least 95% or at most 5% of the held-out answers, or when its share of
+`true` answers is more than 0.4 from the held-out label base rate. A round is a **gain** only when it beats the source and every
 baseline by more than 0.02 accuracy, beats the held-out majority's and the
 shuffled-state control's balanced accuracy by more than 0.02, and is not degenerate;
 a degenerate candidate's round is labelled **degenerate**, and otherwise **flat** or

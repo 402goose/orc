@@ -1032,9 +1032,14 @@ is the training majority.
 **Degenerate candidates.** A question's candidate is degenerate when its
 predicted label is the same on at least 99% of the question's held-out
 answers (`DEGENERATE_SHARE`), or its probabilities are identical on all of
-them. `headline.degenerate` is true when any headline question is
+them. On a true/false question it is also degenerate when its predicted-true
+rate is at least 0.95 or at most 0.05 (`DEGENERATE_POSITIVE_RATE`), or differs
+from the held-out label base rate by more than 0.4
+(`DEGENERATE_BASE_RATE_GAP`). A constant question is not judged by these
+rules. `headline.degenerate` is true when any headline question is
 degenerate, with the reason, e.g. `acceptance:plausible answers false on 54
-of 54 held-out answers`.
+of 54 held-out answers` or `acceptance:plausible answers true on 118 of 120
+held-out answers (98.3%; label base rate 35.0%)`.
 
 A round's outcome is **gain** only if all of these hold:
 

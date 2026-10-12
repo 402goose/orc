@@ -118,5 +118,63 @@ class HonestEvaluationTest(unittest.TestCase):
         self.assertEqual(loop.proof(worse)["outcome"], "flat")
 
 
+class NearConstantCandidateTest(unittest.TestCase):
+    """A true/false candidate that answers true (or false) almost always, or far from the base rate."""
+    BASE = {"false": 0.65, "true": 0.35}
+
+    def answers(self, true, n=120):
+        # Varied probabilities, so the identical-probabilities rule does not fire.
+        return [noul(0.6 + 0.001 * i) if i < true else noul(0.4 - 0.001 * i) for i in range(n)]
+
+    def test_near_constant_true_is_degenerate_and_names_the_share_and_base_rate(self):
+        self.assertEqual(quality.degenerate(self.answers(118), self.BASE),
+                         "answers true on 118 of 120 held-out answers (98.3%; label base rate 35.0%)")
+
+    def test_near_constant_false_is_degenerate(self):
+        self.assertEqual(quality.degenerate(self.answers(6), self.BASE),
+                         "answers true on 6 of 120 held-out answers (5.0%; label base rate 35.0%)")
+
+    def test_a_gap_within_the_bound_is_not_degenerate(self):
+        self.assertIsNone(quality.degenerate(self.answers(72), self.BASE))
+
+    def test_a_gap_beyond_the_bound_is_degenerate(self):
+        self.assertEqual(quality.degenerate(self.answers(96), self.BASE),
+                         "answers true on 96 of 120 held-out answers (80.0%; label base rate 35.0%, 45.0 points apart)")
+
+    def test_without_two_label_values_only_the_share_rules_apply(self):
+        self.assertIsNone(quality.degenerate(self.answers(118)))
+        self.assertIsNone(quality.degenerate(self.answers(118), {"false": 1.0}))
+        rows = [{"id": f"v{i}", "group": f"v{i}", "split": "validation", "kind": "acceptance", "questions": QUESTIONS,
+                 "labels": {"plausible": "true" if i < 42 else "false", "failed_task": "false"}} for i in range(120)]
+        failed = self.answers(118)
+        report = baseline_comparison(rows, {row["id"]: {"plausible": noul(0.3 + 0.001 * i), "failed_task": failed[i]}
+                                            for i, row in enumerate(rows)})
+        question = report["by_question"]["acceptance:failed_task"]
+        self.assertTrue(question["constant"])
+        self.assertEqual((question["degenerate"], question["degenerate_reason"]), (False, None))
+        self.assertEqual(report["headline"]["questions"], ["acceptance:plausible"])
+
+    def test_round_36_headline_recomputed_is_degenerate(self):
+        # The held-out shape of the round: 42 of 120 labels true, the candidate answers
+        # true on every true label and on 76 of the 78 false ones.
+        rows = [{"id": f"v{i}", "group": f"v{i}", "split": "validation", "kind": "acceptance",
+                 "questions": {"plausible": QUESTIONS["plausible"]}, "labels": {"plausible": "true" if i < 42 else "false"}}
+                for i in range(120)]
+        predictions = {row["id"]: {"plausible": noul(0.2 + 0.01 * (i - 118) if i >= 118 else 0.51 + 0.003 * (i % 40))}
+                       for i, row in enumerate(rows)}
+        controls = {row["id"]: {"plausible": noul(0.9)} for row in rows}
+        report = baseline_comparison(rows, predictions, controls)
+        headline = report["headline"]
+        self.assertAlmostEqual(headline["positive_rate"], 118 / 120)
+        self.assertAlmostEqual(headline["balanced_accuracy"], (1 + 2 / 78) / 2)
+        self.assertAlmostEqual(report["baselines"]["majority"]["balanced_margin"], 1 / 78)
+        self.assertTrue(headline["degenerate"])
+        self.assertEqual(headline["degenerate_reason"], "acceptance:plausible answers true on 118 of 120 held-out answers "
+                                                        "(98.3%; label base rate 35.0%)")
+        proof = loop.proof(HonestEvaluationTest().round(report))
+        self.assertEqual(proof["outcome"], "degenerate")
+        self.assertTrue(any("constant predictor" in note for note in proof["notes"]))
+
+
 if __name__ == "__main__":
     unittest.main()
