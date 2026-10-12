@@ -133,7 +133,9 @@ fields are null.
 ## What is exported
 
 Exports fail closed. Each run is counted under the first reason that
-excludes it.
+excludes it. A run dir with no result is never exported and is counted by
+its [state](learning.md#run-states-and-tombstones): `running`, `abandoned`
+or `unknown`. A tombstoned run (`status: "abandoned"`) counts as `abandoned`.
 
 1. **Filters.** `filter_since` and `filter_role` count runs that `--since` or
    `--role` left out.

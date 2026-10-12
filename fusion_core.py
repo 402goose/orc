@@ -30,6 +30,7 @@ from typing import Any, Iterator
 
 from fusion_decisions import DEFAULTS as DECISION_DEFAULTS, LAND_DERIVED_SOURCE
 import fusion_progress as progress
+import fusion_runs
 from fusion_usage import event_quota
 from fusion_reasoning import EFFORTS, validate_pair
 
@@ -1756,7 +1757,9 @@ class RunStore:
                 task = json.loads(task_path.read_text(encoding="utf-8"))
                 result_path = task_path.parent / "result.json"
                 result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else None
-                output.append({"task": task, "result": result})
+                state = fusion_runs.run_state(task_path.parent)
+                output.append({"task": task, "result": result, "state": state["state"],
+                               **({"last_heartbeat": state["last_heartbeat"]} if state.get("last_heartbeat") else {})})
             except (OSError, json.JSONDecodeError):
                 continue
             if len(output) >= limit:
@@ -3522,18 +3525,20 @@ def run_created_ms(run_dir: Path) -> int:
 
 
 def completed_runs(workspace: Path) -> list[tuple[str, Path, dict[str, Any], int]]:
-    """(run_id, run_dir, result, created_ms) for every completed run of this workspace, oldest first."""
+    """(run_id, run_dir, result, created_ms) for every completed run of this workspace, oldest first.
+
+    Running, abandoned and unknown run dirs have no result and are skipped by state; a
+    tombstoned run (status abandoned) is settled as unmeasured and skipped too."""
     runs = []
-    root = RunStore(workspace).runs
-    if not root.is_dir():
-        return runs
-    for run_dir in root.iterdir():
+    for run_id, run_dir, state in fusion_runs.run_states(workspace):
+        if state["state"] != "finished":
+            continue
         try:
             result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if isinstance(result, dict):
-            runs.append((run_dir.name, run_dir, result, run_created_ms(run_dir)))
+        if isinstance(result, dict) and result.get("status") != "abandoned":
+            runs.append((run_id, run_dir, result, run_created_ms(run_dir)))
     return sorted(runs, key=lambda item: (item[3], item[0]))
 
 
@@ -3580,7 +3585,9 @@ def derive_review_outcomes(workspace: Path, issue: str, land_run_id: str) -> lis
 
 def pending_outcomes(workspace: Path, role: str | None = None, hours: float | None = None) -> dict[str, Any]:
     """Completed runs still owed a verdict: unreported (no outcome event at all) and
-    unmeasured (only unmeasured outcomes, with the latest reason), newest first."""
+    unmeasured (only unmeasured outcomes, with the latest reason), newest first. Run dirs
+    abandoned without a result are listed apart, for `fusion runs tombstone`; running and
+    tombstoned runs are not pending."""
     from fusion_decisions import DecisionStore
     from fusion_policy import effective_outcomes
     workspace = RunStore(workspace).workspace
@@ -3614,17 +3621,37 @@ def pending_outcomes(workspace: Path, role: str | None = None, hours: float | No
         found[kind].append(row)
         bucket = counts.setdefault(str(result.get("role") or "unknown"), {"unreported": 0, "unmeasured": 0})
         bucket[kind] += 1
-    return {**found, "counts": counts}
+    abandoned = []
+    for run_id, run_dir, state in fusion_runs.run_states(workspace):
+        if state["state"] != "abandoned":
+            continue
+        try:
+            task = json.loads((run_dir / "task.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            task = {}
+        task = task if isinstance(task, dict) else {}
+        created = run_created_ms(run_dir) if (run_dir / "task.json").is_file() else now
+        if (cutoff is not None and created < cutoff) or (role is not None and task.get("role") != role):
+            continue
+        abandoned.append({"run_id": run_id, "role": task.get("role"), "agent": task.get("agent"), "issue": task.get("issue"),
+                          "last_heartbeat": state["last_heartbeat"], "reasons": state["reasons"],
+                          "age_hours": round((now - created) / 3_600_000, 1)})
+    abandoned.sort(key=lambda row: row["age_hours"])
+    return {**found, "abandoned": abandoned, "counts": counts}
 
 
 def print_pending(payload: dict[str, Any]) -> None:
-    print(f"unreported {len(payload['unreported'])}, unmeasured {len(payload['unmeasured'])}")
+    print(f"unreported {len(payload['unreported'])}, unmeasured {len(payload['unmeasured'])}, "
+          f"abandoned {len(payload['abandoned'])}")
     for role, bucket in sorted(payload["counts"].items()):
         print(f"  {role}: unreported {bucket['unreported']}, unmeasured {bucket['unmeasured']}")
     for kind in ("unreported", "unmeasured"):
         for row in payload[kind]:
             tail = f" — {row['reason'][:120]}" if row.get("reason") else ""
             print(f"{kind} {row['run_id']} {row['role']} {row['agent']} {row['issue'] or '-'} {row['age_hours']}h{tail}")
+    for row in payload["abandoned"]:
+        print(f"abandoned {row['run_id']} {row['role']} {row['agent']} {row['issue'] or '-'} {row['age_hours']}h"
+              f" — last heartbeat {row['last_heartbeat']}; settle with fusion runs tombstone {row['run_id']}")
 
 
 PROVENANCE_SCHEMA_VERSION = 1
@@ -3743,6 +3770,18 @@ def dispatch(
     store: RunStore,
     run_dir: Path | None = None,
 ) -> dict[str, Any]:
+    # The run's heartbeat starts once its run dir exists and stops however the run ends.
+    with contextlib.ExitStack() as heartbeat:
+        return _dispatch(config, task, store, run_dir, heartbeat)
+
+
+def _dispatch(
+    config: dict[str, Any],
+    task: dict[str, Any],
+    store: RunStore,
+    run_dir: Path | None,
+    heartbeat: contextlib.ExitStack,
+) -> dict[str, Any]:
     from fusion_policy import route_task, review_task
     effective_timeout = (validate_timeout(task["timeout_seconds"]) if "timeout_seconds" in task
                          else int(config.get("timeout_seconds", 3600)))
@@ -3816,6 +3855,7 @@ def dispatch(
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"claude.{name} must be a non-negative integer (0 disables)")
     run_dir = run_dir or store.create(task)
+    heartbeat.enter_context(fusion_runs.Heartbeat(run_dir))
     store.event(run_dir, "run.started", {"agent": task["agent"], "write": task["write"]})
     started_at_ms = now_ms()
     cache = cache_settings(config)
@@ -4884,8 +4924,25 @@ def build_parser() -> argparse.ArgumentParser:
     route.add_argument("--needs", action="append", type=cli_need, default=[], metavar="NAME",
                        help="a capability the task needs from its lane (repeatable)")
     route.add_argument("--seed", type=int, help="seed for Thompson draws, so a preview is reproducible")
-    status = sub.add_parser("status", aliases=["runs"], help="show recent runs")
+    status = sub.add_parser("status", aliases=["runs"], help="show recent runs",
+                            description="Show recent runs, each with its state: finished (result.json), running "
+                                        "(a live heartbeat), abandoned (the heartbeat is stale, or its process is dead or "
+                                        "was replaced) or unknown (no run.lock.json, a run from before heartbeats).")
     status.add_argument("--limit", type=int, default=20)
+    runs_sub = status.add_subparsers(dest="runs_command")
+    runs_list = runs_sub.add_parser("list", help="show recent runs with their state (the default)")
+    runs_list.add_argument("--limit", type=int, default=argparse.SUPPRESS)
+    tombstone = runs_sub.add_parser(
+        "tombstone", help="settle an abandoned run: write its result.json (status abandoned) and an unmeasured outcome",
+        description="Settle a run that died without a result. A dry run by default: prints the state, the evidence "
+                    "(pid, last heartbeat, start-time check) and what would be written. With --apply, writes "
+                    "result.json with status abandoned, the evidence and tombstoned_at, and appends an unmeasured "
+                    "outcome event marked abandoned. Refuses running and finished runs; a run with no run.lock.json "
+                    "(unknown) needs --reason to apply. Never deletes anything. Exit codes: 0 printed or written; 1 refused; "
+                    "2 usage error; 4 run not found.")
+    tombstone.add_argument("run_id")
+    tombstone.add_argument("--apply", action="store_true", help="write the tombstone (default: dry run)")
+    tombstone.add_argument("--reason", help="why the run is dead; required when it has no run.lock.json")
     trace = sub.add_parser("trace", help="show recent telemetry spans")
     trace.add_argument("--limit", type=int, default=100)
     usage = sub.add_parser("usage", help="show local ORC, Claude and Codex usage and quota")
@@ -5061,6 +5118,22 @@ def _main(args, parser) -> int:
         return 0 if payload["chosen"] else 1
     if args.command == "doctor":
         return doctor(workspace, config)
+    if args.command in {"status", "runs"} and args.runs_command == "tombstone":
+        try:
+            payload = fusion_runs.tombstone(workspace, args.run_id, args.apply, args.reason)
+        except RunNotFound as exc:
+            print(f"fusion: {exc}; searched {RunStore(workspace).workspace}", file=sys.stderr)
+            return 4
+        except fusion_runs.TombstoneRefused as exc:
+            print(f"fusion: {exc}", file=sys.stderr)
+            return 1
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.json:
+            print(json_text(payload))
+        else:
+            fusion_runs.print_tombstone(payload)
+        return 0
     if args.command in {"status", "runs"}:
         payload = RunStore(workspace).recent(args.limit)
         print(json_text(payload) if args.json else json_text(payload))

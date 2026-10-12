@@ -82,6 +82,46 @@ fusion --json outcome --pending --role review --hours 24
 `--pending` records nothing. It lists completed runs with no measured verdict,
 newest first, split into `unreported` (no outcome event at all) and `unmeasured`
 (only `--unmeasured` outcomes, with the latest reason), with per-role counts.
+Running runs are not listed. Runs that died without a result are listed apart, under
+`abandoned`, until they are tombstoned (below).
+
+### Run states and tombstones
+
+When a run starts, dispatch writes `run.lock.json` in its run dir
+(`.fusion/runs/<id>/`): the dispatching process's `pid`, `pgid`, `host`, `started_at`,
+`process_started_at` (the process's own start time, from `ps -o lstart=` on macOS or
+`/proc/<pid>/stat` on Linux), `fusion_sha` and `heartbeat_at`. A daemon thread
+refreshes `heartbeat_at` every 30 seconds while the run is alive and stops when the
+run ends. The file stays after the run. Each run dir has one state:
+
+| State | Meaning |
+| --- | --- |
+| `finished` | `result.json` exists |
+| `running` | the lock's pid is alive with the recorded start time, and the heartbeat is younger than 120 seconds |
+| `abandoned` | the lock exists, but the heartbeat is stale, the pid is dead, or the pid now belongs to a process with a different start time; `last_heartbeat` is recorded |
+| `unknown` | no lock: a run from before heartbeats were written; never treated as running |
+
+A lock written on another host is judged by its heartbeat alone. A start time that
+cannot be read now is reported as `unavailable`, not as a mismatch.
+`fusion runs` (or `fusion runs list`) shows each run's state. The trajectories export
+counts running, abandoned and unknown run dirs as excluded by state, and review
+grading at land and `--pending` skip them, as they do tombstoned runs.
+
+```sh
+fusion runs tombstone <id>                     # dry run: state, evidence, what it would write
+fusion runs tombstone <id> --apply
+fusion runs tombstone <id> --apply --reason "killed in the host restart"   # a run with no lock
+```
+
+A tombstone settles a run that died without a result. By default it is a dry run: it
+prints the state, the evidence (pid, last heartbeat, start-time check) and what it
+would write. With `--apply` it writes `result.json` with `status: "abandoned"`, the
+evidence and `tombstoned_at`, and appends an `outcome_unmeasured` event marked
+`abandoned: true`, so the run is settled as unmeasured: it is no longer pending and
+never ranks a lane or becomes a label. It refuses a running or finished run. An
+`unknown` run needs `--reason` to apply, and its evidence is the worker pid in `activity.json`.
+It never deletes or moves anything. `fusion outcome <id> --unmeasured` accepts a
+tombstoned run.
 
 The [decision and evidence design](../FUSION_DECISIONS.md) explains label provenance,
 qualification and executed verification. The [learning roadmap](learning-roadmap.md)

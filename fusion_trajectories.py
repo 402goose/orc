@@ -192,8 +192,17 @@ def collect(workspace, config, side, since_days=None, role=None, include_prerele
     wanted_role = normalize_role(role) if role else None
     redact = Redactor(environ)
     runs, steps, excluded = [], {}, Counter()
+    # A run dir with no result is skipped by its state, never exported: running,
+    # abandoned (dead without a result) or unknown (no heartbeat lock to judge it by).
+    import fusion_runs
+    for _, _, state in fusion_runs.run_states(workspace):
+        if state["state"] != "finished":
+            excluded[state["state"]] += 1
     for run_id, run_dir in run_ids(workspace).items():
         result, task = _read_json(run_dir / "result.json"), _read_json(run_dir / "task.json")
+        if result.get("status") == "abandoned":
+            excluded["abandoned"] += 1
+            continue
         run_role = result.get("role") or task.get("role")
         if cutoff is not None and core.run_created_ms(run_dir) < cutoff:
             excluded["filter_since"] += 1
