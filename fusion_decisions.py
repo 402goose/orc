@@ -738,8 +738,9 @@ class DecisionStore:
         self.path = self.root / "events.jsonl"
 
     def append(self, event, **payload):
+        from fusion_hosts import current_host
         append_json(self.path, {"schema": "fusion.decision.v1", "event": event,
-                               "time_ms": int(time.time() * 1000), **payload})
+                               "time_ms": int(time.time() * 1000), "host": current_host(), **payload})
 
     @contextlib.contextmanager
     def review_lock(self):
