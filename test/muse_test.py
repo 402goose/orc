@@ -228,6 +228,7 @@ for event in {events!r}:
             self.assertEqual((result["summary"], result["model"]), ("reviewed", "muse-spark-1.3"))
             self.assertEqual(result["usage"]["input_tokens"], 9)
             self.assertIn("11111111-2222-4333-8444-555555555555", store.sessions().values())
+            self.assertFalse(Path(task["resolved"]["prompt_file"]).exists())
 
 
 if __name__ == "__main__":

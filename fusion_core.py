@@ -4207,6 +4207,8 @@ def _dispatch(
     progress.emit(label, f"selected {task['agent']} ({task.get('route') or 'native'}){selection}; {scope}; {access}")
     try:
         with contextlib.ExitStack() as stack:
+            if metadata.get("prompt_file"):
+                stack.callback(Path(metadata["prompt_file"]).unlink, missing_ok=True)
             with progress.activity(label, "acquiring workspace writer lock" if task["write"] else "preparing read-only worker"):
                 stack.enter_context(writer_lock(Path(task["workspace"]), task["write"], store.control_workspace))
             if codex_browser_reader(config, task, resolved_settings):
