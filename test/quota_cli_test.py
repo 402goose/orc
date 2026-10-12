@@ -69,6 +69,30 @@ class QuotaCliTest(unittest.TestCase):
         self.assertFalse(quota.probe_due(entry, thresholds, NOW))
         self.assertTrue(quota.probe_due(entry, thresholds, NOW + 2 * HOUR))
 
+    def test_an_old_exhausted_reading_is_due_before_its_reset(self):
+        # A plan can reset early; an exhausted lane gets no runs and so no new reading.
+        windows = {"seven_day": {"used": 1.0, "resets_at": NOW + 5 * 24 * HOUR}}
+        self.trace(NOW - 7 * HOUR, windows)
+        thresholds = policy.quota_settings(self.config)
+        entry = quota.usage.headroom(self.store.workspace, include_raw=False)[0]
+        self.assertTrue(quota.probe_due(entry, thresholds, NOW))
+        account = quota.status(self.config, self.store, now=NOW)["accounts"][0]
+        self.assertTrue(account["stale"])
+        self.assertIn("(stale: a probe is due)", quota.render_status(quota.status(self.config, self.store, now=NOW)))
+
+    def test_a_fresh_exhausted_reading_is_not_due_and_zero_turns_staleness_off(self):
+        self.trace(NOW - 2 * HOUR, {"seven_day": {"used": 1.0, "resets_at": NOW + 5 * 24 * HOUR}})
+        entry = quota.usage.headroom(self.store.workspace, include_raw=False)[0]
+        self.assertFalse(quota.probe_due(entry, policy.quota_settings(self.config), NOW))
+        self.assertFalse(quota.status(self.config, self.store, now=NOW)["accounts"][0]["stale"])
+        off = policy.quota_settings({**self.config, "quota": {"stale_probe_hours": 0}})
+        self.assertFalse(quota.probe_due(entry, off, NOW + 30 * HOUR))
+
+    def test_stale_probe_hours_is_validated(self):
+        for value in (-1, True, "6", float("inf")):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "stale_probe_hours"):
+                policy.quota_settings({"quota": {"stale_probe_hours": value}})
+
     def test_probe_runs_one_tiny_read_on_the_account_itself(self):
         self.trace(NOW - 2 * HOUR, {"seven_day": {"used": 1.0, "resets_at": NOW - HOUR}}, status="rejected")
         self.assertEqual(quota.probe(self.config, self.root, self.store, dry_run=True, now=NOW)["probes"][0]["lane"], "claude")

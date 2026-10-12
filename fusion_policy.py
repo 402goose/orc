@@ -151,13 +151,16 @@ def priors_policy(config):
 
 
 def quota_settings(config):
-    settings = {"pace_margin": .15, "soft": .85, "hard": .97, **(config.get("quota") or {})}
+    settings = {"pace_margin": .15, "soft": .85, "hard": .97, "stale_probe_hours": 6, **(config.get("quota") or {})}
     for name in ("pace_margin", "soft", "hard"):
         value = settings[name]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
             raise ValueError(f"quota.{name} must be a fraction between 0 and 1")
     if settings["soft"] > settings["hard"]:
         raise ValueError("quota.soft must not exceed quota.hard")
+    stale = settings["stale_probe_hours"]
+    if isinstance(stale, bool) or not isinstance(stale, (int, float)) or not math.isfinite(stale) or stale < 0:
+        raise ValueError("quota.stale_probe_hours must be a number of hours, 0 or more (0 turns it off)")
     return settings
 
 
