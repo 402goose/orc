@@ -203,9 +203,8 @@ for target in sys.argv[1:]:
             directory = stack.enter_context(tempfile.TemporaryDirectory(prefix=".orc-sandbox-test-", dir=Path.home()))
             siblings = [stack.enter_context(tempfile.TemporaryDirectory(prefix=prefix, dir=slash_tmp))
                         for prefix in ("tenet-agent-probe-", "tenet-round-probe-")]
-            plain = shared / "grading-tree-probe"
-            plain.mkdir(exist_ok=True)
-            stack.callback(shutil.rmtree, plain, True)
+            # Its own directory: a fixed name collides with a second suite running on the same host.
+            plain = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="grading-tree-probe-", dir=shared)))
             env = dict(core.os.environ)
             run_tmp = core.codex_reader_tmpdir(env)
             stack.callback(shutil.rmtree, run_tmp, True)
