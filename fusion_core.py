@@ -5031,6 +5031,8 @@ def build_parser() -> argparse.ArgumentParser:
     quota_parser(sub)
     from fusion_lanes import add_parser as lanes_parser
     lanes_parser(sub)
+    from fusion_scoreboard import add_parser as scoreboard_parser
+    scoreboard_parser(sub)
     from fusion_hosts import add_parser as hosts_parser
     hosts_parser(sub)
     sub.add_parser("mcp-serve", help=argparse.SUPPRESS)
@@ -5155,6 +5157,9 @@ def _main(args, parser) -> int:
             for key, why in sorted(payload["rejected"].items()):
                 print(f"  dropped {key}: {why}")
         return 0 if payload["chosen"] else 1
+    if args.command == "scoreboard":
+        from fusion_scoreboard import run as run_scoreboard
+        return run_scoreboard(args, workspace)
     if args.command == "lanes":
         from fusion_lanes import run as run_lanes
         try:

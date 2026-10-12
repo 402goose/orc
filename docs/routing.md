@@ -452,3 +452,16 @@ Set `decisions.priors` to `false` to disable them, or set its `path` to a differ
 export. Priors do not confer permissions or bypass availability, fit or quota
 checks. See [gym evidence](learning.md#gym) and
 [configuration](configuration.md).
+
+## Lane scoreboard
+
+`fusion routing-report` reads only automatically routed choices. Most work is pinned to a lane, so it
+never reached a comparison. `fusion scoreboard [--since DAYS] [--role ROLE] [--json]` reads every completed
+run with a settled verdict, pinned or routed, under the same rules as `fusion trajectories export`:
+eval_unmeasured, quota, refusal, harness failures, withdrawn verdicts and runs without one are left out and
+counted. It groups the runs by role and lane family (agent, model, effort) and shows, for each:
+- accepted out of settled, with a Wilson 95% interval;
+- median cost and minutes;
+- how the runs got that lane: `routed` automatically, `pinned`, or moved by a quota `fallback`.
+
+Lanes whose intervals overlap are not shown to differ. It is reporting only: no routing choice reads it.
