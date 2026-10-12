@@ -42,6 +42,19 @@ class PriceFallbackTest(unittest.TestCase):
         self.assertIsNone(core.price_fallback(prices, usage, "other"))  # "*" does not price cache reads
         self.assertAlmostEqual(core.price_fallback(prices, {"input_tokens": 1_000_000}, "other"), 1.0)
 
+    def test_openai_style_usage_prices_cached_and_reasoning_tokens_once(self):
+        # A real Codex run: cached tokens are inside input_tokens, reasoning inside output_tokens.
+        usage = {"input_tokens": 287_718, "cached_input_tokens": 243_968, "cache_write_input_tokens": 0,
+                 "output_tokens": 2_280, "reasoning_output_tokens": 934}
+        prices = {"price_per_mtok": {"gpt-6.1-sol": {"input": 2.0, "output": 10.0, "cache_read": 0.1}}}
+        expected = (43_750 * 2.0 + 243_968 * 0.1 + 2_280 * 10.0) / 1e6
+        self.assertAlmostEqual(core.price_fallback(prices, usage, "gpt-6.1-sol"), expected)
+
+    def test_anthropic_style_usage_keeps_disjoint_buckets(self):
+        usage = {"input_tokens": 1_000, "cache_read_input_tokens": 9_000, "output_tokens": 100, "reasoning_output_tokens": 50}
+        prices = {"price_per_mtok": {"input": 1.0, "output": 2.0, "cache_read": 0.1}}
+        self.assertAlmostEqual(core.price_fallback(prices, usage), (1_000 * 1.0 + 9_000 * 0.1 + 150 * 2.0) / 1e6)
+
     def test_a_by_model_table_without_the_model_or_star_prices_nothing(self):
         prices = {"price_per_mtok": {"gpt-6.1-sol": {"input": 2.0}}}
         self.assertIsNone(core.price_fallback(prices, {"input_tokens": 10}, "gpt-6-astra"))

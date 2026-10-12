@@ -2296,10 +2296,18 @@ def price_fallback(settings: dict[str, Any], usage: dict[str, Any], model: str |
     prices = price_per_mtok(settings, model)
     if not prices:
         return None
+    def count(field):
+        value = usage.get(field)
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+    buckets = {kind: sum(count(field) for field in fields) for kind, fields in PRICE_FIELDS.items()}
+    if "cached_input_tokens" in usage and "cache_read_input_tokens" not in usage:
+        # OpenAI-style usage (Codex): cached and cache-write tokens are inside input_tokens,
+        # and reasoning tokens are inside output_tokens. Price each token once.
+        buckets["input"] = max(0, count("input_tokens") - buckets["cache_read"] - buckets["cache_write"])
+        buckets["output"] = count("output_tokens")
     total, counted = 0.0, False
-    for kind, fields in PRICE_FIELDS.items():
-        tokens = sum(usage.get(field) or 0 for field in fields
-                     if isinstance(usage.get(field), (int, float)) and not isinstance(usage.get(field), bool))
+    for kind in PRICE_FIELDS:
+        tokens = buckets[kind]
         if tokens:
             if kind not in prices:
                 return None  # tokens of a kind the lane did not price: still unknown

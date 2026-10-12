@@ -697,6 +697,8 @@ entry. A model with no entry and no `"*"` stays unpriced.
 
 For a subscription lane, the estimate is the API-list equivalent of the tokens used, not money spent.
 
+Codex reports usage in OpenAI's convention, where cached tokens are counted inside `input_tokens` and reasoning tokens inside `output_tokens`; each token is priced once.
+
 ## OpenCode settings
 
 [OpenCode](https://opencode.ai) (`opencode run --format json`) is a fifth worker
