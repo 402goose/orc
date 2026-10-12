@@ -86,6 +86,8 @@ after its name. Aliases and hidden subcommands are included below.
 - [fusion quota probe](#fusion-quota-probe)
 - [fusion quota rates](#fusion-quota-rates)
 - [fusion lanes](#fusion-lanes)
+- [fusion host-info](#fusion-host-info)
+- [fusion hosts](#fusion-hosts)
 - [fusion mcp-serve](#fusion-mcp-serve)
 
 ## fusion
@@ -93,12 +95,12 @@ after its name. Aliases and hidden subcommands are included below.
 ```text
 usage: fusion [-h] [--workspace WORKSPACE] [--control-workspace CONTROL_WORKSPACE]
               [--json] [--progress | --quiet]
-              {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,trajectories,learn,gym,quota,lanes,mcp-serve} ...
+              {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,trajectories,learn,gym,quota,lanes,host-info,hosts,mcp-serve} ...
 
 Lead/sidekick orchestration for Claude Code, Codex CLI, and Antigravity CLI
 
 positional arguments:
-  {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,trajectories,learn,gym,quota,lanes,mcp-serve}
+  {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,trajectories,learn,gym,quota,lanes,host-info,hosts,mcp-serve}
     truffle               scout tractable GitHub issues and queue isolated fixes
     ui                    open the local ORC/Fusion control room in your browser
     lead                  launch an interactive lead agent with the Fusion MCP server
@@ -130,6 +132,10 @@ positional arguments:
                           measure quota per run
     lanes                 show one offer per lane: model, creator, upstream, billing,
                           features and prices; dispatches nothing
+    host-info             this host's ORC commit, harness versions, load, disk, runs in
+                          flight and quota
+    hosts                 host-info here and over ssh on each registered host, as one
+                          table
     mcp-serve             ==SUPPRESS==
 
 options:
@@ -1686,6 +1692,40 @@ options:
   --json
   --live      add each lane's quota class and whether its command is on PATH, from local
               state
+```
+
+## fusion host-info
+
+this host's ORC commit, harness versions, load, disk, runs in flight and quota
+
+```text
+usage: fusion host-info [-h] [--json]
+
+Print this host's facts: host, orc_sha, python, the claude, codex, agy and opencode
+versions (null when absent), the 1/5/15-minute load, free disk under the control
+workspace, runs in flight and the quota classification per account. Makes no network
+calls and prints no secrets. Exit codes: 0 printed; 2 hosts.json refused.
+
+options:
+  -h, --help  show this help message and exit
+  --json
+```
+
+## fusion hosts
+
+host-info here and over ssh on each registered host, as one table
+
+```text
+usage: fusion hosts [-h] [--json]
+
+Run host-info here and on each host in hosts.json with `ssh`, through `ssh -o
+BatchMode=yes -o ConnectTimeout=5 SSH FUSION --json host-info`. An unreachable host is a
+row with reachable false and its error; a host whose orc_sha differs from this one is
+marked skew. Exit codes: 0 printed; 2 hosts.json refused.
+
+options:
+  -h, --help  show this help message and exit
+  --json
 ```
 
 ## fusion mcp-serve

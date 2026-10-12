@@ -342,6 +342,41 @@ not as routing choices. If the control workspace is a git checkout that a host
 pulls on its own (a report loop, a driver), tracking `.fusion/control.json` there
 lets one commit pause that host's workers even when nobody can reach it.
 
+## Hosts
+
+Each host keeps its own control store. Every run's `task.json`, `result.json`
+and trace, and every decision event, records `host`: the registry's `self` when
+set, else the short hostname. Records written before this field have none, and
+readers report `host: null`.
+
+The registry is optional, at `$ORC_HOME/hosts.json` (normally
+`~/.config/orc/hosts.json`):
+
+```json
+{"self": "laptop", "hosts": {"laptop": {"ssh": null}, "runner": {"ssh": "user@runner-host", "fusion": "~/orc/fusion"}}}
+```
+
+Only `self` and `hosts` are allowed. Each host has `ssh`, a destination or
+`null`, and an optional `fusion` path (default `fusion` on the remote `PATH`).
+`fusion host-info` and `fusion hosts` refuse a malformed file with exit 2 and a
+message naming the file and the problem; run records fall back to the short
+hostname until it is fixed.
+
+`fusion host-info [--json]` prints this host's facts without network calls or
+secrets: `host`, `orc_sha` (from `orc.sha` beside the install, else the commit of
+the checkout running), `python`, the `claude`, `codex`, `agy` and `opencode`
+versions (`--version` with a 5-second timeout; `null` when absent or failing),
+the 1/5/15-minute `load`, `disk_free_bytes` under the control workspace,
+`runs_in_flight`, and `quota`, the classification per account from
+`fusion quota`. Harness commands come from each agent's `command` setting.
+
+`fusion hosts [--json]` runs `host-info` here and on each registered host with
+`ssh`, as `ssh -o BatchMode=yes -o ConnectTimeout=5 SSH FUSION --json host-info`,
+and prints one row per host. An unreachable host is a row with
+`reachable: false` and its `error`; the command still exits 0. A host whose
+`orc_sha` differs from this one is marked `skew`. Neither command changes
+dispatch or routing.
+
 ## Runtime permissions
 
 Runtime access is configured with `execution_mode`: `restricted` (default) or

@@ -31,6 +31,7 @@ from typing import Any, Iterator
 from fusion_decisions import DEFAULTS as DECISION_DEFAULTS, LAND_DERIVED_SOURCE
 import fusion_progress as progress
 from fusion_publish import GIT_FLAGS
+import fusion_hosts
 import fusion_runs
 from fusion_usage import event_quota
 from fusion_reasoning import EFFORTS, validate_pair
@@ -1663,6 +1664,7 @@ class RunStore:
             **({"endpoint": metadata["endpoint"]} if metadata.get("endpoint") else {}),
             "write": task.get("write", False),
             **({"repo": task["repo"]} if task.get("repo") else {}),
+            "host": task.get("host") or fusion_hosts.current_host(),
             "execution_choice": result.get("execution_choice"),
             "usage": result.get("usage") or {},
             **({"quota": result["quota"]} if result.get("quota") is not None else {}),
@@ -1760,7 +1762,7 @@ class RunStore:
                 result_path = task_path.parent / "result.json"
                 result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else None
                 state = fusion_runs.run_state(task_path.parent)
-                output.append({"task": task, "result": result, "state": state["state"],
+                output.append({"task": task, "result": result, "host": task.get("host"), "state": state["state"],
                                **({"last_heartbeat": state["last_heartbeat"]} if state.get("last_heartbeat") else {})})
             except (OSError, json.JSONDecodeError):
                 continue
@@ -3881,6 +3883,7 @@ def _dispatch(
     for name, value in (("max_bash_denials", bash_limit), ("max_baseline_denials", baseline_limit)):
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"claude.{name} must be a non-negative integer (0 disables)")
+    task.setdefault("host", fusion_hosts.current_host())
     run_dir = run_dir or store.create(task)
     heartbeat.enter_context(fusion_runs.Heartbeat(run_dir))
     store.event(run_dir, "run.started", {"agent": task["agent"], "write": task["write"]})
@@ -3921,6 +3924,7 @@ def _dispatch(
             **({"repo": task["repo"]} if task.get("repo") else {}),
             "status": "error",
             "agent": task["agent"],
+            "host": task.get("host"),
             "route": task.get("route"),
             "model": metadata.get("model"),
             **({"endpoint": metadata["endpoint"]} if metadata.get("endpoint") else {}),
@@ -4117,6 +4121,7 @@ def _dispatch(
         "execution_mode": task_execution_mode(config, task),
         "agent": task["agent"],
         "role": task["role"],
+        "host": task.get("host"),
         **({"issue": task["issue"]} if task.get("issue") else {}),
         "route": task.get("route"),
         **({"quota_twin": task["quota_twin"]} if task.get("quota_twin") else {}),
@@ -5026,6 +5031,8 @@ def build_parser() -> argparse.ArgumentParser:
     quota_parser(sub)
     from fusion_lanes import add_parser as lanes_parser
     lanes_parser(sub)
+    from fusion_hosts import add_parser as hosts_parser
+    hosts_parser(sub)
     sub.add_parser("mcp-serve", help=argparse.SUPPRESS)
     return parser
 
@@ -5113,6 +5120,9 @@ def _main(args, parser) -> int:
             return run_decisions(args, control_workspace, config)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             parser.error(str(exc))
+    if args.command in {"host-info", "hosts"}:
+        from fusion_hosts import run as run_hosts
+        return run_hosts(args, workspace, config)
     if args.command == "trajectories":
         from fusion_trajectories import run as run_trajectories
         try:

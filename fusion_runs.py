@@ -215,7 +215,8 @@ def tombstone(workspace: Path, run_id: str, apply: bool = False, reason: str | N
     why = "; ".join(state["reasons"] + ([reason] if reason else []))
     result = {"schema": SCHEMA, "run_id": run_id, "workspace": task.get("workspace"),
               **({"repo": task["repo"]} if task.get("repo") else {}), "status": "abandoned",
-              "agent": task.get("agent"), "role": task.get("role"), **({"issue": task["issue"]} if task.get("issue") else {}),
+              "agent": task.get("agent"), "role": task.get("role"), "host": task.get("host"),
+              **({"issue": task["issue"]} if task.get("issue") else {}),
               "route": task.get("route"), "model": (task.get("resolved") or {}).get("model"),
               "summary": f"run abandoned without a result: {why}", "changed": [], "tests": [],
               "blockers": [f"abandoned: {why}"], "previous_state": state["state"],
