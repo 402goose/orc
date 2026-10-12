@@ -31,7 +31,11 @@ after its name. Aliases and hidden subcommands are included below.
 - [fusion doctor](#fusion-doctor)
 - [fusion route](#fusion-route)
 - [fusion status](#fusion-status)
+- [fusion status list](#fusion-status-list)
+- [fusion status tombstone](#fusion-status-tombstone)
 - [fusion runs](#fusion-runs)
+- [fusion runs list](#fusion-runs-list)
+- [fusion runs tombstone](#fusion-runs-tombstone)
 - [fusion trace](#fusion-trace)
 - [fusion usage](#fusion-usage)
 - [fusion control](#fusion-control)
@@ -616,21 +620,111 @@ options:
 show recent runs
 
 ```text
-usage: fusion status [-h] [--limit LIMIT]
+usage: fusion status [-h] [--limit LIMIT] {list,tombstone} ...
+
+Show recent runs, each with its state: finished (result.json), running (a live
+heartbeat), abandoned (the heartbeat is stale, or its process is dead or was replaced)
+or unknown (no run.lock.json, a run from before heartbeats).
+
+positional arguments:
+  {list,tombstone}
+    list            show recent runs with their state (the default)
+    tombstone       settle an abandoned run: write its result.json (status abandoned)
+                    and an unmeasured outcome
+
+options:
+  -h, --help        show this help message and exit
+  --limit LIMIT
+```
+
+## fusion status list
+
+show recent runs with their state (the default)
+
+```text
+usage: fusion status list [-h] [--limit LIMIT]
 
 options:
   -h, --help     show this help message and exit
   --limit LIMIT
 ```
 
+## fusion status tombstone
+
+settle an abandoned run: write its result.json (status abandoned) and an unmeasured outcome
+
+```text
+usage: fusion status tombstone [-h] [--apply] [--reason REASON] run_id
+
+Settle a run that died without a result. A dry run by default: prints the state, the
+evidence (pid, last heartbeat, start-time check) and what would be written. With
+--apply, writes result.json with status abandoned, the evidence and tombstoned_at, and
+appends an unmeasured outcome event marked abandoned. Refuses running and finished runs;
+a run with no run.lock.json (unknown) needs --reason to apply. Never deletes anything.
+Exit codes: 0 printed or written; 1 refused; 2 usage error; 4 run not found.
+
+positional arguments:
+  run_id
+
+options:
+  -h, --help       show this help message and exit
+  --apply          write the tombstone (default: dry run)
+  --reason REASON  why the run is dead; required when it has no run.lock.json
+```
+
 ## fusion runs
 
 ```text
-usage: fusion runs [-h] [--limit LIMIT]
+usage: fusion runs [-h] [--limit LIMIT] {list,tombstone} ...
+
+Show recent runs, each with its state: finished (result.json), running (a live
+heartbeat), abandoned (the heartbeat is stale, or its process is dead or was replaced)
+or unknown (no run.lock.json, a run from before heartbeats).
+
+positional arguments:
+  {list,tombstone}
+    list            show recent runs with their state (the default)
+    tombstone       settle an abandoned run: write its result.json (status abandoned)
+                    and an unmeasured outcome
+
+options:
+  -h, --help        show this help message and exit
+  --limit LIMIT
+```
+
+## fusion runs list
+
+show recent runs with their state (the default)
+
+```text
+usage: fusion runs list [-h] [--limit LIMIT]
 
 options:
   -h, --help     show this help message and exit
   --limit LIMIT
+```
+
+## fusion runs tombstone
+
+settle an abandoned run: write its result.json (status abandoned) and an unmeasured outcome
+
+```text
+usage: fusion runs tombstone [-h] [--apply] [--reason REASON] run_id
+
+Settle a run that died without a result. A dry run by default: prints the state, the
+evidence (pid, last heartbeat, start-time check) and what would be written. With
+--apply, writes result.json with status abandoned, the evidence and tombstoned_at, and
+appends an unmeasured outcome event marked abandoned. Refuses running and finished runs;
+a run with no run.lock.json (unknown) needs --reason to apply. Never deletes anything.
+Exit codes: 0 printed or written; 1 refused; 2 usage error; 4 run not found.
+
+positional arguments:
+  run_id
+
+options:
+  -h, --help       show this help message and exit
+  --apply          write the tombstone (default: dry run)
+  --reason REASON  why the run is dead; required when it has no run.lock.json
 ```
 
 ## fusion trace
