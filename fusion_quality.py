@@ -96,6 +96,10 @@ def review_quality(rows, split="time"):
 
 BASELINES = ("majority", "train_majority", "heuristic", "control")
 DEGENERATE_SHARE = 0.99
+# On a true/false question: a predicted-true rate at or beyond either bound, or
+# this far from the held-out label base rate, is a constant predictor in practice.
+DEGENERATE_POSITIVE_RATE = 0.95
+DEGENERATE_BASE_RATE_GAP = 0.4
 
 
 def _selected(probs):
@@ -135,15 +139,25 @@ def classification(answers):
             "predicted_rates": {k: v / n for k, v in sorted(rates.items())}}
 
 
-def degenerate(probabilities):
+def degenerate(probabilities, label_rates=None):
     if not probabilities:
         return None
     values = set().union(*probabilities)
     if all(max(p.get(v, 0.0) for p in probabilities) - min(p.get(v, 0.0) for p in probabilities) <= 1e-9 for v in values):
         return f"identical probabilities on all {len(probabilities)} held-out answers"
-    value, count = Counter(_selected(p) for p in probabilities).most_common(1)[0]
+    selected = Counter(_selected(p) for p in probabilities)
+    value, count = selected.most_common(1)[0]
     if count / len(probabilities) >= DEGENERATE_SHARE:
         return f"answers {value} on {count} of {len(probabilities)} held-out answers"
+    # Binary questions only: a single held-out label value is a constant question, judged as before.
+    if set(label_rates or {}) != {"true", "false"} or not set(selected) <= {"true", "false"}:
+        return None
+    n, rate, base = len(probabilities), selected["true"] / len(probabilities), label_rates["true"]
+    answers = f"answers true on {selected['true']} of {n} held-out answers ({rate:.1%}; label base rate {base:.1%}"
+    if max(rate, 1 - rate) >= DEGENERATE_POSITIVE_RATE:
+        return answers + ")"
+    if abs(rate - base) > DEGENERATE_BASE_RATE_GAP:
+        return answers + f", {abs(rate - base) * 100:.1f} points apart)"
     return None
 
 
@@ -209,7 +223,9 @@ def baseline_comparison(rows, predictions, controls=None):
         return {b: summary(value) for b, value in triples.items() if value}
 
     headline_names = sorted(name for name in questions if name not in constant)
-    reasons = {name: degenerate([p for _, p in questions[name]["answers"]]) for name in questions}
+    reasons = {name: degenerate([p for _, p in questions[name]["answers"]],
+                                {k: v / sum(held_out[name].values()) for k, v in held_out[name].items()})
+               for name in questions}
     flagged = [f"{name} {reasons[name]}" for name in headline_names if reasons[name]]
     headline = classification([a for name in headline_names for a in questions[name]["answers"]]) or {"n": 0}
     return {"baselines": baselines(headline_names),
