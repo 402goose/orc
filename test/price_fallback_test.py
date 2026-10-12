@@ -36,7 +36,7 @@ class PriceFallbackTest(unittest.TestCase):
         prices = {"price_per_mtok": {"gpt-6.1-sol": {"input": 2.0, "output": 10.0, "cache_read": 0.1},
                                      "gpt-6-astra": {"input": 10.0, "output": 50.0, "cache_read": 1.0},
                                      "*": {"input": 1.0, "output": 1.0}}}
-        usage = {"input_tokens": 1_000_000, "output_tokens": 100_000, "cached_input_tokens": 1_000_000}
+        usage = {"input_tokens": 1_000_000, "output_tokens": 100_000, "cache_read_input_tokens": 1_000_000}
         self.assertAlmostEqual(core.price_fallback(prices, usage, "gpt-6.1-sol"), 2.0 + 1.0 + 0.1)
         self.assertAlmostEqual(core.price_fallback(prices, usage, "gpt-6-astra"), 10.0 + 5.0 + 1.0)
         self.assertIsNone(core.price_fallback(prices, usage, "other"))  # "*" does not price cache reads
