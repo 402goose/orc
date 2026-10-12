@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import fcntl
 import functools
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -254,6 +255,12 @@ def load_config(workspace: Path, control_workspace: Path | None = None) -> tuple
     # that cannot work on a machine without its provider.
     if isinstance(merged.get("routes"), dict):
         merged["routes"] = {name: route for name, route in merged["routes"].items() if route is not None}
+        for name, route in merged["routes"].items():
+            try:
+                if isinstance(route, dict):
+                    endpoint(route)
+            except ValueError as exc:
+                raise ValueError(f"route {name}: {exc}") from None
     execution_mode(merged)
     return merged, source
 
@@ -1650,6 +1657,7 @@ class RunStore:
             "route": task.get("route"),
             "model": metadata.get("model"),
             "reasoning_effort": metadata.get("reasoning_effort"),
+            **({"endpoint": metadata["endpoint"]} if metadata.get("endpoint") else {}),
             "write": task.get("write", False),
             **({"repo": task["repo"]} if task.get("repo") else {}),
             "execution_choice": result.get("execution_choice"),
@@ -2479,6 +2487,86 @@ def route_env(settings: dict[str, Any]) -> dict[str, str]:
     return {key: os.path.expanduser(os.path.expandvars(value)) for key, value in env.items()}
 
 
+ENDPOINT_FIELDS = ("base_url", "api", "api_key_env", "region", "retention")
+ENDPOINT_RETENTION = ("none", "provider_default", "allowed")
+# The wire format each harness can speak to a self-hosted or private server.
+ENDPOINT_APIS = {"opencode": "openai", "claude": "anthropic", "codex": "openai"}
+ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+
+
+def endpoint(settings: dict[str, Any]) -> dict[str, Any] | None:
+    """A lane's `endpoint` block, validated and with `api` defaulted, or None.
+
+    The block says where the lane's model runs. Its key is never part of it:
+    `api_key_env` names the environment variable the key is read from."""
+    value = settings.get("endpoint")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("endpoint must be an object of " + ", ".join(ENDPOINT_FIELDS))
+    unknown = sorted(set(value) - set(ENDPOINT_FIELDS))
+    if unknown:
+        raise ValueError("endpoint has unknown keys: " + ", ".join(unknown)
+                         + "; it takes " + ", ".join(ENDPOINT_FIELDS) + " and never a literal key")
+    url = value.get("base_url")
+    try:
+        parsed = urllib.parse.urlsplit(url) if isinstance(url, str) and not any(c.isspace() for c in url) else None
+        if parsed is not None:
+            parsed.port  # a malformed port raises ValueError
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.query or parsed.fragment:
+        raise ValueError("endpoint.base_url must be an http or https URL with a host and no query")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("endpoint.base_url must not carry credentials; name the key's variable in api_key_env")
+    api = value.get("api", "openai")
+    if api not in ENDPOINT_APIS.values():
+        raise ValueError('endpoint.api must be "openai" or "anthropic"')
+    name = value.get("api_key_env")
+    if name is not None and (not isinstance(name, str) or not ENV_NAME_RE.match(name)):
+        raise ValueError("endpoint.api_key_env must name an environment variable (A-Z, 0-9, _), not hold the key")
+    region = value.get("region")
+    if region is not None and (not isinstance(region, str) or not region.strip()):
+        raise ValueError("endpoint.region must be a non-empty label")
+    if value.get("retention") is not None and value["retention"] not in ENDPOINT_RETENTION:
+        raise ValueError("endpoint.retention must be one of " + ", ".join(ENDPOINT_RETENTION))
+    return {**value, "api": api}
+
+
+def endpoint_for(agent: str, settings: dict[str, Any]) -> dict[str, Any] | None:
+    """The endpoint of a lane on `agent`, refusing a harness or wire format that cannot reach it."""
+    block = endpoint(settings)
+    if block is None:
+        return None
+    if agent not in ENDPOINT_APIS:
+        raise ValueError(f"endpoint works only on claude, codex and opencode lanes, not {agent}")
+    if block["api"] != ENDPOINT_APIS[agent]:
+        raise ValueError(f'a {agent} lane reaches only an endpoint with api "{ENDPOINT_APIS[agent]}", not "{block["api"]}"')
+    if agent == "claude" and Path(str(settings.get("command", agent))).name == "orc":
+        raise ValueError("endpoint does not apply to an orc lane, which sets its own base URL")
+    if agent == "opencode" and "/" not in str(settings.get("model") or ""):
+        raise ValueError("an OpenCode endpoint lane needs model as provider/model; the provider names the endpoint")
+    name = block.get("api_key_env")
+    if name and not {**os.environ, **route_env(settings)}.get(name):
+        raise ValueError(f"endpoint.api_key_env names {name}, which is not set")
+    return block
+
+
+def endpoint_record(settings: dict[str, Any]) -> dict[str, Any] | None:
+    """What a run records about its endpoint, never the key. `data_class` is
+    local when the host is loopback or the region is "host", remote otherwise."""
+    block = endpoint(settings)
+    if block is None:
+        return None
+    host = urllib.parse.urlsplit(block["base_url"]).hostname
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host == "localhost" or host.endswith(".localhost")
+    return {"host": host, "api": block["api"], "region": block.get("region"), "retention": block.get("retention"),
+            "data_class": "local" if loopback or block.get("region") == "host" else "remote"}
+
+
 METERED_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
 
@@ -2737,18 +2825,24 @@ def agent_command(
     # YOLO grants full access to work that writes. A read-only task keeps each
     # harness's read-only mode even in a YOLO workspace: --read-only is a promise.
     yolo = execution_mode(config) == "yolo" and bool(task.get("write"))
+    block = endpoint_for(agent, settings)
+    key = {**os.environ, **route_env(settings)}.get(block["api_key_env"]) if block and block.get("api_key_env") else None
     env = os.environ.copy()
-    if agent == "claude" and not metered(settings):
+    if agent == "claude" and (not metered(settings) or block):
         # Claude Code prefers an API key over the subscription login whenever one
         # is in its environment. Only a lane declared `billing: "api"` may inherit
         # or set one; every other lane runs on the login even if a key leaked
-        # into the parent shell.
+        # into the parent shell. An endpoint lane gets only its own key.
         for name in METERED_ENV:
             env.pop(name, None)
     routed = route_env(settings)
-    if agent == "claude" and not metered(settings):
+    if agent == "claude" and (not metered(settings) or block):
         routed = {k: v for k, v in routed.items() if k not in METERED_ENV}
     env.update(routed)
+    if agent == "claude" and block:
+        env["ANTHROPIC_BASE_URL"] = block["base_url"]
+        if key:
+            env["ANTHROPIC_AUTH_TOKEN"] = key
     if agent == "codex":
         from fusion_reasoning import execution_choice
         choice = execution_choice(settings)
@@ -2763,6 +2857,11 @@ def agent_command(
         argv = [command, "-C", task["workspace"], *permissions]
         if settings.get("reasoning_effort") is not None:
             argv += ["-c", "model_reasoning_effort=" + json.dumps(settings["reasoning_effort"])]
+        if block:
+            provider = {"name": task.get("route") or "endpoint", "base_url": block["base_url"],
+                        **({"env_key": block["api_key_env"]} if block.get("api_key_env") else {}), "wire_api": "chat"}
+            argv += ["-c", "model_providers.fusion_endpoint=" + toml_inline(provider),
+                     "-c", 'model_provider="fusion_endpoint"']
         argv += ["exec", "resume", session_id, "--json"] if session_id else ["exec", "--json", "--skip-git-repo-check"]
         model = settings.get("model")
         if model:
@@ -2817,6 +2916,15 @@ def agent_command(
         env["OPENCODE_PERMISSION"] = json.dumps(policy, separators=(",", ":"))
         worker_agent = opencode_agent_name(settings)
         content = json.loads(opencode_config_content(settings, env) or "{}")
+        if block:
+            # The endpoint is a provider under the model's provider prefix. OpenCode
+            # substitutes {env:NAME} itself, so the key stays in the environment.
+            provider, model_id = str(settings["model"]).split("/", 1)
+            content = deep_merge(content, {"provider": {provider: {
+                "npm": "@ai-sdk/openai-compatible",
+                "options": {"baseURL": block["base_url"],
+                            **({"apiKey": "{env:" + block["api_key_env"] + "}"} if block.get("api_key_env") else {})},
+                "models": {model_id: {}}}}})
         content = deep_merge(content, {"agent": {worker_agent: {
             "permission": policy,
             **({"mode": "primary", "description": "Fusion worker (headless, policy set by Fusion)"}
@@ -3329,6 +3437,8 @@ def dispatch(
             task["session_key"] += ":" + pair_key(validate_pair(settings.get("model"), settings["reasoning_effort"])) + ":delegation=" + str(settings.get("allow_native_delegation", False)).lower()
     if "review" in task["role"].lower() and not task["write"]:
         review_task(config, task, store)
+    # An endpoint the lane's harness cannot reach is refused before a run exists.
+    endpoint_for(task["agent"], agent_settings(config, task))
     claude_settings = agent_settings(config, task) if task["agent"] == "claude" else {}
     refusal = failure = None
     if claude_settings and (not claude_settings.get("user_hooks") or not task["write"]):
@@ -3373,6 +3483,8 @@ def dispatch(
     metadata["lane_key"] = lane_key(task["agent"], resolved_settings)
     # The requested effort, from the task, route or agent; null means the harness default.
     metadata["reasoning_effort"] = resolved_settings.get("reasoning_effort")
+    if record := endpoint_record(resolved_settings):
+        metadata["endpoint"] = record
     task["resolved"] = metadata
     store.write_json(run_dir / "task.json", task)
     binary = executable(argv[0])
@@ -3387,6 +3499,7 @@ def dispatch(
             "agent": task["agent"],
             "route": task.get("route"),
             "model": metadata.get("model"),
+            **({"endpoint": metadata["endpoint"]} if metadata.get("endpoint") else {}),
             "execution_choice": metadata.get("execution_choice"),
             "summary": f"{argv[0]} is not available on PATH",
             "verdict": "error",
@@ -3562,7 +3675,7 @@ def dispatch(
     if verdict_missing:
         blockers.append("verdict missing: a review delegation must answer with a VERDICT: approve or VERDICT: changes "
                         "line and this answer has none, so it is neither accepted nor rejected; retry or escalate")
-    if key_source not in (None, "none") and not metered(agent_settings(config, task)):
+    if key_source not in (None, "none") and not metered(agent_settings(config, task)) and not endpoint(resolved_settings):
         blockers.append(f"billing: a subscription lane ran on {key_source} (metered); declare billing: \"api\" on lanes meant to bill per token")
     result = {
         "schema": SCHEMA,
@@ -3580,6 +3693,7 @@ def dispatch(
         "model": model,
         "reasoning_effort": metadata.get("reasoning_effort"),
         **({"api_key_source": key_source} if key_source is not None else {}),
+        **({"endpoint": metadata["endpoint"]} if metadata.get("endpoint") else {}),
         **harness,
         "execution_choice": metadata.get("execution_choice"),
         "summary": compact(str(handoff.get("summary") or summary).strip(), int(config.get("max_result_chars", 12000))),
@@ -4566,7 +4680,8 @@ def _main(args, parser) -> int:
                 print(f"  all lanes {payload['excluded_reason']}; retaining the full eligible pool")
             for candidate in payload["candidates"]:
                 print(f"  {candidate['key']:<28} p={candidate['propensity']:.3f}  quota={candidate.get('quota') or '-'}  "
-                      f"checked={candidate.get('checked_runs_local', candidate.get('checked_runs'))}")
+                      f"checked={candidate.get('checked_runs_local', candidate.get('checked_runs'))}"
+                      + (f"  data={candidate['data_class']}" if candidate.get("data_class") else ""))
             for key, why in sorted(payload["rejected"].items()):
                 print(f"  dropped {key}: {why}")
         return 0 if payload["chosen"] else 1

@@ -386,6 +386,11 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None, minim
             # any provider; automatic routing needs a lane that names one.
             drop(key, "OpenCode lanes need an explicit provider/model for automatic routing")
             continue
+        try:
+            reached = core.endpoint_record(settings) if core.endpoint_for(agent, settings) else None
+        except ValueError as exc:
+            drop(key, str(exc))
+            continue
         quota = headroom.get(core.lane_key(agent, settings))
         if quota:
             if quota_audit is not None:
@@ -502,6 +507,7 @@ def route_candidates(config, task, store, rejected=None, quota_audit=None, minim
             accepted = sum(verified) + prior.get("prior_successes", 0)
             choices.append({"key": arm, "agent": agent, "route": route, "model": model, **effort,
                             "cost_tier": settings.get("cost_tier"),
+                            **({"data_class": reached["data_class"]} if reached else {}),
                             **({"quota": quota} if quota else {}),
                             "runs": len(spans), "reported_success_rate": sum(s.get("status") == "success" for s in spans) / len(spans) if spans else None,
                             "checked_runs": round(checked, 3) if prior["prior_attempts"] else checked,
@@ -927,7 +933,7 @@ def explain_route(config, task, store, seed=None):
         chances = {key: wins.get(key, 0.0) for key in keys}
     else:
         chances = propensities(keys, keys[0], 0.0 if ranked["trial"] else effective) if keys else {}
-    fields = ("key", "agent", "route", "model", "reasoning_effort", "cost_tier", "checked_runs", "checked_runs_local",
+    fields = ("key", "agent", "route", "model", "reasoning_effort", "cost_tier", "data_class", "checked_runs", "checked_runs_local",
               "acceptance_rate", "acceptance_rate_local", "evidence_scope", "pooled", "mean_cost_usd")
     return {"schema": "fusion.route_explain.v1",
             "task": {"issue": task.get("issue"), "role": task.get("role"), "write": bool(task.get("write")), "needs": task.get("needs") or [],
@@ -1012,8 +1018,11 @@ def route_task(config, task, store, rng=None):
                 "model": settings.get("model", ""),
                 **({"reasoning_effort": settings["reasoning_effort"]} if settings.get("reasoning_effort") is not None else {}),
             }]
+            reached = core.endpoint_record(settings)
             for candidate in candidates:
                 candidate["cost_tier"] = settings.get("cost_tier")
+                if reached:
+                    candidate["data_class"] = reached["data_class"]
         # Rank every eligible lane before bounding Laya options and the audit log.
         candidates = candidates[:8]
     if not candidates:
@@ -1256,14 +1265,17 @@ def routing_report(events, since=None, policy=None, by="lane"):
         units = {}
         for candidate in log.get("candidates") or []:
             key = _family(candidate) if by == "family" else candidate["key"]
-            unit = units.setdefault(key, {"propensity": 0.0, "chosen": False, "lanes": set()})
+            unit = units.setdefault(key, {"propensity": 0.0, "chosen": False, "lanes": set(), "data": set()})
             unit["propensity"] += float(candidate.get("propensity") or 0)
             unit["chosen"] = unit["chosen"] or log.get("chosen") == candidate["key"]
             unit["lanes"].add(candidate["key"])
+            if candidate.get("data_class"):
+                unit["data"].add(candidate["data_class"])
         for key, unit in units.items():
             lane = lanes.setdefault(key, {"key": key, "available": 0, "chosen": 0, "accepted": 0, "zero_propensity": 0,
-                                          "_w": 0.0, "_w2": 0.0, "_wr": 0.0, "_lanes": set()})
+                                          "_w": 0.0, "_w2": 0.0, "_wr": 0.0, "_lanes": set(), "_data": set()})
             lane["_lanes"] |= unit["lanes"]
+            lane["_data"] |= unit["data"]
             propensity = min(1.0, unit["propensity"])
             lane["available"] += 1
             if propensity <= 0:
@@ -1279,6 +1291,10 @@ def routing_report(events, since=None, policy=None, by="lane"):
     for lane in sorted(lanes.values(), key=lambda item: (-item["available"], item["key"])):
         weight, square, weighted = lane.pop("_w"), lane.pop("_w2"), lane.pop("_wr")
         members = sorted(lane.pop("_lanes"))
+        # Where the lane's model ran, as its routing logs recorded it: only endpoint lanes carry one.
+        data = lane.pop("_data")
+        if data:
+            lane["data_class"] = data.pop() if len(data) == 1 else "mixed"
         overlap = lane["zero_propensity"] == 0 and lane["chosen"] > 0
         lane.update(observed_acceptance=lane["accepted"] / lane["chosen"] if lane["chosen"] else None,
                     ips_acceptance=weighted / lane["available"] if overlap else None,
