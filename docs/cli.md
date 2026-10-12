@@ -86,6 +86,7 @@ after its name. Aliases and hidden subcommands are included below.
 - [fusion quota probe](#fusion-quota-probe)
 - [fusion quota rates](#fusion-quota-rates)
 - [fusion lanes](#fusion-lanes)
+- [fusion scoreboard](#fusion-scoreboard)
 - [fusion host-info](#fusion-host-info)
 - [fusion hosts](#fusion-hosts)
 - [fusion mcp-serve](#fusion-mcp-serve)
@@ -95,12 +96,12 @@ after its name. Aliases and hidden subcommands are included below.
 ```text
 usage: fusion [-h] [--workspace WORKSPACE] [--control-workspace CONTROL_WORKSPACE]
               [--json] [--progress | --quiet]
-              {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,trajectories,learn,gym,quota,lanes,host-info,hosts,mcp-serve} ...
+              {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,trajectories,learn,gym,quota,lanes,scoreboard,host-info,hosts,mcp-serve} ...
 
 Lead/sidekick orchestration for Claude Code, Codex CLI, and Antigravity CLI
 
 positional arguments:
-  {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,trajectories,learn,gym,quota,lanes,host-info,hosts,mcp-serve}
+  {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,trajectories,learn,gym,quota,lanes,scoreboard,host-info,hosts,mcp-serve}
     truffle               scout tractable GitHub issues and queue isolated fixes
     ui                    open the local ORC/Fusion control room in your browser
     lead                  launch an interactive lead agent with the Fusion MCP server
@@ -132,6 +133,8 @@ positional arguments:
                           measure quota per run
     lanes                 show one offer per lane: model, creator, upstream, billing,
                           features and prices; dispatches nothing
+    scoreboard            acceptance per role and lane over every settled run, pinned or
+                          routed, with Wilson 95% intervals; reporting only
     host-info             this host's ORC commit, harness versions, load, disk, runs in
                           flight and quota
     hosts                 host-info here and over ssh on each registered host, as one
@@ -1692,6 +1695,21 @@ options:
   --json
   --live      add each lane's quota class and whether its command is on PATH, from local
               state
+```
+
+## fusion scoreboard
+
+acceptance per role and lane over every settled run, pinned or routed, with Wilson 95%% intervals; reporting only
+
+```text
+usage: fusion scoreboard [-h] [--since DAYS] [--role ROLE] [--min-settled MIN_SETTLED]
+
+options:
+  -h, --help              show this help message and exit
+  --since DAYS            only runs started in the last DAYS days
+  --role ROLE             only this role
+  --min-settled MIN_SETTLED
+                          hide lanes with fewer settled runs in the text view
 ```
 
 ## fusion host-info
