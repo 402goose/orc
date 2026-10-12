@@ -26,6 +26,30 @@ PRIOR_CAP = 10
 _PRIORS_CACHE = {}
 
 
+def wilson_interval(successes, n, z=1.96):
+    """The Wilson score interval (95% at z=1.96) for successes out of n, as
+    (low, high), or None when n is 0. Reporting only: no routing choice reads it."""
+    if not n:
+        return None
+    p, square = successes / n, z * z
+    scale = 1 + square / n
+    center = (p + square / (2 * n)) / scale
+    half = z * math.sqrt(max(0.0, p * (1 - p) / n + square / (4 * n * n))) / scale
+    return max(0.0, center - half), min(1.0, center + half)
+
+
+def acceptance_ci95(successes, n):
+    """wilson_interval rounded to 3 places, as a JSON list; None when n is 0."""
+    interval = wilson_interval(successes, n)
+    return [round(interval[0], 3), round(interval[1], 3)] if interval else None
+
+
+def format_rate(successes, n):
+    """`0.62 [0.41, 0.79]`: the observed rate and its Wilson 95% interval; `-` when n is 0."""
+    interval = acceptance_ci95(successes, n)
+    return f"{successes / n:.2f} [{interval[0]:.2f}, {interval[1]:.2f}]" if interval else "-"
+
+
 def prior_settings(config):
     """`decisions.priors`: {path, weight, cap}, or None when set to false.
 
@@ -939,7 +963,10 @@ def explain_route(config, task, store, seed=None):
             "task": {"issue": task.get("issue"), "role": task.get("role"), "write": bool(task.get("write")), "needs": task.get("needs") or [],
                      "gating": gating(task)},
             "chosen": keys[0] if keys else None,
+            # The interval reads the lane's own checked runs, before any gym prior is pooled in.
             "candidates": [{**{f: c.get(f) for f in fields if f in c}, "propensity": chances.get(c["key"], 0.0),
+                            "acceptance_ci95": acceptance_ci95(round((c.get("acceptance_rate_local") or 0) * (c.get("checked_runs_local") or 0)),
+                                                               c.get("checked_runs_local") or 0),
                             "quota": (c.get("quota") or {}).get("classification")}
                            for c in candidates + ranked["excluded_candidates"]],
             "rejected": rejected,
@@ -1297,6 +1324,7 @@ def routing_report(events, since=None, policy=None, by="lane"):
             lane["data_class"] = data.pop() if len(data) == 1 else "mixed"
         overlap = lane["zero_propensity"] == 0 and lane["chosen"] > 0
         lane.update(observed_acceptance=lane["accepted"] / lane["chosen"] if lane["chosen"] else None,
+                    acceptance_ci95=acceptance_ci95(lane["accepted"], lane["chosen"]),
                     ips_acceptance=weighted / lane["available"] if overlap else None,
                     snips_acceptance=weighted / weight if overlap else None,
                     ess=round(weight * weight / square, 3) if square else 0.0,

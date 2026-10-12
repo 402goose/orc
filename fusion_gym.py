@@ -42,6 +42,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -1029,9 +1030,12 @@ def grade_label(gym, row):
     the workflow recorded for the node's reported success. localized ->
     failed_task=false; missed (no changed file in the top 3) ->
     failed_task=true; partial and invalid answers stay unlabeled, as does a
-    read-only run that changed files or any input someone already labeled."""
+    read-only run that changed files or any input someone already labeled.
+    A run on a held-out task (row split "heldout") is graded but never labeled."""
     decision = (row.get("gate_label") or {}).get("decision_id")
     answers = GRADE_LABELS.get(row.get("verdict"))
+    if row.get("split") == "heldout":
+        return {"status": "skipped", "reason": "held-out task: graded for measurement, never a training label"}
     if (row.get("worker") or {}).get("status") != "success":
         return {"status": "skipped", "reason": "the worker did not report success"}
     if not decision:
@@ -1099,6 +1103,7 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
     gym = prepare_gym(gym, tasks[0]["repo_path"])
     config, _ = core.load_config(gym)
     resolved = {name: resolve_lane(config, name) for name in lanes}
+    split = read_split(gym)
     with _locked(gym):
         done = {row["key"] for row in read_results(gym) if row.get("event") == "finished" and row.get("completed")}
         spent, processed, finished, skipped = 0.0, 0, [], []
@@ -1189,6 +1194,8 @@ def run(tasks_path, lanes, gym, max_tasks=None, budget_usd=None, keep_worktrees=
                 if localize or interpret:
                     summarizer = summarize_interpret if interpret else summarize_localize
                     row = summarizer(task, name, lane, outcome, diff_files, wall_ms)
+                    if is_heldout(split, task["id"]):
+                        row["split"] = "heldout"
                     if snapshot_error is not None:
                         row.update(verdict="invalid_snapshot", completed=False, snapshot_error=snapshot_error, scores={})
                     if row["completed"]:
@@ -1309,6 +1316,108 @@ def audit(gym):
     return summary
 
 
+# ---------------------------------------------------------------- held-out split
+
+SPLIT_SCHEMA = "fusion.gym_split.v1"
+SPLIT_FILE = "split.json"
+SPLIT_RULE = "sha256(salt + task_id) < fraction"
+SPLITS = ("all", "train", "heldout")
+
+
+def split_score(salt, task_id):
+    """sha256(salt + task_id) as a number in [0, 1): its first 64 bits over 2**64."""
+    return int(hashlib.sha256((salt + task_id).encode("utf-8")).hexdigest()[:16], 16) / 2 ** 64
+
+
+def task_sha256(task):
+    """A task's content digest over its JSON with sorted keys, so reformatting the file changes nothing."""
+    text = json.dumps(task, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def task_digests(path):
+    """{task id: task_sha256} for the gym tasks (fix, interpret) and decomp tasks under `path`."""
+    from fusion_gym_decomp import load_tasks as load_decomp
+    digests = {}
+    for load, field in ((load_tasks, "id"), (lambda where: [task for _, task in load_decomp(where)], "task_id")):
+        try:
+            digests.update({task[field]: task_sha256(task) for task in load(path)})
+        except ValueError:
+            continue
+    if not digests:
+        raise ValueError(f"no gym tasks in {path}")
+    return dict(sorted(digests.items()))
+
+
+def read_split(gym):
+    """The frozen split (<gym>/split.json), or None: without one nothing is held out."""
+    path = Path(gym) / SPLIT_FILE
+    if not path.is_file():
+        return None
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("schema") != SPLIT_SCHEMA:
+        raise ValueError(f"{path} is not a {SPLIT_SCHEMA} file")
+    return value
+
+
+def is_heldout(split, task_id):
+    """A recorded task keeps its recorded assignment; a task added since is
+    assigned by the same rule, so it is held out before `--extend` records it."""
+    if not split:
+        return False
+    if task_id in split["task_sha256"]:
+        return task_id in split["heldout"]
+    return split_score(split["salt"], task_id) < split["fraction"]
+
+
+def changed_heldout(split, digests):
+    """Held-out tasks whose current digest differs from the one recorded when they were assigned."""
+    return sorted(task for task in split["heldout"] if task in digests and digests[task] != split["task_sha256"].get(task))
+
+
+def freeze_split(gym, tasks, fraction=0.25, salt=None, now=None):
+    """Write <gym>/split.json: each task held out when sha256(salt + id) < fraction.
+    Refuses to overwrite an existing split. Held-out tasks never feed priors or
+    training labels; they are measured on their own by `gym report --split`."""
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not 0 < fraction < 1:
+        raise ValueError("--fraction must be between 0 and 1")
+    path = Path(gym) / SPLIT_FILE
+    if path.exists():
+        raise ValueError(f"{path} exists; a frozen split is never overwritten (use --extend to record new tasks)")
+    digests = task_digests(tasks)
+    salt = secrets.token_hex(8) if salt is None else salt
+    value = {"schema": SPLIT_SCHEMA,
+             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time())),
+             "fraction": fraction, "salt": salt, "rule": SPLIT_RULE,
+             "heldout": [task for task in digests if split_score(salt, task) < fraction], "task_sha256": digests}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(value, indent=2) + "\n")
+    return value
+
+
+def extend_split(gym, tasks, now=None):
+    """Record tasks added since the split was frozen, by its own rule and salt;
+    existing assignments and digests never change. Held-out tasks whose
+    content changed are reported, not re-recorded."""
+    split = read_split(gym)
+    if split is None:
+        raise ValueError(f"no {SPLIT_FILE} in {gym}; freeze one with `gym split --freeze`")
+    digests = task_digests(tasks)
+    added = [task for task in digests if task not in split["task_sha256"]]
+    if added:
+        split["task_sha256"] = dict(sorted({**split["task_sha256"], **{task: digests[task] for task in added}}.items()))
+        split["heldout"] = sorted([*split["heldout"],
+                                   *(task for task in added if split_score(split["salt"], task) < split["fraction"])])
+        split["extended_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time()))
+        path = Path(gym) / SPLIT_FILE
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(split, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)
+    return {"split": split, "added": added, "added_heldout": [task for task in added if task in split["heldout"]],
+            "heldout_task_changed": changed_heldout(split, digests)}
+
+
 # ---------------------------------------------------------------- lane priors
 
 PRIORS_SCHEMA = "fusion.lane_priors.v1"
@@ -1370,36 +1479,60 @@ def lane_prior_key(spec):
     return ":".join(part for part in (route or agent, model, effort) if part)
 
 
+def prior_outcome(row, solved):
+    """What one latest completed hidden-mode row adds to its lane's prior:
+    (None, (attempts, successes)), or (reason, None) when it is excluded.
+    `solved` is _solved over the same rows."""
+    kind, verdict = row["kind"], row.get("verdict")
+    wins, losses = PRIOR_VERDICTS[kind]
+    # A decomp task's reference commit is its proof that it can be matched.
+    if kind not in {"interpret", "decomp"} and (kind, row["mode"], row["task"]) not in solved:
+        return "unsolved_by_all", None
+    if verdict not in wins | losses or row.get("tampered") or row.get("check_inputs_changed"):
+        return verdict or "none", None
+    if kind == "interpret" and (row.get("scores") or {}).get("train", {}).get("total") == 0:
+        return "holdout_only", None
+    attempts, successes = 1, int(verdict in wins)
+    if kind == "interpret":
+        # Holdout scores are evaluation-only. Training questions supply
+        # fractional pseudo-counts; uncertainty is half a rejection.
+        train = (row.get("scores") or {}).get("train")
+        if train is not None:
+            attempts = train["total"] - .5 * train["abstained"]
+            successes = train["correct"]
+        else:
+            attempts = .5 if verdict == "abstained" else 1
+    return None, (attempts, successes)
+
+
 def lane_priors(gym, now=None, config=None, include_repos=(), include_unknown=False):
     """Per lane and work class, from completed hidden-mode rows (latest per
     key): attempts, successes, mean cost and wall seconds. Rows on a task no
     lane solved (fix, per hidden mode) or localized are excluded, as the audit
     withholds their negatives: an underspecified task says nothing about a
     lane. Both hidden modes count toward `write`, each audited on its own.
-    Rows from an excluded or unknown repo (fusion_core.excluded_repo) are
-    excluded first, by reason; `repos` lists the source repos counted."""
+    Rows on a held-out task (split.json) are excluded first, as `heldout`;
+    then rows from an excluded or unknown repo (fusion_core.excluded_repo),
+    by reason; `repos` lists the source repos counted."""
     from fusion_core import excluded_repo
     latest = _latest_hidden(gym)
     solved = _solved(latest)
+    split = read_split(gym)
     generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time()))
     priors, excluded, unsolvable, repos = {}, {}, {}, set()
     for row in sorted([*latest.values(), *_latest_decomp(gym).values()], key=lambda r: r["key"]):
+        # A held-out task is measured, never fitted to.
+        if is_heldout(split, row.get("task")):
+            excluded["heldout"] = excluded.get("heldout", 0) + 1
+            continue
         if reason := excluded_repo(config, row.get("repo"), include_repos, include_unknown):
             excluded[reason] = excluded.get(reason, 0) + 1
             continue
-        kind, verdict = row["kind"], row.get("verdict")
-        wins, losses = PRIOR_VERDICTS[kind]
-        scope = row["mode"] if kind == "fix" else "localize"
-        # A decomp task's reference commit is its proof that it can be matched.
-        if kind not in {"interpret", "decomp"} and (kind, row["mode"], row["task"]) not in solved:
-            unsolvable.setdefault(scope, set()).add(row["task"])
-            excluded["unsolved_by_all"] = excluded.get("unsolved_by_all", 0) + 1
-            continue
-        if verdict not in wins | losses or row.get("tampered") or row.get("check_inputs_changed"):
-            excluded[verdict or "none"] = excluded.get(verdict or "none", 0) + 1
-            continue
-        if kind == "interpret" and (row.get("scores") or {}).get("train", {}).get("total") == 0:
-            excluded["holdout_only"] = excluded.get("holdout_only", 0) + 1
+        reason, counted = prior_outcome(row, solved)
+        if reason == "unsolved_by_all":
+            unsolvable.setdefault(row["mode"] if row["kind"] == "fix" else "localize", set()).add(row["task"])
+        if reason:
+            excluded[reason] = excluded.get(reason, 0) + 1
             continue
         spec = row.get("lane_spec") or {}
         if not spec.get("agent"):
@@ -1412,16 +1545,7 @@ def lane_priors(gym, now=None, config=None, include_repos=(), include_unknown=Fa
             entry["gym_lanes"].append(row["lane"])
         repos.add(str(row.get("repo") or "unknown").lower())
         stats = entry.setdefault(work_class_of(row), {"attempts": 0, "successes": 0, "_cost": 0.0, "_ms": 0})
-        attempts, successes = 1, int(verdict in wins)
-        if kind == "interpret":
-            # Holdout scores are evaluation-only. Training questions supply
-            # fractional pseudo-counts; uncertainty is half a rejection.
-            train = (row.get("scores") or {}).get("train")
-            if train is not None:
-                attempts = train["total"] - .5 * train["abstained"]
-                successes = train["correct"]
-            else:
-                attempts = .5 if verdict == "abstained" else 1
+        attempts, successes = counted
         stats["attempts"] += attempts
         stats["successes"] += successes
         stats["_cost"] += float(row.get("cost_usd") or 0) * attempts
@@ -1536,13 +1660,15 @@ def write_priors(value, path):
 
 
 def priors_table(value):
-    lines = [f"{'key':<60} {'class':<5} {'n':>3} {'ok':>3} {'rate':>5} {'cost$':>7} {'mean s':>7}"]
+    """Per lane and work class: successes/attempts, the rate with its Wilson 95% interval, cost and time."""
+    from fusion_policy import format_rate
+    lines = [f"{'key':<60} {'class':<5} {'ok/n':>9} {'rate [95% CI]':<18} {'cost$':>7} {'mean s':>7}"]
     for key, entry in value["priors"].items():
         for work in work_classes(entry):
             stats = entry.get(work)
             if stats:
-                lines.append(f"{key:<60} {work:<5} {stats['attempts']:>3} {stats['successes']:>3} "
-                             f"{stats['successes'] / stats['attempts']:>5.2f} {stats['mean_cost_usd']:>7.4f} "
+                lines.append(f"{key:<60} {work:<5} {stats['successes']:>4g}/{stats['attempts']:<4g} "
+                             f"{format_rate(stats['successes'], stats['attempts']):<18} {stats['mean_cost_usd']:>7.4f} "
                              f"{stats['mean_seconds']:>7.1f}")
     lines.append("excluded: " + (", ".join(f"{k} {v}" for k, v in value["excluded"].items()) or "none"))
     lines.append("repos counted: " + (", ".join(value.get("repos") or []) or "none"))
@@ -1596,14 +1722,54 @@ def _localize_section(rows):
     return section
 
 
-def report(gym):
+def acceptance(gym, split=None, splits=("train", "heldout"), skip=()):
+    """Per split, gym lane and work class: the successes and attempts the
+    priors would count (prior_outcome over the latest hidden-mode rows), the
+    rate and its Wilson 95% interval. Held-out rows are measured here and
+    nowhere fitted; tasks in `skip` are left out."""
+    from fusion_policy import acceptance_ci95
+    latest = _latest_hidden(gym)
+    solved = _solved(latest)
+    value = {name: {} for name in splits}
+    for row in sorted([*latest.values(), *_latest_decomp(gym).values()], key=lambda r: r["key"]):
+        name = "heldout" if is_heldout(split, row.get("task")) else "train"
+        if name not in value or row.get("task") in skip:
+            continue
+        reason, counted = prior_outcome(row, solved)
+        if reason:
+            continue
+        cell = value[name].setdefault(row["lane"], {}).setdefault(work_class_of(row), {"attempts": 0, "successes": 0})
+        cell["attempts"] += counted[0]
+        cell["successes"] += counted[1]
+    for name, lanes in value.items():
+        for classes in lanes.values():
+            for cell in classes.values():
+                cell.update(rate=round(cell["successes"] / cell["attempts"], 3),
+                            ci95=acceptance_ci95(cell["successes"], cell["attempts"]))
+        value[name] = dict(sorted(lanes.items()))
+    return value
+
+
+def report(gym, split="all", tasks=None):
     """Per kind, then per mode (hidden, visible): per-lane rates and per-task
     solvers. `modes` is the fix kind; `localize` the localization kind. The
-    kinds and modes measure different things and are never pooled."""
+    kinds and modes measure different things and are never pooled.
+
+    `split` ("train" or "heldout") keeps only that side of split.json;
+    `acceptance` holds per-lane rates with Wilson 95% intervals for each side.
+    With `tasks`, held-out tasks edited since they were recorded are listed in
+    `heldout_task_changed` and left out of the held-out rates."""
+    if split not in SPLITS:
+        raise ValueError(f"split must be one of {', '.join(SPLITS)}")
+    frozen = read_split(gym)
+    changed = changed_heldout(frozen, task_digests(tasks)) if frozen and tasks else []
     latest = {}
     for row in read_results(gym):
-        if row.get("event") == "finished":
-            latest[row["key"]] = row
+        if row.get("event") != "finished":
+            continue
+        if split != "all" and is_heldout(frozen, row.get("task")) != (split == "heldout"):
+            continue
+        latest[row["key"]] = row
     modes, localized, interpreted, decomp_rows = {}, [], [], []
     for row in latest.values():
         if not row.get("completed"):
@@ -1659,6 +1825,9 @@ def report(gym):
         value["interpret"] = report_section(interpreted)
     if decomp_rows:
         value["decomp"] = _decomp_section(decomp_rows)
+    value["acceptance"] = acceptance(gym, frozen, ("train", "heldout") if split == "all" else (split,), changed)
+    if frozen:
+        value["heldout_task_changed"] = changed
     return {**value, "incomplete": pending}
 
 
@@ -1709,6 +1878,7 @@ def _percent(value):
 
 
 def table(value):
+    from fusion_policy import format_rate
     lines = []
     for mode, section in value["modes"].items():
         lines += [f"== {MODE_TITLES[mode]}",
@@ -1758,6 +1928,18 @@ def table(value):
                          f"{lane['invalid_answer']:>7} {_percent(lane['score']):>7} {_percent(lane['trap_misread_rate']):>9} "
                          f"{_percent(lane['holdout']['score']):>8} {_percent(lane['holdout']['trap_misread_rate']):>9}")
         lines.append("")
+    if any(value.get("acceptance", {}).values()):
+        lines += ["== acceptance per lane and work class (counted as gym priors count; Wilson 95% interval)",
+                  f"{'split':<8} {'lane':<22} {'class':<12} {'ok/n':>9} rate [95% CI]"]
+        for name, lanes in value["acceptance"].items():
+            for lane, classes in lanes.items():
+                for work, cell in classes.items():
+                    lines.append(f"{name:<8} {lane:<22} {work:<12} {cell['successes']:>4g}/{cell['attempts']:<4g} "
+                                 f"{format_rate(cell['successes'], cell['attempts'])}")
+        lines.append("")
+    if value.get("heldout_task_changed"):
+        lines.append("heldout_task_changed (edited since the split recorded them; not scored): "
+                     + ", ".join(value["heldout_task_changed"]))
     if value["incomplete"]:
         lines.append("incomplete (rerun `gym run` to retry): " + ", ".join(value["incomplete"]))
     return "\n".join(lines).rstrip() or "no completed gym runs"
@@ -1832,6 +2014,18 @@ def add_parser(sub):
                                              "default: start/ next to the task file)")
     report_cmd = commands.add_parser("report", help="per-lane and per-task results of a gym directory")
     report_cmd.add_argument("gym_dir")
+    report_cmd.add_argument("--split", choices=SPLITS, default="all",
+                            help="only held-out tasks (split.json), only the rest (train), or all (default; acceptance shows both)")
+    report_cmd.add_argument("--tasks", help="task JSON file or directory: flag held-out tasks edited since the split recorded them")
+    split_cmd = commands.add_parser("split", help="freeze a held-out task split (split.json); held-out tasks never feed priors or training labels")
+    split_cmd.add_argument("gym_dir")
+    split_cmd.add_argument("--tasks", required=True, help="task JSON file or directory (fix, interpret or decomp tasks)")
+    split_action = split_cmd.add_mutually_exclusive_group(required=True)
+    split_action.add_argument("--freeze", action="store_true", help="write split.json; refuses to overwrite an existing one")
+    split_action.add_argument("--extend", action="store_true",
+                              help="record tasks added since, by the same rule; existing assignments never change")
+    split_cmd.add_argument("--fraction", type=float, default=0.25, help="with --freeze: share of tasks held out (default 0.25)")
+    split_cmd.add_argument("--salt", help="with --freeze: hash salt (default: random); recorded in split.json")
     audit_cmd = commands.add_parser("audit", help="retract negatives from tasks no lane has solved; restore them once one does")
     audit_cmd.add_argument("gym_dir")
     priors_cmd = commands.add_parser("priors", help="export per-lane, per-work-class success priors for routing")
@@ -1979,6 +2173,20 @@ def command(args, workspace, as_json=False, out=None):
         value = audit(args.gym_dir)
         print(json.dumps(value, indent=2), file=out)
         return 0
-    value = report(args.gym_dir)
+    if args.gym_command == "split":
+        if args.extend and (args.salt is not None or args.fraction != 0.25):
+            raise ValueError("--extend keeps the frozen salt and fraction; drop --salt and --fraction")
+        if args.freeze:
+            value = freeze_split(args.gym_dir, args.tasks, args.fraction, args.salt)
+            text = (f"froze {len(value['task_sha256'])} tasks, {len(value['heldout'])} held out "
+                    f"(fraction {value['fraction']}, salt {value['salt']}): {', '.join(value['heldout']) or 'none'}")
+        else:
+            value = extend_split(args.gym_dir, args.tasks)
+            text = (f"recorded {len(value['added'])} new tasks, {len(value['added_heldout'])} held out: "
+                    f"{', '.join(value['added_heldout']) or 'none'}"
+                    + (f"\nheldout_task_changed: {', '.join(value['heldout_task_changed'])}" if value["heldout_task_changed"] else ""))
+        print(json.dumps(value, indent=2) if as_json else text, file=out)
+        return 0
+    value = report(args.gym_dir, args.split, args.tasks)
     print(json.dumps(value, indent=2) if as_json else table(value), file=out)
     return 0

@@ -367,7 +367,8 @@ latest `routing_log` to its latest outcome by run id -- gate outcomes and
 lead verdicts; outcomes marked `laya_veto` are skipped -- and reports per
 lane, over the logged choices where it was a candidate: `available`,
 `chosen`, `accepted`, `observed_acceptance` (on-policy, biased by the
-ranking), `ips_acceptance` (sum of accepted/propensity over the lane's
+ranking), `acceptance_ci95` (its Wilson 95% interval, reporting only),
+`ips_acceptance` (sum of accepted/propensity over the lane's
 picks, divided by `available`), `snips_acceptance` (the same, normalised by
 the summed weights), and `ess`, the effective sample size
 `(sum w)^2 / sum w^2`. A lane that had propensity 0 anywhere it was

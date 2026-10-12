@@ -70,6 +70,7 @@ after its name. Aliases and hidden subcommands are included below.
 - [fusion gym decomp-grade](#fusion-gym-decomp-grade)
 - [fusion gym run](#fusion-gym-run)
 - [fusion gym report](#fusion-gym-report)
+- [fusion gym split](#fusion-gym-split)
 - [fusion gym audit](#fusion-gym-audit)
 - [fusion gym priors](#fusion-gym-priors)
 - [fusion gym priors-merge](#fusion-gym-priors-merge)
@@ -1196,15 +1197,17 @@ replay merged fix PRs as benchmark tasks across lanes
 
 ```text
 usage: fusion gym [-h]
-                  {extract,interpret-seed,decomp-grade,run,report,audit,priors,priors-merge,priors-seed} ...
+                  {extract,interpret-seed,decomp-grade,run,report,split,audit,priors,priors-merge,priors-seed} ...
 
 positional arguments:
-  {extract,interpret-seed,decomp-grade,run,report,audit,priors,priors-merge,priors-seed}
+  {extract,interpret-seed,decomp-grade,run,report,split,audit,priors,priors-merge,priors-seed}
     extract               turn squash-merged fix PRs into tasks with FAIL_TO_PASS tests
     interpret-seed        build read-only evidence tasks from existing gym fix tasks
     decomp-grade          grade one decomp candidate for a lane and record the outcome
     run                   run each task on each lane in its own worktree (resumable)
     report                per-lane and per-task results of a gym directory
+    split                 freeze a held-out task split (split.json); held-out tasks
+                          never feed priors or training labels
     audit                 retract negatives from tasks no lane has solved; restore them
                           once one does
     priors                export per-lane, per-work-class success priors for routing
@@ -1353,13 +1356,41 @@ options:
 per-lane and per-task results of a gym directory
 
 ```text
-usage: fusion gym report [-h] gym_dir
+usage: fusion gym report [-h] [--split {all,train,heldout}] [--tasks TASKS] gym_dir
 
 positional arguments:
   gym_dir
 
 options:
-  -h, --help  show this help message and exit
+  -h, --help              show this help message and exit
+  --split {all,train,heldout}
+                          only held-out tasks (split.json), only the rest (train), or
+                          all (default; acceptance shows both)
+  --tasks TASKS           task JSON file or directory: flag held-out tasks edited since
+                          the split recorded them
+```
+
+## fusion gym split
+
+freeze a held-out task split (split.json); held-out tasks never feed priors or training labels
+
+```text
+usage: fusion gym split [-h] --tasks TASKS (--freeze | --extend) [--fraction FRACTION]
+                        [--salt SALT]
+                        gym_dir
+
+positional arguments:
+  gym_dir
+
+options:
+  -h, --help           show this help message and exit
+  --tasks TASKS        task JSON file or directory (fix, interpret or decomp tasks)
+  --freeze             write split.json; refuses to overwrite an existing one
+  --extend             record tasks added since, by the same rule; existing assignments
+                       never change
+  --fraction FRACTION  with --freeze: share of tasks held out (default 0.25)
+  --salt SALT          with --freeze: hash salt (default: random); recorded in
+                       split.json
 ```
 
 ## fusion gym audit

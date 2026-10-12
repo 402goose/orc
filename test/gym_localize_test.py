@@ -290,6 +290,22 @@ class GroundTruthTest(Isolated):
         self.assertEqual((result["runs"], result["skipped"]),
                          ([], [{"task": "pr-7", "reason": "the fix changed no source file that exists in B"}]))
 
+    def test_a_held_out_task_is_graded_and_its_decision_recorded_but_never_labeled(self):
+        self.extract()
+        salt = next(f"s{n}" for n in range(1000) if gym.split_score(f"s{n}", "pr-7") < .5)
+        self.assertEqual(gym.freeze_split(self.gym_dir, self.tasks, .5, salt)["heldout"], ["pr-7"])
+        result = gym.run(self.tasks, ["right", "wrong"], self.gym_dir, kind="localize")
+        runs = {row["lane"]: row for row in result["runs"]}
+        self.assertEqual({lane: row["verdict"] for lane, row in runs.items()}, {"right": "localized", "wrong": "missed"})
+        for row in runs.values():
+            self.assertEqual((row["split"], row["grade_label"]["status"]), ("heldout", "skipped"))
+            self.assertIn("held-out", row["grade_label"]["reason"])
+        self.assertEqual(self.grade_labels(), [])
+        decisions = {e["id"] for e in read_jsonl(DecisionStore(self.gym_dir).path) if e.get("event") == "decision"}
+        self.assertIn(runs["right"]["gate_label"]["decision_id"], decisions)
+        self.assertEqual(gym.lane_priors(self.gym_dir, include_unknown=True)["excluded"], {"heldout": 2})
+        self.assertEqual(gym.report(self.gym_dir, "heldout")["acceptance"]["heldout"]["right"]["read"]["successes"], 1)
+
 
 class GradeTest(unittest.TestCase):
     truth = {"files": ["a.py", "b.py", "new.py"], "symbols": ["a.f", "b.C.m", "new.g"], "new_files": ["new.py"],
