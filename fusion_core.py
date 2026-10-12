@@ -2268,7 +2268,252 @@ def parse_opencode_output(stdout: str) -> tuple[str | None, str, str | None, dic
     return session_id, "".join(text).strip(), failure, usage, None, notes
 
 
-PRICE_FIELDS = {"input": ("input_tokens",), "output": ("output_tokens", "reasoning_output_tokens"),
+# Trajectory steps: each harness's stdout normalised to one row shape for
+# `fusion trajectories export`. An event a normaliser does not know becomes
+# kind "other" with its raw type and is never dropped; events that only frame
+# or repeat others (a session's init, a step boundary, an in-progress update,
+# usage) add no step. Reasoning is a message with role "reasoning".
+STEP_TEXT_LIMIT = 20000
+
+
+def _step_value(value: Any) -> Any:
+    """Text capped at STEP_TEXT_LIMIT; a structure stays one unless its JSON is over the cap."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return compact(value, STEP_TEXT_LIMIT)
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return value if len(text) <= STEP_TEXT_LIMIT else compact(text, STEP_TEXT_LIMIT)
+
+
+def _step(kind: str, role: str | None = None, text: Any = None, tool: Any = None, arguments: Any = None,
+          result: Any = None, is_error: bool | None = None, time_ms: Any = None, raw_type: str | None = None) -> dict[str, Any]:
+    timed = isinstance(time_ms, (int, float)) and not isinstance(time_ms, bool)
+    return {"kind": kind, "role": role, "text": _step_value(text if text is None or isinstance(text, str) else json_text(text)),
+            "tool": str(tool) if tool else None, "arguments": _step_value(arguments),
+            "result": _step_value(result if result is None or isinstance(result, str) else json_text(result)),
+            "is_error": is_error, "time_ms": int(time_ms) if timed else None, "raw_type": raw_type}
+
+
+def _step_events(stdout: str):
+    """(event, None) for each JSON object line, (None, line) for any other non-blank line."""
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            event = None
+        if isinstance(event, dict):
+            yield event, None
+        elif line.strip():
+            yield None, line
+
+
+def claude_steps(stdout: str) -> list[dict[str, Any]]:
+    """Claude Code stream-json (or the single `--output-format json` result) as steps."""
+    steps: list[dict[str, Any]] = []
+    tools: dict[str, str] = {}
+    answered = False
+    try:
+        whole = json.loads(stdout)
+    except (ValueError, TypeError):
+        whole = None
+    events = [(whole, None)] if isinstance(whole, dict) else _step_events(stdout)
+    for event, line in events:
+        if event is None:
+            steps.append(_step("other", text=line, raw_type="non_json"))
+            continue
+        kind = event.get("type")
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        content = message.get("content")
+        if kind == "system" and event.get("subtype") == "init":
+            continue
+        if kind == "assistant" and isinstance(content, list):
+            for block in content:
+                block_type = block.get("type") if isinstance(block, dict) else None
+                if block_type == "text":
+                    steps.append(_step("message", "assistant", block.get("text")))
+                    answered = True
+                elif block_type == "thinking":
+                    if block.get("thinking"):
+                        steps.append(_step("message", "reasoning", block["thinking"]))
+                elif block_type == "redacted_thinking":
+                    continue
+                elif block_type == "tool_use":
+                    tools[str(block.get("id"))] = str(block.get("name") or "")
+                    steps.append(_step("tool_call", "assistant", tool=block.get("name"), arguments=block.get("input")))
+                else:
+                    steps.append(_step("other", text=block, raw_type=f"assistant.{block_type}"))
+        elif kind == "user" and isinstance(content, (list, str)):
+            for block in content if isinstance(content, list) else [{"type": "text", "text": content}]:
+                block_type = block.get("type") if isinstance(block, dict) else None
+                if block_type == "tool_result":
+                    steps.append(_step("tool_result", "tool", tool=tools.get(str(block.get("tool_use_id"))),
+                                       result=_block_text(block), is_error=bool(block.get("is_error"))))
+                elif block_type == "text":
+                    steps.append(_step("message", "user", block.get("text")))
+                else:
+                    steps.append(_step("other", text=block, raw_type=f"user.{block_type}"))
+        elif kind == "result":
+            # Stream JSON already carried the answer; the one-object format did not.
+            if event.get("is_error") or not answered:
+                text = event.get("result") or event.get("message")
+                if text:
+                    steps.append(_step("message", "error" if event.get("is_error") else "assistant", text,
+                                       is_error=bool(event.get("is_error"))))
+        else:
+            steps.append(_step("other", text=event, raw_type=".".join(str(part) for part in (kind, event.get("subtype")) if part)))
+    return steps
+
+
+CODEX_FRAME_EVENTS = frozenset({"thread.started", "turn.started", "turn.completed", "item.started", "item.updated"})
+
+
+def codex_steps(stdout: str) -> list[dict[str, Any]]:
+    """`codex exec --json` events as steps, from completed items."""
+    steps: list[dict[str, Any]] = []
+    for event, line in _step_events(stdout):
+        if event is None:
+            steps.append(_step("other", text=line, raw_type="non_json"))
+            continue
+        kind = event.get("type")
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        item_type = item.get("type")
+        if kind in CODEX_FRAME_EVENTS:
+            continue
+        if kind == "item.completed" and item_type == "agent_message":
+            steps.append(_step("message", "assistant", item.get("text")))
+        elif kind == "item.completed" and item_type == "reasoning":
+            steps.append(_step("message", "reasoning", item.get("text")))
+        elif kind == "item.completed" and item_type == "command_execution":
+            exit_code = item.get("exit_code")
+            steps.append(_step("tool_call", "assistant", tool="shell", arguments={"command": item.get("command")}))
+            steps.append(_step("tool_result", "tool", tool="shell", result=item.get("aggregated_output"),
+                               is_error=isinstance(exit_code, int) and exit_code != 0 or item.get("status") == "failed"))
+        elif kind == "item.completed" and item_type == "file_change":
+            steps.append(_step("tool_call", "assistant", tool="file_change", arguments={"changes": item.get("changes")}))
+            steps.append(_step("tool_result", "tool", tool="file_change", result=item.get("status"),
+                               is_error=item.get("status") == "failed"))
+        elif kind == "item.completed" and item_type == "mcp_tool_call":
+            name = ".".join(str(part) for part in (item.get("server"), item.get("tool")) if part)
+            steps.append(_step("tool_call", "assistant", tool=name, arguments=item.get("arguments")))
+            steps.append(_step("tool_result", "tool", tool=name, result=item.get("error") or item.get("result"),
+                               is_error=bool(item.get("error")) or item.get("status") == "failed"))
+        elif kind == "item.completed" and item_type in {"web_search", "todo_list"}:
+            steps.append(_step("tool_call", "assistant", tool=item_type,
+                               arguments={key: value for key, value in item.items() if key not in {"id", "type"}}))
+        elif kind == "item.completed" and item_type == "error":
+            steps.append(_step("message", "error", item.get("message"), is_error=True))
+        elif kind == "turn.failed":
+            steps.append(_step("message", "error", (event.get("error") or {}).get("message") or "Codex turn failed", is_error=True))
+        elif kind == "error":
+            steps.append(_step("message", "error", event.get("message") or "Codex emitted an error", is_error=True))
+        else:
+            steps.append(_step("other", text=event, raw_type=f"item.{item_type}" if kind == "item.completed" else str(kind)))
+    return steps
+
+
+def opencode_steps(stdout: str) -> list[dict[str, Any]]:
+    """`opencode run --format json` events as steps."""
+    steps: list[dict[str, Any]] = []
+    for event, line in _step_events(stdout):
+        if event is None:
+            steps.append(_step("other", text=line, raw_type="non_json"))
+            continue
+        kind = event.get("type")
+        part = event.get("part") if isinstance(event.get("part"), dict) else {}
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        at = event.get("timestamp")
+        if kind in {"step_start", "step_finish"}:
+            continue
+        if kind in {"text", "reasoning"}:
+            steps.append(_step("message", "assistant" if kind == "text" else "reasoning", part.get("text"), time_ms=at))
+        elif kind == "tool_use":
+            steps.append(_step("tool_call", "assistant", tool=part.get("tool"), arguments=state.get("input"), time_ms=at))
+            steps.append(_step("tool_result", "tool", tool=part.get("tool"),
+                               result=state.get("error") if state.get("status") == "error" else state.get("output"),
+                               is_error=state.get("status") == "error", time_ms=at))
+        elif kind == "error":
+            error = event.get("error") if isinstance(event.get("error"), dict) else {}
+            data = error.get("data") if isinstance(error.get("data"), dict) else {}
+            steps.append(_step("message", "error", data.get("message") or error.get("message") or error.get("name"),
+                               is_error=True, time_ms=at))
+        else:
+            steps.append(_step("other", text=event, raw_type=str(kind), time_ms=at))
+    return steps
+
+
+def agy_steps(stdout: str) -> list[dict[str, Any]]:
+    """agy's one JSON object (or plain text) as steps: the response and any denied actions."""
+    try:
+        value = json.loads(stdout)
+    except (ValueError, TypeError):
+        value = None
+    if not isinstance(value, dict):
+        return [_step("message", "assistant", stdout.strip())] if stdout.strip() else []
+    steps = [_step("message", "assistant", value["response"])] if value.get("response") else []
+    for item in value.get("denied_actions") or []:
+        name = item.get("display_name") or item.get("action") if isinstance(item, dict) else None
+        steps.append(_step("tool_result", "tool", tool=name or "tool", result=item, is_error=True))
+    if str(value.get("status") or "").upper() not in {"SUCCESS", ""}:
+        steps.append(_step("message", "error", value.get("error") or f"agy reported status {value['status']}", is_error=True))
+    return steps
+
+
+GROK_FRAME_EVENTS = frozenset({"usage", "end"})
+
+
+def grok_steps(stdout: str, output_format: str = "streaming-json") -> list[dict[str, Any]]:
+    """Grok's headless stream as steps; streamed text and thought chunks join into one message each."""
+    if output_format == "plain":
+        return [_step("message", "assistant", stdout.strip())] if stdout.strip() else []
+    steps: list[dict[str, Any]] = []
+    calls: dict[str, dict[str, Any]] = {}
+    for event, line in _step_events(stdout):
+        if event is None:
+            steps.append(_step("other", text=line, raw_type="non_json"))
+            continue
+        kind = event.get("type")
+        if kind in GROK_FRAME_EVENTS:
+            continue
+        if kind in {"text", "thought"} and isinstance(event.get("data"), str):
+            role = "assistant" if kind == "text" else "reasoning"
+            if steps and steps[-1]["kind"] == "message" and steps[-1]["role"] == role:
+                steps[-1] = _step("message", role, steps[-1]["text"] + event["data"])
+            else:
+                steps.append(_step("message", role, event["data"]))
+        elif kind == "tool_call":
+            step = _step("tool_call", "assistant", tool=event.get("toolName") or event.get("title") or event.get("kind"),
+                         arguments=event.get("rawInput"))
+            calls[str(event.get("toolCallId"))] = step
+            steps.append(step)
+        elif kind == "tool_call_update":
+            call = calls.get(str(event.get("toolCallId")))
+            if call is not None and call["arguments"] is None and event.get("rawInput") is not None:
+                call["arguments"] = _step_value(event["rawInput"])
+            if event.get("status") in {"completed", "failed"} or "rawOutput" in event:
+                steps.append(_step("tool_result", "tool", tool=call["tool"] if call else None, result=event.get("rawOutput"),
+                                   is_error=event.get("status") == "failed"))
+        elif kind == "error":
+            steps.append(_step("message", "error", event.get("message") or "Grok reported an error", is_error=True))
+        else:
+            steps.append(_step("other", text=event, raw_type=str(kind)))
+    return steps
+
+
+def harness_steps(agent: str, stdout: str, output_format: str | None = None) -> list[dict[str, Any]]:
+    """A run's stdout as steps, by the harness that wrote it."""
+    if agent == "codex":
+        return codex_steps(stdout)
+    if agent == "opencode":
+        return opencode_steps(stdout)
+    if agent == "agy":
+        return agy_steps(stdout)
+    if agent == "grok":
+        return grok_steps(stdout, output_format or "streaming-json")
+    return claude_steps(stdout)
+
+
+PRICE_FIELDS ={"input": ("input_tokens",), "output": ("output_tokens", "reasoning_output_tokens"),
                 "cache_read": ("cache_read_input_tokens", "cached_input_tokens"),
                 "cache_write": ("cache_creation_input_tokens", "cache_write_input_tokens")}
 
@@ -3382,6 +3627,116 @@ def print_pending(payload: dict[str, Any]) -> None:
             print(f"{kind} {row['run_id']} {row['role']} {row['agent']} {row['issue'] or '-'} {row['age_hours']}h{tail}")
 
 
+PROVENANCE_SCHEMA_VERSION = 1
+DIFF_LIMIT = 200000
+_SHA_RE = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
+
+
+def _git_text(path: str | Path, *args: str) -> str | None:
+    try:
+        completed = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, errors="replace",
+                                   timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return completed.stdout if completed.returncode == 0 else None
+
+
+def git_head(path: str | Path | None) -> str | None:
+    """The commit a checkout has checked out, or None outside git or before a first commit."""
+    head = (_git_text(path, "rev-parse", "HEAD") or "").strip() if path and Path(path).is_dir() else ""
+    return head if _SHA_RE.fullmatch(head) else None
+
+
+@functools.lru_cache(maxsize=1)
+def orc_sha() -> str | None:
+    """The installed ORC commit: `orc.sha` beside this module (written by install.sh),
+    else the commit of the checkout this module runs from, else None."""
+    here = Path(__file__).resolve().parent
+    try:
+        recorded = (here / "orc.sha").read_text(encoding="utf-8").strip()
+    except OSError:
+        recorded = ""
+    if _SHA_RE.fullmatch(recorded):
+        return recorded
+    top = (_git_text(here, "rev-parse", "--show-toplevel") or "").strip()
+    return git_head(here) if top and Path(top).resolve() == here else None
+
+
+def _lane_settings_shape(value: Any, key: str = "") -> Any:
+    """Lane settings with secret-named keys, environment values and paths removed, for hashing."""
+    if isinstance(value, dict):
+        return {name: ("" if key == "env" else _lane_settings_shape(item, name))
+                for name, item in sorted(value.items()) if not SECRET.search(str(name))}
+    if isinstance(value, list):
+        return [_lane_settings_shape(item) for item in value]
+    if isinstance(value, str) and value.startswith(("/", "~", "./", "../")):
+        return Path(value).name
+    return value
+
+
+def _digest(value: Any) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def suite_digest(task: dict[str, Any]) -> str | None:
+    """A digest of the frozen checks a task names: its pinned check-input digests and the
+    check commands beside them. None when the task pins none."""
+    pins = task.get("check_input_pins")
+    if not isinstance(pins, dict) or not pins:
+        return None
+    return _digest({"check_input_pins": pins, "checks": task.get("verification_argv") or []})
+
+
+def run_provenance(task: dict[str, Any], settings: dict[str, Any] | None, repo_head: str | None) -> dict[str, Any]:
+    """What a run was made from, recorded in result.json: the ORC commit, the workspace
+    HEAD at dispatch, the brief sent, the lane settings (secrets and paths stripped) and,
+    when the task pins its checks, the suite."""
+    record = {"schema_version": PROVENANCE_SCHEMA_VERSION, "orc_sha": orc_sha(), "repo_head": repo_head,
+              "prompt_sha256": _digest(brief_for(task)),
+              "lane_config_sha256": _digest(_lane_settings_shape(settings)) if settings is not None else None}
+    if digest := suite_digest(task):
+        record["suite_sha256"] = digest
+    return record
+
+
+def derived_provenance(task: dict[str, Any]) -> dict[str, Any]:
+    """Provenance for a run recorded before dispatch wrote it: what its task.json still
+    determines, with `derived: true`. The brief is rebuilt from the task, so its digest is
+    the brief this ORC would send."""
+    record = {"schema_version": PROVENANCE_SCHEMA_VERSION, "derived": True, "orc_sha": None, "repo_head": None,
+              "prompt_sha256": None, "lane_config_sha256": None}
+    try:
+        record["prompt_sha256"] = _digest(brief_for(task))
+    except (KeyError, TypeError):
+        pass
+    if digest := suite_digest(task):
+        record["suite_sha256"] = digest
+    return record
+
+
+def capture_diff(workspace: str | Path, base: str | None, limit: int = DIFF_LIMIT) -> str | None:
+    """The working tree's diff against `base`, untracked files included as new files, at most
+    `limit` + 1 characters (one over the cap marks it truncated). None outside git or without a base.
+    Fusion's own `.fusion` directory is never part of it."""
+    if not base or not Path(workspace).is_dir():
+        return None
+    text = _git_text(workspace, "diff", "--no-color", "--no-ext-diff", base, "--", ".", ":(exclude).fusion")
+    if text is None:
+        return None
+    untracked = _git_text(workspace, "ls-files", "--others", "--exclude-standard", "-z", "--", ".", ":(exclude).fusion") or ""
+    for path in filter(None, untracked.split("\0")):
+        if len(text) > limit:
+            break
+        try:
+            added = subprocess.run(["git", "-C", str(workspace), "diff", "--no-color", "--no-ext-diff", "--no-index",
+                                    "--", os.devnull, path], capture_output=True, text=True, errors="replace", timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        text += added.stdout
+    return text[:limit + 1]
+
+
 def dispatch(
     config: dict[str, Any],
     task: dict[str, Any],
@@ -3412,6 +3767,7 @@ def dispatch(
         return capped
     if slug := repo_slug(task["workspace"]):
         task["repo"] = slug
+    repo_head = git_head(task["workspace"])
     if store.control_workspace is not None:
         # A shared store must never resume another checkout's conversation.
         suffix = ":workspace=" + hashlib.sha256(task["workspace"].encode()).hexdigest()
@@ -3487,6 +3843,7 @@ def dispatch(
         metadata["endpoint"] = record
     task["resolved"] = metadata
     store.write_json(run_dir / "task.json", task)
+    provenance = run_provenance(task, resolved_settings, repo_head)
     binary = executable(argv[0])
     if binary is None:
         progress.emit(task.get("progress_label", task["role"]), f"cannot start {task['agent']}: executable unavailable")
@@ -3512,6 +3869,7 @@ def dispatch(
             "timeout_seconds": effective_timeout,
             "usage": {},
             **session,
+            "provenance": provenance,
             "artifacts": {"run_dir": str(run_dir)},
         }
         verdict = classify_verdict(result)
@@ -3649,6 +4007,11 @@ def dispatch(
         worker_stdout = exc.output or ""
     duration_ms = int((time.monotonic() - started) * 1000)
     progress.emit(label, f"worker {status} after {progress.elapsed(duration_ms / 1000)}; exit {exit_code}")
+    # The writer's final diff, against the start commit it was given or else HEAD at dispatch.
+    diff = capture_diff(task["workspace"], task.get("start_commit") or repo_head) if task["write"] else None
+    if diff is not None:
+        with open(run_dir / "diff.patch", "w", encoding="utf-8", opener=lambda name, flags: os.open(name, flags, 0o600)) as stream:
+            stream.write(diff)
     denied = provider_denials(task["agent"], worker_stdout)
     init = claude_init(worker_stdout) if task["agent"] == "claude" else {}
     key_source = init.get("apiKeySource") if isinstance(init.get("apiKeySource"), str) else None
@@ -3712,6 +4075,7 @@ def dispatch(
         "usage": usage,
         **session,
         "decisions": task.get("decisions", {}),
+        "provenance": provenance,
         "artifacts": {
             "run_dir": str(run_dir),
             "stdout": str(stdout_path),
@@ -4568,6 +4932,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     from fusion_decision_cli import add_parser
     add_parser(sub)
+    from fusion_trajectories import add_parser as trajectories_parser
+    trajectories_parser(sub)
     from fusion_learn_cli import add_parser as learn_parser
     learn_parser(sub)
     from fusion_gym import add_parser as gym_parser
@@ -4660,6 +5026,12 @@ def _main(args, parser) -> int:
         try:
             return run_decisions(args, control_workspace, config)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            parser.error(str(exc))
+    if args.command == "trajectories":
+        from fusion_trajectories import run as run_trajectories
+        try:
+            return run_trajectories(args, control_workspace, config)
+        except (OSError, ValueError) as exc:
             parser.error(str(exc))
     if args.command == "mcp-serve":
         return run_mcp(workspace, config)

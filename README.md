@@ -24,6 +24,7 @@ All three Fusion surfaces use the same workflow and run artifacts.
 | Builds, acceptance, resume, reports and publishing | [Workflows](docs/workflows.md) |
 | GitHub backlog surveys and selected issue fixes | [Truffle pig](docs/truffle.md) |
 | Outcomes, labels, Laya, training and gym benchmarks | [Learning](docs/learning.md) |
+| Exporting settled runs as trajectories | [Trajectory export](docs/trajectories.md) |
 | Local usage, historical headroom and outbound telemetry | [Telemetry](docs/telemetry.md) |
 | Every CLI command / every MCP tool input | [CLI](docs/cli.md) · [MCP](docs/mcp.md) |
 

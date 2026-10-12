@@ -1,0 +1,9 @@
+{"type": "thread.started", "thread_id": "t-codex"}
+{"type": "turn.started"}
+{"type": "item.completed", "item": {"id": "i0", "type": "reasoning", "text": "Look at the parser."}}
+{"type": "item.started", "item": {"id": "i1", "type": "command_execution", "command": "pytest -q", "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "i1", "type": "command_execution", "command": "pytest -q", "aggregated_output": "E assert 1 == 2", "exit_code": 1, "status": "failed"}}
+{"type": "item.completed", "item": {"id": "i2", "type": "file_change", "changes": [{"path": "parser.py", "kind": "update"}], "status": "completed"}}
+{"type": "item.completed", "item": {"id": "i3", "type": "future_widget", "payload": "__PLANTED_ENV__"}}
+{"type": "item.completed", "item": {"id": "i4", "type": "agent_message", "text": "STATUS: partial\nSUMMARY: one test still red"}}
+{"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 20}}

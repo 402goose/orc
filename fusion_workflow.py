@@ -1668,6 +1668,11 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
             route=route,
             settings_overrides=settings,
         )
+        # Provenance: the commit the worker's diff is taken against, and the pinned check inputs.
+        if start := own["start_sha"] if own else (self.git_context or {}).get("base_sha"):
+            task["start_commit"] = start
+        if node.get("_check_input_pins"):
+            task["check_input_pins"] = dict(node["_check_input_pins"])
         if node.get("_plan_checks"):
             # The coordinator runs these after the worker finishes. A worker that
             # cannot run them reports its own work unverified, so let it run

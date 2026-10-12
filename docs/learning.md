@@ -19,6 +19,10 @@ outcome. The latest measured external verdict for a run feeds outcome ranking.
 A verdict with a reason on a run that delivered work (status `success` or
 `partial`) can also produce an acceptance training label. Acceptance does not prove that the selected lane was optimal.
 
+Settled runs leave the host as a trajectory dataset through `fusion trajectories
+export`: each run's normalised steps, task, diff, effective verdict and
+provenance, behind per-side data walls. See [trajectory export](trajectories.md).
+
 Write workflows fingerprint existing acceptance inputs before the first attempt.
 If a worker changes or deletes one, `check_inputs_changed` marks the receipts and
 gate span as untrusted (`tampered`). The node can still succeed, but its structural

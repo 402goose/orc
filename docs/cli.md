@@ -59,6 +59,9 @@ after its name. Aliases and hidden subcommands are included below.
 - [fusion decisions calibrate](#fusion-decisions-calibrate)
 - [fusion decisions train](#fusion-decisions-train)
 - [fusion decisions evaluate](#fusion-decisions-evaluate)
+- [fusion trajectories](#fusion-trajectories)
+- [fusion trajectories export](#fusion-trajectories-export)
+- [fusion trajectories parquet](#fusion-trajectories-parquet)
 - [fusion learn](#fusion-learn)
 - [fusion learn tick](#fusion-learn-tick)
 - [fusion learn status](#fusion-learn-status)
@@ -85,12 +88,12 @@ after its name. Aliases and hidden subcommands are included below.
 ```text
 usage: fusion [-h] [--workspace WORKSPACE] [--control-workspace CONTROL_WORKSPACE]
               [--json] [--progress | --quiet]
-              {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,learn,gym,quota,mcp-serve} ...
+              {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,trajectories,learn,gym,quota,mcp-serve} ...
 
 Lead/sidekick orchestration for Claude Code, Codex CLI, and Antigravity CLI
 
 positional arguments:
-  {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,learn,gym,quota,mcp-serve}
+  {truffle,ui,lead,build,run,delegate,outcome,ultra,workflow,doctor,route,status,runs,trace,usage,control,tmp,telemetry,decisions,trajectories,learn,gym,quota,mcp-serve}
     truffle               scout tractable GitHub issues and queue isolated fixes
     ui                    open the local ORC/Fusion control room in your browser
     lead                  launch an interactive lead agent with the Fusion MCP server
@@ -113,6 +116,8 @@ positional arguments:
     tmp                   per-run temp directories of sandboxed readers
     telemetry             local and remote telemetry configuration
     decisions             local Laya setup, decisions and reviewed learning
+    trajectories          export settled runs as a trajectory dataset (runs, steps,
+                          verdicts)
     learn                 advance and inspect Laya's learning loop without the control
                           room
     gym                   replay merged fix PRs as benchmark tasks across lanes
@@ -1104,6 +1109,62 @@ options:
   --device DEVICE
   --control               also score held-out examples against a different example's
                           state
+```
+
+## fusion trajectories
+
+export settled runs as a trajectory dataset (runs, steps, verdicts)
+
+```text
+usage: fusion trajectories [-h] {export,parquet} ...
+
+positional arguments:
+  {export,parquet}
+    export          write settled runs and their normalised steps as JSONL
+    parquet         convert an export to parquet; needs pyarrow
+
+options:
+  -h, --help        show this help message and exit
+```
+
+## fusion trajectories export
+
+write settled runs and their normalised steps as JSONL
+
+```text
+usage: fusion trajectories export [-h] --out DIR --for {personal,employer}
+                                  [--since DAYS] [--role ROLE] [--include-prerelease]
+                                  [--dry-run]
+
+Write meta/info.json, meta/runs.jsonl and steps/chunk-NNN.jsonl. Only runs with an
+effective accepted or rejected verdict, from repos on the --for side of export.walls,
+are written; every excluded run is counted by reason in info.json.
+
+options:
+  -h, --help              show this help message and exit
+  --out DIR               output directory; must not exist or be empty
+  --for {personal,employer}
+                          which side of export.walls to export; a repo on both sides or
+                          neither is excluded
+  --since DAYS            only runs started in the last DAYS days
+  --role ROLE             only runs of this role
+  --include-prerelease    also export repos listed in export.walls.prerelease
+  --dry-run               print the counts per filter and exclusion reason; write
+                          nothing
+```
+
+## fusion trajectories parquet
+
+convert an export to parquet; needs pyarrow
+
+```text
+usage: fusion trajectories parquet [-h] directory
+
+positional arguments:
+  directory   a directory written by trajectories export
+
+options:
+  -h, --help  show this help message and exit
 ```
 
 ## fusion learn

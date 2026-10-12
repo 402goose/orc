@@ -291,6 +291,11 @@ To include one on purpose, pass `--include-repo OWNER/NAME` (repeatable) or
 `export.exclude_repos` to `[]` to exclude no named repo; unknown repos stay
 excluded.
 
+`fusion trajectories export` also applies `export.exclude_repos`, and then
+`export.walls`: it exports only repos on the requested side (`personal` or
+`employer`) and excludes repos on both sides, neither, or the `prerelease` list.
+See [trajectory export](trajectories.md#what-is-exported).
+
 ## Control workspace
 
 To collect evidence from several checkouts in one controller directory:
