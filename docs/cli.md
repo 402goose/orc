@@ -1356,7 +1356,9 @@ options:
 per-lane and per-task results of a gym directory
 
 ```text
-usage: fusion gym report [-h] [--split {all,train,heldout}] [--tasks TASKS] gym_dir
+usage: fusion gym report [-h] [--split {all,train,heldout}] [--tasks TASKS]
+                         [--bradley-terry]
+                         gym_dir
 
 positional arguments:
   gym_dir
@@ -1368,6 +1370,8 @@ options:
                           all (default; acceptance shows both)
   --tasks TASKS           task JSON file or directory: flag held-out tasks edited since
                           the split recorded them
+  --bradley-terry         also fit lane strength per kind from pairwise outcomes on the
+                          same task (each split on its own; reporting only)
 ```
 
 ## fusion gym split

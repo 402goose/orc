@@ -1750,7 +1750,32 @@ def acceptance(gym, split=None, splits=("train", "heldout"), skip=()):
     return value
 
 
-def report(gym, split="all", tasks=None):
+def bradley_terry(gym, split=None, splits=("train", "heldout"), skip=()):
+    """Per split and kind: Bradley-Terry lane strengths (fusion_gym_strength)
+    from pairs of lanes graded on the same task and mode, over the latest
+    completed rows, each graded as the priors grade it (PRIOR_VERDICTS;
+    tampered runs and changed check inputs are not graded). Each split is
+    fitted on its own, never pooled; tasks in `skip` are left out. Reporting
+    only: no routing choice, prior or label reads it."""
+    from fusion_gym_strength import strengths
+    latest = {}
+    for row in read_results(gym):
+        if row.get("event") == "finished":
+            latest[row["key"]] = row
+    value = {name: {} for name in splits}
+    for row in sorted(latest.values(), key=lambda r: r["key"]):
+        name = "heldout" if is_heldout(split, row.get("task")) else "train"
+        if name not in value or row.get("task") in skip or not row.get("completed") or row["kind"] not in PRIOR_VERDICTS:
+            continue
+        wins, losses = PRIOR_VERDICTS[row["kind"]]
+        if row.get("verdict") not in wins | losses or row.get("tampered") or row.get("check_inputs_changed"):
+            continue
+        groups = value[name].setdefault(row["kind"], {}).setdefault(row["task"], {})
+        groups.setdefault(row["mode"], {})[row["lane"]] = row["verdict"] in wins
+    return {name: {kind: strengths(tasks) for kind, tasks in sorted(kinds.items())} for name, kinds in value.items()}
+
+
+def report(gym, split="all", tasks=None, bradley_terry_fit=False):
     """Per kind, then per mode (hidden, visible): per-lane rates and per-task
     solvers. `modes` is the fix kind; `localize` the localization kind. The
     kinds and modes measure different things and are never pooled.
@@ -1758,7 +1783,8 @@ def report(gym, split="all", tasks=None):
     `split` ("train" or "heldout") keeps only that side of split.json;
     `acceptance` holds per-lane rates with Wilson 95% intervals for each side.
     With `tasks`, held-out tasks edited since they were recorded are listed in
-    `heldout_task_changed` and left out of the held-out rates."""
+    `heldout_task_changed` and left out of the held-out rates. With
+    `bradley_terry_fit`, `bradley_terry` holds lane strengths per side and kind."""
     if split not in SPLITS:
         raise ValueError(f"split must be one of {', '.join(SPLITS)}")
     frozen = read_split(gym)
@@ -1825,7 +1851,10 @@ def report(gym, split="all", tasks=None):
         value["interpret"] = report_section(interpreted)
     if decomp_rows:
         value["decomp"] = _decomp_section(decomp_rows)
-    value["acceptance"] = acceptance(gym, frozen, ("train", "heldout") if split == "all" else (split,), changed)
+    sides = ("train", "heldout") if split == "all" else (split,)
+    value["acceptance"] = acceptance(gym, frozen, sides, changed)
+    if bradley_terry_fit:
+        value["bradley_terry"] = bradley_terry(gym, frozen, sides, changed)
     if frozen:
         value["heldout_task_changed"] = changed
     return {**value, "incomplete": pending}
@@ -1937,6 +1966,26 @@ def table(value):
                     lines.append(f"{name:<8} {lane:<22} {work:<12} {cell['successes']:>4g}/{cell['attempts']:<4g} "
                                  f"{format_rate(cell['successes'], cell['attempts'])}")
         lines.append("")
+    if "bradley_terry" in value:
+        lines += ["== Bradley-Terry strength per kind (pairs of lanes on the same task and mode; log-score, mean 0; "
+                  "bootstrap 95% interval over tasks; reporting only)",
+                  f"{'split':<8} {'kind':<10} {'lane':<22} {'strength [95% CI]':<22} {'P(beats median) [95% CI]':<25} "
+                  f"{'pairs':>5} {'tasks':>5}"]
+        for name, kinds in value["bradley_terry"].items():
+            for kind, section in kinds.items():
+                for lane, cell in section["lanes"].items():
+                    if cell["strength"] is None:
+                        lines.append(f"{name:<8} {kind:<10} {lane:<22} no pairs")
+                        continue
+                    strength = "{:+.2f} [{:+.2f}, {:+.2f}]".format(cell["strength"], *cell["strength_ci95"])
+                    beats = "{:.2f} [{:.2f}, {:.2f}]".format(cell["p_beats_median"], *cell["p_beats_median_ci95"])
+                    lines.append(f"{name:<8} {kind:<10} {lane:<22} {strength:<22} {beats:<25} "
+                                 f"{cell['pairs']:>5} {cell['tasks']:>5}")
+                lines.append(f"{name:<8} {kind:<10} {section['tasks']} tasks with a decisive pair, "
+                             f"{section['skipped_tasks']} without (ties, all pass, all fail or one lane)")
+        if not any(value["bradley_terry"].values()):
+            lines.append("no graded runs")
+        lines.append("")
     if value.get("heldout_task_changed"):
         lines.append("heldout_task_changed (edited since the split recorded them; not scored): "
                      + ", ".join(value["heldout_task_changed"]))
@@ -2017,6 +2066,9 @@ def add_parser(sub):
     report_cmd.add_argument("--split", choices=SPLITS, default="all",
                             help="only held-out tasks (split.json), only the rest (train), or all (default; acceptance shows both)")
     report_cmd.add_argument("--tasks", help="task JSON file or directory: flag held-out tasks edited since the split recorded them")
+    report_cmd.add_argument("--bradley-terry", action="store_true",
+                            help="also fit lane strength per kind from pairwise outcomes on the same task "
+                                 "(each split on its own; reporting only)")
     split_cmd = commands.add_parser("split", help="freeze a held-out task split (split.json); held-out tasks never feed priors or training labels")
     split_cmd.add_argument("gym_dir")
     split_cmd.add_argument("--tasks", required=True, help="task JSON file or directory (fix, interpret or decomp tasks)")
@@ -2187,6 +2239,6 @@ def command(args, workspace, as_json=False, out=None):
                     + (f"\nheldout_task_changed: {', '.join(value['heldout_task_changed'])}" if value["heldout_task_changed"] else ""))
         print(json.dumps(value, indent=2) if as_json else text, file=out)
         return 0
-    value = report(args.gym_dir, args.split, args.tasks)
+    value = report(args.gym_dir, args.split, args.tasks, args.bradley_terry)
     print(json.dumps(value, indent=2) if as_json else table(value), file=out)
     return 0
