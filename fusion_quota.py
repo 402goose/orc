@@ -70,24 +70,33 @@ def status(config, store, now=None):
                          "classification": assessed["classification"], "reasons": assessed["reasons"], "status": assessed["status"],
                          "observed_at": entry.get("observed_at"),
                          "reading_age_s": round(now - observed.timestamp()) if observed else None,
+                         "stale": bool(observed and thresholds["stale_probe_hours"]
+                                       and assessed["classification"] in {"exhausted", "tight"}
+                                       and now - observed.timestamp() > thresholds["stale_probe_hours"] * 3600),
                          "windows": windows, "probe_due": probe_due(entry, thresholds, now)})
     return {"thresholds": thresholds, "accounts": accounts, "cooling": cooling(config, store, now * 1000)}
 
 
 def probe_due(entry, thresholds, now):
-    """A window read exhausted has since reset and no reading came after the reset.
+    """A window read exhausted has since reset and no reading came after the reset,
+    or its exhausted reading is older than `stale_probe_hours`.
 
     Only the spent window counts: an account blocked on seven_day is not back
     because its five_hour window reset, and a newer reading that carried only
     another window says nothing about it. Each window is judged by its own
-    reading time (windows merge per name), falling back to the account's."""
+    reading time (windows merge per name), falling back to the account's. An
+    exhausted lane gets no runs and so no new readings; a plan can reset early,
+    so an old exhausted reading is probed rather than trusted until its reset."""
     quota, account_observed = entry.get("quota") or {}, usage.timestamp(entry.get("observed_at"))
+    stale_after = (thresholds.get("stale_probe_hours") or 0) * 3600
     for window in (quota.get("windows") or {}).values():
         reset = usage.timestamp(window.get("resets_at"))
         observed = usage.timestamp(window.get("observed_at")) or account_observed
         used = window.get("used")
         spent = used > thresholds["hard"] if used is not None else quota.get("status") == "rejected"
         if spent and reset and observed and observed < reset and reset.timestamp() <= now:
+            return True
+        if spent and observed and stale_after and now - observed.timestamp() > stale_after:
             return True
     return False
 
@@ -197,8 +206,9 @@ def render_status(view):
     lines = []
     for a in view["accounts"]:
         age = a["reading_age_s"]
-        lines.append(f"{a['lane_key']}: {a['classification']}  (reading {age // 3600}h{age % 3600 // 60:02d}m old)" if age is not None
-                     else f"{a['lane_key']}: {a['classification']}")
+        state = a["classification"] + (" (stale: a probe is due)" if a.get("stale") else "")
+        lines.append(f"{a['lane_key']}: {state}  (reading {age // 3600}h{age % 3600 // 60:02d}m old)" if age is not None
+                     else f"{a['lane_key']}: {state}")
         for name, w in a["windows"].items():
             used = "unknown" if w["used"] is None else f"{w['used']:.0%}"
             lines.append(f"    {name}: {used} used, resets {w['resets_at'] or 'unknown'}{'' if w['active'] else ' (reset passed)'}")

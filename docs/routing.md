@@ -309,6 +309,11 @@ an overflow twin, records a fresh reading, and does nothing when no account is
 due, so it is safe on a short schedule. `--dry-run` lists what it would probe;
 `--stale HOURS` also probes any reading older than that.
 
+An exhausted lane gets no runs, so it gets no new readings, and a plan can reset before the
+reset its last reading recorded. So an account whose spent window was read more than
+`quota.stale_probe_hours` ago (default 6; 0 turns it off) is also due, before that reset.
+`fusion quota` marks such a classification `stale`.
+
 `fusion quota rates [--days 7]` measures how much of each window ORC runs
 consume: every rise between consecutive readings of one account and window is
 charged to the ORC runs on that account that ended in between, as window share
