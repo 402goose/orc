@@ -473,6 +473,12 @@ Export gym evidence with `fusion gym priors GYM_DIR`; see
 from excluded or unknown repos are left out by default; see
 [exports and excluded repos](configuration.md#exports-and-excluded-repos).
 
+The priors table and `gym report` print each lane's successes/attempts per
+work class with a Wilson 95% interval, as `0.62 [0.41, 0.79]`; `gym report
+--json` carries it as `acceptance.<split>.<lane>.<class>.ci95`. With a few
+dozen runs per lane, a 10-point gap between lanes is often inside both
+intervals. The intervals are reporting only: no routing choice reads them.
+
 
 Use `interpret` to measure read-only triage against factual evidence. Seed it
 from existing extracted fix tasks, including their real check commands,
@@ -528,6 +534,35 @@ Holdout answers never supply priors. Unlike fix/localize solvability audits,
 curated factual gold does not need another lane to answer correctly before a
 misread counts against a lane. Read-only roles containing `triage` or
 `interpret` use this prior class; other readers retain the `read` class.
+
+### Held-out split
+
+Gym grades feed both routing priors and Laya's training labels (`gym_grade`),
+so without a held-out set nothing measures a lane, or Laya, on tasks it was
+not fitted to. Freeze one:
+
+```sh
+fusion gym split /tmp/gym --tasks /tmp/fix-tasks --freeze [--fraction 0.25] [--salt TEXT]
+fusion gym split /tmp/gym --tasks /tmp/fix-tasks --extend
+fusion gym report /tmp/gym --split heldout --tasks /tmp/fix-tasks
+```
+
+`--freeze` writes `<gym>/split.json` (`fusion.gym_split.v1`) and refuses to
+overwrite one. A task is held out when `int(sha256(salt + task_id)[:16], 16) /
+2**64 < fraction`; the salt (random unless given), fraction and rule are
+recorded, with each task's sha256 (over its JSON with sorted keys). Tasks added
+later are assigned by the same rule as soon as they appear; `--extend` records
+them and their sha256. Recorded assignments and digests never change.
+
+The held-out split must never be used for priors or training. `gym priors`
+skips its rows (counted as `excluded.heldout`), and gym runs on held-out tasks
+record no `gym_grade` label; their decisions and grades are still recorded.
+`gym report --split heldout` reports only held-out tasks, `--split train` only
+the rest, and the default `all` shows acceptance on both sides. With `--tasks`,
+a held-out task whose current sha256 differs from the recorded one is listed in
+`heldout_task_changed` and left out of the held-out rates rather than silently
+re-scored. Without `split.json` nothing is held out and the gym behaves as
+before.
 
 ### Decomp tasks
 

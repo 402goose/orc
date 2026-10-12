@@ -173,6 +173,14 @@ lane a non-zero chance. Which estimate holds depends on the policy:
   lane they didn't choose, so they deny overlap forever. `--since T` and
   `--policy thompson|epsilon` restrict the report to one policy era.
 
+Each lane also carries `acceptance_ci95: [low, high]`, the Wilson 95% interval
+of `accepted` / `chosen` beside `observed_acceptance`; `fusion route --explain`
+gives each candidate the same interval over its own checked runs
+(`checked_runs_local`, before gym priors are pooled in), printed as
+`accepted=0.62 [0.41, 0.79]`. With a few dozen runs per lane, a 10-point gap is
+often noise; overlapping intervals say so. The intervals are reporting only: no
+routing choice reads them.
+
 `exploration` splits `explored` into `epsilon`, `thompson` (sampled picks whose
 model had `p_win` < 1) and `write_trial`. Before this split, `explored` counted
 epsilon picks only, so cumulative figures that straddle the change are not
@@ -387,6 +395,11 @@ FROM=TO` maps a private proxy's model ids to vendor ids first. `fusion gym
 priors-seed --map AGENT:MODEL[:EFFORT]=SLUG` writes small starting priors from a
 public leaderboard (`data/quality.json`): a few pseudo-attempts on `write` at the
 model's index / 100, so a handful of verified outcomes outweighs it.
+
+A gym with a frozen held-out split (`fusion gym split --freeze`, see
+[held-out split](learning.md#held-out-split)) leaves its held-out tasks out of
+the export, counted as `excluded.heldout`: the split must never be used for
+priors or training, so it stays a fair measure of every lane.
 
 Set `decisions.priors` to `false` to disable them, or set its `path` to a different
 export. Priors do not confer permissions or bypass availability, fit or quota

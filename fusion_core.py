@@ -4679,8 +4679,10 @@ def _main(args, parser) -> int:
             if payload.get("all_lanes_rejected"):
                 print(f"  all lanes {payload['excluded_reason']}; retaining the full eligible pool")
             for candidate in payload["candidates"]:
+                interval = candidate.get("acceptance_ci95")
                 print(f"  {candidate['key']:<28} p={candidate['propensity']:.3f}  quota={candidate.get('quota') or '-'}  "
                       f"checked={candidate.get('checked_runs_local', candidate.get('checked_runs'))}"
+                      + (f"  accepted={candidate['acceptance_rate_local']:.2f} [{interval[0]:.2f}, {interval[1]:.2f}]" if interval else "")
                       + (f"  data={candidate['data_class']}" if candidate.get("data_class") else ""))
             for key, why in sorted(payload["rejected"].items()):
                 print(f"  dropped {key}: {why}")

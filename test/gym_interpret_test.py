@@ -176,6 +176,15 @@ class InterpretTest(Isolated):
         self.assertEqual((got["prior_attempts"], got["prior_successes"]), (8, 4))
         self.assertEqual(gym.run(self.output, ["codex"], self.gym_dir, kind="interpret", runner=self.fake_runner("trust"))["runs"], [])
 
+    def test_a_held_out_interpret_task_is_graded_but_never_labeled(self):
+        task = self.seed()
+        salt = next(f"s{n}" for n in range(1000) if gym.split_score(f"s{n}", task["id"]) < .5)
+        self.assertEqual(gym.freeze_split(self.gym_dir, self.output, .5, salt)["heldout"], [task["id"]])
+        [row] = gym.run(self.output, ["codex"], self.gym_dir, kind="interpret", runner=self.fake_runner("trust"))["runs"]
+        self.assertEqual((row["verdict"], row["split"], row["grade_label"]["status"]), ("misread", "heldout", "skipped"))
+        self.assertFalse([e for e in read_jsonl(DecisionStore(self.gym_dir).path) if e.get("source") == "gym_grade"])
+        self.assertEqual(gym.lane_priors(self.gym_dir, include_unknown=True)["excluded"], {"heldout": 1})
+
     def test_abstain_half_weight_invalid_failure_tamper_excluded_and_holdout_excluded(self):
         self.seed()
         for behavior, verdict in (("abstain", "abstained"), ("invalid", "invalid_answer"), ("tamper", "tampered")):

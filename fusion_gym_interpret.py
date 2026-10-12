@@ -205,6 +205,8 @@ def run_lane(task, name, lane, gym, config, runner, workflow_id, remaining, keep
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             snapshot_error = str(exc)
         row = gym_api.summarize_interpret(task, name, lane, outcome, diff_files, wall_ms)
+        if gym_api.is_heldout(gym_api.read_split(gym), task["id"]):
+            row["split"] = "heldout"
         if snapshot_error is not None:
             # Unknown integrity is never a clean tree. Retry after inspection works.
             row.update(verdict="invalid_snapshot", completed=False, snapshot_error=snapshot_error, scores={})
