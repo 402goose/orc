@@ -49,6 +49,12 @@ cp "$FUSION_WORKFLOW_SRC" "$DEST/fusion_workflow.py"
 for module_path in "$(dirname "$FUSION_CORE_SRC")"/fusion_*.py; do
   cp "$module_path" "$DEST/$(basename "$module_path")"
 done
+# The installed commit, recorded in each run's provenance; absent outside a git checkout.
+if orc_sha="$(git -C "$(dirname "$FUSION_CORE_SRC")" rev-parse HEAD 2>/dev/null)"; then
+  printf '%s\n' "$orc_sha" > "$DEST/orc.sha"
+else
+  rm -f "$DEST/orc.sha"
+fi
 cp "$(dirname "$FUSION_CORE_SRC")/fusion_browser_preload.cjs" "$DEST/fusion_browser_preload.cjs"
 mkdir -p "$DEST/gym"
 cp "$(dirname "$FUSION_CORE_SRC")/gym/interpret_traps.json" "$DEST/gym/interpret_traps.json"
