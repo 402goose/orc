@@ -1292,12 +1292,16 @@ LIMITATIONS: caveats that do not block (unverified scope, skipped checks), or no
                             return True
                         except ProcessLookupError:
                             return False
+                        except PermissionError:
+                            # EPERM means the group exists but cannot be signalled (macOS reports it while a
+                            # member is a zombie), so it is still alive, not an error.
+                            return True
 
                     def terminate_group() -> None:
                         observed["group_termination_requested"] = True
                         try:
                             os.killpg(process.pid, signal.SIGKILL)
-                        except ProcessLookupError:
+                        except (ProcessLookupError, PermissionError):
                             pass
 
                     try:

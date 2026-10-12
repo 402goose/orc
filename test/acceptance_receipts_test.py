@@ -334,8 +334,9 @@ class AcceptanceReceiptsTest(unittest.TestCase):
         finally:
             release.touch()
         self.assertFalse(accepted)
-        self.assertTrue(any("processes remaining" in problem for problem in problems))
         receipt = result["acceptance_checks"][0]
+        self.assertTrue(any("processes remaining" in problem for problem in problems),
+                        {"problems": problems, "error": receipt.get("error"), "process": receipt.get("process")})
         self.assert_receipt(receipt, "error")
         self.assertEqual(receipt["exit_code"], 0)  # Direct exit remains truthful.
         self.assertTrue(receipt["process"]["exit_observed"])
