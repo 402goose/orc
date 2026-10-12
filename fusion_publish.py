@@ -52,7 +52,11 @@ def run(argv, cwd, *, data=None, env=None, timeout=120):
 
 
 def git(workspace, *args, **kwargs):
-    return run(["git", "-c", "core.fsmonitor=false", *args], workspace, **kwargs)
+    """Every internal Git call. Since Git 2.47 a commit can spawn a detached
+    `git maintenance run --auto` that outlives the caller and still holds locks
+    under .git, so background maintenance, auto-gc and fsmonitor stay off."""
+    return run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0", "-c", "core.fsmonitor=false", *args],
+               workspace, **kwargs)
 
 
 def text(workspace, *args):
@@ -105,8 +109,11 @@ def repo_for(workspace, remote):
     match = re.fullmatch(r"(?:git@github\.com:|https://github\.com/|ssh://git@github\.com/)([\w.-]+/[\w.-]+?)(?:\.git)?/?", raw)
     if not match:
         raise ValueError("Publishing requires a GitHub remote (SSH or HTTPS)")
-    push = subprocess.run(["git", "config", "--get-all", f"remote.{remote}.pushurl"], cwd=workspace, capture_output=True, text=True)
-    if push.stdout.strip() and push.stdout.strip() != raw:
+    try:
+        push = text(workspace, "config", "--get-all", f"remote.{remote}.pushurl")
+    except ValueError:
+        push = ""  # no push URL configured
+    if push and push != raw:
         raise ValueError("Remote has a different push URL; use a remote with matching fetch and push destinations")
     return match[1], raw
 
