@@ -2265,29 +2265,49 @@ PRICE_FIELDS = {"input": ("input_tokens",), "output": ("output_tokens", "reasoni
                 "cache_write": ("cache_creation_input_tokens", "cache_write_input_tokens")}
 
 
-def price_per_mtok(settings: dict[str, Any]) -> dict[str, float] | None:
-    """A route's or agent's `price_per_mtok`: USD per million tokens by kind, or None."""
-    value = settings.get("price_per_mtok")
-    if value is None:
-        return None
+def _price_table(value: Any) -> dict[str, float]:
     if (not isinstance(value, dict) or not value or set(value) - set(PRICE_FIELDS)
             or any(isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0 for v in value.values())):
-        raise ValueError("price_per_mtok must map input, output, cache_read, cache_write to non-negative USD per 1M tokens")
+        raise ValueError("price_per_mtok must map input, output, cache_read, cache_write to non-negative USD per 1M tokens"
+                         " (or map model ids, and optionally \"*\", to such tables)")
     return {key: float(price) for key, price in value.items()}
 
 
-def price_fallback(settings: dict[str, Any], usage: dict[str, Any]) -> float | None:
+def price_per_mtok(settings: dict[str, Any], model: str | None = None) -> dict[str, float] | None:
+    """A route's or agent's `price_per_mtok`: USD per million tokens by kind, or None.
+
+    The table is either one set of prices for every model, or a map from model id to
+    prices, with `"*"` for any other model. A by-model table without an entry for
+    `model` and without `"*"` prices nothing. Every entry is validated either way."""
+    value = settings.get("price_per_mtok")
+    if value is None:
+        return None
+    if isinstance(value, dict) and value and not set(value) <= set(PRICE_FIELDS):
+        tables = {name: _price_table(table) for name, table in value.items()}
+        return tables.get(model) if model in tables else tables.get("*")
+    return _price_table(value)
+
+
+def price_fallback(settings: dict[str, Any], usage: dict[str, Any], model: str | None = None) -> float | None:
     """The cost of a run whose worker reported tokens but no cost, from the lane's declared
-    prices. Reported costs always win; without prices or tokens the cost stays unknown."""
+    prices for `model`. Reported costs always win; without prices or tokens the cost stays unknown."""
     if usage.get("cost_usd") is not None:
         return None
-    prices = price_per_mtok(settings)
+    prices = price_per_mtok(settings, model)
     if not prices:
         return None
+    def count(field):
+        value = usage.get(field)
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+    buckets = {kind: sum(count(field) for field in fields) for kind, fields in PRICE_FIELDS.items()}
+    if "cached_input_tokens" in usage and "cache_read_input_tokens" not in usage:
+        # OpenAI-style usage (Codex): cached and cache-write tokens are inside input_tokens,
+        # and reasoning tokens are inside output_tokens. Price each token once.
+        buckets["input"] = max(0, count("input_tokens") - buckets["cache_read"] - buckets["cache_write"])
+        buckets["output"] = count("output_tokens")
     total, counted = 0.0, False
-    for kind, fields in PRICE_FIELDS.items():
-        tokens = sum(usage.get(field) or 0 for field in fields
-                     if isinstance(usage.get(field), (int, float)) and not isinstance(usage.get(field), bool))
+    for kind in PRICE_FIELDS:
+        tokens = buckets[kind]
         if tokens:
             if kind not in prices:
                 return None  # tokens of a kind the lane did not price: still unknown
@@ -3468,7 +3488,7 @@ def dispatch(
             # count toward budgets or routing cost.
             usage["cost_estimate_usd"] = usage.pop("cost_usd")
             usage["cost_usd"] = 0.0
-        estimated = price_fallback(resolved_settings, usage)
+        estimated = price_fallback(resolved_settings, usage, model)
         if estimated is not None:
             usage["cost_usd"], usage["cost_estimated"] = estimated, True
         if metadata.get("execution_choice") and event_model:
