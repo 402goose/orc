@@ -261,6 +261,7 @@ def load_config(workspace: Path, control_workspace: Path | None = None) -> tuple
             try:
                 if isinstance(route, dict):
                     endpoint(route)
+                    offer_overrides(route)
             except ValueError as exc:
                 raise ValueError(f"route {name}: {exc}") from None
     execution_mode(merged)
@@ -2816,6 +2817,31 @@ def endpoint_record(settings: dict[str, Any]) -> dict[str, Any] | None:
             "data_class": "local" if loopback or block.get("region") == "host" else "remote"}
 
 
+OFFER_FIELDS = ("creator", "upstream", "billing", "features")
+OFFER_BILLING = ("api", "subscription", "free", "local")
+
+
+def offer_overrides(settings: dict[str, Any]) -> dict[str, Any]:
+    """A route's `offer` block, validated: what its lane offer states in place of the derived values."""
+    value = settings.get("offer")
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("offer must be an object of " + ", ".join(OFFER_FIELDS))
+    unknown = sorted(set(value) - set(OFFER_FIELDS))
+    if unknown:
+        raise ValueError("offer has unknown keys: " + ", ".join(unknown) + "; it takes " + ", ".join(OFFER_FIELDS))
+    for name in ("creator", "upstream"):
+        if name in value and value[name] is not None and (not isinstance(value[name], str) or not value[name]):
+            raise ValueError(f"offer.{name} must be a non-empty string or null")
+    if "billing" in value and value["billing"] not in OFFER_BILLING:
+        raise ValueError("offer.billing must be one of " + ", ".join(OFFER_BILLING))
+    features = value.get("features", [])
+    if not isinstance(features, list) or not all(isinstance(item, str) and item for item in features):
+        raise ValueError("offer.features must be a list of feature names")
+    return value
+
+
 METERED_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
 
@@ -4998,6 +5024,8 @@ def build_parser() -> argparse.ArgumentParser:
     gym_parser(sub)
     from fusion_quota import add_parser as quota_parser
     quota_parser(sub)
+    from fusion_lanes import add_parser as lanes_parser
+    lanes_parser(sub)
     sub.add_parser("mcp-serve", help=argparse.SUPPRESS)
     return parser
 
@@ -5117,6 +5145,12 @@ def _main(args, parser) -> int:
             for key, why in sorted(payload["rejected"].items()):
                 print(f"  dropped {key}: {why}")
         return 0 if payload["chosen"] else 1
+    if args.command == "lanes":
+        from fusion_lanes import run as run_lanes
+        try:
+            return run_lanes(args, workspace, config)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.command == "doctor":
         return doctor(workspace, config)
     if args.command in {"status", "runs"} and args.runs_command == "tombstone":

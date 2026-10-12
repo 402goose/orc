@@ -1,0 +1,229 @@
+[
+  {
+    "schema": "fusion.lane_offer.v1",
+    "lane": "orc-free",
+    "agent": "claude",
+    "model": null,
+    "reasoning_effort": null,
+    "creator": null,
+    "upstream": "openrouter",
+    "billing": "free",
+    "endpoint": null,
+    "features": [
+      "tools"
+    ],
+    "rates_usd_per_mtok": null,
+    "cost_tier": null
+  },
+  {
+    "schema": "fusion.lane_offer.v1",
+    "lane": "claude-sub",
+    "agent": "claude",
+    "model": "claude-sonnet-5",
+    "reasoning_effort": null,
+    "creator": "anthropic",
+    "upstream": "anthropic",
+    "billing": "subscription",
+    "endpoint": null,
+    "features": [
+      "write",
+      "tools"
+    ],
+    "rates_usd_per_mtok": null,
+    "cost_tier": 1
+  },
+  {
+    "schema": "fusion.lane_offer.v1",
+    "lane": "claude-api",
+    "agent": "claude",
+    "model": "claude-sonnet-5",
+    "reasoning_effort": null,
+    "creator": "anthropic",
+    "upstream": "anthropic",
+    "billing": "api",
+    "endpoint": null,
+    "features": [
+      "write",
+      "tools"
+    ],
+    "rates_usd_per_mtok": {
+      "input": 3.0,
+      "output": 15.0,
+      "cache_read": 0.3,
+      "cache_write": 3.75
+    },
+    "cost_tier": 3
+  },
+  {
+    "schema": "fusion.lane_offer.v1",
+    "lane": "codex-sol61-high",
+    "agent": "codex",
+    "model": "gpt-6.1-sol",
+    "reasoning_effort": "high",
+    "creator": "openai",
+    "upstream": "openai",
+    "billing": "subscription",
+    "endpoint": null,
+    "features": [
+      "write",
+      "browser",
+      "tools"
+    ],
+    "rates_usd_per_mtok": {
+      "input": 2.0,
+      "output": 10.0,
+      "cache_read": 0.1
+    },
+    "cost_tier": 1
+  },
+  {
+    "schema": "fusion.lane_offer.v1",
+    "lane": "codex-astra-read",
+    "agent": "codex",
+    "model": "gpt-6-astra",
+    "reasoning_effort": null,
+    "creator": "openai",
+    "upstream": "openai",
+    "billing": "subscription",
+    "endpoint": null,
+    "features": [
+      "browser",
+      "tools"
+    ],
+    "rates_usd_per_mtok": {
+      "input": 10.0,
+      "output": 50.0,
+      "cache_read": 1.0
+    },
+    "cost_tier": 2
+  },
+  {
+    "schema": "fusion.lane_offer.v1",
+    "lane": "oc-local",
+    "agent": "opencode",
+    "model": "local/coder-30b",
+    "reasoning_effort": null,
+    "creator": null,
+    "upstream": "self",
+    "billing": "local",
+    "endpoint": {
+      "host": "127.0.0.1",
+      "data_class": "local"
+    },
+    "features": [
+      "write",
+      "tools"
+    ],
+    "rates_usd_per_mtok": {
+      "input": 0.0,
+      "output": 0.0
+    },
+    "cost_tier": null
+  },
+  {
+    "schema": "fusion.lane_offer.v1",
+    "lane": "oc-kimi",
+    "agent": "opencode",
+    "model": "gateway/kimi-k2.6",
+    "reasoning_effort": null,
+    "creator": "kimi",
+    "upstream": "gateway",
+    "billing": "api",
+    "endpoint": null,
+    "features": [
+      "write",
+      "tools"
+    ],
+    "rates_usd_per_mtok": {
+      "input": 0.95,
+      "output": 4.0,
+      "cache_read": 0.095
+    },
+    "cost_tier": 1
+  },
+  {
+    "schema": "fusion.lane_offer.v1",
+    "lane": "claude",
+    "agent": "claude",
+    "model": "claude-sonnet-5",
+    "reasoning_effort": null,
+    "creator": "anthropic",
+    "upstream": "anthropic",
+    "billing": "subscription",
+    "endpoint": null,
+    "features": [
+      "write",
+      "tools"
+    ],
+    "rates_usd_per_mtok": null,
+    "cost_tier": null
+  },
+  {
+    "schema": "fusion.lane_offer.v1",
+    "lane": "codex",
+    "agent": "codex",
+    "model": null,
+    "reasoning_effort": null,
+    "creator": null,
+    "upstream": "openai",
+    "billing": "subscription",
+    "endpoint": null,
+    "features": [
+      "write",
+      "browser",
+      "tools"
+    ],
+    "rates_usd_per_mtok": null,
+    "cost_tier": null
+  },
+  {
+    "schema": "fusion.lane_offer.v1",
+    "lane": "opencode",
+    "agent": "opencode",
+    "model": null,
+    "reasoning_effort": null,
+    "creator": null,
+    "upstream": null,
+    "billing": "subscription",
+    "endpoint": null,
+    "features": [
+      "write",
+      "tools"
+    ],
+    "rates_usd_per_mtok": null,
+    "cost_tier": null
+  },
+  {
+    "schema": "fusion.lane_offer.v1",
+    "lane": "agy",
+    "agent": "agy",
+    "model": null,
+    "reasoning_effort": null,
+    "creator": null,
+    "upstream": "google",
+    "billing": "subscription",
+    "endpoint": null,
+    "features": [
+      "write",
+      "tools"
+    ],
+    "rates_usd_per_mtok": null,
+    "cost_tier": null
+  },
+  {
+    "schema": "fusion.lane_offer.v1",
+    "lane": "grok",
+    "agent": "grok",
+    "model": null,
+    "reasoning_effort": null,
+    "creator": null,
+    "upstream": "xai",
+    "billing": "subscription",
+    "endpoint": null,
+    "features": [
+      "tools"
+    ],
+    "rates_usd_per_mtok": null,
+    "cost_tier": null
+  }
+]
