@@ -177,6 +177,9 @@ model you trust to read but not to change code:
 {"routes": {"agy-flash-medium": {"agent": "agy", "lacks": ["write"]}}}
 ```
 
+An agy route may drop it only where ORC can wrap agy writers in its own sandbox
+(macOS); see [agy writer confinement](#agy-writer-confinement).
+
 ### Metered lanes and overflow
 
 Claude Code prefers `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`) over the
@@ -411,6 +414,10 @@ Explicit legacy `sandbox_mode` settings in Codex config take precedence over nam
 profiles; remove those settings to use this scoped profile. Already-running workers
 keep the permissions they started with; new launches and resumed workers use the update.
 
+Restricted agy writers run inside ORC's own `sandbox-exec` profile, which lets them
+write their workspace, its Git metadata and their own run temp directory, and refuse
+to start on a host without it; see [agy writer confinement](#agy-writer-confinement).
+
 Codex writers have no network by default, which also blocks a server the
 worker starts on 127.0.0.1. `codex.network` (on the agent or a route) adds a
 network table to the `fusion_git_write` profile using Codex's own
@@ -561,8 +568,8 @@ shared `$TMPDIR` were all denied. With the previous settings, the workspace and 
 
 **Stale reader temp directories.** A run that is killed (SIGKILL, a host crash) never
 removes its `/tmp/orc-run-<id>`. Each such directory carries an owner marker, `.orc-owner`,
-holding the creating process's pid and start time, and every new reader directory first
-sweeps old ones. A directory is removed only if it is a plain directory (never a
+holding the creating process's pid and start time, and every new reader or agy writer
+directory first sweeps old ones. A directory is removed only if it is a plain directory (never a
 symlink, which is not followed), is owned by the current user, has a name ORC creates
 (`orc-run-` and 8 characters from `mkdtemp`, or 12 hex digits; the older `orc-` form is
 still recognised), is older than 24 hours, carries a readable ORC owner marker, and that
@@ -572,7 +579,7 @@ removed, so a same-named directory a person or agent made is left alone. The cap
 entries counts only matching names, never the rest of `/tmp`. Runs end
 long before 24 hours, so the age limit alone protects live runs. For a Claude reader the
 marker sits in the directory root, which the reader cannot write. A Codex browser reader
-can write its whole directory, marker included, but a forged marker can only keep that
+or an agy writer can write its whole directory, marker included, but a forged marker can only keep that
 one directory from being swept, never cause another to be removed. Errors are skipped
 and reported once per process.
 
@@ -709,6 +716,70 @@ uses the bypass flags described above. `agy` has no per-call budget flag, so cap
 cost with `timeout_seconds` and the workflow's `budget_usd`. OpenRouter models
 are not in the `agy` host list — route those through the `orc` path instead.
 `agy` is not (yet) a lead candidate; `fusion lead` accepts Claude, Codex or OpenCode.
+
+### agy writer confinement
+
+agy's own `--sandbox` lets shell commands write all of `/tmp` and the shared
+per-user temp directory (`/var/folders/…/T`), where other runs keep their trees,
+and agy has no flag to narrow it. So in restricted mode ORC runs every agy writer
+inside its own macOS `sandbox-exec` profile, around the unchanged agy command line
+(`sandbox-exec -p <profile> agy -p … --mode accept-edits --sandbox`). The profile
+allows everything except file writes, which reach only:
+
+- the workspace and, for a linked worktree, its Git directories outside it;
+- a fresh run temp directory, `/tmp/orc-run-<id>` (`/private/tmp/...` on macOS),
+  created `0700` by dispatch and removed when the run ends (or by the sweep; see
+  *Stale reader temp directories*). It is the writer's `TMPDIR`, `TMP` and `TEMP`,
+  and its tool caches point inside it as a reader's do;
+- the paths in `agy.writer_allow`, default `["~/.gemini/antigravity-cli"]`
+  (agy's conversations, logs and caches);
+- the macOS per-user cache directory (`getconf DARWIN_USER_CACHE_DIR`, `/var/folders/…/C`),
+  which the Security framework writes while agy loads its login (without it agy reports a
+  failed login and starts a new one, even when signed in);
+- `/dev/null`, `/dev/ptmx` and `/dev/tty*` (agy runs shell commands in a pseudo-terminal),
+  and `/dev/dtracehelper`.
+
+Paths are resolved (symlinks followed) and quoted for the profile language. Reads,
+network and agy's own flags are unchanged. A `writer_allow` entry must be absolute
+or start with `~/`; ORC refuses one that is, contains or sits inside `/tmp`,
+`/var/folders` or the per-user temp directory, and one that is `$HOME` or a parent
+of it. If the probe below shows agy denied a path it needs, add that exact path;
+never open `/tmp`.
+
+```json
+{"agy": {"writer_allow": ["~/.gemini/antigravity-cli"]}}
+```
+
+A host without `sandbox-exec` (Linux and others) refuses an agy writer before it
+starts, with an error naming the missing wrapper. Readers are unaffected there and
+everywhere: they keep `--mode plan --sandbox`. YOLO writers (writing work in a
+yolo workspace) run unwrapped, as every harness does there.
+agy's own `--sandbox` cannot run inside the wrapper (`sandbox-exec` does not nest), so a
+wrapped writer runs with `--dangerously-skip-permissions` instead and the wrapper is its
+only sandbox. That flag never drops the wrapper.
+
+**A writer route needs the wrapper.** Drop `lacks: ["write"]` from an agy route
+only on a host that has `sandbox-exec`:
+
+```json
+{"routes": {"agy-argon-writer": {"agent": "agy", "model": "gemini-4-argon-high", "lacks": []}}}
+```
+
+The deploy gate checks the wrapper with a real writer: `FUSION_REAL=1 make
+agy-sandbox-probe` (`test/agy_sandbox_probe.sh`, spends quota) dispatches one
+through fusion on such a route, has it attempt seven shell writes and then checks
+the filesystem, never the model's report. The workspace and the writer's own run
+temp dir must be written; a workspace sibling, a file in `/tmp`, another run's
+directory in `/tmp`, another directory in the shared temp directory and `$HOME`
+must not. On failure it prints the file writes the sandbox denied, which is where a
+missing `writer_allow` path shows. Run it outside any other sandbox, since
+`sandbox-exec` cannot apply a profile inside one. Re-probe on agy upgrades.
+
+Measured on agy 1.3.3: Gemini models (`gemini-4-argon-*`) pass. agy's Claude models
+(`claude-opus-5-5-*`, `claude-sonnet-5-5-*`) do not yet. Their agent wraps every shell
+command in agy's terminal sandbox whatever the flag, that sandbox cannot start inside the
+wrapper, and agy has no per-run setting to turn it off (only the global
+`enableTerminalSandbox` in its settings file). Keep those routes `lacks: ["write"]`.
 
 ## Declared prices
 

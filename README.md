@@ -322,8 +322,9 @@ make test-ui
 The [generator](scripts/gen_docs.py) derives [CLI](docs/cli.md) and [MCP](docs/mcp.md)
 references from the runtime definitions. The [drift test](test/docs_generated_test.py)
 runs in `make test`; regenerate both files after changing those interfaces.
-The Python runner rejects unexpected skips and expected failures, with one
-explicit allowance for an unavailable real Codex sandbox probe.
+The Python runner rejects unexpected skips and expected failures, with explicit
+allowances for an unavailable real Codex sandbox probe and for the real agy writer
+profile check where `sandbox-exec` cannot apply a profile.
 
 Launcher sources are `orc`, `hud.sh.in` and `pricing.jq`; `./build.sh` assembles
 the shipped scripts. See [launcher development](docs/launcher.md#development)

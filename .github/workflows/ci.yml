@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck orc hud.sh hud.sh.in install.sh build.sh test/run.sh test/fusion_dogfood.sh test/fusion_real_smoke.sh
+      - run: shellcheck orc hud.sh hud.sh.in install.sh build.sh test/run.sh test/fusion_dogfood.sh test/fusion_real_smoke.sh test/agy_sandbox_probe.sh
 
   test:
     strategy:

@@ -167,14 +167,23 @@ class AgySkipPermissionsTest(unittest.TestCase):
         self.config = core.deep_merge(core.DEFAULTS, {"routes": {}, "decisions": {"mode": "off"},
                                                       "agy": {"command": sys.executable}, "codex": {"command": sys.executable}})
 
-    def argv(self, agent, overrides):
-        task = core.make_task(self.root, agent, "Check the fixture", "review", [], [], None, False, True, settings_overrides=overrides)
-        return core.agent_command(self.config, task, None)[0]
+    def argv(self, agent, overrides, write=True):
+        task = core.make_task(self.root, agent, "Check the fixture", "review", [], [], None, False, write, settings_overrides=overrides)
+        # agy writers are wrapped in sandbox-exec (agy_sandbox_test); HOME here sits in a real shared temp root.
+        with patch.object(core, "sandbox_exec", return_value="/usr/bin/sandbox-exec"), \
+                patch.object(core, "shared_write_roots", return_value=[]):
+            return core.agent_command(self.config, task, None)[0]
 
-    def test_only_the_explicit_agy_flag_skips_its_sandbox(self):
-        self.assertIn("--sandbox", self.argv("agy", {}))
-        self.assertNotIn("--dangerously-skip-permissions", self.argv("agy", {"approval": "never"}))
-        argv = self.argv("agy", {"dangerously_skip_permissions": True})
+    def test_only_the_explicit_agy_flag_skips_a_readers_sandbox(self):
+        self.assertIn("--sandbox", self.argv("agy", {}, write=False))
+        self.assertNotIn("--dangerously-skip-permissions", self.argv("agy", {"approval": "never"}, write=False))
+        argv = self.argv("agy", {"dangerously_skip_permissions": True}, write=False)
+        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertNotIn("--sandbox", argv)
+
+    def test_a_writer_trades_agys_own_sandbox_for_the_outer_profile(self):
+        argv = self.argv("agy", {})
+        self.assertEqual(argv[0], "/usr/bin/sandbox-exec")
         self.assertIn("--dangerously-skip-permissions", argv)
         self.assertNotIn("--sandbox", argv)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", self.argv("codex", {"approval": "never"}))
