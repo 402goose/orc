@@ -166,6 +166,7 @@ DEFAULTS: dict[str, Any] = {
         "mode": "",
         "model": "",
         "sandbox": True,
+        "network_retries": 3,
         "writer_allow": ["~/.gemini/antigravity-cli"],
     },
     "grok": {
@@ -536,6 +537,8 @@ def classify_verdict(result: dict[str, Any]) -> dict[str, Any]:
     if kind == "quota":
         match = RESETS_RE.search(text)
         return {"verdict": "quota", "reason": "quota", "resets_at": match.group(1).strip() if match else None}
+    if kind == "provider_network":
+        return {"verdict": "error", "reason": "provider_network"}
     # Structural first: exit code 3 is the refusal code tenet-cli's
     # agent-outcome contract uses. A first-person decline is only a fallback.
     if result.get("exit_code") == 3:
@@ -771,18 +774,27 @@ PERMISSION_MARKERS = ("permission denied", "agy denied", "agy auto-denied", "per
 # A rejected login belongs to the account, like quota, and says nothing about the model.
 AUTH_MARKERS = ("unauthorized", "(401)", "status=401", "refresh_token", "not logged in", "please log in",
                 "authentication failed", "invalid api key")
+AGY_NETWORK_PATTERNS = (r"connection reset by peer", r"operation timed out", r"network issue connecting to the server",
+                        r"Eligibility check failed", r"i/o timeout",
+                        r"(?=.*\bEOF\b)(?=.*https?://(?:[\w-]+\.)*googleapis\.)")
+AGY_NETWORK_RETRY_DELAYS = (15, 60, 180)
+AGY_NETWORK_CONTINUATION = ("The previous attempt was cut off by a network error. Continue the same task from where "
+                            "you stopped; files you already changed are on disk.")
+AGY_INCREMENTAL_EDITS = ("Write your changes to files as you go rather than in one final step, "
+                         "so partial work survives an interruption.")
 LANE_COOLDOWN_SECONDS = 900
 
 
 def quota_failure(result: dict[str, Any]) -> bool:
+    provider_text = (str(result.get("provider_failure") or "") if "provider_failure" in result else
+                     " ".join(str(item) for item in [*(result.get("blockers") or []), result.get("summary") or ""]))
+    if (result.get("verdict_reason") == "provider_network" or provider_text.startswith("provider_network:")
+            or agy_network_error(provider_text)):
+        return False
     quota = result.get("quota")
     if isinstance(quota, dict) and quota.get("status") == "rejected":
         return True
-    if "provider_failure" in result:
-        text = str(result.get("provider_failure") or "").lower()
-    else:
-        text = " ".join(str(item) for item in result.get("blockers", []))
-        text = f"{text} {result.get('summary', '')}".lower()
+    text = provider_text.lower()
     return any(marker in text for marker in QUOTA_MARKERS)
 
 
@@ -1389,7 +1401,14 @@ def failure_class(result: dict[str, Any]) -> str | None:
         return "coordinator_error"
     if result.get("status") == "verdict_missing":
         return "verdict_missing"
-    text = " ".join(str(item) for item in result.get("blockers", [])).lower()
+    text = " ".join(str(item) for item in result.get("blockers", []))
+    provider_text = (str(result.get("provider_failure") or "") if "provider_failure" in result
+                     else text + " " + str(result.get("summary") or ""))
+    if result.get("status") not in {"success", "cache_hit"} and (
+            result.get("verdict_reason") == "provider_network" or provider_text.startswith("provider_network:")
+            or agy_network_error(provider_text)):
+        return "provider_network"
+    text = text.lower()
     worked_around = result.get("status") in {"partial", "blocked"} and result.get("exit_code") == 0 and not denial_blocks_lane(result)
     if any(marker in text for marker in PERMISSION_MARKERS) and not worked_around:
         return "permission_denied"
@@ -1934,6 +1953,7 @@ def brief_for(task: dict[str, Any]) -> str:
     criteria = "\n".join(f"- {item}" for item in task["success_criteria"]) or "- Report what you verified."
     constraints = "\n".join(f"- {item}" for item in task["constraints"]) or "- Keep the change scoped to the task."
     verdict = "VERDICT: approve | changes\n" if task.get("requires_verdict") else ""
+    incremental = "\n" + AGY_INCREMENTAL_EDITS if task.get("agent") == "agy" and task.get("write") else ""
     return f"""You are the {task['role']} sidekick in a Fusion coding harness.
 
 Workspace: {task['workspace']}
@@ -1945,7 +1965,7 @@ Success criteria:
 Constraints:
 {constraints}
 
-Work directly in the workspace when the task permits writes. Inspect the repository before editing. Run the narrowest meaningful verification. Do not wait for a human response; make reasonable assumptions and report them.
+Work directly in the workspace when the task permits writes. Inspect the repository before editing. Run the narrowest meaningful verification. Do not wait for a human response; make reasonable assumptions and report them.{incremental}
 
 Return a compact handoff with these exact labels:
 {verdict}STATUS: success | partial | blocked | error
@@ -2192,14 +2212,45 @@ def parse_grok_output(stdout: str, output_format: str = "streaming-json"):
     return final.get("sessionId"), "".join(text).strip(), failure, usage, model, []
 
 
-def parse_agy_output(stdout: str) -> tuple[str | None, str, str | None, dict[str, Any], str | None, list[str]]:
+def agy_network_error(stdout: str, stderr: str = "") -> str | None:
     try:
         value = json.loads(stdout)
     except json.JSONDecodeError:
-        return None, stdout.strip(), None, {}, None, []
+        value = None
+    if isinstance(value, dict) and str(value.get("status") or "").upper() == "SUCCESS":
+        stdout = str(value.get("error") or "")
+    for line in (stderr + "\n" + stdout).splitlines():
+        if "AGY_ERROR:" in line:
+            try:
+                error = json.loads(line.partition("AGY_ERROR:")[2])
+            except json.JSONDecodeError:
+                error = None
+            if isinstance(error, dict) and error.get("retryable") is True:
+                return "provider_network: " + compact(line.strip(), 1482)
+        else:
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                value = None
+            if isinstance(value, dict) and str(value.get("status") or "").upper() == "SUCCESS":
+                line = str(value.get("error") or "")
+        if any(re.search(pattern, line, re.IGNORECASE) for pattern in AGY_NETWORK_PATTERNS):
+            return compact(line.strip(), 1500)
+    return None
+
+
+def parse_agy_output(stdout: str, stderr: str = "") -> tuple[str | None, str, str | None, dict[str, Any], str | None, list[str]]:
+    network_error = agy_network_error(stdout, stderr)
+    try:
+        value = json.loads(stdout)
+    except json.JSONDecodeError:
+        try:
+            value = json.loads("\n".join(line for line in stdout.splitlines() if not line.lstrip().startswith("AGY_ERROR:")))
+        except json.JSONDecodeError:
+            return None, stdout.strip(), network_error, {}, None, []
     if not isinstance(value, dict):
-        return None, stdout.strip(), None, {}, None, []
-    session_id = value.get("conversation_id")
+        return None, stdout.strip(), network_error, {}, None, []
+    session_id = value.get("conversation_id") or None
     text = str(value.get("response") or "")
     status = str(value.get("status") or "").upper()
     denied = value.get("denied_actions") or []
@@ -2235,7 +2286,7 @@ def parse_agy_output(stdout: str) -> tuple[str | None, str, str | None, dict[str
         if text and isinstance(denied, list) and denied
         else []
     )
-    return session_id, text, failure, usage, model, denial_notes
+    return session_id, text, network_error or failure, usage, model, denial_notes
 
 
 _OPENCODE_DENIAL = re.compile(r"rejected permission|specified a rule which prevents|permission denied", re.IGNORECASE)
@@ -3431,6 +3482,9 @@ def agent_command(
         return argv, env, {"command": command, "model": settings.get("model") or "",
                                          "execution_choice": choice}
     if agent == "agy":
+        network_retries = settings.get("network_retries", 3)
+        if isinstance(network_retries, bool) or not isinstance(network_retries, int) or network_retries < 0:
+            raise ValueError("agy.network_retries must be a non-negative integer (0 disables)")
         command = settings.get("command", "agy")
         mode_key = str(settings.get("mode") or settings.get("permission_mode") or "")
         mode = "accept-edits" if yolo else (AGY_MODE_ALIASES.get(mode_key) or "accept-edits") if task["write"] else "plan"
@@ -4337,6 +4391,7 @@ def _dispatch(
     handoff: dict[str, Any] = {}
     evidence_notes: list[str] = []
     worker_stdout = ""
+    network_retries: list[dict[str, Any]] = []
     exit_code = 1
     label = task.get("progress_label", task["role"])
     scope = "implementation" if task["write"] else "review/investigation only"
@@ -4366,17 +4421,56 @@ def _dispatch(
             if metadata.get("execution_choice"):
                 metadata["execution_choice"]["dispatch"] = {"status": "attempted", "argv": argv}
                 store.write_json(run_dir / "task.json", task)
-            completed = progress.run_logged(
-                argv,
-                cwd=task["workspace"],
-                env=env,
-                input=prompt,
-                timeout=effective_timeout,
-                stdout_path=stdout_path, stderr_path=stderr_path, label=label,
-                plain_output=task["agent"] == "grok" and metadata.get("output_format") == "plain",
-                abort_on=(opencode_empty_step_guard(metadata["empty_step_limit"]) if metadata.get("empty_step_limit") else
-                          claude_denial_guard(bash_limit, baseline_limit, not task["write"]) if task["agent"] == "claude" else None),
-            )
+            retry = None
+            while True:
+                remaining = effective_timeout - (time.monotonic() - started)
+                if retry:
+                    if remaining < 120:
+                        break
+                    network_retries.append(retry)
+                    for path in (stdout_path, stderr_path):
+                        with path.open("a", encoding="utf-8") as stream:
+                            stream.write(f"\n--- network retry {retry['attempt']} ---\n")
+                    store.event(run_dir, "worker.network_retry", retry)
+                completed = progress.run_logged(
+                    argv,
+                    cwd=task["workspace"],
+                    env=env,
+                    input=prompt,
+                    timeout=max(0, remaining) if task["agent"] == "agy" else effective_timeout,
+                    stdout_path=stdout_path, stderr_path=stderr_path, label=label,
+                    plain_output=task["agent"] == "grok" and metadata.get("output_format") == "plain",
+                    abort_on=(opencode_empty_step_guard(metadata["empty_step_limit"]) if metadata.get("empty_step_limit") else
+                              claude_denial_guard(bash_limit, baseline_limit, not task["write"]) if task["agent"] == "claude" else None),
+                    **({"append": True} if network_retries else {}),
+                )
+                if task["agent"] != "agy":
+                    break
+                new_session = parse_agy_output(completed.stdout, completed.stderr)[0]
+                if new_session:
+                    session_id_seen = new_session
+                    store.set_session(task["session_key"], new_session)
+                network_error = agy_network_error(completed.stdout, completed.stderr)
+                if not network_error or len(network_retries) >= resolved_settings.get("network_retries", 3):
+                    break
+                delay = AGY_NETWORK_RETRY_DELAYS[min(len(network_retries), len(AGY_NETWORK_RETRY_DELAYS) - 1)]
+                if effective_timeout - (time.monotonic() - started) - delay < 120:
+                    break
+                progress.emit(label, f"provider network error; retrying in {delay}s")
+                time.sleep(delay)
+                progress.check_cancelled()
+                if effective_timeout - (time.monotonic() - started) < 120:
+                    break
+                retry = {"attempt": len(network_retries) + 1, "delay_s": delay,
+                         "error_head": compact(network_error, 300), "resumed": bool(session_id_seen)}
+                argv = list(argv)
+                if session_id_seen:
+                    argv[argv.index("--output-format") - 1] = AGY_NETWORK_CONTINUATION + (
+                        "\n" + AGY_INCREMENTAL_EDITS if task["write"] else "")
+                    if "--conversation" in argv:
+                        argv[argv.index("--conversation") + 1] = session_id_seen
+                    else:
+                        argv += ["--conversation", session_id_seen]
         exit_code, worker_stdout = completed.returncode, completed.stdout
         if metadata.get("execution_choice"):
             metadata["execution_choice"]["dispatch"]["status"] = "returned"
@@ -4384,7 +4478,10 @@ def _dispatch(
             new_session, summary, failure, usage, event_model, evidence_notes = parse_codex_events(completed.stdout)
             session_id_seen = new_session
         elif task["agent"] == "agy":
-            new_session, summary, failure, usage, event_model, evidence_notes = parse_agy_output(completed.stdout)
+            new_session, summary, failure, usage, event_model, evidence_notes = parse_agy_output(completed.stdout, completed.stderr)
+            new_session = new_session or session_id_seen
+            if exit_code != 0 and completed.stderr.strip():
+                failure = failure or compact(progress.clean(completed.stderr), 1500)
         elif task["agent"] == "grok":
             new_session, summary, failure, usage, event_model, evidence_notes = parse_grok_output(completed.stdout, metadata.get("output_format", "plain"))
             if exit_code != 0 and completed.stderr.strip():
@@ -4521,6 +4618,7 @@ def _dispatch(
         "blockers": blockers,
         "limitations": handoff.get("limitations", []),
         "provider_failure": failure,
+        **({"network_retries": network_retries, "session_id": session_id_seen} if task["agent"] == "agy" else {}),
         "denied_tools": denied_tools or blocker_denied_tools(blockers),
         "denied": denied,
         "denied_count": len(denied),

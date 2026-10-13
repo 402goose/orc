@@ -285,11 +285,12 @@ def _stop_process(proc):
     proc.wait()
 
 
-def run_logged(argv, *, cwd, env, input, timeout, stdout_path, stderr_path, label, plain_output=False, abort_on=None):
+def run_logged(argv, *, cwd, env, input, timeout, stdout_path, stderr_path, label, plain_output=False, abort_on=None, append=False):
     """Write worker output as it arrives, retaining the original result parsers.
 
     `abort_on`, if given, sees each complete stdout line and returns a reason
     to stop the worker early (WorkerAborted), or None to keep going.
+    `append` retains earlier attempts in the logs; parsers see only this attempt.
     """
     check_cancelled()
     started = time.monotonic()
@@ -305,14 +306,22 @@ def run_logged(argv, *, cwd, env, input, timeout, stdout_path, stderr_path, labe
         temporary.replace(activity_path)
 
     with ExitStack() as stack:
-        out = stack.enter_context(stdout_path.open("wb"))
-        err = stack.enter_context(stderr_path.open("wb"))
+        out = stack.enter_context(stdout_path.open("ab" if append else "wb"))
+        err = stack.enter_context(stderr_path.open("ab" if append else "wb"))
+        stdout_start, stderr_start = out.tell(), err.tell()
+
+        def output(path, offset):
+            with path.open("rb") as stream:
+                stream.seek(offset)
+                return stream.read().decode(errors="replace")
+
         stdin = subprocess.DEVNULL
         if input is not None:
             stdin = stack.enter_context(tempfile.TemporaryFile())
             stdin.write(input.encode("utf-8"))
             stdin.seek(0)
         reader = stack.enter_context(stdout_path.open("rb"))
+        reader.seek(stdout_start)
         proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin, stdout=out, stderr=err, start_new_session=True)
         started_at = int(time.time() * 1000)
         pending = b""
@@ -371,11 +380,11 @@ def run_logged(argv, *, cwd, env, input, timeout, stdout_path, stderr_path, labe
             _stop_process(proc)
             save("timed_out" if isinstance(exc, subprocess.TimeoutExpired) else "aborted" if isinstance(exc, WorkerAborted) else "interrupted")
             if isinstance(exc, (subprocess.TimeoutExpired, WorkerAborted)):
-                exc.output = stdout_path.read_text(errors="replace")
-                exc.stderr = stderr_path.read_text(errors="replace")
+                exc.output = output(stdout_path, stdout_start)
+                exc.stderr = output(stderr_path, stderr_start)
             raise
         save("finished")
-    return subprocess.CompletedProcess(argv, proc.returncode, stdout_path.read_text(errors="replace"), stderr_path.read_text(errors="replace"))
+    return subprocess.CompletedProcess(argv, proc.returncode, output(stdout_path, stdout_start), output(stderr_path, stderr_start))
 
 
 def print_workflow(result):
