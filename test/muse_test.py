@@ -4,6 +4,8 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -16,6 +18,7 @@ import fusion_policy
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "muse_exec_echo.jsonl"
 HANDOFF = "STATUS: success\nSUMMARY: reviewed\nCHANGED: none\nTESTS: none\nBLOCKERS: none"
+WRAPPER = "/usr/bin/sandbox-exec"
 
 
 def stream(*events):
@@ -75,26 +78,39 @@ class MuseParseTest(unittest.TestCase):
 class MuseCommandTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.shared = [str(self.root / "shared-tmp"), str(self.root / "shared-folders")]
+        for mock in (patch.dict(os.environ, {"HOME": str(self.home)}),
+                     patch.object(core, "darwin_user_cache_dir", return_value=None),
+                     patch.object(core, "shared_write_roots", return_value=self.shared)):
+            mock.start()
+            self.addCleanup(mock.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def command(self, write=True, mode="restricted", route=None, session=None, **settings):
+    def command(self, write=True, mode="restricted", route=None, session=None, wrapper=WRAPPER, **settings):
         config = core.deep_merge(core.DEFAULTS, {"execution_mode": mode, "muse": settings})
         task = core.make_task(self.root, "muse", "Review", "reviewer", [], [], None, False, write, route=route)
-        return core.agent_command(config, task, session)
+        with patch.object(core, "sandbox_exec", return_value=wrapper):
+            result = core.agent_command(config, task, session)
+        self.addCleanup(Path(result[2]["prompt_file"]).unlink, missing_ok=True)
+        return result
 
     def test_writer_argv_matches_spec_and_brief_is_a_file(self):
         argv, _, metadata = self.command(model="muse-wonder-full-1.0", reasoning_effort="high")
-        self.assertEqual(argv[:3], ["muse", "exec", "--json"])
+        self.assertEqual(argv[:2], [WRAPPER, "-p"])
+        self.assertEqual(argv[3:6], ["muse", "exec", "--json"])
         for flag, value in (("--model", "muse-wonder-full-1.0"), ("--reasoning-effort", "high"),
                             ("--approval-mode", "never"), ("--contributor-mode", "off"),
                             ("--sandbox-network", "proxy-only"), ("--workspace", str(self.root))):
             self.assertEqual(argv[argv.index(flag) + 1], value, flag)
-        for flag in ("--no-foreign-personal-context", "--no-session-log"):
+        # The outer profile replaces Muse's own sandbox, which cannot nest inside it.
+        for flag in ("--no-foreign-personal-context", "--no-session-log", "--disable-sandbox"):
             self.assertIn(flag, argv)
-        for flag in ("--yolo", "--disable-sandbox", "--disable-write", "--disable-shell"):
+        for flag in ("--yolo", "--disable-write", "--disable-shell"):
             self.assertNotIn(flag, argv)
         brief = Path(argv[argv.index("--prompt-file") + 1])
         self.assertIn("Fusion coding harness", brief.read_text())
@@ -102,16 +118,102 @@ class MuseCommandTest(unittest.TestCase):
 
     def test_reader_cannot_write_or_shell_out_even_in_yolo_workspace(self):
         for mode in ("restricted", "yolo"):
-            argv, _, _ = self.command(write=False, mode=mode, model="muse-spark-1.3")
-            self.assertIn("--disable-write", argv)
-            self.assertIn("--disable-shell", argv)
-            self.assertNotIn("--yolo", argv)
+            for wrapper in (WRAPPER, None):
+                for profile in ("", "reviewer"):
+                    with self.subTest(mode=mode, wrapper=wrapper, profile=profile):
+                        argv, _, _ = self.command(write=False, mode=mode, wrapper=wrapper,
+                                                  permission_profile=profile, inner_sandbox=False)
+                        expected = ["muse", "exec", "--json", "--approval-mode", "never",
+                                    "--sandbox-network", "proxy-only", "--contributor-mode", "off",
+                                    "--no-foreign-personal-context", "--no-session-log", "--disable-write"]
+                        expected += ["--permission-profile", profile] if profile else ["--disable-shell"]
+                        expected += ["--workspace", str(self.root), "--prompt-file", argv[-1]]
+                        self.assertEqual(argv, expected)
 
     def test_yolo_writer_is_the_only_yolo(self):
-        argv, _, _ = self.command(mode="yolo", model="muse-wonder-1.0")
-        self.assertIn("--yolo", argv)
-        self.assertNotIn("--approval-mode", argv)
-        self.assertIn("--contributor-mode", argv)
+        for wrapper in (WRAPPER, None):
+            with self.subTest(wrapper=wrapper):
+                argv, _, _ = self.command(mode="yolo", wrapper=wrapper, inner_sandbox=False,
+                                          model="muse-wonder-1.0", writer_allow="ignored")
+                self.assertEqual(argv[:3], ["muse", "exec", "--json"])
+                self.assertIn("--yolo", argv)
+                self.assertNotIn("--approval-mode", argv)
+                self.assertNotIn("--disable-sandbox", argv)
+                self.assertIn("--contributor-mode", argv)
+
+    def test_inner_sandbox_can_only_be_disabled_under_the_wrapper(self):
+        self.assertIs(core.DEFAULTS["muse"]["inner_sandbox"], False)
+        for inner in (True, False):
+            with self.subTest(inner=inner):
+                argv, _, _ = self.command(inner_sandbox=inner)
+                self.assertEqual(argv[:2], [WRAPPER, "-p"])
+                self.assertEqual("--disable-sandbox" in argv[3:], not inner)
+                self.assertIn("--sandbox-network", argv)
+        with self.assertRaisesRegex(ValueError, "muse writers run only inside ORC's macOS sandbox-exec profile"):
+            self.command(wrapper=None, inner_sandbox=False)
+
+    def test_no_sandbox_exec_refuses_writers_before_creating_a_prompt(self):
+        with patch.object(core.tempfile, "NamedTemporaryFile", side_effect=AssertionError("must refuse first")):
+            with self.assertRaisesRegex(ValueError, "muse writers run only inside ORC's macOS sandbox-exec profile"):
+                self.command(wrapper=None)
+
+    def test_profile_has_exact_writable_set_and_no_shared_roots(self):
+        cache = str(self.root / "shared-folders" / "C")
+        git = str(self.root.parent / (self.root.name + "-external-git"))
+        with patch.object(core, "darwin_user_cache_dir", return_value=cache), \
+                patch.object(core, "git_metadata_dirs", return_value={git, str(self.root / ".git")}):
+            argv, env, metadata = self.command()
+        directory = metadata["run_tmpdir"]
+        writable = [str(self.root), git, directory, str(Path(directory) / "xdg"),
+                    str(self.home / ".local/share/muse"), cache]
+        expected = ["(version 1)", "(allow default)", "(deny file-write*)", "(allow file-write*",
+                    *(f'    (subpath "{path}")' for path in writable), '    (literal "/dev/null")',
+                    '    (literal "/dev/ptmx")', '    (literal "/dev/dtracehelper")',
+                    '    (regex #"^/dev/tty[^/]*$"))']
+        self.assertEqual(argv[2].splitlines(), expected)
+        for shared in ("/tmp", "/private/tmp", "/var/folders", os.path.realpath(tempfile.gettempdir()),
+                       str(self.home), str(self.home / ".config"), *self.shared):
+            self.assertNotIn(f'(subpath "{shared}")', argv[2])
+            self.assertNotIn(f'(subpath "{shared}/")', argv[2])
+        self.assertEqual((env["TMPDIR"], env["TMP"], env["TEMP"]), (directory + "/", directory, directory))
+        for name, leaf in core.READER_CACHE_DIRS.items():
+            self.assertEqual(env[name], f"{directory}/{leaf}")
+        self.assertEqual(env["XDG_CONFIG_HOME"], str(Path(directory) / "xdg"))
+        self.assertFalse(Path(directory).exists())
+
+    def test_worktree_git_metadata_is_writable_outside_the_workspace(self):
+        repo = self.root / "repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        git = ["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@example.invalid"]
+        subprocess.run([*git, "commit", "--allow-empty", "-qm", "fixture"], check=True)
+        worktree = self.root / "worktree"
+        subprocess.run([*git, "worktree", "add", "-qb", "fixture-worktree", str(worktree)], check=True)
+        task = core.make_task(worktree, "muse", "edit", "implement", [], [], None, False, True)
+        with patch.object(core, "sandbox_exec", return_value=WRAPPER):
+            argv, _, metadata = core.agent_command(core.DEFAULTS, task, None)
+        self.addCleanup(Path(metadata["prompt_file"]).unlink, missing_ok=True)
+        for path in (worktree, repo / ".git", repo / ".git/worktrees/worktree"):
+            self.assertIn(f'(subpath "{path}")', argv[2])
+        self.assertNotIn(f'(subpath "{repo}")', argv[2])
+
+    def test_writer_allow_uses_the_agy_validation_rules(self):
+        extra = self.root / 'state "quoted"'
+        link = self.root / "state-link"
+        link.symlink_to(extra)
+        profile = self.command(writer_allow=[str(link), "~/.config/muse/auth.json"])[0][2]
+        self.assertIn(f'(subpath {core.sbpl_string(str(extra))})', profile)
+        self.assertIn(f'(subpath "{self.home / ".config/muse/auth.json"}")', profile)
+        self.assertIn(f'(subpath "{self.home / ".local/share/muse"}")', profile)
+        self.assertNotIn(str(link), profile)
+        (self.root / "link-to-tmp").symlink_to(self.shared[0])
+        for bad in ("relative/dir", "", 7, "/", "~", "~/", str(self.home.parent),
+                    *self.shared, self.shared[0] + "/other-run", self.shared[1] + "/T/other-run",
+                    str(self.root / "link-to-tmp")):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "muse.writer_allow"):
+                self.command(writer_allow=[bad])
+        for bad in ("~/.config/muse", None, {}):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "muse.writer_allow"):
+                self.command(writer_allow=bad)
 
     def test_worker_mcp_never_appears_in_argv_or_metadata(self):
         muse_home = self.root / "xdg" / "muse"
@@ -289,6 +391,11 @@ class MuseDispatchTest(unittest.TestCase):
             (muse / "auth.json").write_text("login-secret")
             servers = {"worker": {"command": "fixture", "env": {"TOKEN": "worker-secret"}}}
             worker = root / "muse-fixture"
+            wrapper = root / "sandbox-exec-fixture"
+            wrapper.write_text(f"#!{sys.executable}\nimport os,sys\n"
+                               "assert sys.argv[1] == '-p' and '(deny file-write*)' in sys.argv[2]\n"
+                               "os.execvp(sys.argv[3], sys.argv[3:])\n")
+            wrapper.chmod(0o755)
             events = [event("run.lifecycle.started", {"kind": "run_started"}),
                       event("model.usage", {"kind": "model_usage", "model": "muse-spark-1.3",
                                             "usage": {"inputTokens": 9, "outputTokens": 4}}),
@@ -306,6 +413,11 @@ assert '-c' not in sys.argv and not any(arg.startswith('mcpServers') for arg in 
 xdg = Path(os.environ['XDG_CONFIG_HOME'])
 assert xdg.is_dir() and xdg == Path(os.environ['TMPDIR']) / 'xdg'
 assert (xdg.parent / '.orc-owner').is_file()
+assert xdg.parent.stat().st_mode & 0o777 == {stat.S_IRWXU}
+if os.environ['FIXTURE_WRITE'] == '1' and os.environ['FIXTURE_MODE'] == 'restricted':
+    assert os.environ['TMP'] == os.environ['TEMP'] == str(xdg.parent)
+    for name, leaf in {core.READER_CACHE_DIRS!r}.items():
+        assert os.environ[name] == str(xdg.parent / leaf)
 assert json.loads((xdg / 'muse' / 'settings.json').read_text()) == {{'mcpServers': {servers!r}}}
 assert (xdg / 'muse' / 'auth.json').is_symlink()
 brief = open(sys.argv[sys.argv.index('--prompt-file')+1]).read()
@@ -316,7 +428,9 @@ for event in {events!r}:
             worker.chmod(0o755)
             for write in (False, True):
                 for mode in ("restricted", "yolo"):
-                    with self.subTest(write=write, mode=mode), patch.dict(os.environ, {"XDG_CONFIG_HOME": str(config_root)}):
+                    with self.subTest(write=write, mode=mode), patch.dict(os.environ, {"XDG_CONFIG_HOME": str(config_root)}), \
+                            patch.object(core, "sandbox_exec", return_value=str(wrapper)), \
+                            patch.object(core, "darwin_user_cache_dir", return_value=None):
                         config = core.deep_merge(core.DEFAULTS, {"execution_mode": mode,
                                                                 "muse": {"command": str(worker), "model": "muse-spark-1.3",
                                                                          "mcp_servers": servers,
@@ -341,18 +455,22 @@ for event in {events!r}:
                                                                       "FUSION_DECISIONS_MODE": "off", "FUSION_TELEMETRY": "0"}):
             root = Path(d)
             config = core.deep_merge(core.DEFAULTS, {"muse": {"command": sys.executable}, "decisions": {"mode": "off"}})
-            task = core.make_task(root, "muse", "fixture", "review", [], [], None, False, False)
-
             def fail(argv, **kwargs):
                 xdg = Path(kwargs["env"]["XDG_CONFIG_HOME"])
                 self.assertEqual(json.loads((xdg / "muse" / "settings.json").read_text()), {"mcpServers": {}})
+                self.assertTrue((xdg.parent / ".orc-owner").is_file())
+                self.assertEqual(xdg.parent.stat().st_mode & 0o777, stat.S_IRWXU)
                 raise OSError("fixture could not start")
 
-            with patch("fusion_progress.run_logged", side_effect=fail):
-                result = core.dispatch(config, task, core.RunStore(root))
-            self.assertEqual((result["status"], result["exit_code"]), ("error", 126))
-            self.assertFalse(Path(task["resolved"]["run_tmpdir"]).exists())
-            self.assertFalse(Path(task["resolved"]["prompt_file"]).exists())
+            for write in (False, True):
+                task = core.make_task(root, "muse", "fixture", "review", [], [], None, False, write)
+                with self.subTest(write=write), patch("fusion_progress.run_logged", side_effect=fail), \
+                        patch.object(core, "sandbox_exec", return_value=sys.executable), \
+                        patch.object(core, "darwin_user_cache_dir", return_value=None):
+                    result = core.dispatch(config, task, core.RunStore(root))
+                self.assertEqual((result["status"], result["exit_code"]), ("error", 126))
+                self.assertFalse(Path(task["resolved"]["run_tmpdir"]).exists())
+                self.assertFalse(Path(task["resolved"]["prompt_file"]).exists())
 
 
 if __name__ == "__main__":

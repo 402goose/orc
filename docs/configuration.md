@@ -993,7 +993,7 @@ an `offer` block changes no routing choice, quota or price.
 
 ## Muse Code settings
 
-[Muse Code](https://muse.ai) (`muse exec --json`) is a sixth worker harness, hosted by Meta. Workers always run with `--approval-mode never`, the OS sandbox on (`--sandbox-network proxy-only`), `--contributor-mode off` (worker content is never used for product improvement, whatever your setting) and `--no-foreign-personal-context` (your personal rules and skills are not loaded). Writers may write the workspace through the sandbox; readers also get `--disable-write` and no shell tool (`--disable-shell`), so neither file tools nor shell commands can write for a reader. A `permission_profile` defined in your Muse settings replaces `--disable-shell` for readers. Only a writing task in an `execution_mode: "yolo"` workspace gets `muse exec --yolo`; nothing else passes `--yolo` or `--disable-sandbox`.
+[Muse Code](https://muse.ai) (`muse exec --json`) is a sixth worker harness, hosted by Meta. Restricted workers run with `--approval-mode never`, the OS sandbox on by default (`--sandbox-network proxy-only`), `--contributor-mode off` (worker content is never used for product improvement, whatever your setting) and `--no-foreign-personal-context` (your personal rules and skills are not loaded). Restricted writers also run inside the same ORC `sandbox-exec` profile as agy writers. Readers keep `--disable-write` and no shell tool (`--disable-shell`), so neither file tools nor shell commands can write for a reader. A `permission_profile` defined in your Muse settings replaces `--disable-shell` for readers. Only a writing task in an `execution_mode: "yolo"` workspace gets `muse exec --yolo`, without the outer wrapper.
 
 ```json
 {
@@ -1001,6 +1001,8 @@ an `offer` block changes no routing choice, quota or price.
     "command": "muse",
     "model": "muse-wonder-1.0",
     "sandbox_network": "proxy-only",
+    "inner_sandbox": false,
+    "writer_allow": [],
     "permission_profile": "",
     "mcp_servers": {},
     "api_key_env": "",
@@ -1009,9 +1011,31 @@ an `offer` block changes no routing choice, quota or price.
 }
 ```
 
+Restricted writers run as `/usr/bin/sandbox-exec -p <profile> muse exec …`. The profile allows file writes only to:
+
+- the workspace and its Git metadata directories outside it (including worktree metadata)
+- the run's private temp directory, used for `TMPDIR`, `TMP`, `TEMP` and tool caches through `reader_cache_env`
+- the per-run Muse config root, `<run tmp>/xdg`
+- Muse's state directory, `~/.local/share/muse`
+- paths in `muse.writer_allow` (default `[]`)
+- the macOS user cache directory (`DARWIN_USER_CACHE_DIR`)
+- `/dev/null`, `/dev/ptmx`, `/dev/dtracehelper` and `/dev/tty*`
+
+The profile denies writes elsewhere, including workspace siblings, other runs' temp directories, shared temp roots and the rest of `$HOME`. `muse.writer_allow` uses the same validation as `agy.writer_allow`: a list of absolute or `~/` paths, resolved through symlinks; entries cannot be `$HOME` or its ancestors, shared temp roots, their ancestors or paths inside them. Allow individual auth or trust files there if login refreshes need to write through the per-run config symlinks; the original config directory is not writable by default.
+
+`muse.inner_sandbox` defaults to `false`: Muse's own OS sandbox cannot start inside `sandbox-exec` (measured on Muse 1.4.7: every shell command fails with `sandbox_apply: Operation not permitted`), so ORC adds `--disable-sandbox` to a restricted writer inside the outer wrapper, whose profile provides confinement. Readers and yolo writers never receive that flag. Hosts without `sandbox-exec` refuse restricted Muse writers with a `ValueError`; readers keep their existing argv and permission policy.
+
+Run the seven-target writer probe outside any other sandbox:
+
+```sh
+FUSION_REAL=1 ./test/muse_writer_probe.sh
+```
+
+It dispatches a real writer on `muse-wonder-high` (override with `MUSE_PROBE_ROUTE`), checks file existence for workspace, run temp, workspace sibling, `/tmp`, another run's directory in `/tmp`, another directory in the user temp root and `$HOME`, and observes run-temp writes before dispatch removes the directory. It consumes provider quota. An explicit `FUSION_CONFIG` preserves operator settings while the probe forces restricted execution; re-probe after Muse upgrades and when changing `inner_sandbox`.
+
 The default routes `muse-wonder-full-high` (`muse-wonder-full-1.0`), `muse-wonder-high` (`muse-wonder-1.0`) and `muse-spark-high` (`muse-spark-1.3`) each derive a lane offer with creator and upstream `meta` and subscription billing; set `cost_tier` on a route to price one (with no published per-token price the lanes stay unpriced). **Muse lanes are not auto-routed by default**: name one in `decisions.auto_routes` to opt in once gym or held-out evidence says it earns it. Muse is a hosted provider, so only delegate repositories you have cleared for Meta-hosted processing.
 
-Every worker run, including readers and yolo writers, gets a per-run config root at `<run tmp>/xdg` through `XDG_CONFIG_HOME`. It mirrors every entry except `muse` from the parent environment’s `XDG_CONFIG_HOME` (or `~/.config`) with symlinks, so other tools keep their existing config. Its real `muse/` directory has mode 0700 and symlinks to the existing `auth.json` and `trust.json`; login token refreshes update the original auth file. Its `settings.json` copies the operator’s settings with `mcpServers` replaced by `muse.mcp_servers` only, or an empty object by default. The config root is created at dispatch and removed with the run. Keys come from the symlinked login, or from `--api-key-stdin` fed from the env var named by `api_key_env`; a key never appears in argv or run logs, results or traces. Sessions are not logged by default (`--no-session-log`), so resume starts fresh unless `session_log: true` lets `--session-id` resume a persisted session. `muse` is a sidekick, workflow node, Ultra stage and labeling worker, not an interactive Fusion lead.
+Every worker run, including readers and yolo writers, gets a per-run config root at `<run tmp>/xdg` through `XDG_CONFIG_HOME`. It mirrors every entry except `muse` from the parent environment’s `XDG_CONFIG_HOME` (or `~/.config`) with symlinks, so other tools keep their existing config. Its real `muse/` directory has mode 0700 and symlinks to the existing `auth.json` and `trust.json`; login token refreshes update the original auth file when writable under the worker's sandbox. Its `settings.json` copies the operator’s settings with `mcpServers` replaced by `muse.mcp_servers` only, or an empty object by default. The config root is created at dispatch and removed with the run. Keys come from the symlinked login, or from `--api-key-stdin` fed from the env var named by `api_key_env`; a key never appears in argv or run logs, results or traces. Sessions are not logged by default (`--no-session-log`), so resume starts fresh unless `session_log: true` lets `--session-id` resume a persisted session. `muse` is a sidekick, workflow node, Ultra stage and labeling worker, not an interactive Fusion lead.
 
 ## Older Grok clients
 
