@@ -24,7 +24,7 @@ SHARED_TMP="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 OTHER_RUN="$(mktemp -d "$SLASH_TMP/orc-agy-probe-other-XXXXXX")"
 OTHER_SHARED="$(mktemp -d "$SHARED_TMP/orc-agy-probe-other-XXXXXX")"
 WATCH_PID=""
-# shellcheck disable=SC2329 # invoked by the EXIT trap
+# shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
 cleanup() {
   [ -n "$WATCH_PID" ] && kill "$WATCH_PID" 2>/dev/null
   rm -rf "$TMP" "$OTHER_RUN" "$OTHER_SHARED"
