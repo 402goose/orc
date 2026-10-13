@@ -1,4 +1,4 @@
-"""Per-run temp directories for sandboxed readers, and the sweep that removes stale ones.
+"""Per-run temp directories for sandboxed readers and agy writers, and the sweep that removes stale ones.
 
 A reader's `/tmp/orc-<name>` directory is removed when its run ends. A run that is
 SIGKILLed never gets there, so each directory carries an owner marker
@@ -12,8 +12,8 @@ directory without a readable marker is never removed, so a same-named directory 
 ORC did not create (or one from before markers existed) is left alone.
 
 For a Claude reader the directory root is outside what the worker may write (it gets
-`<root>/claude-<uid>`), so its marker cannot be forged. A Codex browser reader may
-write its whole directory, marker included; a forged marker can only keep that
+`<root>/claude-<uid>`), so its marker cannot be forged. A Codex browser reader or an agy
+writer may write its whole directory, marker included; a forged marker can only keep that
 directory from being swept early, never cause another directory to be removed.
 """
 from __future__ import annotations

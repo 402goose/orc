@@ -158,11 +158,15 @@ DEFAULTS: dict[str, Any] = {
         "max_bash_denials": 6,
         "max_baseline_denials": 2,
     },
+    # A restricted agy writer runs inside ORC's own sandbox-exec profile
+    # (agy_writer_sandbox); `writer_allow` lists the only paths beyond its
+    # workspace, Git metadata and run temp directory that it may write.
     "agy": {
         "command": "agy",
         "mode": "",
         "model": "",
         "sandbox": True,
+        "writer_allow": ["~/.gemini/antigravity-cli"],
     },
     "grok": {
         "command": "grok",
@@ -1085,8 +1089,16 @@ def claude_reader_tmpdir(env: dict[str, str]) -> str:
     reader must not write it. The path is only chosen here; dispatch creates it (0700) for the run,
     records itself as owner in the directory root (which the reader cannot write) and removes it
     when the run ends; fusion_tmp's sweep removes it if the run never gets there."""
+    directory = run_tmpdir(env)
+    env["CLAUDE_CODE_TMPDIR"] = directory
+    return directory
+
+
+def run_tmpdir(env: dict[str, str]) -> str:
+    """A fresh per-run temp directory path under /tmp (realpath), set as TMPDIR, TMP and TEMP.
+    Only the path is chosen here; dispatch creates, marks and removes it."""
     directory = str(Path("/tmp").resolve() / f"orc-run-{uuid.uuid4().hex[:12]}")
-    env.update(CLAUDE_CODE_TMPDIR=directory, TMPDIR=directory + "/", TMP=directory, TEMP=directory)
+    env.update(TMPDIR=directory + "/", TMP=directory, TEMP=directory)
     return directory
 
 
@@ -3213,6 +3225,109 @@ def codex_browser_reader(config: dict[str, Any], task: dict[str, Any], settings:
             and codex_browser(settings) is not None)
 
 
+def git_metadata_dirs(workspace: str | Path) -> set[str]:
+    """A workspace's Git directory and, for a linked worktree, the shared one (resolved paths)."""
+    try:
+        result = subprocess.run(
+            ["git", *GIT_FLAGS, "-C", str(workspace), "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()  # A new, non-Git workspace may still initialize its own .git.
+    if result.returncode != 0:
+        return set()
+    return {str(Path(line).resolve()) for line in result.stdout.splitlines() if line.strip()}
+
+
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+
+def sandbox_exec() -> str | None:
+    """macOS sandbox-exec, or None on a host without it (Linux and others)."""
+    return SANDBOX_EXEC if sys.platform == "darwin" and os.access(SANDBOX_EXEC, os.X_OK) else None
+
+
+@functools.lru_cache(maxsize=1)
+def darwin_user_cache_dir() -> str | None:
+    """This user's macOS cache directory (`/var/folders/…/C`), or None. It is per-user system
+    state, not run scratch: the Security framework writes there while agy loads its login, and
+    agy reports a failed login when it cannot."""
+    try:
+        value = subprocess.run(["/usr/bin/getconf", "DARWIN_USER_CACHE_DIR"], capture_output=True,
+                               text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return os.path.realpath(value) if value else None
+
+
+def sbpl_string(path: str) -> str:
+    """A path as a sandbox profile string literal."""
+    if re.search(r"[\x00-\x1f\x7f]", path):
+        raise ValueError(f"a sandbox profile path cannot contain control characters: {path!r}")
+    return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _within(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def shared_write_roots() -> list[str]:
+    """Temp roots every run shares: /tmp and the per-user temp directories (resolved)."""
+    return list(dict.fromkeys(os.path.realpath(root) for root in ("/tmp", "/var/folders", tempfile.gettempdir())))
+
+
+def agy_writer_allow(settings: dict[str, Any]) -> list[str]:
+    """`agy.writer_allow` as resolved paths. Each entry is absolute or `~/`; none may be,
+    contain or sit inside the shared temp roots, nor be $HOME or one of its parents."""
+    entries = settings.get("writer_allow", DEFAULTS["agy"]["writer_allow"])
+    if not isinstance(entries, list) or not all(isinstance(entry, str) and entry.startswith(("/", "~/"))
+                                                for entry in entries):
+        raise ValueError("agy.writer_allow must be a list of absolute or ~/ paths")
+    home = os.path.realpath(Path.home())
+    shared = shared_write_roots()
+    paths = []
+    for entry in entries:
+        path = os.path.realpath(os.path.expanduser(entry))
+        opened = ([home] if _within(home, path) else []) + [root for root in shared
+                                                           if _within(path, root) or _within(root, path)]
+        if opened:
+            raise ValueError(f"agy.writer_allow: {entry} would open {opened[0]}, which other runs share")
+        paths.append(path)
+    return paths
+
+
+def agy_writer_profile(writable: list[str]) -> str:
+    """The sandbox-exec profile for an agy writer: everything is allowed except file
+    writes, which reach only `writable` (subpaths), /dev/null and the terminal devices
+    (agy runs shell commands in a pseudo-terminal it opens through /dev/ptmx)."""
+    rules = [f"(subpath {sbpl_string(path)})" for path in dict.fromkeys(writable)]
+    return "\n".join(["(version 1)", "(allow default)", "(deny file-write*)", "(allow file-write*",
+                      *(f"    {rule}" for rule in rules), '    (literal "/dev/null")',
+                      '    (literal "/dev/ptmx")', '    (literal "/dev/dtracehelper")',
+                      '    (regex #"^/dev/tty[^/]*$"))', ""])
+
+
+def agy_writer_sandbox(argv: list[str], workspace: str, settings: dict[str, Any],
+                       env: dict[str, str]) -> tuple[list[str], str]:
+    """Wrap a restricted agy writer in ORC's sandbox-exec profile. agy's own --sandbox lets
+    shell commands write all of /tmp and the shared per-user temp directory, and agy has no
+    flag to narrow it, so the outer profile allows writes only to the workspace, its Git
+    metadata, a fresh run temp directory (its TMPDIR, TMP and TEMP, and tool caches) and
+    `agy.writer_allow`. Returns the wrapped argv and the run temp directory path, which
+    dispatch creates and removes. A host without sandbox-exec refuses the writer."""
+    wrapper = sandbox_exec()
+    if wrapper is None:
+        raise ValueError("agy writers run only inside ORC's macOS sandbox-exec profile, which this host lacks; "
+                         "keep agy lanes read-only here (lacks: [\"write\"]) or use a yolo workspace")
+    allow = agy_writer_allow(settings)
+    directory = run_tmpdir(env)
+    reader_cache_env(env, directory)
+    root = os.path.realpath(workspace)
+    git = sorted(path for path in git_metadata_dirs(workspace) if not _within(path, root))
+    system = [path for path in (darwin_user_cache_dir(),) if path]
+    return [wrapper, "-p", agy_writer_profile([root, *git, directory, *allow, *system]), *argv], directory
+
+
 def codex_permission_args(workspace: Path, settings: dict[str, Any], write: bool) -> list[str]:
     """Allow repository Git operations for writers without unrestricted access.
     An optional `network` table (Codex's permission-profile keys) applies to
@@ -3225,17 +3340,7 @@ def codex_permission_args(workspace: Path, settings: dict[str, Any], write: bool
         return ["-s", sandbox]
     # Inherit Codex's workspace/temp/network boundary and protected .codex paths.
     # Only Git metadata is added, including the shared directory of a worktree.
-    roots = set()
-    try:
-        result = subprocess.run(
-            ["git", *GIT_FLAGS, "-C", str(workspace), "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
-            capture_output=True, text=True, check=False, timeout=5,
-        )
-        if result.returncode == 0:
-            roots = {str(Path(line).resolve()) for line in result.stdout.splitlines() if line.strip()}
-    except (OSError, subprocess.TimeoutExpired):
-        pass  # A new, non-Git workspace may still initialize its own .git.
-    paths = [json.dumps(path) + '="write"' for path in sorted(roots)]
+    paths = [json.dumps(path) + '="write"' for path in sorted(git_metadata_dirs(workspace))]
     filesystem = ','.join(['":workspace_roots"={".git"="write"}', *paths])
     network, flags = codex_network(settings)
     profile = '{extends=":workspace",filesystem={' + filesystem + '}' + network + '}'
@@ -3304,9 +3409,11 @@ def agent_command(
         mode_key = str(settings.get("mode") or settings.get("permission_mode") or "")
         mode = "accept-edits" if yolo else (AGY_MODE_ALIASES.get(mode_key) or "accept-edits") if task["write"] else "plan"
         argv = [command, "-p", brief_for(task), "--output-format", "json", "--mode", mode]
-        # Headless agy auto-denies tools it would prompt for. This per-lane opt-out
-        # is the only restricted-mode path that drops its sandbox, and says so.
-        if yolo or settings.get("dangerously_skip_permissions") is True:
+        # Headless agy auto-denies tools it would prompt for. A restricted writer runs inside
+        # ORC's sandbox-exec profile, where agy's own --sandbox cannot nest (it would deny
+        # every shell command), so the outer profile replaces it. A reader keeps --sandbox
+        # unless the per-lane opt-out drops it, which says so.
+        if yolo or settings.get("dangerously_skip_permissions") is True or task["write"]:
             argv.append("--dangerously-skip-permissions")
         elif settings.get("sandbox", True) is True:
             argv.append("--sandbox")
@@ -3323,8 +3430,11 @@ def agent_command(
             argv += ["--print-timeout", str(print_timeout)]
         if session_id:
             argv += ["--conversation", session_id]
-        return argv, env, {"command": command, "model": selected_model,
-                                         **({"execution_choice": choice} if choice else {})}
+        metadata = {"command": command, "model": selected_model, **({"execution_choice": choice} if choice else {})}
+        # Readers keep agy's plan mode and --sandbox; YOLO writers run unwrapped, as elsewhere.
+        if task["write"] and not yolo:
+            argv, metadata["run_tmpdir"] = agy_writer_sandbox(argv, task["workspace"], settings, env)
+        return argv, env, metadata
     if agent == "grok":
         command = settings.get("command", "grok")
         mode = "bypassPermissions" if yolo else settings.get("permission_mode", "plan") if task["write"] else "plan"
@@ -4143,7 +4253,12 @@ def _dispatch(
     store.write_json(run_dir / "task.json", task)
     provenance = run_provenance(task, resolved_settings, repo_head)
     binary = executable(argv[0])
-    if binary is None:
+    missing = argv[0] if binary is None else None
+    # A wrapped worker (an agy writer under sandbox-exec) also needs the command it wraps.
+    wrapped = metadata.get("command")
+    if missing is None and wrapped and wrapped != argv[0] and executable(wrapped) is None:
+        missing = wrapped
+    if missing is not None:
         progress.emit(task.get("progress_label", task["role"]), f"cannot start {task['agent']}: executable unavailable")
         result = {
             "schema": SCHEMA,
@@ -4157,12 +4272,12 @@ def _dispatch(
             "model": metadata.get("model"),
             **({"endpoint": metadata["endpoint"]} if metadata.get("endpoint") else {}),
             "execution_choice": metadata.get("execution_choice"),
-            "summary": f"{argv[0]} is not available on PATH",
+            "summary": f"{missing} is not available on PATH",
             "verdict": "error",
             "verdict_reason": "missing_binary",
             "changed": [],
             "tests": [],
-            "blockers": [f"install or expose {argv[0]} before dispatching"],
+            "blockers": [f"install or expose {missing} before dispatching"],
             "exit_code": 127,
             "duration_ms": 0,
             "timeout_seconds": effective_timeout,
@@ -4215,12 +4330,12 @@ def _dispatch(
                 reader_tmp = codex_reader_tmpdir(env)
                 reader_cache_env(env, reader_tmp)
                 stack.callback(shutil.rmtree, reader_tmp, True)
-            if metadata.get("reader_tmpdir"):
+            if run_tmp := metadata.get("reader_tmpdir") or metadata.get("run_tmpdir"):
                 import fusion_tmp
                 fusion_tmp.sweep_quietly()
-                os.mkdir(metadata["reader_tmpdir"], 0o700)
-                stack.callback(shutil.rmtree, metadata["reader_tmpdir"], True)
-                fusion_tmp.mark(metadata["reader_tmpdir"])
+                os.mkdir(run_tmp, 0o700)
+                stack.callback(shutil.rmtree, run_tmp, True)
+                fusion_tmp.mark(run_tmp)
             store.event(run_dir, "worker.started", {"argv": argv, "resumed_session": bool(session_id), **session})
             if metadata.get("execution_choice"):
                 metadata["execution_choice"]["dispatch"] = {"status": "attempted", "argv": argv}

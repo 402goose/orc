@@ -14,7 +14,7 @@ CMNDCNTR ?= $(HOME)/code/hathbanger/cmndcntr
 FETCHER := $(CMNDCNTR)/scripts/fetch-artificial-analysis-leaderboard.mjs
 OUT     := data/quality.json
 
-.PHONY: refresh-quality build test test-ui dogfood dogfood-paired dogfood-real
+.PHONY: refresh-quality build test test-ui dogfood dogfood-paired dogfood-real agy-sandbox-probe
 
 refresh-quality:
 	@command -v node >/dev/null || { echo "node required" >&2; exit 1; }
@@ -51,3 +51,9 @@ dogfood-paired:
 
 dogfood-real:
 	FUSION_REAL=$${FUSION_REAL:-0} ./test/fusion_real_smoke.sh
+
+# The deploy gate for agy writers: a real writer must write only its workspace
+# and its own run temp dir. Opt-in (spends quota); run it outside any sandbox,
+# since sandbox-exec cannot nest.
+agy-sandbox-probe:
+	FUSION_REAL=$${FUSION_REAL:-0} ./test/agy_sandbox_probe.sh

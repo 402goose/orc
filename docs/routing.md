@@ -417,7 +417,9 @@ fusion --json ultra --harness agy 'Explore and review this change.'
 Restricted-mode automatic AGY routing requires explicit
 `dangerously_skip_permissions: true` on the lane; sandbox/native command settings
 alone do not qualify it. Explicit AGY selection can use a narrower setup.
-See [AGY permissions and setup](configuration.md#antigravity-settings).
+See [AGY permissions and setup](configuration.md#antigravity-settings). An AGY
+writer route needs ORC's `sandbox-exec` wrapper (macOS); elsewhere AGY writers are
+refused. See [agy writer confinement](configuration.md#agy-writer-confinement).
 
 ## Prompt cache and sessions
 

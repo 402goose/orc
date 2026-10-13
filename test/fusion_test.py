@@ -857,7 +857,9 @@ print(json.dumps({'conversation_id':'conv-denied','status':'SUCCESS','response':
         )
         self.config(agy=agy)
         output = io.StringIO()
-        with contextlib.redirect_stdout(output):
+        # These writers test denial parsing; the sandbox-exec wrapper is covered in agy_sandbox_test.
+        with contextlib.redirect_stdout(output), \
+                patch.object(fusion_core, "agy_writer_sandbox", lambda argv, *_: (argv, None)):
             self.assertEqual(
                 fusion_core.main(
                     ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "agy", "--fresh", "run something"]
@@ -883,7 +885,9 @@ print(json.dumps({'conversation_id':'conv-partial','status':'SUCCESS','response'
         )
         self.config(agy=agy)
         output = io.StringIO()
-        with contextlib.redirect_stdout(output):
+        # These writers test denial parsing; the sandbox-exec wrapper is covered in agy_sandbox_test.
+        with contextlib.redirect_stdout(output), \
+                patch.object(fusion_core, "agy_writer_sandbox", lambda argv, *_: (argv, None)):
             self.assertEqual(
                 fusion_core.main(
                     ["--workspace", str(self.workspace), "--json", "delegate", "--agent", "agy", "--fresh", "run something"]

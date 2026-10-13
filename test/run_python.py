@@ -2,6 +2,7 @@
 from pathlib import Path
 import os
 import shutil
+import subprocess
 import sys
 import unittest
 
@@ -11,9 +12,21 @@ SANDBOX_PROBE = ('codex_permissions_test.CodexPermissionsTest.'
 BROWSER_PROBE = ('codex_permissions_test.CodexPermissionsTest.'
                  'test_real_browser_reader_binds_loopback_and_writes_temp_but_not_the_workspace')
 SANDBOX_PROBES = {SANDBOX_PROBE, BROWSER_PROBE}
+AGY_PROFILE_PROBE = 'agy_sandbox_test.AgySandboxTest.test_real_profile_writes_workspace_and_run_temp_only'
+
+
+def sandbox_exec_applies():
+    """Whether sandbox-exec can apply a profile here; it cannot inside another sandbox."""
+    try:
+        return subprocess.run(['/usr/bin/sandbox-exec', '-p', '(version 1)(allow default)', '/usr/bin/true'],
+                              capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def expected_skip(test, reason):
+    if test.id() == AGY_PROFILE_PROBE:
+        return reason == 'sandbox-exec cannot apply a profile here' and (sys.platform != 'darwin' or not sandbox_exec_applies())
     if test.id() not in SANDBOX_PROBES:
         return False
     if reason == 'requires the macOS Codex sandbox':

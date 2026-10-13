@@ -39,6 +39,18 @@ class RunnerTest(unittest.TestCase):
             self.assertFalse(run_python.check_result(self.result(skip='requires the macOS Codex sandbox', identity=run_python.SANDBOX_PROBE), io.StringIO()))
             self.assertTrue(run_python.check_result(self.result(skip='installed Codex does not support named permission profiles', identity=run_python.SANDBOX_PROBE), io.StringIO()))
 
+    def test_the_agy_profile_probe_may_skip_only_where_sandbox_exec_cannot_apply(self):
+        reason = 'sandbox-exec cannot apply a profile here'
+        identity = run_python.AGY_PROFILE_PROBE
+        with patch.object(run_python.sys, 'platform', 'linux'):
+            self.assertTrue(run_python.check_result(self.result(skip=reason, identity=identity), io.StringIO()))
+            self.assertFalse(run_python.check_result(self.result(skip=reason), io.StringIO()))
+        with patch.object(run_python.sys, 'platform', 'darwin'):
+            with patch.object(run_python, 'sandbox_exec_applies', return_value=False):
+                self.assertTrue(run_python.check_result(self.result(skip=reason, identity=identity), io.StringIO()))
+            with patch.object(run_python, 'sandbox_exec_applies', return_value=True):
+                self.assertFalse(run_python.check_result(self.result(skip=reason, identity=identity), io.StringIO()))
+
     def test_resolving_the_installed_laya_runtime_fails_the_run(self):
         module = type('Decisions', (), {'runtime_python': staticmethod(lambda options: options['python'])})
         resolved = run_python.record_runtimes(module)
