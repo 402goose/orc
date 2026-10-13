@@ -1002,7 +1002,6 @@ an `offer` block changes no routing choice, quota or price.
     "model": "muse-wonder-1.0",
     "sandbox_network": "proxy-only",
     "permission_profile": "",
-    "disable_mcp": [],
     "mcp_servers": {},
     "api_key_env": "",
     "session_log": false
@@ -1012,7 +1011,7 @@ an `offer` block changes no routing choice, quota or price.
 
 The default routes `muse-wonder-full-high` (`muse-wonder-full-1.0`), `muse-wonder-high` (`muse-wonder-1.0`) and `muse-spark-high` (`muse-spark-1.3`) each derive a lane offer with creator and upstream `meta` and subscription billing; set `cost_tier` on a route to price one (with no published per-token price the lanes stay unpriced). **Muse lanes are not auto-routed by default**: name one in `decisions.auto_routes` to opt in once gym or held-out evidence says it earns it. Muse is a hosted provider, so only delegate repositories you have cleared for Meta-hosted processing.
 
-Muse loads MCP servers from `mcpServers` in its own `settings.json`. Workers get none of them: every server named there (plus `disable_mcp`) is disabled for the run with `-c mcpServers.<name>.enabled=false`, except servers declared for workers in `mcp_servers` (for example a Playwright-only server). Keys come from `muse login`, or from `--api-key-stdin` fed from the env var named by `api_key_env`; a key never appears in argv, the run directory or logs. Sessions are not logged by default (`--no-session-log`), so resume starts fresh unless `session_log: true` lets `--session-id` resume a persisted session. `muse` is a sidekick, workflow node, Ultra stage and labeling worker, not an interactive Fusion lead.
+Every worker run, including readers and yolo writers, gets a per-run config root at `<run tmp>/xdg` through `XDG_CONFIG_HOME`. It mirrors every entry except `muse` from the parent environment’s `XDG_CONFIG_HOME` (or `~/.config`) with symlinks, so other tools keep their existing config. Its real `muse/` directory has mode 0700 and symlinks to the existing `auth.json` and `trust.json`; login token refreshes update the original auth file. Its `settings.json` copies the operator’s settings with `mcpServers` replaced by `muse.mcp_servers` only, or an empty object by default. The config root is created at dispatch and removed with the run. Keys come from the symlinked login, or from `--api-key-stdin` fed from the env var named by `api_key_env`; a key never appears in argv or run logs, results or traces. Sessions are not logged by default (`--no-session-log`), so resume starts fresh unless `session_log: true` lets `--session-id` resume a persisted session. `muse` is a sidekick, workflow node, Ultra stage and labeling worker, not an interactive Fusion lead.
 
 ## Older Grok clients
 

@@ -1,4 +1,6 @@
 """Muse Code (`muse exec --json`) as a Fusion worker (issue #70)."""
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -111,19 +113,29 @@ class MuseCommandTest(unittest.TestCase):
         self.assertNotIn("--approval-mode", argv)
         self.assertIn("--contributor-mode", argv)
 
-    def test_worker_mcp_is_none_by_default_and_configurable(self):
+    def test_worker_mcp_never_appears_in_argv_or_metadata(self):
         muse_home = self.root / "xdg" / "muse"
         muse_home.mkdir(parents=True)
         (muse_home / "settings.json").write_text(json.dumps(
             {"schema_version": 1, "mcpServers": {"alpha": {}, "beta": {}}}))
-        playwright = {"transport": "stdio", "command": "playwright-mcp", "mode": "optional"}
+        server = {"transport": "stdio", "command": "fixture", "env": {"TOKEN": "worker-secret"}}
         with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "xdg")}):
-            argv, _, _ = self.command(model="muse-spark-1.3", mcp_servers={"playwright": playwright})
-        overrides = [argv[i + 1] for i, item in enumerate(argv) if item == "-c"]
-        self.assertIn("mcpServers.alpha.enabled=false", overrides)
-        self.assertIn("mcpServers.beta.enabled=false", overrides)
-        added = next(item for item in overrides if item.startswith("mcpServers.playwright="))
-        self.assertEqual(json.loads(added.split("=", 1)[1]), playwright)
+            for write in (False, True):
+                for mode in ("restricted", "yolo"):
+                    for servers in ({}, {"worker": server}):
+                        with self.subTest(write=write, mode=mode, servers=bool(servers)):
+                            argv, env, metadata = self.command(write=write, mode=mode,
+                                                              model="muse-spark-1.3", mcp_servers=servers)
+                            self.assertFalse(any(item.startswith("mcpServers") for item in argv))
+                            self.assertNotIn("-c", argv)
+                            self.assertNotIn("worker-secret", json.dumps(argv) + json.dumps(metadata))
+                            self.assertEqual(env["XDG_CONFIG_HOME"], str(Path(metadata["run_tmpdir"]) / "xdg"))
+                            self.assertFalse(Path(metadata["run_tmpdir"]).exists())
+
+    def test_worker_mcp_validation_is_preserved(self):
+        for servers in ("invalid", {"bad name": {}}, {"worker": "invalid"}):
+            with self.subTest(servers=servers), self.assertRaisesRegex(ValueError, "muse.mcp_servers"):
+                self.command(mcp_servers=servers)
 
     def test_api_key_comes_from_stdin_never_argv(self):
         with patch.dict(os.environ, {"MUSE_TEST_KEY": "sk-do-not-print"}):
@@ -153,6 +165,62 @@ class MuseCommandTest(unittest.TestCase):
                               route="muse-spark-high")
         argv, _, _ = core.agent_command(core.DEFAULTS, task, None)
         self.assertEqual(argv[argv.index("--model") + 1], "muse-spark-1.3")
+
+
+class MuseConfigTest(unittest.TestCase):
+    def test_config_mirrors_other_tools_and_shares_login_with_only_worker_servers(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            home = root / "home"
+            home.mkdir()
+            for explicit_xdg in (False, True):
+                config = root / "config" if explicit_xdg else home / ".config"
+                muse = config / "muse"
+                muse.mkdir(parents=True)
+                (config / "git").mkdir()
+                (config / "gh").mkdir()
+                (config / "tool.conf").write_text("tool settings")
+                (config / "linked").symlink_to(config / "git")
+                original = {"schema_version": 1, "permissionProfiles": {"reader": {}},
+                            "mcpServers": {"operator": {"env": {"TOKEN": "operator-secret"}}}}
+                (muse / "settings.json").write_text(json.dumps(original))
+                (muse / "auth.json").write_text("login-secret")
+                (muse / "trust.json").write_text("trust settings")
+                env = {"HOME": str(home)}
+                if explicit_xdg:
+                    env["XDG_CONFIG_HOME"] = str(config)
+                for servers in ({}, {"worker": {"command": "fixture", "env": {"TOKEN": "worker-secret"}}}):
+                    with self.subTest(explicit_xdg=explicit_xdg, servers=bool(servers)):
+                        run = Path(tempfile.mkdtemp(dir=root))
+                        core.muse_worker_config(str(run), servers, env)
+                        xdg = run / "xdg"
+                        self.assertEqual({p.name for p in xdg.iterdir()}, {p.name for p in config.iterdir()})
+                        for name in ("git", "gh", "tool.conf", "linked"):
+                            self.assertTrue((xdg / name).is_symlink())
+                            self.assertEqual((xdg / name).readlink(), config / name)
+                        worker = xdg / "muse"
+                        self.assertFalse(worker.is_symlink())
+                        self.assertEqual(worker.stat().st_mode & 0o777, 0o700)
+                        for name in ("auth.json", "trust.json"):
+                            self.assertTrue((worker / name).is_symlink())
+                            self.assertEqual((worker / name).readlink(), muse / name)
+                        (worker / "auth.json").write_text("refreshed-login")
+                        self.assertEqual((muse / "auth.json").read_text(), "refreshed-login")
+                        self.assertFalse((worker / "settings.json").is_symlink())
+                        self.assertEqual(json.loads((worker / "settings.json").read_text()),
+                                         {**original, "mcpServers": servers})
+                        self.assertEqual(json.loads((muse / "settings.json").read_text()), original)
+                        self.assertNotIn("operator-secret", (worker / "settings.json").read_text())
+
+    def test_config_without_existing_settings_or_login_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            run = root / "run"
+            run.mkdir()
+            core.muse_worker_config(str(run), {}, {"HOME": str(root / "home")})
+            worker = run / "xdg" / "muse"
+            self.assertEqual({p.name for p in worker.iterdir()}, {"settings.json"})
+            self.assertEqual(json.loads((worker / "settings.json").read_text()), {"mcpServers": {}})
 
 
 class MuseLaneOfferTest(unittest.TestCase):
@@ -201,33 +269,89 @@ class MuseRoutingTest(unittest.TestCase):
 
 
 class MuseDispatchTest(unittest.TestCase):
+    def test_cli_delegate_accepts_a_muse_route_and_the_muse_agent(self):
+        parser = core.build_parser()
+        self.assertEqual(parser.parse_args(["delegate", "--agent", "muse", "task"]).agent, "muse")
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {"FUSION_DECISIONS_MODE": "off", "FUSION_TELEMETRY": "0"}), \
+                patch.object(core, "dispatch", return_value={"status": "success", "summary": "ok", "artifacts": {"run_dir": None}}) as dispatch, \
+                contextlib.redirect_stdout(io.StringIO()):
+            core.main(["--workspace", d, "delegate", "--route", "muse-wonder-high", "--fresh", "task"])
+        self.assertEqual(dispatch.call_args.args[1]["agent"], "muse")
+
     def test_dispatch_records_session_usage_and_public_handoff(self):
         with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {"FUSION_DECISIONS_MODE": "off", "FUSION_TELEMETRY": "0"}):
             root = Path(d)
+            config_root = root / "config"
+            muse = config_root / "muse"
+            muse.mkdir(parents=True)
+            (muse / "settings.json").write_text(json.dumps({"mcpServers": {
+                "operator": {"env": {"TOKEN": "operator-secret"}}}}))
+            (muse / "auth.json").write_text("login-secret")
+            servers = {"worker": {"command": "fixture", "env": {"TOKEN": "worker-secret"}}}
             worker = root / "muse-fixture"
             events = [event("run.lifecycle.started", {"kind": "run_started"}),
                       event("model.usage", {"kind": "model_usage", "model": "muse-spark-1.3",
                                             "usage": {"inputTokens": 9, "outputTokens": 4}}),
                       delta(HANDOFF), terminal()]
-            worker.write_text(f"#!{sys.executable}\n" + f"""import json,sys
+            worker.write_text(f"#!{sys.executable}\n" + f"""import json,os,sys
+from pathlib import Path
 assert sys.argv[1:3]==['exec','--json'], sys.argv
 assert '--contributor-mode' in sys.argv and sys.argv[sys.argv.index('--contributor-mode')+1]=='off'
-assert '--disable-write' in sys.argv and '--disable-shell' in sys.argv
+if os.environ['FIXTURE_WRITE'] == '0':
+    assert '--disable-write' in sys.argv and '--disable-shell' in sys.argv and '--yolo' not in sys.argv
+else:
+    assert '--disable-write' not in sys.argv
+assert ('--yolo' in sys.argv) == (os.environ['FIXTURE_WRITE'] == '1' and os.environ['FIXTURE_MODE'] == 'yolo')
+assert '-c' not in sys.argv and not any(arg.startswith('mcpServers') for arg in sys.argv)
+xdg = Path(os.environ['XDG_CONFIG_HOME'])
+assert xdg.is_dir() and xdg == Path(os.environ['TMPDIR']) / 'xdg'
+assert (xdg.parent / '.orc-owner').is_file()
+assert json.loads((xdg / 'muse' / 'settings.json').read_text()) == {{'mcpServers': {servers!r}}}
+assert (xdg / 'muse' / 'auth.json').is_symlink()
 brief = open(sys.argv[sys.argv.index('--prompt-file')+1]).read()
 assert 'Fusion coding harness' in brief
 for event in {events!r}:
     print(json.dumps(event))
 """)
             worker.chmod(0o755)
-            config = core.deep_merge(core.DEFAULTS, {"muse": {"command": str(worker), "model": "muse-spark-1.3"},
-                                                     "decisions": {"mode": "off"}})
-            task = core.make_task(root, "muse", "Review fixture", "review", [], [], None, False, False)
-            store = core.RunStore(root)
-            result = core.dispatch(config, task, store)
-            self.assertEqual(result["status"], "success", result)
-            self.assertEqual((result["summary"], result["model"]), ("reviewed", "muse-spark-1.3"))
-            self.assertEqual(result["usage"]["input_tokens"], 9)
-            self.assertIn("11111111-2222-4333-8444-555555555555", store.sessions().values())
+            for write in (False, True):
+                for mode in ("restricted", "yolo"):
+                    with self.subTest(write=write, mode=mode), patch.dict(os.environ, {"XDG_CONFIG_HOME": str(config_root)}):
+                        config = core.deep_merge(core.DEFAULTS, {"execution_mode": mode,
+                                                                "muse": {"command": str(worker), "model": "muse-spark-1.3",
+                                                                         "mcp_servers": servers,
+                                                                         "env": {"FIXTURE_WRITE": str(int(write)), "FIXTURE_MODE": mode}},
+                                                                "decisions": {"mode": "off"}})
+                        task = core.make_task(root, "muse", "Review fixture", "review", [], [], None, False, write)
+                        store = core.RunStore(root)
+                        result = core.dispatch(config, task, store)
+                        self.assertEqual(result["status"], "success", result)
+                        self.assertEqual((result["summary"], result["model"]), ("reviewed", "muse-spark-1.3"))
+                        self.assertEqual(result["usage"]["input_tokens"], 9)
+                        self.assertIn("11111111-2222-4333-8444-555555555555", store.sessions().values())
+                        self.assertFalse(Path(task["resolved"]["prompt_file"]).exists())
+                        self.assertFalse(Path(task["resolved"]["run_tmpdir"]).exists())
+                        for artifact in store.root.rglob("*"):
+                            if artifact.is_file():
+                                for secret in ("operator-secret", "login-secret", "worker-secret"):
+                                    self.assertNotIn(secret, artifact.read_text(), str(artifact))
+
+    def test_dispatch_cleans_config_when_worker_cannot_start(self):
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {"HOME": d, "XDG_CONFIG_HOME": str(Path(d) / "config"),
+                                                                      "FUSION_DECISIONS_MODE": "off", "FUSION_TELEMETRY": "0"}):
+            root = Path(d)
+            config = core.deep_merge(core.DEFAULTS, {"muse": {"command": sys.executable}, "decisions": {"mode": "off"}})
+            task = core.make_task(root, "muse", "fixture", "review", [], [], None, False, False)
+
+            def fail(argv, **kwargs):
+                xdg = Path(kwargs["env"]["XDG_CONFIG_HOME"])
+                self.assertEqual(json.loads((xdg / "muse" / "settings.json").read_text()), {"mcpServers": {}})
+                raise OSError("fixture could not start")
+
+            with patch("fusion_progress.run_logged", side_effect=fail):
+                result = core.dispatch(config, task, core.RunStore(root))
+            self.assertEqual((result["status"], result["exit_code"]), ("error", 126))
+            self.assertFalse(Path(task["resolved"]["run_tmpdir"]).exists())
             self.assertFalse(Path(task["resolved"]["prompt_file"]).exists())
 
 

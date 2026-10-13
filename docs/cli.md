@@ -346,7 +346,7 @@ options:
 run one bounded sidekick task
 
 ```text
-usage: fusion delegate [-h] [--agent {auto,claude,codex,agy,grok,opencode}]
+usage: fusion delegate [-h] [--agent {auto,claude,codex,agy,grok,opencode,muse}]
                        [--role ROLE] [--needs NAME] [--timeout SECONDS] [--read-only]
                        [--fresh] [--session-key SESSION_KEY] [--route ROUTE]
                        [--model MODEL]
@@ -364,7 +364,7 @@ positional arguments:
 
 options:
   -h, --help              show this help message and exit
-  --agent {auto,claude,codex,agy,grok,opencode}
+  --agent {auto,claude,codex,agy,grok,opencode,muse}
                           worker agent; defaults to the named route agent
   --role ROLE
   --needs NAME            capability the task needs from its lane, such as local_server

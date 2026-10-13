@@ -204,8 +204,7 @@ DEFAULTS: dict[str, Any] = {
     # --disable-write and no shell, so neither tool writes nor shell writes
     # reach the workspace. A named `permission_profile` (defined in the
     # user's Muse settings) replaces --disable-shell for readers. Muse
-    # loads MCP servers from `mcpServers` in its settings.json; workers get
-    # every server named there (plus `disable_mcp`) disabled per run, except
+    # loads settings from a per-run config root with only the MCP
     # servers declared for workers in `mcp_servers`. Keys come from `muse
     # login`, or from the env var named by `api_key_env` fed to
     # --api-key-stdin -- never argv. Sessions are not logged unless
@@ -215,7 +214,6 @@ DEFAULTS: dict[str, Any] = {
         "model": "",
         "sandbox_network": "proxy-only",
         "permission_profile": "",
-        "disable_mcp": [],
         "mcp_servers": {},
         "api_key_env": "",
         "session_log": False,
@@ -2725,20 +2723,28 @@ def parse_muse_output(stdout: str) -> tuple[str | None, str, str | None, dict[st
     return session_id, text.strip(), failure, usage, model, evidence
 
 
-def muse_settings_mcp_names(env: dict[str, str]) -> list[str]:
-    """MCP server names Muse would load from the user's settings.json.
-
-    Names only -- never commands, URLs or headers -- so a worker run can
-    disable every one of them (`-c mcpServers.<name>.enabled=false`)
-    without Fusion ever holding the operator's MCP configuration."""
-    root = env.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    path = Path(root).expanduser() / "muse" / "settings.json"
+def muse_worker_config(directory: str, servers: dict[str, Any], env: dict[str, str]) -> None:
+    """Mirror other tools' config and share login files, replacing the worker server list."""
+    root = env.get("XDG_CONFIG_HOME") or str(Path(env.get("HOME") or str(Path.home())) / ".config")
+    root = Path(root).expanduser().absolute()
+    xdg = Path(directory) / "xdg"
+    xdg.mkdir(mode=0o700)
+    if root.is_dir():
+        for entry in root.iterdir():
+            if entry.name != "muse":
+                (xdg / entry.name).symlink_to(entry)
+    muse = xdg / "muse"
+    muse.mkdir(mode=0o700)
+    for name in ("auth.json", "trust.json"):
+        source = root / "muse" / name
+        if source.exists():
+            (muse / name).symlink_to(source)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    servers = value.get("mcpServers") if isinstance(value, dict) else None
-    return sorted(name for name in servers if isinstance(name, str) and name) if isinstance(servers, dict) else []
+        settings = json.loads((root / "muse" / "settings.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        settings = {}
+    settings["mcpServers"] = servers
+    (muse / "settings.json").write_text(json.dumps(settings) + "\n", encoding="utf-8")
 
 
 def opencode_empty_step_guard(limit: int):
@@ -3531,22 +3537,11 @@ def agent_command(
             argv += ["--permission-profile", profile] if profile and not yolo else ["--disable-shell"]
         elif profile and not yolo:
             argv += ["--permission-profile", profile]
-        # Workers get none of the operator's MCP servers: every server the
-        # user's Muse settings would load is disabled for this run, except
-        # servers declared for workers in muse.mcp_servers.
         worker_servers = settings.get("mcp_servers") or {}
         if not isinstance(worker_servers, dict) or not all(
                 isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", name) and isinstance(server, dict)
                 for name, server in worker_servers.items()):
             raise ValueError("muse.mcp_servers must be an object of MCP server objects by name")
-        disabled = settings.get("disable_mcp") or []
-        if not isinstance(disabled, list) or not all(isinstance(item, str) and item for item in disabled):
-            raise ValueError("muse.disable_mcp must be a list of MCP server names")
-        for name in sorted((set(muse_settings_mcp_names(env)) | set(disabled)) - set(worker_servers)):
-            if re.fullmatch(r"[A-Za-z0-9_.-]+", name):
-                argv += ["-c", f"mcpServers.{name}.enabled=false"]
-        for name, server in worker_servers.items():
-            argv += ["-c", f"mcpServers.{name}=" + json.dumps(server, separators=(",", ":"))]
         metadata: dict[str, Any] = {"command": command, "model": selected_model,
                                     **({"execution_choice": choice} if choice else {})}
         key_env = str(settings.get("api_key_env") or "")
@@ -3569,6 +3564,8 @@ def agent_command(
         prompt.close()
         argv += ["--prompt-file", prompt.name]
         metadata["prompt_file"] = prompt.name
+        metadata["run_tmpdir"] = run_tmpdir(env)
+        env["XDG_CONFIG_HOME"] = str(Path(metadata["run_tmpdir"]) / "xdg")
         return argv, env, metadata
     if agent == "claude":
         command = settings.get("command", "claude")
@@ -4336,6 +4333,8 @@ def _dispatch(
                 os.mkdir(run_tmp, 0o700)
                 stack.callback(shutil.rmtree, run_tmp, True)
                 fusion_tmp.mark(run_tmp)
+                if task["agent"] == "muse":
+                    muse_worker_config(run_tmp, resolved_settings.get("mcp_servers") or {}, os.environ)
             store.event(run_dir, "worker.started", {"argv": argv, "resumed_session": bool(session_id), **session})
             if metadata.get("execution_choice"):
                 metadata["execution_choice"]["dispatch"] = {"status": "attempted", "argv": argv}
@@ -5224,7 +5223,7 @@ def build_parser() -> argparse.ArgumentParser:
                                           "with a VERDICT: approve or VERDICT: changes line; without one the run ends "
                                           "verdict_missing. Exit 0 on success, 2 paused by operator control, 4 capped, "
                                           "5 verdict_missing, 1 otherwise.")
-    delegate.add_argument("--agent", choices=["auto", "claude", "codex", "agy", "grok", "opencode"], help="worker agent; defaults to the named route agent")
+    delegate.add_argument("--agent", choices=["auto", "claude", "codex", "agy", "grok", "opencode", "muse"], help="worker agent; defaults to the named route agent")
     delegate.add_argument("--role", default="implementation")
     delegate.add_argument("--needs", action="append", type=cli_need, default=[], metavar="NAME",
                           help="capability the task needs from its lane, such as local_server (repeatable); auto skips lanes whose config lacks it")
@@ -5777,7 +5776,7 @@ def _main(args, parser) -> int:
             args.agent = route.get("agent")
             if not args.agent:
                 parser.error(f"route {args.route} has no agent; specify --agent")
-            if args.agent not in {"auto", "claude", "codex", "agy", "grok", "opencode"}:
+            if args.agent not in {"auto", "claude", "codex", "agy", "grok", "opencode", "muse"}:
                 parser.error(f"route {args.route} has an invalid agent: {args.agent}")
         try:
             criterion_text = (Path(args.criterion_file).expanduser().read_text(encoding="utf-8")
