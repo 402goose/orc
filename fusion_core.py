@@ -200,7 +200,8 @@ DEFAULTS: dict[str, Any] = {
     },
     # Muse Code (`muse exec --json`, Meta-hosted). Workers always run with
     # --contributor-mode off and --no-foreign-personal-context, approvals
-    # never and the OS sandbox on (proxy-only network); readers also get
+    # never and the OS sandbox on by default (proxy-only network); restricted writers
+    # also run inside writer_sandbox. Readers also get
     # --disable-write and no shell, so neither tool writes nor shell writes
     # reach the workspace. A named `permission_profile` (defined in the
     # user's Muse settings) replaces --disable-shell for readers. Muse
@@ -213,6 +214,8 @@ DEFAULTS: dict[str, Any] = {
         "command": "muse",
         "model": "",
         "sandbox_network": "proxy-only",
+        "inner_sandbox": False,
+        "writer_allow": [],
         "permission_profile": "",
         "mcp_servers": {},
         "api_key_env": "",
@@ -3282,13 +3285,13 @@ def shared_write_roots() -> list[str]:
     return list(dict.fromkeys(os.path.realpath(root) for root in ("/tmp", "/var/folders", tempfile.gettempdir())))
 
 
-def agy_writer_allow(settings: dict[str, Any]) -> list[str]:
-    """`agy.writer_allow` as resolved paths. Each entry is absolute or `~/`; none may be,
+def writer_allow(settings: dict[str, Any], agent: str) -> list[str]:
+    """`writer_allow` as resolved paths. Each entry is absolute or `~/`; none may be,
     contain or sit inside the shared temp roots, nor be $HOME or one of its parents."""
-    entries = settings.get("writer_allow", DEFAULTS["agy"]["writer_allow"])
+    entries = settings.get("writer_allow", DEFAULTS[agent]["writer_allow"])
     if not isinstance(entries, list) or not all(isinstance(entry, str) and entry.startswith(("/", "~/"))
                                                 for entry in entries):
-        raise ValueError("agy.writer_allow must be a list of absolute or ~/ paths")
+        raise ValueError(f"{agent}.writer_allow must be a list of absolute or ~/ paths")
     home = os.path.realpath(Path.home())
     shared = shared_write_roots()
     paths = []
@@ -3297,20 +3300,47 @@ def agy_writer_allow(settings: dict[str, Any]) -> list[str]:
         opened = ([home] if _within(home, path) else []) + [root for root in shared
                                                            if _within(path, root) or _within(root, path)]
         if opened:
-            raise ValueError(f"agy.writer_allow: {entry} would open {opened[0]}, which other runs share")
+            raise ValueError(f"{agent}.writer_allow: {entry} would open {opened[0]}, which other runs share")
         paths.append(path)
     return paths
 
 
-def agy_writer_profile(writable: list[str]) -> str:
-    """The sandbox-exec profile for an agy writer: everything is allowed except file
+def agy_writer_allow(settings: dict[str, Any]) -> list[str]:
+    return writer_allow(settings, "agy")
+
+
+def writer_sandbox_profile(writable: list[str]) -> str:
+    """The sandbox-exec profile for a writer: everything is allowed except file
     writes, which reach only `writable` (subpaths), /dev/null and the terminal devices
-    (agy runs shell commands in a pseudo-terminal it opens through /dev/ptmx)."""
+    (shell commands use a pseudo-terminal opened through /dev/ptmx)."""
     rules = [f"(subpath {sbpl_string(path)})" for path in dict.fromkeys(writable)]
     return "\n".join(["(version 1)", "(allow default)", "(deny file-write*)", "(allow file-write*",
                       *(f"    {rule}" for rule in rules), '    (literal "/dev/null")',
                       '    (literal "/dev/ptmx")', '    (literal "/dev/dtracehelper")',
                       '    (regex #"^/dev/tty[^/]*$"))', ""])
+
+
+def agy_writer_profile(writable: list[str]) -> str:
+    return writer_sandbox_profile(writable)
+
+
+def writer_sandbox(argv: list[str], workspace: str, settings: dict[str, Any],
+                   env: dict[str, str], agent: str, directory: str | None = None,
+                   writable: tuple[str, ...] = ()) -> tuple[list[str], str]:
+    """Wrap a restricted writer, reusing its run temp directory if already chosen.
+    Dispatch creates and removes the directory. Extra state paths are explicit;
+    writer_allow cannot open shared temp roots."""
+    wrapper = sandbox_exec()
+    if wrapper is None:
+        raise ValueError(f"{agent} writers run only inside ORC's macOS sandbox-exec profile, which this host lacks; "
+                         f"keep {agent} lanes read-only here (lacks: [\"write\"]) or use a yolo workspace")
+    allow = writer_allow(settings, agent)
+    directory = directory or run_tmpdir(env)
+    reader_cache_env(env, directory)
+    root = os.path.realpath(workspace)
+    git = sorted(path for path in git_metadata_dirs(workspace) if not _within(path, root))
+    system = [path for path in (darwin_user_cache_dir(),) if path]
+    return [wrapper, "-p", writer_sandbox_profile([root, *git, directory, *writable, *allow, *system]), *argv], directory
 
 
 def agy_writer_sandbox(argv: list[str], workspace: str, settings: dict[str, Any],
@@ -3321,17 +3351,7 @@ def agy_writer_sandbox(argv: list[str], workspace: str, settings: dict[str, Any]
     metadata, a fresh run temp directory (its TMPDIR, TMP and TEMP, and tool caches) and
     `agy.writer_allow`. Returns the wrapped argv and the run temp directory path, which
     dispatch creates and removes. A host without sandbox-exec refuses the writer."""
-    wrapper = sandbox_exec()
-    if wrapper is None:
-        raise ValueError("agy writers run only inside ORC's macOS sandbox-exec profile, which this host lacks; "
-                         "keep agy lanes read-only here (lacks: [\"write\"]) or use a yolo workspace")
-    allow = agy_writer_allow(settings)
-    directory = run_tmpdir(env)
-    reader_cache_env(env, directory)
-    root = os.path.realpath(workspace)
-    git = sorted(path for path in git_metadata_dirs(workspace) if not _within(path, root))
-    system = [path for path in (darwin_user_cache_dir(),) if path]
-    return [wrapper, "-p", agy_writer_profile([root, *git, directory, *allow, *system]), *argv], directory
+    return writer_sandbox(argv, workspace, settings, env, "agy")
 
 
 def codex_permission_args(workspace: Path, settings: dict[str, Any], write: bool) -> list[str]:
@@ -3513,9 +3533,9 @@ def agent_command(
             choice = recorded_choice(check_pair("muse", settings),
                                      {"status": "unchecked", "reason": "Muse reports no per-model effort catalog in exec events"})
             argv += ["--reasoning-effort", settings["reasoning_effort"]]
-        # Approvals off, sandbox on: a headless worker cannot answer prompts,
-        # and the OS sandbox is what keeps it in its workspace. YOLO (writing
-        # work in a yolo workspace) is the only exception, as elsewhere.
+        # Approvals off: a headless worker cannot answer prompts. Restricted
+        # writers also use ORC's outer profile to confine shared temp writes.
+        # YOLO (writing work in a yolo workspace) is the only exception, as elsewhere.
         if yolo:
             argv.append("--yolo")
         else:
@@ -3558,14 +3578,21 @@ def agent_command(
                 session_id = None
             if session_id:
                 argv += ["--session-id", session_id]
+        metadata["run_tmpdir"] = run_tmpdir(env)
+        env["XDG_CONFIG_HOME"] = str(Path(metadata["run_tmpdir"]) / "xdg")
+        if task["write"] and not yolo:
+            if settings.get("inner_sandbox", False) is False:
+                argv.append("--disable-sandbox")
+            argv, _ = writer_sandbox(argv, task["workspace"], settings, env, "muse",
+                                     directory=metadata["run_tmpdir"],
+                                     writable=(os.path.realpath(env["XDG_CONFIG_HOME"]),
+                                               os.path.realpath(Path.home() / ".local/share/muse")))
         prompt = tempfile.NamedTemporaryFile(mode="w", suffix=".md", prefix="fusion-muse-brief-",
                                              delete=False, encoding="utf-8")
         prompt.write(brief_for(task))
         prompt.close()
         argv += ["--prompt-file", prompt.name]
         metadata["prompt_file"] = prompt.name
-        metadata["run_tmpdir"] = run_tmpdir(env)
-        env["XDG_CONFIG_HOME"] = str(Path(metadata["run_tmpdir"]) / "xdg")
         return argv, env, metadata
     if agent == "claude":
         command = settings.get("command", "claude")
@@ -4251,7 +4278,7 @@ def _dispatch(
     provenance = run_provenance(task, resolved_settings, repo_head)
     binary = executable(argv[0])
     missing = argv[0] if binary is None else None
-    # A wrapped worker (an agy writer under sandbox-exec) also needs the command it wraps.
+    # A writer under sandbox-exec also needs the command it wraps.
     wrapped = metadata.get("command")
     if missing is None and wrapped and wrapped != argv[0] and executable(wrapped) is None:
         missing = wrapped
