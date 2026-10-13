@@ -678,6 +678,22 @@ applies to writers too.
 
 ## Antigravity settings
 
+`agy.network_retries` is a non-negative integer, default `3`; `0` disables
+network retries. Retryable provider errors wait 15, 60, then 180 seconds
+(further retries, if configured, also wait 180 seconds). With a conversation ID,
+each retry uses `--conversation` and a short continuation brief to continue the
+same task; without one it repeats the original brief. Writers are asked to save
+edits as they go, and retries reuse the run's sandbox temp directory. All attempts
+append to the same stdout and stderr logs with separators. The result records
+`network_retries` with each retry's attempt number (starting at 1), delay,
+error excerpt and whether it resumed a conversation. Conversation IDs are saved
+even on failures so a later resume can continue them.
+
+Backoff and attempts share `timeout_seconds`; a retry is skipped unless at least
+120 seconds remain after its delay. An exhausted or skipped network retry ends
+with verdict `error` and reason `provider_network`, rather than a refusal. This
+transient failure does not count against lane quality or trigger quota cooldown.
+
 In restricted mode, Fusion launches `agy` with `--sandbox` and uses `plan` for
 readers or `accept-edits` for writers. Execution mode alone does not grant command
 permissions. In `~/.gemini/antigravity-cli/settings.json`, merge these settings

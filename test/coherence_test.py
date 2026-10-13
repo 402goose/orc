@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # set to probe and no entry in the CLI's map. Any other kind missing from
 # either is drift.
 DYNAMIC_KINDS = {"routing"}
-FAILURE_CLASSES = {"quota", "auth", "permission_denied", "timeout", "missing_executable", "worker_error"}
+FAILURE_CLASSES = {"quota", "auth", "permission_denied", "timeout", "provider_network", "missing_executable", "worker_error"}
 
 
 def cli_parser():
@@ -98,6 +98,7 @@ class CoherenceTest(unittest.TestCase):
             {"status": "error", "blockers": ["You've hit your usage limit; resets at 5:10am"]},
             {"status": "error", "blockers": ["something nobody has seen before"]},
             {"status": "error", "blockers": [], "exit_code": 124},
+            {"status": "error", "provider_failure": "connection reset by peer"},
             {"status": "error", "blockers": ["codex is not available on PATH"]},
             {"status": "blocked", "blockers": []},
             {},

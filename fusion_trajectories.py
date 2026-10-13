@@ -27,7 +27,7 @@ RUN_FIELDS = ("run_id", "issue", "role", "write", "agent", "lane_key", "model", 
 STEP_FIELDS = ("run_id", "index", "kind", "role", "text", "tool", "arguments", "result", "is_error", "time_ms", "raw_type")
 OUTCOME_FIELDS = ("accepted", "stage", "rejection_class", "reporter", "reason")
 # Runs whose failure was the harness's, not the work's: no verdict on them is a label.
-HARNESS_FAILURES = frozenset({"permission_denied", "auth", "missing_executable", "coordinator_error", "verdict_missing"})
+HARNESS_FAILURES = frozenset({"permission_denied", "auth", "missing_executable", "coordinator_error", "verdict_missing", "provider_network"})
 REDACTED = "[REDACTED]"
 
 
