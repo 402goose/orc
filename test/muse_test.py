@@ -254,6 +254,12 @@ class MuseCommandTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--session-id") + 1], session)
         self.assertNotIn("--no-session-log", argv)
 
+    def test_without_session_logging_a_stored_session_is_not_passed(self):
+        argv, env, _ = self.command(model="muse-spark-1.3", session="11111111-2222-4333-8444-555555555555")
+        self.assertIn("--no-session-log", argv)
+        self.assertNotIn("--session-id", argv)
+        self.assertEqual(env["MUSE_NO_AUTO_UPDATE"], "1")
+
     def test_default_routes_are_the_catalog_lanes(self):
         routes = core.DEFAULTS["routes"]
         expected = {"muse-wonder-full-high": "muse-wonder-full-1.0",

@@ -3625,7 +3625,9 @@ def agent_command(
             argv.append("--api-key-stdin")
             metadata["api_key_env"] = key_env
         argv += ["--workspace", task["workspace"]]
-        if session_id:
+        # Muse resumes a session only from a retained log, so a run with --no-session-log
+        # always starts fresh; passing an id there makes muse refuse the run.
+        if session_id and settings.get("session_log") is True:
             try:
                 uuid.UUID(session_id)
             except (ValueError, TypeError, AttributeError):
@@ -3634,6 +3636,9 @@ def agent_command(
                 argv += ["--session-id", session_id]
         metadata["run_tmpdir"] = run_tmpdir(env)
         env["XDG_CONFIG_HOME"] = str(Path(metadata["run_tmpdir"]) / "xdg")
+        # A worker never updates the operator's muse install; its launcher would also try to
+        # write an update stamp beside itself, which a writer's sandbox denies.
+        env["MUSE_NO_AUTO_UPDATE"] = "1"
         if task["write"] and not yolo:
             if settings.get("inner_sandbox", False) is False:
                 argv.append("--disable-sandbox")
