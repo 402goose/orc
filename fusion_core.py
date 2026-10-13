@@ -775,7 +775,7 @@ PERMISSION_MARKERS = ("permission denied", "agy denied", "agy auto-denied", "per
 AUTH_MARKERS = ("unauthorized", "(401)", "status=401", "refresh_token", "not logged in", "please log in",
                 "authentication failed", "invalid api key")
 AGY_NETWORK_PATTERNS = (r"connection reset by peer", r"operation timed out", r"network issue connecting to the server",
-                        r"Eligibility check failed", r"i/o timeout",
+                        r"Eligibility check failed", r"i/o timeout", r"broken pipe", r"write: connection reset",
                         r"(?=.*\bEOF\b)(?=.*https?://(?:[\w-]+\.)*googleapis\.)")
 AGY_NETWORK_RETRY_DELAYS = (15, 60, 180)
 AGY_NETWORK_CONTINUATION = ("The previous attempt was cut off by a network error. Continue the same task from where "
@@ -1804,13 +1804,19 @@ class RunStore:
                 except (OSError, json.JSONDecodeError):
                     current = {}
                 current = current if isinstance(current, dict) else {}
-                current[key] = value
+                if value is None:
+                    current.pop(key, None)
+                else:
+                    current[key] = value
                 self.write_json(path, current)
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def set_session(self, key: str, session_id: str) -> None:
         self._update_json(self.sessions_path, key, session_id)
+
+    def clear_session(self, key: str) -> None:
+        self._update_json(self.sessions_path, key, None)
 
     def session_last_used(self, key: str) -> int | None:
         """End time (ms) of the last worker run under this session key."""
@@ -2234,6 +2240,7 @@ def agy_network_error(stdout: str, stderr: str = "") -> str | None:
                 value = None
             if isinstance(value, dict) and str(value.get("status") or "").upper() == "SUCCESS":
                 line = str(value.get("error") or "")
+        # Provider transport errors remain retryable even when the flag is false.
         if any(re.search(pattern, line, re.IGNORECASE) for pattern in AGY_NETWORK_PATTERNS):
             return compact(line.strip(), 1500)
     return None
@@ -4337,6 +4344,8 @@ def _dispatch(
     if missing is None and wrapped and wrapped != argv[0] and executable(wrapped) is None:
         missing = wrapped
     if missing is not None:
+        if task["agent"] == "agy":
+            store.clear_session(task["session_key"])
         progress.emit(task.get("progress_label", task["role"]), f"cannot start {task['agent']}: executable unavailable")
         result = {
             "schema": SCHEMA,
@@ -4360,6 +4369,7 @@ def _dispatch(
             "duration_ms": 0,
             "timeout_seconds": effective_timeout,
             "usage": {},
+            **({"agy_conversation_id": session_id_seen} if task["agent"] == "agy" else {}),
             **session,
             "provenance": provenance,
             "artifacts": {"run_dir": str(run_dir)},
@@ -4449,7 +4459,6 @@ def _dispatch(
                 new_session = parse_agy_output(completed.stdout, completed.stderr)[0]
                 if new_session:
                     session_id_seen = new_session
-                    store.set_session(task["session_key"], new_session)
                 network_error = agy_network_error(completed.stdout, completed.stderr)
                 if not network_error or len(network_retries) >= resolved_settings.get("network_retries", 3):
                     break
@@ -4519,7 +4528,7 @@ def _dispatch(
                 "source": "codex_json" if task["agent"] == "codex" else f"{task['agent']}_events",
                 "note": "effort is not attested by the stock exec event stream"}
         handoff = parse_handoff(summary)
-        if new_session:
+        if new_session and task["agent"] != "agy":
             store.set_session(task["session_key"], new_session)
         # Codex and Muse command exits remain evidence; provider permission denials fail.
         if failure or (task["agent"] not in {"codex", "muse"} and evidence_notes):
@@ -4586,6 +4595,13 @@ def _dispatch(
                        and not handoff.get("reported_verdict"))
     if verdict_missing:
         status = "verdict_missing"
+    if task["agent"] == "agy":
+        session_id_seen = parse_agy_output(worker_stdout)[0] or session_id_seen
+        if status == "success":
+            if session_id_seen:
+                store.set_session(task["session_key"], session_id_seen)
+        else:
+            store.clear_session(task["session_key"])
     blockers = handoff.get("blockers", []) + (evidence_notes if task["agent"] != "codex" else []) + ([failure] if failure else [])
     if verdict_missing:
         blockers.append("verdict missing: a review delegation must answer with a VERDICT: approve or VERDICT: changes "
@@ -4618,7 +4634,8 @@ def _dispatch(
         "blockers": blockers,
         "limitations": handoff.get("limitations", []),
         "provider_failure": failure,
-        **({"network_retries": network_retries, "session_id": session_id_seen} if task["agent"] == "agy" else {}),
+        **({"network_retries": network_retries, "session_id": session_id_seen,
+            "agy_conversation_id": session_id_seen} if task["agent"] == "agy" else {}),
         "denied_tools": denied_tools or blocker_denied_tools(blockers),
         "denied": denied,
         "denied_count": len(denied),
