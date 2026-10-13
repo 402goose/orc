@@ -680,14 +680,19 @@ applies to writers too.
 
 `agy.network_retries` is a non-negative integer, default `3`; `0` disables
 network retries. Retryable provider errors wait 15, 60, then 180 seconds
-(further retries, if configured, also wait 180 seconds). With a conversation ID,
+(further retries, if configured, also wait 180 seconds). Network error patterns,
+including `broken pipe` and `write: connection reset`, override `retryable: false`;
+`retryable: true` alone also qualifies. With a conversation ID,
 each retry uses `--conversation` and a short continuation brief to continue the
 same task; without one it repeats the original brief. Writers are asked to save
 edits as they go, and retries reuse the run's sandbox temp directory. All attempts
 append to the same stdout and stderr logs with separators. The result records
 `network_retries` with each retry's attempt number (starting at 1), delay,
-error excerpt and whether it resumed a conversation. Conversation IDs are saved
-even on failures so a later resume can continue them.
+error excerpt and whether it resumed a conversation. Successful runs save their
+conversation as the session for the key. Failed runs (any non-success status)
+clear that session, so the next dispatch starts a fresh conversation. Retries
+within a run still resume its conversation. The result records
+`agy_conversation_id` so an operator can resume that conversation explicitly.
 
 Backoff and attempts share `timeout_seconds`; a retry is skipped unless at least
 120 seconds remain after its delay. An exhausted or skipped network retry ends

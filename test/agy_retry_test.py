@@ -22,6 +22,11 @@ NETWORK_ERROR = 'AGY_ERROR: ' + json.dumps({
                    'read tcp 127.0.0.1: read: operation timed out',
     "status": "UNKNOWN", "error_code": 2, "code_kind": "grpc", "retryable": True, "error_id": "error-123",
 })
+BROKEN_PIPE_ERROR = 'AGY_ERROR ' + json.dumps({
+    "short_error": 'pre-invocation hook: context summarization: request failed: Post '
+                   '"https://example.googleapis.com/v1": write tcp 127.0.0.1: write: broken pipe',
+    "retryable": False,
+})
 HANDOFF = "STATUS: success\nSUMMARY: done\nCHANGED: none\nTESTS: none\nBLOCKERS: none"
 
 
@@ -49,7 +54,7 @@ class AgyRetryTest(unittest.TestCase):
         self.store = core.RunStore(self.workspace)
 
     def write_agent(self, failures=1, conversation="conv-123", error=NETWORK_ERROR, stdout_error=False,
-                    scratch=False, empty_final_id=False):
+                    scratch=False, empty_final_id=False, handoff=HANDOFF):
         agent = self.root / "agy"
         agent.write_text(f"#!{sys.executable}\n" + f'''
 import json, os, pathlib, sys
@@ -69,7 +74,7 @@ with calls.open('a') as stream:
 failed = attempt < {failures!r}
 conversation = {conversation!r} if failed or not {empty_final_id!r} else ''
 print(json.dumps({{'conversation_id': conversation, 'status': 'ERROR' if failed else 'SUCCESS',
-                  'error': 'provider failed' if failed else '', 'response': '' if failed else {HANDOFF!r}}}))
+                  'error': 'provider failed' if failed else '', 'response': '' if failed else {handoff!r}}}))
 if failed:
     print({error!r}, file=sys.stdout if {stdout_error!r} else sys.stderr)
 sys.exit(3 if failed else 0)
@@ -108,6 +113,7 @@ sys.exit(3 if failed else 0)
         self.assertEqual((retry["attempt"], retry["delay_s"], retry["resumed"]), (1, 15, True))
         self.assertIn("AGY_ERROR:", retry["error_head"])
         self.assertEqual(result["session_id"], "conv-123")
+        self.assertEqual(result["agy_conversation_id"], "conv-123")
         self.assertEqual(self.store.sessions()[self.task["session_key"]], "conv-123")
         self.sleep.assert_called_once_with(15)
         stdout = Path(result["artifacts"]["stdout"]).read_text()
@@ -126,24 +132,68 @@ sys.exit(3 if failed else 0)
         self.assertEqual([r["delay_s"] for r in result["network_retries"]], [15, 60, 180])
         self.assertTrue(all(r["resumed"] for r in result["network_retries"]))
         self.assertEqual(self.sleep.call_args_list, [call(15), call(60), call(180)])
-        self.assertEqual(self.store.sessions()[self.task["session_key"]], "conv-123")
+        key = self.task["session_key"]
+        self.assertNotIn(key, self.store.sessions())
+        self.assertEqual(result["agy_conversation_id"], "conv-123")
+        saved_result = json.loads(Path(result["artifacts"]["run_dir"], "result.json").read_text())
+        self.assertEqual(saved_result["agy_conversation_id"], "conv-123")
         self.dispatch(self.root / "agy", resume=True, settings={"network_retries": 0})
-        self.assertIn("--conversation", self.recorded_calls()[-1]["argv"])
+        self.assertEqual(self.task["session_key"], key)
+        self.assertNotIn("--conversation", self.recorded_calls()[-1]["argv"])
 
     def test_non_retryable_error_does_not_retry(self):
-        result = self.dispatch(self.write_agent(error='AGY_ERROR: {"short_error":"invalid request","retryable":false}'))
-        self.assertEqual(len(self.recorded_calls()), 1)
+        self.dispatch(self.write_agent(failures=0))
+        key = self.task["session_key"]
+        result = self.dispatch(self.write_agent(failures=99, error='AGY_ERROR: '
+                               '{"short_error":"invalid-argument 400","retryable":false}'), resume=True)
+        self.assertEqual(len(self.recorded_calls()), 2)
+        self.assertIn("--conversation", self.recorded_calls()[-1]["argv"])
         self.assertEqual(result["network_retries"], [])
         self.assertNotEqual(result["verdict_reason"], "provider_network")
+        self.assertNotEqual(core.failure_class(result), "provider_network")
+        self.assertNotIn(key, self.store.sessions())
+        self.assertEqual(result["agy_conversation_id"], "conv-123")
         self.sleep.assert_not_called()
 
-    def test_zero_disables_network_retries_and_saves_session(self):
-        result = self.dispatch(self.write_agent(), settings={"network_retries": 0})
-        self.assertEqual(len(self.recorded_calls()), 1)
+    def test_zero_disables_network_retries_and_clears_session(self):
+        self.dispatch(self.write_agent(failures=0))
+        key = self.task["session_key"]
+        result = self.dispatch(self.write_agent(failures=99), resume=True, settings={"network_retries": 0})
+        self.assertEqual(len(self.recorded_calls()), 2)
         self.assert_network_failure(result)
         self.assertEqual(result["network_retries"], [])
-        self.assertEqual(self.store.sessions()[self.task["session_key"]], "conv-123")
+        self.assertNotIn(key, self.store.sessions())
+        self.assertEqual(result["agy_conversation_id"], "conv-123")
         self.sleep.assert_not_called()
+
+    def test_non_success_handoffs_clear_existing_session(self):
+        for status in ("partial", "blocked", "error"):
+            with self.subTest(status=status):
+                self.dispatch(self.write_agent(failures=0))
+                key = self.task["session_key"]
+                result = self.dispatch(self.write_agent(failures=0, handoff=HANDOFF.replace(
+                    "STATUS: success", "STATUS: " + status)), resume=True)
+                self.assertEqual(result["status"], status)
+                self.assertEqual(result["agy_conversation_id"], "conv-123")
+                self.assertNotIn(key, self.store.sessions())
+
+    def test_timeout_clears_existing_session_and_records_conversation(self):
+        self.dispatch(self.write_agent(failures=0))
+        key = self.task["session_key"]
+        with patch.object(core.progress, "run_logged", side_effect=core.subprocess.TimeoutExpired(
+                "agy", 3600, output=json.dumps({"conversation_id": "conv-timeout"}))):
+            result = self.dispatch(self.root / "agy", resume=True)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["agy_conversation_id"], "conv-timeout")
+        self.assertNotIn(key, self.store.sessions())
+
+    def test_missing_binary_clears_existing_session(self):
+        self.dispatch(self.write_agent(failures=0))
+        key = self.task["session_key"]
+        result = self.dispatch(self.root / "missing-agy", resume=True)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["agy_conversation_id"], "conv-123")
+        self.assertNotIn(key, self.store.sessions())
 
     def test_without_conversation_repeats_original_brief(self):
         result = self.dispatch(self.write_agent(conversation=""))
@@ -252,15 +302,36 @@ sys.exit(3 if failed else 0)
         self.assertEqual(core.classify_verdict({"status": "error", "exit_code": 3, "blockers": [NETWORK_ERROR]}),
                          {"verdict": "error", "reason": "provider_network"})
 
+    def test_broken_pipe_overrides_false_retryable_flag(self):
+        failure = core.parse_agy_output("", BROKEN_PIPE_ERROR)[2]
+        result = {"status": "error", "exit_code": 3, "provider_failure": failure}
+        self.assertEqual(core.classify_verdict(result), {"verdict": "error", "reason": "provider_network"})
+        self.assertEqual(core.failure_class(result), "provider_network")
+        result = self.dispatch(self.write_agent(error=BROKEN_PIPE_ERROR))
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(self.recorded_calls()), 2)
+        self.assertIn("broken pipe", result["network_retries"][0]["error_head"])
+        self.sleep.assert_called_once_with(15)
+
+    def test_write_reset_overrides_false_retryable_flag(self):
+        error = 'AGY_ERROR: ' + json.dumps({"short_error": "write: connection reset", "retryable": False})
+        result = self.dispatch(self.write_agent(error=error), settings={"network_retries": 0})
+        self.assert_network_failure(result)
+
     def test_retryable_json_flag_without_known_message(self):
         error = 'AGY_ERROR: ' + json.dumps({"short_error": "transport interrupted", "retryable": True})
         failure = core.parse_agy_output("", error)[2]
         self.assertEqual(core.failure_class({"status": "error", "provider_failure": failure}), "provider_network")
         self.assertEqual(core.classify_verdict({"status": "error", "exit_code": 3, "blockers": [error]}),
                          {"verdict": "error", "reason": "provider_network"})
+        result = self.dispatch(self.write_agent(error=error))
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(self.recorded_calls()), 2)
+        self.sleep.assert_called_once_with(15)
 
     def test_network_message_patterns(self):
-        messages = ["read: connection reset by peer", "read: operation timed out",
+        messages = ["read: connection reset by peer", "write: connection reset", "write: broken pipe",
+                    "read: operation timed out",
                     "There was a network issue connecting to the server, please try again.",
                     "Eligibility check failed: loadCodeAssist", "read: i/o timeout",
                     'Post "https://example.googleapis.com/v1": EOF',
